@@ -194,6 +194,12 @@ jobs:
     name: PR scope check (the diff matches the issue)
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    # This is the ONE lane with a job-level `if`, and it is safe for a reason
+    # that does not generalize: a push event has no pull request, so there is
+    # genuinely nothing to check, and direct pushes to main are blocked by
+    # branch protection anyway. Every other lane runs unconditionally, because
+    # GitHub reports a skipped job to branch protection as SUCCESS and a gate
+    # that can be skipped into a pass asserts a guarantee it is not providing.
     if: github.event_name == 'pull_request'
     permissions:
       contents: read

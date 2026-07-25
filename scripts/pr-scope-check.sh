@@ -30,7 +30,35 @@ REPO="${GITHUB_REPOSITORY:-$(gh repo view --json nameWithOwner --jq .nameWithOwn
 # artifacts rather than implementation.
 ALWAYS_ALLOWED='^(CHANGELOG\.md)$'
 
-body="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.body // ""')"
+pr_json="$(gh api "repos/$REPO/pulls/$PR_NUMBER")"
+body="$(printf '%s' "$pr_json" | jq -r '.body // ""')"
+author="$(printf '%s' "$pr_json" | jq -r '.user.login // ""')"
+
+# Automated dependency and workflow bumps have no issue and never will. They are
+# exempt ONLY when the author is a known bot AND every file they touch is a
+# dependency manifest or a workflow. A bot PR that touches source code is NOT
+# exempt, which is the case that would actually matter if a token were misused.
+# This is a positive check in the script rather than a skipped job, because
+# GitHub reports a skipped job to branch protection as SUCCESS.
+BOT_ALLOWED='^(Cargo\.toml|Cargo\.lock|\.github/workflows/[^/]+\.ya?ml|\.github/dependabot\.yml|packages/[^/]+/package(-lock)?\.json)$'
+case "$author" in
+  dependabot\[bot\]|renovate\[bot\]|github-actions\[bot\])
+    changed_now="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
+    offending=""
+    for f in $changed_now; do
+      printf '%s' "$f" | grep -qE "$BOT_ALLOWED" || offending="$offending$f
+"
+    done
+    if [ -z "$offending" ]; then
+      echo "pr-scope-check: EXEMPT. Automated dependency bump by $author touching only manifests and workflows:"
+      printf '%s\n' $changed_now | sed 's/^/    /'
+      exit 0
+    fi
+    echo "FAIL: $author is a bot but this PR touches files outside the dependency allowlist:" >&2
+    printf '%s' "$offending" | sed 's/^/    /' >&2
+    exit 1
+    ;;
+esac
 
 # Accept the GitHub closing keywords, case insensitively.
 issues="$(printf '%s' "$body" \
