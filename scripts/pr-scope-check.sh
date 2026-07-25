@@ -111,7 +111,12 @@ for line in lines:
     cells = [c.strip() for c in s.strip("|").split("|")]
     if not cells:
         continue
-    path = cells[0].strip().strip("`").strip()
+    # A row may annotate the path, e.g. `Cargo.toml` (workspace root). Take the
+    # FIRST backticked span when present, else the bare cell. The corpus
+    # validator uses the identical rule; if these two ever disagree, CI rejects
+    # a diff the author was told was in scope.
+    m = re.search(r"`([^`]+)`", cells[0])
+    path = (m.group(1) if m else cells[0]).strip()
     # Skip the header row and the --- separator row.
     if not path or path.lower() == "path" or set(path) <= set("-: "):
         continue
