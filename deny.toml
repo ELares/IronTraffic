@@ -1,0 +1,69 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# The dependency policy. The dependency tree of a process that terminates
+# hostile traffic IS part of the attack surface, so it is reviewed rather than
+# accumulated. Three rules follow from that:
+#
+#   1. Permissive licenses only. A copyleft crate in the tree changes what
+#      users may do with the binary, which is a promise we make in COVENANTS.md.
+#   2. No unmaintained or advisory-flagged crate without a written, scoped
+#      exception naming why the vulnerable path is unreachable.
+#   3. Pure Rust wherever possible, so the single static musl binary holds.
+#      cargo-deny cannot check that; the musl CI lane does.
+
+[graph]
+all-features = true
+
+[advisories]
+version = 2
+yanked = "deny"
+# Every ignore below MUST carry a comment explaining why the vulnerable code
+# path is unreachable in our usage. An ignore without that reasoning is a
+# silent acceptance of a known vulnerability and will be rejected in review.
+ignore = []
+
+[licenses]
+version = 2
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "CC0-1.0",
+    "MIT-0",
+]
+confidence-threshold = 0.93
+# Deliberately NOT allowed, and each for a reason we can state publicly:
+#   GPL / LGPL / AGPL: would change the terms under which users may ship the
+#     binary, which COVENANTS.md promises never to do.
+#   MPL-2.0: file-level copyleft. Tolerable for some projects, but it forces a
+#     per-file analysis on every contributor and we would rather not have that
+#     conversation on every dependency bump.
+#   CDLA-Permissive-2.0: pulled in by webpki-roots. We use the OS trust store
+#     instead, so this never needs to enter the tree.
+#   BUSL / SSPL / Elastic: not open source; see the licensing section of
+#     COVENANTS.md for why we treat these as disqualifying.
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+# Crates that must never appear, with the reason.
+deny = [
+    # OpenSSL and native-tls pull a C dependency, break the static musl build,
+    # and carry a CVE history we would then inherit. rustls is the decision.
+    { name = "openssl" },
+    { name = "openssl-sys" },
+    { name = "native-tls" },
+    # webpki-roots ships a bundled CA set under CDLA-Permissive-2.0 and pins
+    # trust to a crate release; rustls-native-certs reads the OS store instead.
+    { name = "webpki-roots" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]

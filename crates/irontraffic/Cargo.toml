@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "irontraffic"
+version = "0.0.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "IronTraffic: a traffic and API manager. L4 and L7 load balancing, API gateway, and ingress."
+
+[lints]
+workspace = true

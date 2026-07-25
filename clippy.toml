@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# Production code may not unwrap, expect, panic, or index a slice. Test code
+# may do all four: a test that cannot panic cannot fail, and forcing tests to
+# thread Results makes them longer and less readable for no safety gain. These
+# four settings are what make the deny-level lints in Cargo.toml livable.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+allow-dbg-in-tests = false
+
+# Words that are not typos and must not be flagged in doc comments.
+doc-valid-idents = [
+    "IronTraffic", "IronCache", "IronBus", "IronAuth",
+    "HAProxy", "NGINX", "OpenResty", "KrakenD", "APISIX", "Pingora", "GitHub",
+    "OpenAPI", "AsyncAPI", "GraphQL", "OpenTelemetry", "Prometheus", "Kubernetes",
+    "TypeScript", "JavaScript", "WebAssembly", "WebSocket", "QUIC", "QPACK", "HPACK",
+    "ACME", "JWKS", "OAuth", "OpenID", "SPIFFE", "SPIRE", "mTLS", "SNI", "ALPN",
+    "EndpointSlice", "GatewayClass", "HTTPRoute", "Maglev", "CoDel", "GCRA", "EWMA",
+    "..",
+]
+
+# A struct big enough to be passed by value expensively is a real cost on the
+# request path. The default (256) is generous for a system that cares.
+trivial-copy-size-limit = 64
+too-many-arguments-threshold = 8

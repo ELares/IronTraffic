@@ -1,0 +1,115 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# The IronTraffic Cargo virtual workspace.
+#
+# The crate graph IS the architecture. Each crate is a seam that the compiler
+# enforces, which matters more here than in most projects because the
+# implementers are small language models: a boundary written only in prose gets
+# crossed, and a boundary expressed as a crate cannot be.
+#
+# The full planned graph is documented in ARCHITECTURE.md. Crates appear in this
+# file as the issues that create them land, so that `cargo build` is green at
+# every commit and no member ever points at a directory that does not exist.
+
+[workspace]
+resolver = "2"
+members = ["crates/irontraffic"]
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.85"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/ELares/IronTraffic"
+
+[workspace.dependencies]
+# The single-binary entry point. Every other crate is a library behind a seam.
+irontraffic = { path = "crates/irontraffic", version = "0.0.0" }
+
+[workspace.lints.rust]
+# A proxy parses attacker-controlled bytes on every request. There is no
+# unsafe block an implementer is authorized to write; performance work that
+# appears to need one is a design conversation on the issue, not a local edit.
+unsafe_code = "deny"
+# Every public item is documented, because the implementers of the NEXT issue
+# read these docs as their specification.
+missing_docs = "warn"
+unreachable_pub = "warn"
+# A narrowing conversion on a value derived from the network is a truncation
+# bug waiting to happen; make the lossy ones visible.
+trivial_casts = "warn"
+trivial_numeric_casts = "warn"
+
+[workspace.lints.clippy]
+# Pedantic is the floor. CI runs with `-D warnings`, so every entry below that
+# says "warn" is an ERROR in CI; the level only changes the local experience.
+# Exceptions are granted per item with `reason = "..."`, never blanket-allowed,
+# and the allow-needs-reason invariant lint enforces that.
+pedantic = { level = "warn", priority = -1 }
+
+# The async correctness lints that matter most in a proxy. Holding a lock or a
+# RefCell borrow across an await point is the single most common way to turn a
+# working handler into a deadlock or a data race under load. The subtle form is
+# a guard held by a temporary in a `while let` scrutinee, which lives to the end
+# of the loop body; bind the guard in an inner scope so it drops before the await.
+await_holding_lock = "deny"
+await_holding_refcell_ref = "deny"
+
+# A narrowing or sign-changing cast applied to a length or an index that came
+# off the wire is a truncation bug. `try_from` with a real error, or a proven
+# bound, every time.
+cast_possible_truncation = "deny"
+cast_possible_wrap = "deny"
+cast_sign_loss = "deny"
+
+# Panics are outages. clippy.toml turns these off inside test code, so unit
+# tests may unwrap freely while production code may not.
+unwrap_used = "deny"
+expect_used = "deny"
+panic = "deny"
+indexing_slicing = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+# Hygiene. print_stdout and print_stderr are denied so that diagnostics go
+# through the telemetry seam; the CLI opts out per item with a reason.
+dbg_macro = "deny"
+print_stdout = "deny"
+print_stderr = "deny"
+mem_forget = "deny"
+integer_division = "warn"
+rc_buffer = "warn"
+str_to_string = "warn"
+large_stack_arrays = "warn"
+needless_collect = "warn"
+
+# DELIBERATELY NOT ENABLED WORKSPACE WIDE: clippy::arithmetic_side_effects. It
+# fires on every `+` between integers, which under `-D warnings` would make
+# ordinary code unwritable and would train implementers to sprinkle `#[allow]`.
+# It is enabled PER CRATE on the crates that parse attacker-controlled input
+# (the HTTP, protocol, and configuration crates), where it is exactly right.
+# Those crates carry `#![deny(clippy::arithmetic_side_effects)]` in lib.rs.
+
+[profile.release]
+# A proxy is one long-lived process; a slower build for a faster binary is
+# always the right trade. LTO and one codegen unit matter most on the request
+# path, which is a chain of small functions across crate boundaries that only
+# cross-crate inlining can flatten.
+lto = "fat"
+codegen-units = 1
+# panic = "unwind", the default, is DELIBERATE and must not be changed to
+# "abort". Under unwind, tokio catches a panic at the task boundary: the one
+# connection dies, the panic is logged and counted, and the process keeps
+# serving. Under abort, a single panic on a single request from a single client
+# terminates the whole proxy, which converts any residual panic bug anywhere in
+# the tree into a remote denial of service. The no-panic rules exist so this
+# never fires; this setting is what bounds the blast radius when they fail.
+panic = "unwind"
+# Keep line tables. A stripped binary turns the one panic we did not prevent
+# into an unactionable incident. The size cost is small next to that.
+strip = "none"
+debug = 1
+
+[profile.bench]
+lto = "thin"
+codegen-units = 1
+debug = true

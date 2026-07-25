@@ -1,0 +1,212 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# The merge gate.
+#
+# This pipeline is designed against a specific adversary: a small language model
+# that wants CI to be green more than it wants the code to be correct. Every
+# lane below closes a way to get green without doing the work. In particular:
+#
+#   - No lane is gated by an `if:` on a repository variable. GitHub reports a
+#     SKIPPED job to branch protection as SUCCESS, so a required check that can
+#     be skipped is a check that can be turned green by unsetting a variable.
+#     Lanes that have nothing to do yet RUN and assert the absence explicitly.
+#   - Every lane that could pass vacuously (fuzz with no targets, benchmarks
+#     with no benches, conformance with no suite) fails closed if its inputs
+#     are missing, rather than reporting success for having found nothing.
+#
+# scripts/gate.sh runs the locally runnable subset in the same order.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: never
+  RUST_BACKTRACE: 1
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --all --check
+
+  clippy:
+    name: clippy (pedantic, -D warnings)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+
+  test:
+    name: test (ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: tests (workspace, all features)
+        run: cargo test --workspace --all-features
+      - name: doctests
+        run: cargo test --workspace --all-features --doc
+      - name: default features build (the edge and k3s profile must not rot)
+        # The data-plane-only build is what runs on constrained edge and k3s
+        # nodes. It is built on every PR so that a dependency added to the
+        # control plane cannot silently land in the data plane.
+        run: cargo check --workspace --no-default-features
+
+  msrv:
+    name: msrv (1.85)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # rust-toolchain.toml pins a newer stable and outranks `rustup default`,
+      # which would silently turn this lane into a no-op. RUSTUP_TOOLCHAIN
+      # outranks the toolchain file, so the check genuinely runs under 1.85.
+      RUSTUP_TOOLCHAIN: "1.85"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo check --workspace --all-features --all-targets
+
+  musl:
+    name: musl static build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install the musl target for the PINNED toolchain
+        # rust-toolchain.toml pins the toolchain cargo actually uses, so the
+        # target must be added through rustup (which honors the pin), not via
+        # the action (which only equips its own toolchain).
+        run: rustup target add x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --target x86_64-unknown-linux-musl -p irontraffic
+      - name: Verify the binary is genuinely static
+        run: |
+          set -euo pipefail
+          BIN=target/x86_64-unknown-linux-musl/release/irontraffic
+          file "$BIN"
+          if ldd "$BIN" 2>&1 | grep -vq 'not a dynamic executable\|statically linked'; then
+            echo "FAIL: binary is not static. A C dependency entered the tree."
+            ldd "$BIN" || true
+            exit 1
+          fi
+          echo "static: ok"
+
+  deny:
+    name: cargo-deny (advisories, licenses, bans, sources)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          command: check
+
+  invariants:
+    name: invariant lints, dash scan, governance
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: invariant lints (the structural rules clippy cannot express)
+        run: scripts/invariant-lints.sh
+      - name: invariant lint self-test
+        # The lints are themselves code, and a lint that silently stops
+        # matching is worse than no lint: it reports success forever. This
+        # replays a corpus of deliberate violations and fails if any rule stops
+        # firing, and replays a clean corpus and fails if any rule fires
+        # spuriously. Without this, a bad refactor of a grep is undetectable.
+        run: scripts/invariant-lints-selftest.sh
+      - name: dash scan (no em dashes, no en dashes)
+        run: scripts/dash-scan.sh
+      - name: governance files present
+        # These files are trust infrastructure. This lint ensures they cannot
+        # be silently removed, renamed, or emptied.
+        run: |
+          set -euo pipefail
+          for f in LICENSE LICENSE-APACHE LICENSE-MIT COVENANTS.md SECURITY.md \
+                   CONTRIBUTING.md AGENTS.md ARCHITECTURE.md \
+                   docs/WILL-NOT-IMPLEMENT.md docs/THREAT-MODEL.md; do
+            test -s "$f" || { echo "missing or empty governance file: $f"; exit 1; }
+          done
+          echo "governance: ok"
+
+  fuzz:
+    name: fuzz (smoke, fails closed on a missing corpus)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+      - name: Run every declared fuzz target briefly
+        # FAILS CLOSED. Once fuzz/Cargo.toml exists, every declared target must
+        # run. A parser crate that ships without a fuzz target is caught by the
+        # second check below, so "no targets" can never mean "nothing to do".
+        run: |
+          set -euo pipefail
+          if [ ! -f fuzz/Cargo.toml ]; then
+            echo "No fuzz directory yet. Asserting no parser crate has shipped without one."
+            if ls -d crates/irontraffic-http crates/irontraffic-config 2>/dev/null | grep -q .; then
+              echo "FAIL: a crate that parses untrusted input exists but fuzz/ does not."
+              exit 1
+            fi
+            echo "ok: no parser crates yet, no fuzz targets required"
+            exit 0
+          fi
+          cargo install cargo-fuzz --locked
+          targets=$(cargo fuzz list)
+          if [ -z "$targets" ]; then
+            echo "FAIL: fuzz/Cargo.toml exists but declares no targets."
+            exit 1
+          fi
+          for t in $targets; do
+            echo "== fuzzing $t =="
+            cargo fuzz run "$t" -- -max_total_time=60 -timeout=10
+          done
+
+  scope:
+    name: PR scope check (the diff matches the issue)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    if: github.event_name == 'pull_request'
+    permissions:
+      contents: read
+      pull-requests: read
+      issues: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Compare the changed files against the issue's Files table
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: scripts/pr-scope-check.sh

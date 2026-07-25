@@ -138,10 +138,10 @@ If a case is genuinely unreachable, prove it in a comment and use the escape:
 # 3. determinism-seam: one source of time and entropy, so tests are reproducible.
 # ---------------------------------------------------------------------------
 hits="$(scan_prod determinism-seam '(SystemTime::now|Instant::now|UNIX_EPOCH|\brand::|thread_rng|getrandom|OsRng|Utc::now|Local::now)' \
-  | grep -v '^crates/irontraffic-env/' || true)"
+  | grep -vE '^crates/irontraffic-(time|rand)/' || true)"
 [ -n "$hits" ] && fail determinism-seam \
 "All wall-clock time, monotonic time, and entropy flows through the
-irontraffic-env seam. Direct access makes tests non-deterministic and makes
+irontraffic-time and irontraffic-rand seams. Direct access makes tests non-deterministic and makes
 time-dependent bugs unreproducible. Take a Clock or Entropy handle instead." "$hits"
 
 # ---------------------------------------------------------------------------
