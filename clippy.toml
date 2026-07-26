@@ -4,6 +4,7 @@
 # may do all four: a test that cannot panic cannot fail, and forcing tests to
 # thread Results makes them longer and less readable for no safety gain. These
 # four settings are what make the deny-level lints in Cargo.toml livable.
+msrv = "1.85"
 allow-unwrap-in-tests = true
 allow-expect-in-tests = true
 allow-panic-in-tests = true

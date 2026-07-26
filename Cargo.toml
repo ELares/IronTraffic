@@ -12,18 +12,51 @@
 # every commit and no member ever points at a directory that does not exist.
 
 [workspace]
-resolver = "2"
+resolver = "3"
 members = ["crates/irontraffic"]
 
 [workspace.package]
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/ELares/IronTraffic"
 
 [workspace.dependencies]
-# The single-binary entry point. Every other crate is a library behind a seam.
-irontraffic = { path = "crates/irontraffic", version = "0.0.0" }
+# The runtime. Named only inside `irontraffic-io` and `irontraffic-runtime`.
+tokio = { version = "1.53.1", features = ["rt", "rt-multi-thread", "net", "io-util", "time", "sync", "signal", "macros"] }
+# `hyper::rt::Read` / `hyper::rt::Write` / `ReadBuf` / `Timer`: the transport seam.
+hyper = { version = "1.11.0", default-features = false }
+# `TokioIo` and `TokioTimer`, the only place tokio and hyper meet.
+hyper-util = { version = "0.1", features = ["tokio"] }
+# `BytesMut` pooled read chunks. Never `Vec<u8>` in the data plane.
+bytes = { version = "1.10" }
+# `set_reuse_port` before `bind`, backlog, `TCP_NODELAY`, `ipv6_only`.
+socket2 = { version = "0.6", features = ["all"] }
+# `clock_gettime(CLOCK_BOOTTIME)` without a C build and without `unsafe` in our code.
+rustix = { version = "1.0", features = ["time"] }
+# The CSPRNG side of the randomness seam.
+getrandom = { version = "0.3" }
+# Config layer 1.
+serde = { version = "1.0.151", features = ["derive"] }
+# JSON config input, canonical serialisation.
+serde_json = { version = "1.0.151" }
+# YAML config input. `serde_yaml` is `0.9.34+deprecated`.
+serde_norway = { version = "0.9.42" }
+# Short interned names in config types, inline up to 23 bytes in 0.3.
+smol_str = { version = "0.3" }
+# `CachePadded` for the per-core state array.
+crossbeam-utils = { version = "0.8" }
+# Typed error enums without hand-written `Display`.
+thiserror = { version = "2.0" }
+# Lifecycle logging. Banned from the request path.
+tracing = { version = "0.1.41" }
+# The one subscriber, installed in the binary.
+tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
+# Property tests.
+proptest = { version = "1.5" }
+# Benchmarks.
+criterion = { version = "0.7" }
 
 [workspace.lints.rust]
 # A proxy parses attacker-controlled bytes on every request. There is no
@@ -38,6 +71,8 @@ unreachable_pub = "warn"
 # bug waiting to happen; make the lossy ones visible.
 trivial_casts = "warn"
 trivial_numeric_casts = "warn"
+# A Result or future that is silently dropped is a bug; explicit discards are required.
+unused_must_use = "deny"
 
 [workspace.lints.clippy]
 # Pedantic is the floor. CI runs with `-D warnings`, so every entry below that

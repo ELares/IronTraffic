@@ -1,50 +1,73 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! The IronTraffic server binary.
-//!
-//! This is deliberately a thin shell over the `irontraffic` library so that
-//! every behavior is reachable from a test. Keep it that way.
 
-use std::io::Write as _;
+mod logging;
 
-use irontraffic::{Mode, VERSION};
-
+/// Process entrypoint. Returns the process exit code:
+/// 0 for `--version` and `--help`, 2 for any usage error.
 fn main() -> std::process::ExitCode {
-    let arg = std::env::args().nth(1);
-    let mut out = std::io::stdout().lock();
+    let argv: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|a| a.to_string_lossy().into_owned())
+        .collect();
 
-    let Some(arg) = arg else {
-        // it-allow: no-swallowed-error reason: a failed write to stdout at startup has no recovery path and no observer
-        let _ = writeln!(
-            out,
-            "irontraffic {VERSION} (default mode: {})",
-            Mode::default().as_str()
-        );
-        return std::process::ExitCode::SUCCESS;
-    };
+    logging::init();
 
-    if arg == "--version" || arg == "-V" {
-        // it-allow: no-swallowed-error reason: a failed write to stdout at startup has no recovery path and no observer
-        let _ = writeln!(out, "irontraffic {VERSION}");
-        return std::process::ExitCode::SUCCESS;
+    match argv.as_slice() {
+        [] => {
+            let _ = print_usage(&mut std::io::stderr()); // it-allow: no-swallowed-error reason: a broken pipe changes nothing; the exit code is already decided
+            std::process::ExitCode::from(2)
+        }
+        [arg] if arg == "--version" || arg == "-V" => {
+            #[allow(clippy::print_stdout, reason = "version output")]
+            {
+                println!("irontraffic {}", env!("CARGO_PKG_VERSION"));
+            }
+            std::process::ExitCode::SUCCESS
+        }
+        [arg] if arg == "--help" || arg == "-h" => {
+            let _ = print_usage(&mut std::io::stdout()); // it-allow: no-swallowed-error reason: a broken pipe changes nothing; the exit code is already decided
+            std::process::ExitCode::SUCCESS
+        }
+        _ => {
+            let joined = argv
+                .iter()
+                .map(|a| sanitize_for_terminal(a))
+                .collect::<Vec<_>>()
+                .join(" ");
+            #[allow(clippy::print_stderr, reason = "error diagnostics go to stderr")]
+            {
+                eprintln!("error: unrecognised arguments: {joined}");
+            }
+            let _ = print_usage(&mut std::io::stderr()); // it-allow: no-swallowed-error reason: a broken pipe changes nothing; the exit code is already decided
+            std::process::ExitCode::from(2)
+        }
     }
+}
 
-    let Some(mode) = Mode::parse(&arg) else {
-        // it-allow: no-swallowed-error reason: a failed write to stderr during argument rejection has no recovery path
-        let _ = writeln!(
-            std::io::stderr(),
-            "irontraffic: unknown mode {arg:?}; expected one of: run, proxy, control, validate"
-        );
-        return std::process::ExitCode::FAILURE;
-    };
+/// Writes the usage block to `out`. Used for both the `--help` (stdout) and the
+/// usage-error (stderr) paths so the two can never drift.
+fn print_usage(out: &mut dyn std::io::Write) -> std::io::Result<()> {
+    writeln!(out, "irontraffic {}", env!("CARGO_PKG_VERSION"))?;
+    writeln!(out, "usage:")?;
+    writeln!(out, "  irontraffic --version")?;
+    writeln!(out, "  irontraffic --help")?;
+    Ok(())
+}
 
-    // The runtime, configuration loader, and serving paths are milestone 1
-    // deliverables. Until they land, a recognized mode reports what it would
-    // do and exits successfully. It does not pretend to serve traffic.
-    // it-allow: no-swallowed-error reason: a failed write to stdout at startup has no recovery path and no observer
-    let _ = writeln!(
-        out,
-        "irontraffic {VERSION}: mode {} is not yet wired up",
-        mode.as_str()
-    );
-    std::process::ExitCode::SUCCESS
+/// Replaces every control character except tab with `.`.
+///
+/// Applied to any command-line argument echoed back in an error message. An
+/// argument is untrusted text and stderr is a terminal and a log: an unfiltered
+/// escape sequence can move the cursor, recolour the screen, or forge a log line.
+fn sanitize_for_terminal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        if c == '\u{7f}' || (c.is_control() && c != '\t') {
+            out.push('.');
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
