@@ -44,6 +44,7 @@
 
 pub mod error;
 pub mod field;
+pub mod hlist;
 pub mod limits;
 pub mod scalar;
 
