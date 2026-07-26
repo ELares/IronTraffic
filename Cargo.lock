@@ -348,6 +348,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "irontraffic-limits"
+version = "0.1.0"
+dependencies = [
+ "irontraffic-time",
+ "proptest",
+ "thiserror",
+]
+
+[[package]]
 name = "irontraffic-rand"
 version = "0.1.0"
 dependencies = [
