@@ -13,7 +13,7 @@
 
 [workspace]
 resolver = "3"
-members = ["crates/irontraffic", "crates/irontraffic-filter", "crates/irontraffic-http", "crates/irontraffic-io", "crates/irontraffic-k8s", "crates/irontraffic-limits", "crates/irontraffic-rand", "crates/irontraffic-resilience", "crates/irontraffic-router", "crates/irontraffic-runtime", "crates/irontraffic-time"]
+members = ["crates/irontraffic", "crates/irontraffic-filter", "crates/irontraffic-http", "crates/irontraffic-io", "crates/irontraffic-k8s", "crates/irontraffic-limits", "crates/irontraffic-rand", "crates/irontraffic-resilience", "crates/irontraffic-router", "crates/irontraffic-runtime", "crates/irontraffic-time", "crates/irontraffic-tls"]
 
 [workspace.package]
 version = "0.1.0"
@@ -68,6 +68,9 @@ criterion = { version = "0.7" }
 kube = { version = "4.2.0", default-features = false, features = ["client"] }
 # Kubernetes API types. `latest` matches the bundled OpenAPI spec.
 k8s-openapi = { version = "0.28.0", features = ["latest"] }
+# NOTE: --all-features cannot build irontraffic-tls; its crypto-* features are
+# mutually exclusive by design. See docs/tls/BUILD-MATRIX.md.
+rustls = { version = "0.23.42", default-features = false, features = ["std", "tls12", "logging"] }
 
 [workspace.lints.rust]
 # A proxy parses attacker-controlled bytes on every request. There is no
