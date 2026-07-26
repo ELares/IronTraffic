@@ -6,12 +6,14 @@
 #![deny(missing_docs)]
 
 pub mod acceptor;
+pub mod shutdown;
 pub mod spawn;
 pub mod timer;
 pub mod transport;
 
 pub use acceptor::{Acceptor, TcpAcceptor};
 pub use hyper::rt::{Read, ReadBuf, ReadBufCursor, Sleep, Timer, Write};
+pub use shutdown::{Phase, ShutdownController, ShutdownToken, accept_or_drain};
 pub use spawn::{NoRuntime, Spawner, TaskError, TaskHandle};
 pub use timer::{SystemTimer, TimedOut, sleep, with_timeout};
 pub use transport::{TcpTransport, Transport};
