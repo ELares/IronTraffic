@@ -24,3 +24,13 @@ crypto-fips = ["rustls/fips", "rustls/aws_lc_rs", "rustls/prefer-post-quantum"]
 
 [dependencies]
 rustls = { workspace = true }
+siphasher = { workspace = true }
+irontraffic-rand = { path = "../irontraffic-rand", version = "0.1.0" }
+
+[dev-dependencies]
+proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "name"
+harness = false
