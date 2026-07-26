@@ -67,7 +67,7 @@ tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
 # Property tests.
 proptest = { version = "1.5" }
 # Benchmarks.
-criterion = { version = "0.7" }
+criterion = { version = "0.8" }
 # Kubernetes client. Only in the control-plane crate.
 kube = { version = "4.2.0", default-features = false, features = ["client"] }
 # Kubernetes API types. `latest` matches the bundled OpenAPI spec.
