@@ -23,9 +23,10 @@ use bytes::BytesMut;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use irontraffic_http::authority::Authority;
 use irontraffic_http::field::{validate_name, validate_value};
+use irontraffic_http::framing::{OtherCodings, resolve_request_framing};
 use irontraffic_http::known::{self, KnownHeader};
 use irontraffic_http::section::{FieldSection, FieldSectionBuilder};
-use irontraffic_http::{Limits, Scheme, WireVersion};
+use irontraffic_http::{Limits, Method, Scheme, WireVersion};
 use std::hint::black_box;
 
 /// Sixteen (name, value) pairs, 40 bytes each (an 8-byte name, a 32-byte
@@ -223,11 +224,139 @@ fn bench_authority_parse(c: &mut Criterion) {
     group.finish();
 }
 
+/// Builds the "typical section" input for [`bench_resolve_framing`]: 16
+/// fields under `Limits::DEFAULT`, the last of which is
+/// `content-length: 1234`.
+#[allow(
+    clippy::unwrap_used,
+    reason = "bench harness setup, not request-path code: every name/value pushed here is a \
+              short fixed literal well inside every limit, so push cannot fail"
+)]
+fn typical_framing_section() -> FieldSection {
+    let limits = Limits::DEFAULT.clamped();
+    let mut arena = BytesMut::new();
+    let mut builder = FieldSectionBuilder::new(&arena, &limits);
+    for i in 0..15_u32 {
+        let name = format!("x-bench-{i:02}");
+        builder.push(&mut arena, name.as_bytes(), b"v").unwrap();
+    }
+    builder
+        .push(&mut arena, b"content-length", b"1234")
+        .unwrap();
+    builder.finish(&mut arena)
+}
+
+/// Builds the "chunked section" input for [`bench_resolve_framing`]: 16
+/// fields under `Limits::DEFAULT`, the last of which is
+/// `transfer-encoding: chunked`.
+#[allow(
+    clippy::unwrap_used,
+    reason = "bench harness setup, not request-path code: every name/value pushed here is a \
+              short fixed literal well inside every limit, so push cannot fail"
+)]
+fn chunked_framing_section() -> FieldSection {
+    let limits = Limits::DEFAULT.clamped();
+    let mut arena = BytesMut::new();
+    let mut builder = FieldSectionBuilder::new(&arena, &limits);
+    for i in 0..15_u32 {
+        let name = format!("x-bench-{i:02}");
+        builder.push(&mut arena, name.as_bytes(), b"v").unwrap();
+    }
+    builder
+        .push(&mut arena, b"transfer-encoding", b"chunked")
+        .unwrap();
+    builder.finish(&mut arena)
+}
+
+/// Builds the "adversarial section" input for [`bench_resolve_framing`]: 100
+/// fields under `Limits::DEFAULT`, with 8 `transfer-encoding` tokens spread
+/// across 3 field lines (none of them `chunked`), refused as
+/// `TransferEncodingFinalNotChunked` only after the whole combined list has
+/// been scanned.
+#[allow(
+    clippy::unwrap_used,
+    reason = "bench harness setup, not request-path code: every name/value pushed here is a \
+              short fixed literal well inside every limit, so push cannot fail"
+)]
+fn adversarial_framing_section() -> FieldSection {
+    let limits = Limits::DEFAULT.clamped();
+    let mut arena = BytesMut::new();
+    let mut builder = FieldSectionBuilder::new(&arena, &limits);
+    for i in 0..97_u32 {
+        let name = format!("x-bench-{i:03}");
+        builder.push(&mut arena, name.as_bytes(), b"v").unwrap();
+    }
+    builder
+        .push(&mut arena, b"transfer-encoding", b"a, b, c")
+        .unwrap();
+    builder
+        .push(&mut arena, b"transfer-encoding", b"d, e, f")
+        .unwrap();
+    builder
+        .push(&mut arena, b"transfer-encoding", b"g, h")
+        .unwrap();
+    builder.finish(&mut arena)
+}
+
+/// Benchmarks `resolve_request_framing` on the three inputs the design
+/// budgets (reference runner, same as above): under 120 ns for the two
+/// accepting cases and under 500 ns for the refusing case. Framing
+/// resolution runs once per request and must not be a measurable fraction
+/// of a 300,000 requests-per-second per-core budget (3.3 microseconds per
+/// request). Criterion does not enforce a budget itself; compare the
+/// reported time against it by hand.
+fn bench_resolve_framing(c: &mut Criterion) {
+    let typical = typical_framing_section();
+    let chunked = chunked_framing_section();
+    let adversarial = adversarial_framing_section();
+
+    let mut group = c.benchmark_group("bench_resolve_framing");
+
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("typical_content_length", |b| {
+        b.iter(|| {
+            resolve_request_framing(
+                black_box(&Method::Post),
+                black_box(WireVersion::Http11),
+                black_box(&typical),
+                black_box(OtherCodings::Reject),
+            )
+        });
+    });
+
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("chunked", |b| {
+        b.iter(|| {
+            resolve_request_framing(
+                black_box(&Method::Post),
+                black_box(WireVersion::Http11),
+                black_box(&chunked),
+                black_box(OtherCodings::Reject),
+            )
+        });
+    });
+
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("adversarial_refused", |b| {
+        b.iter(|| {
+            resolve_request_framing(
+                black_box(&Method::Post),
+                black_box(WireVersion::Http11),
+                black_box(&adversarial),
+                black_box(OtherCodings::Reject),
+            )
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_authority_parse,
     bench_field_validate,
     bench_header_lookup,
     bench_known_classify,
+    bench_resolve_framing,
 );
 criterion_main!(benches);
