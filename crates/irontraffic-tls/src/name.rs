@@ -295,6 +295,16 @@ pub fn parent(name: &str) -> Option<&str> {
 
 /// The parent domain of a wildcard entry such as `*.example.com`.
 ///
+/// The returned slice borrows the RAW `raw` input. It is NOT normalized: it
+/// is not lowercased, a trailing dot is not stripped, and none of
+/// [`normalize`]'s validation has run on it. The caller MUST pass the result
+/// through [`normalize`] before using it as a certificate-index lookup key
+/// or checking it against any policy list (for example a `SUFFIX_DENY`
+/// list). Comparing or hashing the raw slice directly lets a mixed-case
+/// wildcard entry such as `*.CO.UK` slip past a lowercase-only policy check,
+/// or lets a mixed-case configured wildcard silently fail to match the SNI
+/// it was meant to cover.
+///
 /// # Errors
 /// `WildcardError::NotWildcard` if the name has no leading `*.`, and
 /// `WildcardError::PartialWildcard` for any other placement of `*`.
