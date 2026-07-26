@@ -17,6 +17,14 @@ workspace = true
 irontraffic-io = { path = "../irontraffic-io", version = "0.1.0" }
 # ListenerName, BindAddr, and Backlog: the validated newtypes bind() takes.
 irontraffic-config = { path = "../irontraffic-config", version = "0.1.0" }
+# core::with, Counter, and turn_tick: the accept loop's per-turn clock and
+# counter seam.
+irontraffic-runtime = { path = "../irontraffic-runtime", version = "0.1.0" }
+# The accept loop's `time` parameter is `Arc<dyn irontraffic_time::TimeSource>`,
+# passed straight through to `irontraffic_runtime::core::turn_tick`.
+irontraffic-time = { path = "../irontraffic-time", version = "0.1.0" }
+# CachePadded for ConnRegistry's shared atomic.
+crossbeam-utils = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
 
@@ -25,3 +33,11 @@ thiserror = { workspace = true }
 # real tokio runtime; this crate's own src/ never names tokio, enforced by
 # the transport-seam invariant lint.
 tokio = { workspace = true }
+# Test 13, prop_registry_conservation.
+proptest = { workspace = true }
+# The registry benchmarks.
+criterion = { workspace = true }
+
+[[bench]]
+name = "registry"
+harness = false

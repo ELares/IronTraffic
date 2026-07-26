@@ -744,8 +744,13 @@ dependencies = [
 name = "irontraffic-conn"
 version = "0.1.0"
 dependencies = [
+ "criterion",
+ "crossbeam-utils",
  "irontraffic-config",
  "irontraffic-io",
+ "irontraffic-runtime",
+ "irontraffic-time",
+ "proptest",
  "thiserror",
  "tokio",
  "tracing",
