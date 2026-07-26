@@ -12,9 +12,21 @@ description = "IronTraffic's sans-IO HTTP parse boundary: the single place attac
 workspace = true
 
 [dependencies]
+# D6: bytes, smallvec and memchr were declared here but referenced by
+# nothing in src/ (smallvec pulled in with the `union` feature, its unsafe
+# union-storage variant, into a crate that is `#![forbid(unsafe_code)]`).
+# deny.toml's own preamble says the tree is reviewed rather than
+# accumulated; removed. The issue that first actually uses one of these
+# declares it again then.
+#
+# `authority-parsing-and-reconciliation` (#30) is that first user: `Authority`
+# stores its canonical host in a `Bytes`, and `Authority::parse_into` writes
+# into a caller-supplied `BytesMut` and takes a `Bytes` view of it with
+# `split_off`/`freeze`, the same pattern `irontraffic-io`'s buffer pool
+# already uses. Declared here again per D6's own note above.
+bytes = { workspace = true }
 # `BytesMut`, the join buffer `hlist::CookieAccumulator::join_into` writes
 # into. Never `Vec<u8>` in the data plane.
-bytes = { workspace = true }
 # Inline, non-heap-allocated crumb index (`SmallVec<[(u32, u32); 8]>`) in
 # `hlist::CookieAccumulator`, so the common one- or two-crumb cookie never
 # allocates. `memchr` stays out of this manifest: still referenced by
