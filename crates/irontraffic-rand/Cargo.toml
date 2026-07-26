@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "irontraffic-rand"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Seedable fast PRNG and OS CSPRNG for IronTraffic."
+
+[lints]
+workspace = true
+
+[dependencies]
+getrandom = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
