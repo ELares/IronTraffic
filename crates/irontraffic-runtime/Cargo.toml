@@ -16,3 +16,10 @@ workspace = true
 tracing = { workspace = true }
 # Used by `runtime-dataplane-build` (#12) for typed error enums.
 thiserror = { workspace = true }
+# Used by `runtime-dataplane-build` (#12) to build the data-plane and
+# control-plane runtimes.
+tokio = { workspace = true }
+# Used by `runtime-dataplane-build` (#12): `DataPlane::spawner` and
+# `ControlPlane::spawner` return `irontraffic_io::Spawner`, the only way out
+# of this crate into task spawning.
+irontraffic-io = { path = "../irontraffic-io", version = "0.1.0" }
