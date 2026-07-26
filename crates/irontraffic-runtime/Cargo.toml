@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "irontraffic-runtime"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Runtime construction for IronTraffic."
+
+[lints]
+workspace = true
+
+[dependencies]
+# Used by `runtime-dataplane-build` (#12) for the runtime startup log.
+tracing = { workspace = true }
+# Used by `runtime-dataplane-build` (#12) for typed error enums.
+thiserror = { workspace = true }
