@@ -395,6 +395,62 @@ scan_prod() {
 }
 
 # ---------------------------------------------------------------------------
+# 0. untracked-source: a file this gate cannot see is a file it did not
+#    check, no matter what every rule below reports.
+#
+#    WHY THIS EXISTS (issue #513). Every rule below discovers what to scan
+#    through git, never through the filesystem: rust_files() is `git ls-files
+#    -z -- '*.rs' | ...`, and crate-inherits-workspace reads `git ls-files --
+#    'crates/*/Cargo.toml'` directly. `git ls-files` lists only what git is
+#    already tracking. A file created on disk and not yet `git add`ed is
+#    therefore invisible to every one of them: a todo!(), a bare .store( with
+#    no allowlist entry, a CoreCtx stored as a struct field, or a test with no
+#    assertion, in a brand-new file, all sail through a gate that reports
+#    clean because nothing below ever reads a byte of it. This happened for
+#    real: three new files created for issue #13 produced an identical clean
+#    invariant-lints run and an identical clean test-census run before and
+#    after `git add`, even though one of the files held two un-marked
+#    .store( calls that single-snapshot-publish correctly rejected the moment
+#    staging made them visible.
+#
+#    THE FIX IS A REFUSAL, NOT A QUIET WIDENING. rust_files() could instead
+#    read the filesystem directly and quietly include untracked files, and
+#    every rule above would then see them without anyone having to do
+#    anything. That is precisely the wrong fix: it would make the gate
+#    correct by accident, for a reason nobody had to notice, understand, or
+#    keep true. The next rewrite of a scan that goes back to a plain git
+#    enumeration, or a rule added later that reads git directly instead of
+#    going through rust_files(), silently reopens the exact same hole with
+#    nothing here left to catch it. Refusing outright makes "stage it" a step
+#    the gate itself enforces rather than a convention an implementer has to
+#    remember, and it matches every other rule in this file: named, explained,
+#    with the offending lines listed, not silently patched around.
+#
+#    SCOPE. `git ls-files --others --exclude-standard` is the honest
+#    enumeration: "others" means untracked, and `--exclude-standard` applies
+#    .gitignore, .git/info/exclude, and git's own always-on excludes, so a
+#    build artifact under target/, an editor swap file, or anything else
+#    .gitignore already knows about is never reported by it. This is
+#    restricted to the same two patterns a rule below actually scans (`*.rs`,
+#    exactly rust_files()'s own pathspec, and `crates/*/Cargo.toml`, exactly
+#    crate-inherits-workspace's own pathspec): a file outside both is not
+#    silently unchecked by anything below, so flagging it here would be noise
+#    with no rule behind it, which is exactly the failure mode that gets a
+#    rule disabled by the first person it annoys.
+# ---------------------------------------------------------------------------
+hits="$(git ls-files --others --exclude-standard -- '*.rs' 'crates/*/Cargo.toml' \
+  | grep -v -E '^(target|fuzz/target)/' \
+  | sed 's/$/: untracked; git add it before this gate can see it/' \
+  || true)"
+[ -n "$hits" ] && fail untracked-source \
+"This file exists on disk but git is not tracking it, so no rule in this
+script, and no rule in test-census.sh, has scanned a single byte of it: every
+one of them discovers what to check through git, not through the filesystem.
+Stage it with git add (along with every other new file this diff introduces)
+before trusting a green result here; an untracked file is not a smaller
+version of a tracked one, it is one this script never opened." "$hits"
+
+# ---------------------------------------------------------------------------
 # 1. no-stub: a stub that compiles is not a deliverable.
 # ---------------------------------------------------------------------------
 hits="$(scan no-stub '\b(todo!|unimplemented!)\s*\(' rust_files)"

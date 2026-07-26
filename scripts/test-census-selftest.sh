@@ -238,6 +238,65 @@ else
   FAILED=1
 fi
 
+# ---------------------------------------------------------------------------
+# 7. untracked-source (issue #513). census_worktree builds the head side from
+#    `git ls-files -- '*.rs'`, tracked files only, so a brand-new .rs file
+#    that has not been `git add`ed must make the census refuse outright
+#    rather than silently compare a head side that never read it. Proven in
+#    the same three directions as the identical guard in
+#    invariant-lints.sh: a fully tracked tree passes, a .gitignore-excluded
+#    file does not trip it, and a genuine untracked file does and is named.
+# ---------------------------------------------------------------------------
+D7="$WORK/untracked"
+base_commit "$D7" '//! A clean, tracked baseline for the untracked-source corpus.
+pub fn add(a: u8, b: u8) -> u8 { a + b }
+'
+echo "== untracked-source, stage 1: a fully tracked tree must not trip it =="
+OUT7A="$(run_census "$D7")"
+if printf '%s\n' "$OUT7A" | grep -q '^FAIL \[untracked-source\]$'; then
+  echo "FAIL: untracked-source fired on a fully tracked tree. Got:"
+  echo "$OUT7A" | sed 's/^/    /'
+  FAILED=1
+else
+  note "fully tracked tree does not trip untracked-source"
+fi
+
+printf 'ignored.rs\n' > "$D7/.gitignore"
+cat > "$D7/src/ignored.rs" <<'RS'
+//! Excluded by .gitignore; must not surface even though it is untracked.
+pub fn stub() {}
+RS
+echo "== untracked-source, stage 2: a .gitignore-excluded file must not trip it =="
+OUT7B="$(run_census "$D7")"
+if printf '%s\n' "$OUT7B" | grep -q '^FAIL \[untracked-source\]$'; then
+  echo "FAIL: untracked-source fired on a file .gitignore already excludes. Got:"
+  echo "$OUT7B" | sed 's/^/    /'
+  FAILED=1
+else
+  note "gitignored file does not trip untracked-source"
+fi
+
+cat > "$D7/src/new_untracked.rs" <<'RS'
+//! Untracked on purpose: never `git add`ed in this corpus step.
+pub fn double(a: u8) -> u8 { a * 2 }
+RS
+echo "== untracked-source, stage 3: an untracked .rs file must trip it and be named =="
+OUT7C="$(run_census "$D7")"
+if printf '%s\n' "$OUT7C" | grep -q '^FAIL \[untracked-source\]$' \
+    && printf '%s\n' "$OUT7C" | grep -qF 'src/new_untracked.rs'; then
+  note "untracked .rs file trips untracked-source and is named"
+else
+  echo "FAIL: an untracked .rs file did not trip untracked-source, or did not name it. Got:"
+  echo "$OUT7C" | sed 's/^/    /'
+  FAILED=1
+fi
+if printf '%s\n' "$OUT7C" | grep -qF 'ignored.rs'; then
+  echo "FAIL: the gitignored file was named as an untracked-source offender."
+  FAILED=1
+else
+  note "the gitignored file is never named, even in a failing run"
+fi
+
 echo
 if [ "$FAILED" -ne 0 ]; then
   echo "test-census-selftest: FAILED. The census no longer enforces what it claims."

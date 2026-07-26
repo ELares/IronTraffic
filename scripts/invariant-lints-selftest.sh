@@ -33,6 +33,14 @@ run_lints_in() {
 }
 fired_rules() { run_lints_in "$1" | sed -n 's/^FAIL \[\(.*\)\]$/\1/p' | LC_ALL=C sort -u; }
 
+# Run the lints against a repo AS IT ALREADY STANDS, with no add/commit step
+# of its own. Used only by the untracked-source corpus below, which has to
+# control exactly what is staged, untracked, and ignored at each step; the
+# blanket `git add -A` in run_lints_in would defeat the very thing being
+# tested.
+run_lints_raw() { ( cd "$1" && bash "$LINTS" 2>&1 || true ) }
+fired_rules_raw() { run_lints_raw "$1" | sed -n 's/^FAIL \[\(.*\)\]$/\1/p' | LC_ALL=C sort -u; }
+
 # ---------------------------------------------------------------------------
 # Corpus A: deliberate violations. Every rule listed must fire.
 # ---------------------------------------------------------------------------
@@ -1060,6 +1068,88 @@ else
   echo "FAIL: a bare transport-seam escape marker with no written reason suppressed the rule."
   echo "      The escape hatch would then be a silent off switch."
   FAILED=1
+fi
+
+# ---------------------------------------------------------------------------
+# Corpus G: untracked-source (issue #513). Proven in both directions, per the
+# standing rule that an untested rule is a rule nobody knows works: a fully
+# staged tree passes, a file .gitignore already excludes still does not trip
+# it even though it commits a real violation, and a genuine untracked .rs
+# file does trip it and is named in the failure. One directory, mutated in
+# sequence, the same progressive-fixture style corpus C/D and E/F above use.
+# ---------------------------------------------------------------------------
+G="$WORK/untracked"
+mkdir -p "$G/crates/irontraffic-router/src"
+cat > "$G/crates/irontraffic-router/src/lib.rs" <<'RS'
+//! A clean, tracked baseline for the untracked-source corpus.
+/// Adds two numbers.
+#[must_use]
+pub fn add(a: u8, b: u8) -> u8 { a + b }
+RS
+cat > "$G/Cargo.toml" <<'TOML'
+[workspace.dependencies]
+# serde: baseline dependency for this corpus; no rule scans this file.
+serde = "1"
+TOML
+cat > "$G/.gitignore" <<'TXT'
+ignored.rs
+TXT
+( cd "$G" && git init -q . && git config user.email t@t && git config user.name t \
+    && git add -A >/dev/null && git commit -qm baseline >/dev/null )
+
+echo "== corpus G, stage 1: a fully staged tree must not trip untracked-source =="
+if fired_rules_raw "$G" | grep -q '^untracked-source$'; then
+  echo "FAIL: untracked-source fired on a fully staged tree with nothing untracked."
+  run_lints_raw "$G" | sed 's/^/    /'
+  FAILED=1
+else
+  note "fully staged tree does not trip untracked-source"
+fi
+
+# A file .gitignore already excludes, committing a real violation (todo!())
+# to prove the point precisely: even a genuine defect in an ignored file must
+# stay invisible, matching the accepted design that a build artifact or an
+# editor swap file is never scanned by anything in this file.
+cat > "$G/crates/irontraffic-router/src/ignored.rs" <<'RS'
+//! Excluded by .gitignore; even a real violation here must not surface,
+//! the same way a build artifact or an editor swap file never does.
+pub fn stub() { todo!() }
+RS
+echo "== corpus G, stage 2: a .gitignore-excluded file must not trip untracked-source =="
+if fired_rules_raw "$G" | grep -q '^untracked-source$'; then
+  echo "FAIL: untracked-source fired on a file .gitignore already excludes."
+  run_lints_raw "$G" | sed 's/^/    /'
+  FAILED=1
+else
+  note "gitignored file does not trip untracked-source"
+fi
+
+# A genuinely untracked, non-ignored .rs file, added on top of the state
+# above without staging it.
+cat > "$G/crates/irontraffic-router/src/new_untracked.rs" <<'RS'
+//! Untracked on purpose: never `git add`ed in this corpus step.
+/// Doubles a value.
+#[must_use]
+pub fn double(a: u8) -> u8 { a * 2 }
+RS
+echo "== corpus G, stage 3: an untracked .rs file must trip untracked-source and be named =="
+OUT_G="$(run_lints_raw "$G")"
+if printf '%s\n' "$OUT_G" | grep -q '^FAIL \[untracked-source\]$' \
+    && printf '%s\n' "$OUT_G" | grep -qF 'crates/irontraffic-router/src/new_untracked.rs'; then
+  note "untracked .rs file trips untracked-source and is named in the output"
+else
+  echo "FAIL: an untracked .rs file did not trip untracked-source, or did not name it. Got:"
+  printf '%s\n' "$OUT_G" | sed 's/^/    /'
+  FAILED=1
+fi
+# The ignored file must never be named as an offender, even in a run that
+# does fail for the unrelated untracked file: naming it would mean the scope
+# guard is not actually filtering by .gitignore.
+if printf '%s\n' "$OUT_G" | grep -qF 'ignored.rs: untracked'; then
+  echo "FAIL: the gitignored file was named as an untracked-source offender."
+  FAILED=1
+else
+  note "the gitignored file is never named, even in a failing run"
 fi
 
 echo
