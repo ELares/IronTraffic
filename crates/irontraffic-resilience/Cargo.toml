@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "irontraffic-resilience"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Resilience primitives for IronTraffic: health checking, retries, deadlines, and load shedding."
+
+[lints]
+workspace = true
+
+[dependencies]
+irontraffic-rand = { path = "../irontraffic-rand", version = "0.1.0" }
+crossbeam-utils.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "primitives"
+harness = false
