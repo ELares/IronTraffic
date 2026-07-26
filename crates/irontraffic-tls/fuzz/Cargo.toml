@@ -31,3 +31,10 @@ path = "fuzz_targets/fuzz_sni_normalize.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_cert_load"
+path = "fuzz_targets/fuzz_cert_load.rs"
+test = false
+doc = false
+bench = false

@@ -25,11 +25,21 @@ crypto-fips = ["rustls/fips", "rustls/aws_lc_rs", "rustls/prefer-post-quantum"]
 [dependencies]
 rustls = { workspace = true }
 siphasher = { workspace = true }
+blake3 = { workspace = true }
+x509-cert = { workspace = true }
 irontraffic-rand = { path = "../irontraffic-rand", version = "0.1.0" }
 
 [dev-dependencies]
 proptest = { workspace = true }
 criterion = { workspace = true }
+# rcgen's `ring`-only default features cannot generate RSA keys at all (RSA key generation is
+# gated behind the `aws_lc_rs` feature; see rcgen's own KeyPair::generate_for). Test 3
+# (load_rsa2048) needs a real, freshly generated RSA key pair and the issue that specifies this
+# module forbids committing a private key fixture instead, so this feature is added on top of
+# the workspace-level dependency rather than relying on its default features. aws-lc-rs is
+# already a resolved dependency of this crate's own default `crypto-aws-lc-rs` feature, so this
+# does not add a new crate to the tree.
+rcgen = { workspace = true, features = ["aws_lc_rs"] }
 
 [[bench]]
 name = "name"
