@@ -1,0 +1,16 @@
+# Files permitted to use Cell<, RefCell<, or UnsafeCell< in a hot-path crate
+# (irontraffic-io, irontraffic-runtime, irontraffic-conn, irontraffic-upstream,
+# irontraffic-dataplane). See the interior-mutability rule in
+# scripts/invariant-lints.sh for why these are banned by default: a tokio
+# task migrates between worker threads at any await point, so per-core state
+# reached through a Cell is a data race; per-core cells should be relaxed
+# atomics instead.
+#
+# One repository-relative path per file, exactly as it appears in `git
+# ls-files`. Matching is EXACT path equality only: never a prefix, a suffix,
+# a glob, or a directory. Blank lines and lines starting with `#` are
+# ignored. Every entry must be justified with a comment on the line above it
+# explaining why that specific file is a legitimate exception, added in the
+# same PR that needs it.
+#
+# Empty in M1: no exception has landed yet.

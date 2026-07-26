@@ -323,6 +323,372 @@ hits="$(scan no-unsafe '(unsafe\s+(fn|impl|\{)|allow\(unsafe_code\))' rust_files
 authorized to make; raise it on the issue instead." "$hits"
 
 # ---------------------------------------------------------------------------
+# Allowlist files: one repository-relative path per line, blank lines and `#`
+# comments ignored. Matching is EXACT path equality only, never a prefix, a
+# suffix, a glob, or a directory: an entry that names a directory or a stale
+# path matches nothing and is reported by allowlist_stale_hits, because an
+# exemption nobody re-reads is worse than no exemption.
+# ---------------------------------------------------------------------------
+
+# allowlist_entries <file> -- trimmed, non-blank, non-comment lines.
+allowlist_entries() {
+  local f="$1"
+  [ -f "$f" ] || return 0
+  sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' "$f" 2>/dev/null | grep -v -E '^(#|$)' || true
+}
+
+# allowlisted <file> <path> -- true if <path> exactly matches a listed entry.
+allowlisted() {
+  allowlist_entries "$1" | grep -qxF "$2"
+}
+
+# drop_allowlisted <file> -- reads "path:line:..." hits on stdin, drops any
+# whose path (the text before the first colon) exactly matches an entry.
+drop_allowlisted() {
+  local allow="$1" line path
+  while IFS= read -r line; do
+    path="${line%%:*}"
+    allowlisted "$allow" "$path" || printf '%s\n' "$line"
+  done
+}
+
+# allowlist_stale_hits <file> -- one "file:line: message" per entry that is
+# not the exact repository-relative path of a tracked Rust source file. A
+# directory, a prefix, a deleted file, or a path with stray whitespace all
+# fail this the same way: they match nothing, so they are reported rather
+# than silently treated as exemptions.
+allowlist_stale_hits() {
+  local allow="$1"
+  [ -f "$allow" ] || return 0
+  local valid lineno=0 raw trimmed
+  valid="$(rust_files)"
+  while IFS= read -r raw; do
+    lineno=$((lineno + 1))
+    trimmed="$(printf '%s' "$raw" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+    [ -z "$trimmed" ] && continue
+    case "$trimmed" in '#'*) continue ;; esac
+    if ! printf '%s\n' "$valid" | grep -qxF "$trimmed"; then
+      printf '%s:%d: stale allowlist entry %s does not name a tracked file\n' "$allow" "$lineno" "$trimmed"
+    fi
+  done < "$allow"
+}
+
+# ---------------------------------------------------------------------------
+# Hot-path CRATE scope, used by balance-drop-only and interior-mutability.
+# This is NOT hot_scan and the `//! HOT PATH` header above: a balance or a
+# cell can live in a file nobody remembered to mark, so this is a path
+# predicate over a fixed list of crate directories rather than a per-file
+# opt-in. Do not fold this into hot_scan and do not change the two rules that
+# use hot_scan. The directory list is a literal here, matched as a path
+# prefix, because it names a crate directory rather than an exemption; later
+# milestones add their own crates to it in their own issues.
+# ---------------------------------------------------------------------------
+hotpath_crate_files() {
+  build_prod_tree
+  ( cd "$PROD_TREE" && find . -name '*.rs' -print0 ) | tr '\0' '\n' | sed 's|^\./||' \
+    | while IFS= read -r rel; do
+        case "$rel" in
+          crates/irontraffic-io/*|crates/irontraffic-runtime/*|crates/irontraffic-conn/*|crates/irontraffic-upstream/*|crates/irontraffic-dataplane/*)
+            printf '%s\n' "$rel" ;;
+        esac
+      done
+}
+
+# hotpath_crate_scan <rule> <pattern> -- like scan_prod, restricted to the
+# hot-path crate scope above.
+hotpath_crate_scan() {
+  local rule="$1" pattern="$2"
+  build_prod_tree
+  hotpath_crate_files | tr '\n' '\0' \
+    | ( cd "$PROD_TREE" && xargs -0 -r grep -HnE "$pattern" 2>/dev/null ) \
+    | drop_escaped "$rule" || true
+}
+
+# balance_drop_only_hits -- the balance-drop-only rule's file-level scan. A
+# monotone counter may lose an increment; a balance may not, so this checks a
+# whole file rather than trying to prove a given fetch_sub sits inside a Drop
+# body, which grep cannot express.
+#
+# BALANCE_PATTERN also catches fetch_add(TYPE::MAX, ...): adding a type's
+# maximum value wraps an unsigned integer by exactly -1, so `fetch_add(u32::
+# MAX, ...)` IS a decrement spelled to dodge a fetch_sub grep. An ordinary
+# incrementing fetch_add (no ::MAX operand) is left alone on purpose: treating
+# every fetch_add like fetch_sub would demand a Drop impl on every plain
+# monotone counter in a hot-path crate, which is not what this rule guards.
+#
+# ::MAX must be the WHOLE first argument (identifier(s), "::MAX", then a
+# comma), not merely present somewhere before the first close-paren. A naive
+# `[^)]*::MAX` matches straight through a nested call, so a genuine saturating
+# increment like `fetch_add(n.min(usize::MAX - current), Ordering::Relaxed)`
+# would falsely fire: its first argument is `n.min(...)`, and the `::MAX`
+# sits inside that nested call's own argument, not as the top-level operand
+# fetch_add receives. Requiring the identifier-then-"::MAX"-then-comma shape
+# to start immediately after the open paren rules that out, because the
+# nested call's dot and parenthesis break the shape before "::MAX" is ever
+# reached.
+#
+# ACCEPTED GAP (documented, not fixed): this is a file-level, five-crate-
+# scoped grep. Known evasions out of reach of a text search:
+#   1. A decrement wrapped some OTHER way (wrapping_sub, a hand-rolled
+#      negative-cast fetch_add, a MAX literal wrapped in its own cast or
+#      parenthesised expression) that does not spell a bare TYPE::MAX first
+#      argument.
+#   2. The decrement moved into a helper or extension-trait method defined in
+#      a crate OUTSIDE the five scanned directories, so the balance-owning
+#      struct's file never contains the text `fetch_add` or `fetch_sub` at
+#      all. Seeing through that requires tracking which crate defines a
+#      "balance type" and where its release method is called, which is a
+#      cross-crate type-flow question, not a grep. Review is the second line
+#      of defense here, exactly as it already is for the Drop-body-membership
+#      question this rule was always coarse about.
+BALANCE_PATTERN='fetch_sub|fetch_add\([[:space:]]*([A-Za-z_][A-Za-z0-9_]*::)*[A-Za-z_][A-Za-z0-9_]*::MAX[[:space:]]*,'
+balance_drop_only_hits() {
+  build_prod_tree
+  hotpath_crate_files | while IFS= read -r rel; do
+    [ -n "$rel" ] || continue
+    grep -qE "$BALANCE_PATTERN" "$PROD_TREE/$rel" 2>/dev/null || continue
+    grep -q 'impl Drop for' "$PROD_TREE/$rel" 2>/dev/null && continue
+    allowlisted scripts/allowlist-balance.txt "$rel" && continue
+    grep -nE "$BALANCE_PATTERN" "$PROD_TREE/$rel" 2>/dev/null | sed "s|^|$rel:|"
+  done
+  allowlist_stale_hits scripts/allowlist-balance.txt
+}
+
+# ---------------------------------------------------------------------------
+# 16. transport-seam: the data plane is generic over hyper::rt::Read/Write, so
+#     tokio may be named directly only in the two crates that implement the
+#     seam. Without this rule the runtime is theoretically swappable rather
+#     than actually swappable, and the seam rots in about three months.
+# ---------------------------------------------------------------------------
+hits="$(scan_prod transport-seam '(^|[^A-Za-z_])tokio::|^[[:space:]]*use tokio' \
+  | grep -vE '^crates/irontraffic-(io|runtime)/' || true)"
+[ -n "$hits" ] && fail transport-seam \
+"tokio:: and \`use tokio\` are permitted only in crates/irontraffic-io and
+crates/irontraffic-runtime, the two crates that implement the transport seam.
+Everywhere else, reach the runtime through irontraffic_io::Transport
+(hyper::rt::Read + hyper::rt::Write) instead of naming tokio directly, so the
+runtime stays actually swappable rather than theoretically so:
+  // it-allow: transport-seam reason: <why this file is the seam itself>" "$hits"
+
+# ---------------------------------------------------------------------------
+# 17. no-unbounded-channel: an unbounded queue between the read half and the
+#     write half of a proxied connection is precisely the out-of-memory
+#     failure the forwarding design exists to prevent, and it is the single
+#     most likely thing an inexperienced implementer writes because it makes
+#     the borrow checker happy.
+#
+#     The bare-constructor alternative tolerates an optional turbofish
+#     (::<T>) between the identifier and the paren, because all three channel
+#     crates named in the design (flume, async-channel, crossbeam-channel)
+#     spell their unbounded constructor as a generic function, and
+#     `unbounded::<u8>()` is unremarkable, ordinary call syntax, not evasion.
+# ---------------------------------------------------------------------------
+hits="$(scan_prod no-unbounded-channel 'unbounded_channel|channel::unbounded|(^|[^A-Za-z_.])unbounded(::<[^)]*>)?\(')"
+[ -n "$hits" ] && fail no-unbounded-channel \
+"An unbounded channel compiles and satisfies the borrow checker, and it is an
+out-of-memory bug: nothing bounds how far the fast half of a connection can
+outrun the slow half. Read one buffer, write it to completion, then read
+again; backpressure must be structural, never a queue with no ceiling." "$hits"
+
+# ---------------------------------------------------------------------------
+# 18. balance-drop-only: a monotone counter may lose an increment; a balance
+#     (in-flight connections, permits, pooled buffers outstanding) may not.
+#     A lost decrement is capacity that silently disappears for the life of
+#     the process, so a fetch_sub in a hot-path crate is a violation unless
+#     that file also releases the balance in a Drop impl.
+# ---------------------------------------------------------------------------
+hits="$(balance_drop_only_hits | drop_escaped balance-drop-only || true)"
+[ -n "$hits" ] && fail balance-drop-only \
+"fetch_sub, or fetch_add whose first argument is exactly TYPE::MAX (that
+wraps an unsigned integer by exactly -1, i.e. a decrement spelled to dodge a
+fetch_sub grep), on an atomic in irontraffic-io, -runtime, -conn, -upstream,
+or -dataplane must live in a file that also defines impl Drop for something:
+that is where a balance release belongs. Move the release into the Drop
+impl, or if this file is a documented, reviewed exception, add it to
+scripts/allowlist-balance.txt with a reason in the same PR." "$hits"
+
+# ---------------------------------------------------------------------------
+# 19. interior-mutability: Cell<, RefCell<, and UnsafeCell< are banned in
+#     hot-path crates. A tokio task migrates between workers at any await
+#     point, so per-core state reached through a Cell is a data race; use a
+#     relaxed atomic instead. std::cell::OnceCell is unaffected: it is a
+#     legitimate one-shot initialiser, not a per-core mutable cell.
+# ---------------------------------------------------------------------------
+hits="$(hotpath_crate_scan interior-mutability '(^|[^A-Za-z_])(Cell|RefCell|UnsafeCell)<' \
+  | drop_allowlisted scripts/allowlist-interior-mutability.txt; \
+  allowlist_stale_hits scripts/allowlist-interior-mutability.txt)"
+[ -n "$hits" ] && fail interior-mutability \
+"Cell<, RefCell<, and UnsafeCell< are banned in irontraffic-io, -runtime,
+-conn, -upstream, and -dataplane. A tokio task migrates between worker
+threads at any await point, so per-core state reached through a Cell is a
+data race; use a relaxed atomic instead. std::cell::OnceCell is not banned:
+it is a one-shot initialiser, not a per-core mutable cell. If this use is a
+documented, reviewed exception (the M1 thread-local buffer pool, whose
+borrow is confined to a synchronous closure), add the file to
+scripts/allowlist-interior-mutability.txt with a reason in the same PR." "$hits"
+
+# ---------------------------------------------------------------------------
+# 20. single-snapshot-publish: ArcSwap::store may be called in exactly one
+#     function in the whole workspace, because a second publication site
+#     reintroduces torn configuration: a request could see a route from
+#     generation N and a filter chain from N+1.
+#
+#     INVERTED, not detected: this used to require ArcSwap|arc_swap and
+#     .store( on the SAME line, which is close to vacuous, because real code
+#     almost never writes it that way. The type name lives on the field
+#     declaration; the store call lives in a method, lines or files away:
+#
+#       struct Holder { table: ArcSwap<RouteSnapshot> }
+#       fn publish(h: &Holder, next: Arc<RouteSnapshot>) { h.table.store(next); }
+#
+#     That is ordinary, idiomatic Rust, and the old same-line pattern never
+#     saw it: no alias, no evasion needed, the co-occurrence requirement was
+#     simply never true for real code. So this rule no longer tries to prove
+#     a store call touches specifically an ArcSwap. It bans `.store(` outright
+#     in production code and allowlists the legitimate call sites, the same
+#     shape balance-drop-only and interior-mutability already use. This is
+#     deliberately over-broad: it also catches a `.store(` on something that
+#     is not an ArcSwap. That is the intended trade, not a defect. An
+#     over-broad rule fails LOUDLY on a real file and costs one allowlist
+#     entry with a reason; a rule narrow enough to name only ArcSwap can be
+#     silently blind to the exact call it exists to guard, which is a torn-
+#     config bug waiting to ship. No ArcSwap exists in M1, so the allowlist
+#     ships empty and every current `.store(` (there are none yet) would
+#     need one; this rule is in place before the config plane lands rather
+#     than retrofitted after.
+# ---------------------------------------------------------------------------
+hits="$(
+  {
+    scan_prod single-snapshot-publish '\.store\(' | drop_allowlisted scripts/allowlist-arcswap-store.txt
+    allowlist_stale_hits scripts/allowlist-arcswap-store.txt
+  } || true
+)"
+[ -n "$hits" ] && fail single-snapshot-publish \
+".store( in production code is a violation unless the file is listed in
+scripts/allowlist-arcswap-store.txt. This rule exists to keep ArcSwap::store
+called from exactly one function in the whole workspace: a second
+publication site reintroduces torn configuration, where a request could see
+a route from generation N and a filter chain from N+1. It fires on any
+.store( call, not only ArcSwap's, because a same-line ArcSwap-plus-store
+pattern misses ordinary multi-line code and would report a guarantee it does
+not provide. If this file is not an ArcSwap publisher (for example a plain
+Atomic::store), or if it is the one designated publisher, add it to
+scripts/allowlist-arcswap-store.txt with a reason in the same PR." "$hits"
+
+# ---------------------------------------------------------------------------
+# 21. core-ctx-not-stored: a CoreCtx (or CoreHandle, the name design
+#     documents used for the same idea) may be borrowed as a synchronous
+#     closure argument, never stored: a struct field of this type makes its
+#     container !Send, which either fails to compile far from the mistake or
+#     is worked around with an unsafe impl Send that reintroduces the data
+#     race the seam exists to remove. The type system cannot express "may be
+#     borrowed, never stored", so this is a grep.
+#
+#     The trailing `(//.*)?` tolerates an end-of-line comment after the field
+#     (`ctx: CoreCtx, // per-core context`), which would otherwise defeat the
+#     `$` anchor with a single keystroke. It only matches a comment that
+#     starts immediately after the allowed punctuation/whitespace, so it does
+#     not open the door to matching CoreCtx text that appears earlier in an
+#     unrelated trailing comment on a line that is not itself a field.
+# ---------------------------------------------------------------------------
+hits="$(scan_prod core-ctx-not-stored 'Core(Ctx|Handle)[,;>[:space:]]*(//.*)?$')"
+[ -n "$hits" ] && fail core-ctx-not-stored \
+"CoreCtx and CoreHandle may be borrowed as the argument of a synchronous
+closure, never stored. A struct field of this type makes its container
+!Send, which either fails to compile far from the mistake or gets worked
+around with an unsafe impl Send that reintroduces the data race
+runtime-core-scope exists to remove. Thread the context through as a
+parameter instead of holding it:
+  // it-allow: core-ctx-not-stored reason: <why storing it here is safe>" "$hits"
+
+# ---------------------------------------------------------------------------
+# 22. no-guarded-alias: a grep matches a name, not a meaning, so it cannot see
+#     through `use ... as X`, a re-export, or a `type X = ...` alias. It does
+#     not need to: creating that alias is itself one greppable line, and
+#     forbidding the alias makes every rename attempt visible at the moment
+#     it is written, rather than hoping no one ever renames a guarded symbol.
+#
+#     Two shapes per guarded group, `as` and `type`, plus one crate-scoped
+#     re-export shape:
+#       - `RefCell`/`Cell`/`UnsafeCell` renamed via `as`, OR named on the
+#         right-hand side of a `type X = ...;` alias (defeats
+#         interior-mutability: the alias no longer contains the guarded
+#         token anywhere it is used at the call site). The `type` form is
+#         the worse of the two, because it can live in ANY crate, including
+#         one of the four that are not among the five interior-mutability
+#         scans, so `pub type SharedCache<T> = std::cell::RefCell<T>;` in an
+#         unrelated crate is invisible to interior-mutability no matter what
+#         its own pattern does.
+#       - `ArcSwap` renamed via `as`, or aliased via `type` (defeats
+#         single-snapshot-publish's allowlist the same way: `type Snap =
+#         ArcSwap<u8>;` then `.store(` on a `Snap` never mentions ArcSwap at
+#         the call site).
+#       - `CoreCtx`/`CoreHandle` renamed via `as`, aliased via `type`, OR
+#         named in a `pub use` (aliased or bare/braced). core-ctx-not-stored
+#         anchors on the END of a line, so `pub use inner::{Helper,
+#         CoreCtx};` never reaches that anchor; the pub-use alternative does
+#         not anchor at all, so it catches CoreCtx anywhere on a pub-use
+#         line regardless of position.
+#       - `pub use tokio...` (anything) from inside irontraffic-io or
+#         irontraffic-runtime. Naming tokio there is legitimate and exempted
+#         by transport-seam, but PUBLICLY re-exporting it hands the seam's
+#         escape hatch to every downstream crate: code outside the seam can
+#         then write `irontraffic_io::RawListener` and never type `tokio::`
+#         at all. The re-export marker is matched as `pub`, `pub(crate)`, or
+#         `pub(super)`, with an optional leading `::` before `tokio`, because
+#         `pub(crate) use tokio::net::TcpListener;` inside a private module
+#         followed by `pub use that_module::TcpListener as Listener;`
+#         one level up is the same laundering trick with the crate-visible
+#         re-export doing the actual work: blocking the first hop (which
+#         still names tokio) closes the sequence even though the second hop's
+#         own line never mentions tokio at all and could not be matched by
+#         any text search. This is the only one of the four scoped to
+#         specific crates; the other three are banned everywhere, because
+#         aliasing a guarded symbol anywhere hides it from a rule that has no
+#         crate restriction to begin with.
+#
+#     ACCEPTED GAP: a re-export chain three or more hops deep, where the
+#     FINAL hop that actually crosses the crate boundary re-exports a local
+#     alias whose own line never names tokio (or any other guarded token),
+#     is not reachable by this or any text search once the first hop is
+#     itself only crate-local and unblocked by a different rule. Blocking the
+#     first hop closes the two-hop case the review demonstrated; a longer
+#     chain is a control-flow question (what does this name eventually
+#     resolve to), not a text-search one.
+#
+#     No allowlist: an alias of a guarded symbol has no legitimate case the
+#     way a lone Drop-releasing file or a lone ArcSwap publisher does. The
+#     escape hatch is the same `// it-allow: no-guarded-alias reason: ...`
+#     every other rule uses.
+# ---------------------------------------------------------------------------
+GUARDED_TYPE_ALIAS_HEAD='^[[:space:]]*(pub[[:space:]]+)?type[[:space:]]+[A-Za-z_][A-Za-z0-9_]*.*=.*'
+hits="$(
+  {
+    scan_prod no-guarded-alias '(^|[^A-Za-z_])(Cell|RefCell|UnsafeCell)[[:space:]]+as[[:space:]]+[A-Za-z_]'
+    scan_prod no-guarded-alias '(^|[^A-Za-z_])ArcSwap[[:space:]]+as[[:space:]]+[A-Za-z_]'
+    scan_prod no-guarded-alias '(^|[^A-Za-z_])Core(Ctx|Handle)[[:space:]]+as[[:space:]]+[A-Za-z_]|^[[:space:]]*pub[[:space:]]+use[[:space:]].*Core(Ctx|Handle)'
+    scan_prod no-guarded-alias "${GUARDED_TYPE_ALIAS_HEAD}[^A-Za-z_](Cell|RefCell|UnsafeCell)<"
+    scan_prod no-guarded-alias "${GUARDED_TYPE_ALIAS_HEAD}[^A-Za-z_]ArcSwap"
+    scan_prod no-guarded-alias "${GUARDED_TYPE_ALIAS_HEAD}[^A-Za-z_]Core(Ctx|Handle)"
+    scan_prod no-guarded-alias '^[[:space:]]*pub(\(crate\)|\(super\))?[[:space:]]+use[[:space:]]+(::)?tokio' \
+      | grep -E '^crates/irontraffic-(io|runtime)/'
+  } || true
+)"
+[ -n "$hits" ] && fail no-guarded-alias \
+"Renaming or re-exporting a guarded symbol, including through a \`type X =
+...;\` alias, removes the text every other rule greps for, without removing
+the hazard the rule guards against. Cell, RefCell, and UnsafeCell may not be
+imported \`as\` another name or aliased via \`type\`; neither may ArcSwap;
+neither may CoreCtx or CoreHandle, which also may not appear in a pub use
+(aliased or bare) since that anchors nowhere a rename can hide.
+irontraffic-io and irontraffic-runtime may name tokio directly, but may not
+publicly re-export it (pub, pub(crate), or pub(super), with or without a
+leading ::): that hands the transport seam's escape hatch to every
+downstream crate. Keep the guarded name in scope under its own name, or
+route the value through a function instead of a re-exported type:
+  // it-allow: no-guarded-alias reason: <why this alias cannot hide anything>" "$hits"
+
+# ---------------------------------------------------------------------------
 if [ "$FAILED" -ne 0 ]; then
   printf '\ninvariant-lints: FAILED. Each block above names the rule, explains why it\n'
   printf 'exists, and lists the offending lines. Fix the code; do not silence a lint\n'
