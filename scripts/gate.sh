@@ -38,7 +38,12 @@ echo "==> doctests"
 cargo test --workspace "${EXCLUDE_ARGS[@]+"${EXCLUDE_ARGS[@]}"}" --all-features --doc
 
 echo "==> data-plane-only build (the edge and k3s profile must not rot)"
-cargo check --workspace --no-default-features
+# Same exclusion as the three lines above, same reason: a matrixed crate
+# activates NONE of its exclusive features under --no-default-features, and
+# zero providers is a compile_error! by design, not something this flag can
+# ever satisfy. The feature-matrix loop further down already checks it under
+# this exact flag combination, once per valid provider.
+cargo check --workspace "${EXCLUDE_ARGS[@]+"${EXCLUDE_ARGS[@]}"}" --no-default-features
 
 # The crates excluded above, checked once per valid feature combination
 # instead of the single --all-features run that cannot compile them. This is
