@@ -11,11 +11,13 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 pub mod name;
+pub mod policy;
 pub mod provider;
 pub mod store;
 pub mod time;
 
 pub use name::{NameHasher, NameKey};
+pub use policy::{TlsPolicy, TlsProfile};
 pub use provider::{
     ProviderError, ProviderKind, fips_active, install_process_provider, post_quantum_available,
     provider_kind,
