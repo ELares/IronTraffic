@@ -75,3 +75,48 @@ reaching an undocumented endpoint; audit gaps; secret disclosure through configu
 client with a CI route audit proving it calls no undocumented path; every mutation writes an audit
 row in the same transaction; secret material is referenced by URI rather than inlined, so the
 configuration history is safe to store and to commit to version control.
+
+## 1. Trust boundary
+
+Everything read from a downstream socket is attacker chosen, namely request bytes, field names,
+field values, the request target, the authority, the forwarding chain and the PROXY protocol header.
+Everything read from an upstream socket is attacker chosen too, because an origin can be compromised
+or can be an attacker-controlled tenant. The `irontraffic-http` crate is the single place where those
+bytes become a decision, and no component outside it may re-parse them. One piece of non-coverage
+every operator must know about: IronTraffic parses and replaces exactly three families of identity
+field (`Forwarded`, `X-Forwarded-*` and `X-Real-IP`), and vendor identity fields that other products
+invent (`True-Client-IP`, `CF-Connecting-IP`, `X-Client-IP`, `X-Cluster-Client-IP`,
+`X-Original-Forwarded-For`) are forwarded untouched, so an origin that trusts one of them is trusting
+a value the client wrote. That set is open ended and is therefore a remove-header filter an operator
+configures, not a constant this product guesses at. `hop-by-hop-strip-set` (#26) states the same rule
+from the strip side and points here.
+
+## 2. Attacker model
+
+An attacker has unlimited requests, full knowledge of this source, the ability to choose every byte
+on a connection, the ability to open many connections, and the ability to select which upstream a
+request lands on. The attacker cannot read process memory and cannot change configuration.
+
+## 3. Refusal is not an oracle
+
+Every refusal answers with the status from `RejectReason::status` and closes the connection. The
+`RejectReason` variant name, its `metric_label`, the offending byte, the offending field name, and
+the byte offset at which parsing failed are NEVER written into the response body, into a response
+header, or into a response reason phrase. They go to metrics and to the access log only. A response
+that names the failing branch hands an attacker a free desync-probing oracle: the whole technique in
+"HTTP/1.1 Must Die" is distinguishing which of two parsers refused and why.
+
+## 4. Bounded state
+
+Every buffer, table, counter map and queue reachable from the network has a named limit with a
+default, stated either in `Limits` or in a per-issue constant, and a defined behaviour at the limit.
+The subsections under section 5 name each one.
+
+## 5. Per-surface sections
+
+Later issues append one subsection per surface here: `path-normalization` (#29),
+`authority-parsing-and-reconciliation` (#30), `forwarded-element-parsing` (#31),
+`trust-policy-and-peer-identity` (#32), `h1-head-parser` (#34), `h1-chunked-and-trailers` (#36),
+`mplex-pseudo-header-validation` (#38) and `proxy-protocol-parser` (#43) each add one, and
+`desync-corpus-and-reject-table` (#47) adds a section 6 that ties every named attack to its corpus
+entry.

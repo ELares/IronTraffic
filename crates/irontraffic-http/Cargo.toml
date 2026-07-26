@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "irontraffic-http"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "IronTraffic's sans-IO HTTP parse boundary: the single place attacker-chosen bytes become a decision."
+
+[lints]
+workspace = true
+
+[dependencies]
+# D6: bytes, smallvec and memchr were declared here but referenced by
+# nothing in src/ (smallvec pulled in with the `union` feature, its unsafe
+# union-storage variant, into a crate that is `#![forbid(unsafe_code)]`).
+# deny.toml's own preamble says the tree is reviewed rather than
+# accumulated; removed. The issue that first actually uses one of these
+# declares it again then.
+
+[dev-dependencies]
+proptest = { workspace = true }

@@ -13,7 +13,7 @@
 
 [workspace]
 resolver = "3"
-members = ["crates/irontraffic", "crates/irontraffic-rand", "crates/irontraffic-runtime", "crates/irontraffic-time"]
+members = ["crates/irontraffic", "crates/irontraffic-http", "crates/irontraffic-rand", "crates/irontraffic-runtime", "crates/irontraffic-time"]
 
 [workspace.package]
 version = "0.1.0"
@@ -31,6 +31,13 @@ hyper = { version = "1.11.0", default-features = false }
 hyper-util = { version = "0.1", features = ["tokio"] }
 # `BytesMut` pooled read chunks. Never `Vec<u8>` in the data plane.
 bytes = { version = "1.10" }
+# Inline, non-heap-allocated small buffers (a method token, a chunk extension)
+# in `irontraffic-http`. `union` and `const_generics` are the layout and sizing
+# features the parse-boundary crate needs; no C build involved.
+smallvec = { version = "1", features = ["union", "const_generics"] }
+# SIMD-accelerated byte search for scanning header and line terminators
+# (CRLF, colon, space) in `irontraffic-http`. Pure Rust, musl safe.
+memchr = { version = "2" }
 # `set_reuse_port` before `bind`, backlog, `TCP_NODELAY`, `ipv6_only`.
 socket2 = { version = "0.6", features = ["all"] }
 # `clock_gettime(CLOCK_BOOTTIME)` without a C build and without `unsafe` in our code.
