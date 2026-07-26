@@ -133,6 +133,24 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          # actions/checkout defaults to fetch-depth: 1, a single commit with
+          # no history in common with origin/main. scripts/test-census.sh
+          # (invoked below) needs a real merge base between HEAD and the base
+          # branch to diff against, and git merge-base finds nothing between
+          # two disconnected single-commit graphs. That was the entire cause
+          # of this job failing on every open pull request: not a bug in the
+          # census logic, a missing history.
+          #
+          # Full history is the correct fix, not a partial fetch of just the
+          # base ref: a partial fetch would need to guess how deep to go, and
+          # guessing wrong reintroduces this exact failure the day a PR sits
+          # open through more commits than the guess covers. This repository
+          # is small enough today that fetch-depth 0 costs a few extra seconds
+          # per run. If that ever changes, the alternative is fetching only
+          # the base ref with `git fetch origin <base>` and no depth limit
+          # (equivalent correctness, less data), not a shallow depth guess.
+          fetch-depth: 0
       - name: Restore every gate script and lint config from the BASE branch
         # THE JUDGE MAY NOT BE EDITED BY THE DEFENDANT.
         #
@@ -250,6 +268,37 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Restore pr-scope-check.sh from the BASE branch
+        # THE JUDGE MAY NOT BE EDITED BY THE DEFENDANT, the same rule the
+        # invariants job applies to the other gate scripts, and it was NOT
+        # actually being applied here.
+        #
+        # The invariants job's restore step lists scripts/pr-scope-check.sh
+        # among the files it checks out from the base branch, but that job
+        # never runs pr-scope-check.sh. It only restores the file into ITS OWN
+        # job workspace, on its own runner, and then does nothing further with
+        # it. The actual execution of pr-scope-check.sh happens here, in this
+        # separate job, on a separate runner with a separate checkout, and
+        # this job had no restore step of its own. So a PR could rewrite
+        # scripts/pr-scope-check.sh to exit 0 unconditionally, or to widen its
+        # allowlist to match anything, and that rewritten copy is exactly what
+        # would have judged it, unnoticed, because the invariants job's
+        # restore of the same filename created the appearance of protection
+        # without providing it.
+        #
+        # A PR may still PROPOSE a change to this script, same as any other
+        # gate script; it takes effect on the next PR once a human has
+        # reviewed it, not on the PR that introduces it.
+        run: |
+          set -euo pipefail
+          git fetch --depth=1 origin "${{ github.base_ref || github.ref_name }}"
+          if git cat-file -e "FETCH_HEAD:scripts/pr-scope-check.sh" 2>/dev/null; then
+            git checkout FETCH_HEAD -- scripts/pr-scope-check.sh
+            echo "restored from base: scripts/pr-scope-check.sh"
+          else
+            echo "not on base yet (new file, will be judged from head): scripts/pr-scope-check.sh"
+          fi
+          chmod +x scripts/pr-scope-check.sh
       - name: Compare the changed files against the issue's Files table
         env:
           GH_TOKEN: ${{ github.token }}
