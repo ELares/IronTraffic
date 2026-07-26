@@ -524,6 +524,10 @@ mod tests {
             PostQuantum::Unavailable
         };
         assert_eq!(policy.post_quantum(), expected);
+        assert!(!policy.require_ecdsa_capable_clients());
+        // `default_alpn` is the serde default for `TlsPolicyConfig::alpn`, so its value is a
+        // contract in its own right, independent of `default_https`'s own literal ALPN list.
+        assert_eq!(default_alpn(), vec!["h2".to_owned(), "http/1.1".to_owned()]);
     }
 
     #[test]
@@ -597,6 +601,12 @@ mod tests {
 
     #[test]
     fn alpn_65_entries_rejected() {
+        // The boundary itself: exactly 64 entries is allowed. Without this, a mutant that
+        // widens the `> 64` check to `>= 64` still rejects 65 entries and survives.
+        let at_limit: Vec<String> = (0..64).map(|i| format!("proto-{i}")).collect();
+        let at_limit_cfg = cfg_with_alpn(at_limit);
+        assert!(TlsPolicy::compile(&at_limit_cfg).is_ok());
+
         let alpn: Vec<String> = (0..65).map(|i| format!("proto-{i}")).collect();
         let cfg = cfg_with_alpn(alpn);
         assert_eq!(
@@ -613,6 +623,17 @@ mod tests {
             policy.startup_warnings(),
             vec!["listener has an empty ALPN list: HTTP/2 will not be negotiated"]
         );
+
+        // `require_ecdsa_capable_clients` threads through `compile` unchanged: `cfg_with_alpn`
+        // always sets it to `false` (checked as the default case in
+        // `default_https_is_intermediate_h2_http11`), so this is the one place a `true` value is
+        // proven to reach the compiled policy.
+        let strict_cfg = TlsPolicyConfig {
+            require_ecdsa_capable_clients: true,
+            ..cfg_with_alpn(Vec::new())
+        };
+        let strict = TlsPolicy::compile(&strict_cfg).expect("still a valid configuration");
+        assert!(strict.require_ecdsa_capable_clients());
     }
 
     #[cfg(any(feature = "crypto-aws-lc-rs", feature = "crypto-fips"))]
@@ -633,6 +654,22 @@ mod tests {
 
     #[test]
     fn post_quantum_off_filters_hybrid_group() {
+        // `postQuantum: "off"` resolves to `Disabled` when the provider actually has the hybrid
+        // to disable, and to `Unavailable` on a `crypto-ring` build, exactly like `resolve_post_quantum`
+        // resolves `Prefer` in `post_quantum_preferred_on_aws_lc` / `post_quantum_unavailable_on_ring`.
+        let off_cfg = TlsPolicyConfig {
+            post_quantum: PostQuantumConfig::Off,
+            ..cfg_with_alpn(default_alpn())
+        };
+        let off_policy =
+            TlsPolicy::compile(&off_cfg).expect("off is a valid post-quantum preference");
+        let expected_pq = if crate::post_quantum_available() {
+            PostQuantum::Disabled
+        } else {
+            PostQuantum::Unavailable
+        };
+        assert_eq!(off_policy.post_quantum(), expected_pq);
+
         // A locally built provider, not the process default: this crate's tests must never
         // install a process wide provider themselves (see `test_provider`'s doc comment), so
         // this exercises the exact transformation `provider_for` applies for
@@ -709,6 +746,15 @@ mod tests {
 
     #[test]
     fn modern_profile_refuses_tls12_client() {
+        // `TlsPolicy::profile()` actually reports what was configured, not just the `Intermediate`
+        // default every other test in this module happens to use.
+        let modern_cfg = TlsPolicyConfig {
+            profile: TlsProfile::Modern,
+            ..cfg_with_alpn(default_alpn())
+        };
+        let modern_policy = TlsPolicy::compile(&modern_cfg).expect("modern is a valid profile");
+        assert_eq!(modern_policy.profile(), TlsProfile::Modern);
+
         // Fixture: rcgen self-signed leaf for "t.example".
         let (leaf_der, key_der) = gen_leaf(&rcgen::PKCS_ECDSA_P256_SHA256, &["t.example"]);
         let chain = vec![rustls::pki_types::CertificateDer::from(leaf_der.clone())];

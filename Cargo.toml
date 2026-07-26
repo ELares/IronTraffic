@@ -93,6 +93,14 @@ loom = { version = "0.7" }
 # the Rust types so the schema and the validator can never disagree. No
 # integration feature needed: every newtype spells `#[schemars(with = "...")]`
 # rather than deriving a schema from its private field.
+# Also emits the JSON Schema the config plane publishes; optional in each member
+# crate, behind that crate's `schema` feature. This branch originally added a
+# SECOND `schemars` key here at 0.8 while main already carried 1.2.1, which is
+# invalid TOML rather than a merge conflict, so git produced it without a marker
+# and only `cargo metadata` complained (issue #596). One key, 1.2.1: every use on
+# this branch is `derive(schemars::JsonSchema)`, which exists in both majors, and
+# member crates take it via `workspace = true` so they follow whatever is pinned
+# here.
 schemars = { version = "1.2.1" }
 # content-addressing DER blobs and computing stable certificate fingerprints
 blake3 = "1"
