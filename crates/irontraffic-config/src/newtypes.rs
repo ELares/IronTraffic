@@ -49,9 +49,22 @@ pub enum FieldError {
 
 /// A listener name: 1 to 63 bytes matching `[a-z0-9]([a-z0-9-]*[a-z0-9])?`.
 #[derive(
-    Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, serde::Deserialize, serde::Serialize,
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    PartialOrd,
+    Ord,
+    serde::Deserialize,
+    serde::Serialize,
+    schemars::JsonSchema,
 )]
 #[serde(try_from = "String", into = "String")]
+#[schemars(
+    with = "String",
+    extend("pattern" = "^[a-z0-9]([a-z0-9-]*[a-z0-9])?$", "maxLength" = 63)
+)]
 pub struct ListenerName(smol_str::SmolStr);
 
 impl ListenerName {
@@ -119,8 +132,19 @@ impl From<ListenerName> for String {
 }
 
 /// An address to bind a listener to, parsed from `"0.0.0.0:8080"` or `"[::]:8080"`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Deserialize,
+    serde::Serialize,
+    schemars::JsonSchema,
+)]
 #[serde(try_from = "String", into = "String")]
+#[schemars(with = "String")]
 pub struct BindAddr(std::net::SocketAddr);
 
 impl BindAddr {
@@ -185,8 +209,19 @@ impl From<BindAddr> for String {
 /// The single upstream socket address for this version. Must be an IP literal
 /// with a port; hostnames are rejected because the data plane has no
 /// asynchronous resolver.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Deserialize, serde::Serialize)]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    serde::Deserialize,
+    serde::Serialize,
+    schemars::JsonSchema,
+)]
 #[serde(try_from = "String", into = "String")]
+#[schemars(with = "String")]
 pub struct UpstreamAddr(std::net::SocketAddr);
 
 impl UpstreamAddr {
@@ -240,8 +275,11 @@ impl From<UpstreamAddr> for String {
 }
 
 /// A `listen(2)` backlog, 1 to 65535.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize, schemars::JsonSchema,
+)]
 #[serde(try_from = "u32", into = "u32")]
+#[schemars(with = "u32", extend("minimum" = 1, "maximum" = 65535))]
 pub struct Backlog(u32);
 
 impl Backlog {
@@ -285,9 +323,19 @@ impl From<Backlog> for u32 {
 
 /// A duration in milliseconds, 1 to 86,400,000 (24 hours).
 #[derive(
-    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Deserialize, serde::Serialize,
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    serde::Deserialize,
+    serde::Serialize,
+    schemars::JsonSchema,
 )]
 #[serde(try_from = "u32", into = "u32")]
+#[schemars(with = "u32", extend("minimum" = 1, "maximum" = 86_400_000))]
 pub struct Millis(u32);
 
 impl Millis {
