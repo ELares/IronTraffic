@@ -41,14 +41,23 @@ impl CoarseMono {
     pub const MAX_INTERVAL_MS: u32 = u32::MAX / 4;
 
     /// Builds a timestamp from milliseconds since process start.
+    ///
+    /// `pub(crate)`, not `pub`: the only legitimate way to obtain a
+    /// `CoarseMono` is to read it from the clock. That path is the
+    /// `TimeSource` seam (`time-source-seam`, #5), which lives in this
+    /// crate and can see this constructor; a downstream crate building one
+    /// out of a bare integer it happened to have is always a bug, and
+    /// privacy refuses it at compile time instead of relying on review.
     #[must_use]
-    pub const fn from_millis(ms: u32) -> Self {
+    #[rustfmt::skip]
+    #[allow(dead_code, reason = "constructed only by tests until time-source-seam (#5) adds a real caller in this crate")]
+    pub(crate) const fn from_millis_since_start(ms: u32) -> Self {
         Self(ms)
     }
 
     /// Milliseconds since process start, as stored.
     #[must_use]
-    pub const fn as_millis(self) -> u32 {
+    pub const fn as_millis_since_start(self) -> u32 {
         self.0
     }
 
@@ -103,8 +112,14 @@ pub struct CoarseWall(u64);
 
 impl CoarseWall {
     /// Builds a wall timestamp from milliseconds since the Unix epoch.
+    ///
+    /// `pub(crate)`, not `pub`: see [`CoarseMono::from_millis_since_start`]
+    /// for why a raw-integer constructor for a clock type must not be
+    /// public.
     #[must_use]
-    pub const fn from_unix_millis(ms: u64) -> Self {
+    #[rustfmt::skip]
+    #[allow(dead_code, reason = "constructed only by tests until time-source-seam (#5) adds a real caller in this crate")]
+    pub(crate) const fn from_unix_millis(ms: u64) -> Self {
         Self(ms)
     }
 
@@ -134,24 +149,22 @@ impl CoarseWall {
 pub struct Boot(u64);
 
 impl Boot {
-    /// Builds a boot timestamp from nanoseconds.
+    /// Builds a boot timestamp from nanoseconds on `CLOCK_BOOTTIME`.
+    ///
+    /// `pub(crate)`, not `pub`: see [`CoarseMono::from_millis_since_start`]
+    /// for why a raw-integer constructor for a clock type must not be
+    /// public.
     #[must_use]
-    pub const fn from_nanos(ns: u64) -> Self {
+    #[rustfmt::skip]
+    #[allow(dead_code, reason = "constructed only by tests until time-source-seam (#5) adds a real caller in this crate")]
+    pub(crate) const fn from_boottime_nanos(ns: u64) -> Self {
         Self(ns)
     }
 
-    /// Nanoseconds, as stored.
+    /// Nanoseconds on `CLOCK_BOOTTIME`, as stored.
     #[must_use]
-    pub const fn as_nanos(self) -> u64 {
+    pub const fn as_boottime_nanos(self) -> u64 {
         self.0
-    }
-
-    /// Whole milliseconds, truncating.
-    #[must_use]
-    #[rustfmt::skip]
-    #[allow(clippy::integer_division, reason = "documented truncation to whole milliseconds")]
-    pub const fn as_millis(self) -> u64 {
-        self.0 / 1_000_000
     }
 
     /// Nanoseconds from `earlier` to `self`, saturating at 0.
@@ -169,14 +182,20 @@ pub struct PreciseMono(u64);
 
 impl PreciseMono {
     /// Builds a measurement timestamp from nanoseconds.
+    ///
+    /// `pub(crate)`, not `pub`: see [`CoarseMono::from_millis_since_start`]
+    /// for why a raw-integer constructor for a clock type must not be
+    /// public.
     #[must_use]
-    pub const fn from_nanos(ns: u64) -> Self {
+    #[rustfmt::skip]
+    #[allow(dead_code, reason = "constructed only by tests until time-source-seam (#5) adds a real caller in this crate")]
+    pub(crate) const fn from_measurement_nanos(ns: u64) -> Self {
         Self(ns)
     }
 
     /// Nanoseconds, as stored.
     #[must_use]
-    pub const fn as_nanos(self) -> u64 {
+    pub const fn as_measurement_nanos(self) -> u64 {
         self.0
     }
 
@@ -202,32 +221,44 @@ mod tests {
 
     #[test]
     fn coarse_mono_reached_is_true_at_equality() {
-        assert!(CoarseMono::from_millis(7).reached(CoarseMono::from_millis(7)));
+        assert!(
+            CoarseMono::from_millis_since_start(7).reached(CoarseMono::from_millis_since_start(7))
+        );
     }
 
     #[test]
     fn coarse_mono_reached_is_false_before_deadline() {
-        assert!(!CoarseMono::from_millis(10).reached(CoarseMono::from_millis(11)));
+        assert!(
+            !CoarseMono::from_millis_since_start(10)
+                .reached(CoarseMono::from_millis_since_start(11))
+        );
     }
 
     #[test]
     fn coarse_mono_reached_across_wrap() {
-        assert!(CoarseMono::from_millis(0).reached(CoarseMono::from_millis(u32::MAX)));
-        assert!(!CoarseMono::from_millis(u32::MAX).reached(CoarseMono::from_millis(0)));
+        assert!(
+            CoarseMono::from_millis_since_start(0)
+                .reached(CoarseMono::from_millis_since_start(u32::MAX))
+        );
+        assert!(
+            !CoarseMono::from_millis_since_start(u32::MAX)
+                .reached(CoarseMono::from_millis_since_start(0))
+        );
     }
 
     #[test]
     fn coarse_mono_reached_at_half_modulus_is_false() {
         assert!(
-            !CoarseMono::from_millis(CoarseMono::HALF_MODULUS_MS)
-                .reached(CoarseMono::from_millis(0))
+            !CoarseMono::from_millis_since_start(CoarseMono::HALF_MODULUS_MS)
+                .reached(CoarseMono::from_millis_since_start(0))
         );
     }
 
     #[test]
     fn coarse_mono_elapsed_wraps_exactly() {
         assert_eq!(
-            CoarseMono::from_millis(5).elapsed_ms_since(CoarseMono::from_millis(u32::MAX)),
+            CoarseMono::from_millis_since_start(5)
+                .elapsed_ms_since(CoarseMono::from_millis_since_start(u32::MAX)),
             6
         );
     }
@@ -235,8 +266,8 @@ mod tests {
     #[test]
     fn coarse_mono_add_wraps() {
         assert_eq!(
-            CoarseMono::from_millis(u32::MAX).saturating_add_ms(1),
-            CoarseMono::from_millis(0)
+            CoarseMono::from_millis_since_start(u32::MAX).saturating_add_ms(1),
+            CoarseMono::from_millis_since_start(0)
         );
     }
 
@@ -255,19 +286,14 @@ mod tests {
     #[test]
     fn boot_elapsed_saturates_at_zero() {
         assert_eq!(
-            Boot::from_nanos(5).elapsed_nanos_since(Boot::from_nanos(9)),
+            Boot::from_boottime_nanos(5).elapsed_nanos_since(Boot::from_boottime_nanos(9)),
             0
         );
     }
 
     #[test]
-    fn boot_as_millis_truncates() {
-        assert_eq!(Boot::from_nanos(1_999_999).as_millis(), 1);
-    }
-
-    #[test]
     fn precise_as_micros_truncates() {
-        assert_eq!(PreciseMono::from_nanos(1_999).as_micros(), 1);
+        assert_eq!(PreciseMono::from_measurement_nanos(1_999).as_micros(), 1);
     }
 
     #[test]
@@ -277,10 +303,13 @@ mod tests {
     fn max_interval_is_a_usable_deadline() {
         assert_eq!(CoarseMono::MAX_INTERVAL_MS, u32::MAX / 4);
         assert!(CoarseMono::MAX_INTERVAL_MS < CoarseMono::HALF_MODULUS_MS);
-        let now = CoarseMono::from_millis(7);
+        let now = CoarseMono::from_millis_since_start(7);
         let d = now.saturating_add_ms(CoarseMono::MAX_INTERVAL_MS);
         assert!(!now.reached(d));
-        assert!(CoarseMono::from_millis(7u32.wrapping_add(CoarseMono::MAX_INTERVAL_MS)).reached(d));
+        assert!(
+            CoarseMono::from_millis_since_start(7u32.wrapping_add(CoarseMono::MAX_INTERVAL_MS))
+                .reached(d)
+        );
     }
 
     proptest! {
@@ -290,10 +319,10 @@ mod tests {
             base: u32,
             delta in 0..=CoarseMono::MAX_INTERVAL_MS,
         ) {
-            let deadline = CoarseMono::from_millis(base).saturating_add_ms(delta);
-            assert!(deadline.reached(CoarseMono::from_millis(base)));
+            let deadline = CoarseMono::from_millis_since_start(base).saturating_add_ms(delta);
+            assert!(deadline.reached(CoarseMono::from_millis_since_start(base)));
             if delta > 0 {
-                assert!(!CoarseMono::from_millis(base).reached(deadline));
+                assert!(!CoarseMono::from_millis_since_start(base).reached(deadline));
             }
         }
     }
@@ -305,10 +334,29 @@ mod tests {
             base: u32,
             delta in 0..=CoarseMono::MAX_INTERVAL_MS,
         ) {
-            let elapsed = CoarseMono::from_millis(base)
+            let elapsed = CoarseMono::from_millis_since_start(base)
                 .saturating_add_ms(delta)
-                .elapsed_ms_since(CoarseMono::from_millis(base));
+                .elapsed_ms_since(CoarseMono::from_millis_since_start(base));
             assert_eq!(elapsed, delta);
+        }
+    }
+
+    // `prop_elapsed_inverts_add` above is bounded to `0..=MAX_INTERVAL_MS` because
+    // `saturating_add_ms` carries `debug_assert!(ms <= MAX_INTERVAL_MS)`, so it can
+    // never exercise a delta that actually crosses the 32-bit wrap boundary. The
+    // wraparound identity is still a claim this type makes (`elapsed_ms_since` is
+    // documented as correct "for any interval under 49.7 days" and is implemented
+    // with `wrapping_sub`), so it needs its own test that reaches it directly with
+    // `wrapping_add`/`wrapping_sub`, bypassing `saturating_add_ms` and its contract
+    // bound entirely. No `MAX_INTERVAL_MS` clamp applies here: `delta` ranges over
+    // the full `u32`.
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(1024))]
+        #[test]
+        fn prop_elapsed_since_inverts_wrapping_add_beyond_contract(base: u32, delta: u32) {
+            let later = CoarseMono::from_millis_since_start(base.wrapping_add(delta));
+            let earlier = CoarseMono::from_millis_since_start(base);
+            assert_eq!(later.elapsed_ms_since(earlier), delta);
         }
     }
 }
