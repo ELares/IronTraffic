@@ -45,6 +45,56 @@ fi
 MERGE_BASE="$(git merge-base "$BASE_REV" HEAD)" || {
   echo "test-census: no merge base with $BASE_REV" >&2; exit 1; }
 
+# ---------------------------------------------------------------------------
+# untracked-source (issue #513): census_worktree, below, enumerates the head
+# side with `git ls-files -- '*.rs'`, tracked files only. A test file created
+# on disk and not yet `git add`ed is invisible to it: its tests never enter
+# head.tests or head.asserts, so this comparison has nothing to weigh them
+# against.
+#
+# THE CONSEQUENCE DIFFERS FROM invariant-lints.sh's identical blind spot
+# there, an untracked file with a real violation sails through because
+# nothing scans it at all. Here the failure is quieter: an untracked test
+# file is simply absent from both sides of the comparison, which is not
+# itself a false pass on anything the base branch already proved. But it
+# means a coder can add tests, watch the gate pass, and delete that same
+# file again before ever staging it, and this census will have had no record
+# that it ever existed to report its removal. Silence about presence becomes
+# silence about disappearance the moment the file is gone.
+#
+# THE FIX IS THE SAME REFUSAL, APPLIED INDEPENDENTLY, NOT BY RELYING ON
+# invariant-lints.sh HAVING ALREADY RUN. scripts/gate-fast.sh and scripts/
+# gate.sh both run invariant-lints.sh, which carries the identical guard,
+# before this script, so a properly gated run never reaches here with an
+# untracked .rs file on disk: invariant-lints.sh already exited 1 first. But
+# this script's own header says it "must remain fully self-contained" and
+# assume nothing about what ran before it, precisely so it keeps working
+# when invoked on its own (BASE_REF=main scripts/test-census.sh, exactly how
+# an implementer debugging a census-only failure would run it) or from any
+# future caller that composes the gate differently. A guard that only holds
+# because of a sibling script's ordering is not a guard, it is a coincidence.
+# ---------------------------------------------------------------------------
+UNTRACKED_RS="$(git ls-files --others --exclude-standard -- '*.rs' \
+  | grep -v -E '^(target|fuzz/target)/' || true)"
+if [ -n "$UNTRACKED_RS" ]; then
+  echo
+  echo "FAIL [untracked-source]"
+  cat <<'EOF' | sed 's/^/  /'
+These files exist on disk but git is not tracking them, so the head side of
+this census, which is built from git ls-files, has not read a single byte of
+any of them. A brand-new test file added here would be invisible to both the
+"removed" and the "weakened" comparisons below: adding it looks like nothing
+happened, and deleting it again before staging looks like nothing happened
+either. Stage every new file with git add before trusting this census.
+EOF
+  printf '%s\n' "$UNTRACKED_RS" | sed 's/^/    /'
+  echo
+  echo "test-census: FAILED. Tests are the only thing standing between a"
+  echo "plausible implementation and a correct one; they are not an obstacle to"
+  echo "route around."
+  exit 1
+fi
+
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 export WORK
