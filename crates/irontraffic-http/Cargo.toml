@@ -19,6 +19,10 @@ workspace = true
 # accumulated; removed. The issue that first actually uses one of these
 # declares it again then.
 #
+# field-section-and-known-headers (#24) is that issue for bytes and
+# smallvec: `FieldSection`'s arena is a caller-supplied `BytesMut`/`Bytes`
+# and its slot index is a `SmallVec<[FieldSlot; 32]>`. memchr remains
+# unused by this crate and stays out.
 # `authority-parsing-and-reconciliation` (#30) is that first user: `Authority`
 # stores its canonical host in a `Bytes`, and `Authority::parse_into` writes
 # into a caller-supplied `BytesMut` and takes a `Bytes` view of it with

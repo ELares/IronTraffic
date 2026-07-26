@@ -46,8 +46,10 @@ pub mod authority;
 pub mod error;
 pub mod field;
 pub mod hlist;
+pub mod known;
 pub mod limits;
 pub mod scalar;
+pub mod section;
 
 pub use error::RejectReason;
 pub use limits::{ClampedLimits, Limits};
