@@ -62,6 +62,45 @@ deny = [
     # trust to a crate release; rustls-native-certs reads the OS store instead.
     { name = "webpki-roots" },
 ]
+# NOTE ON THE EXCEPTION BELOW, placed here deliberately, because a reader who
+# gets this far will meet `aws-lc-fips-sys` carrying an OpenSSL licence term a
+# few lines down and reasonably conclude it contradicts the ban just above.
+# It does not, and the distinction is worth stating rather than leaving to be
+# rediscovered:
+#
+#   - The ban names three specific CRATES. `aws-lc-fips-sys` is not one of them.
+#     What the exception below grants is a LICENCE term, which is a separate
+#     policy from the crate ban, and it grants it for exactly one crate.
+#   - Of the ban's three stated reasons, the sharpest one does not apply. The
+#     static musl artifact builds DEFAULT features, and `crypto-fips` is opt-in,
+#     so `aws-lc-fips-sys` never enters it. Verified, not assumed.
+#   - The remaining reason, an inherited CVE history, applies only partly:
+#     AWS-LC is a BoringSSL fork maintained by AWS, and its FIPS variant is the
+#     most audited code in that lineage.
+#   - There is no alternative that keeps FIPS. FIPS 140-3 validates a specific
+#     COMPILED ARTIFACT, and every validated module is C. "We support FIPS" and
+#     "no C in the crypto path" are mutually exclusive today. That is the state
+#     of the world rather than a failure of this policy.
+#
+# COVENANTS.md is cited above as the authority for the licence policy. Its
+# promise is that IRONTRAFFIC's OWN licence stays MIT or Apache-2.0. An optional
+# dependency under the OpenSSL licence does not relicense IronTraffic, and
+# neither COVENANTS.md nor ARCHITECTURE.md promises a C-free dependency tree.
+#
+# The obligation this DOES create is attribution: the OpenSSL licence carries an
+# advertising clause, so any shipped FIPS artifact must carry the notice. That is
+# required by the release artifact issue in milestone 17. An accepted exception
+# with no NOTICE output is a licence violation chosen deliberately, which is
+# worse than the failing check this exception replaces.
+#
+# Owner decision, 2026-07-26, recorded in full on issue #488.
+
+# Scoped to ONE crate on purpose. A blanket `allow = ["OpenSSL"]` in the licence
+# list above would admit any OpenSSL-licensed crate anywhere in the tree, which
+# is precisely the hole the crate ban exists to close.
+[[licenses.exceptions]]
+name = "aws-lc-fips-sys"
+allow = ["OpenSSL"]
 
 [sources]
 unknown-registry = "deny"
