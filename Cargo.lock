@@ -1021,6 +1021,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "irontraffic-obs"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "irontraffic-runtime",
+ "irontraffic-time",
+ "proptest",
+]
+
+[[package]]
 name = "irontraffic-quota"
 version = "0.1.0"
 dependencies = [

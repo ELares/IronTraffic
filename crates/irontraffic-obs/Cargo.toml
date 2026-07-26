@@ -1,0 +1,28 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "irontraffic-obs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared observability primitives (counters, per-core shards, epoch witness, byte rendering) for IronTraffic."
+
+[lints]
+workspace = true
+
+[dependencies]
+# `irontraffic_runtime::core::{with, core_count}` and `CoreCtx`: `Shards::with_current`
+# and `Shards::from_core_count` reach per-core state only through this seam.
+irontraffic-runtime = { path = "../irontraffic-runtime", version = "0.1.0" }
+# `CoarseWall` and the `TimeSource` seam: `EpochWitness::observe` and
+# `CachedWall::refresh` take a timestamp as an argument rather than reading a clock.
+irontraffic-time = { path = "../irontraffic-time", version = "0.1.0" }
+
+[dev-dependencies]
+proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "obs_core"
+harness = false
