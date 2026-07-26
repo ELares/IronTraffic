@@ -707,6 +707,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "irontraffic-config"
+version = "0.1.0"
+dependencies = [
+ "irontraffic-runtime",
+ "proptest",
+ "serde",
+ "serde_json",
+ "smol_str",
+ "thiserror",
+]
+
+[[package]]
 name = "irontraffic-filter"
 version = "0.1.0"
 dependencies = [

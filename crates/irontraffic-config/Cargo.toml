@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "irontraffic-config"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Layer 1 of IronTraffic's configuration model: the document an operator writes, with every scalar a validating newtype."
+
+[lints]
+workspace = true
+
+[dependencies]
+# BootstrapDoc and every newtype implement serde::Deserialize and serde::Serialize.
+serde = { workspace = true }
+# ListenerName is interned, inline up to 23 bytes in the pinned 0.3 line.
+smol_str = { workspace = true }
+# FieldError is a typed error enum without a hand-written Display impl.
+thiserror = { workspace = true }
+# From<ModeSpec> for irontraffic_runtime::RuntimeMode: config names the mode,
+# the runtime does not name config. Only RuntimeMode is used from this crate.
+irontraffic-runtime = { path = "../irontraffic-runtime", version = "0.1.0" }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+proptest = { workspace = true }
