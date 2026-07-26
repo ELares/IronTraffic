@@ -225,12 +225,219 @@ impl Leases {
 }
 RS
 
+# Deliberately missing [lints] workspace = true, and hardcoding edition
+# instead of edition.workspace = true: crate-inherits-workspace (#452).
+cat > "$A/crates/irontraffic-router/Cargo.toml" <<'TOML'
+[package]
+name = "irontraffic-router"
+edition = "2021"
+version.workspace = true
+license.workspace = true
+
+[dependencies]
+TOML
+
+# Deliberately violates the NOT-line-oriented forms added under #453/#456:
+# a multi-line #[allow(...)] with no reason anywhere in it, a wrapped
+# assert!(matches!(..., _)), a wrapped secret == comparison, a wrapped
+# fetch_add(TYPE::MAX, ...) with no Drop impl, every new ArcSwap-publish
+# spelling, and a wrapped pub-use / type alias hiding a guarded symbol.
+# Each of these previously either failed to fire (a bypass) or, for the
+# rustfmt-forced #[allow(...)] wrap, fired on code that had a reason and
+# simply could not spell it on one line (a false positive cargo fmt and this
+# rule disagreed about, which is its own kind of bug).
+cat > "$A/crates/irontraffic-router/src/multiline_bad.rs" <<'RS'
+//! Deliberately violates every NOT-line-oriented rule added under #453/#456.
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
+use arc_swap::ArcSwap;
+
+/// A multi-line #[allow(...)] whose reason never made it onto any line:
+/// deliberately missing, not merely wrapped.
+#[allow(
+    clippy::too_many_arguments,
+    clippy::too_many_lines
+)]
+pub fn many_lints_no_reason(
+    a: u8, b: u8, c: u8, d: u8, e: u8, f: u8, g: u8, h: u8, i: u8,
+) -> u8 {
+    a + b + c + d + e + f + g + h + i
+}
+
+/// A wrapped vacuous assert!(matches!(..., _)): the exact shape
+/// no-vacuous-assert exists to catch, spread across lines by rustfmt
+/// because the expression under test is realistically long rather than a
+/// placeholder.
+pub fn check_shape(some_moderately_long_expression_result_value_here: u8) {
+    assert!(matches!(
+        some_moderately_long_expression_result_value_here,
+        _
+    ));
+}
+
+/// A wrapped secret == comparison: constant-time-secrets must still see it
+/// once rustfmt has moved `==` onto its own line.
+pub fn compare(
+    some_api_key_variable_name_used_for_probing_purposes_here: u64,
+    expected_value_variable_name_used_here: u64,
+) -> bool {
+    if some_api_key_variable_name_used_for_probing_purposes_here
+        == expected_value_variable_name_used_here
+    {
+        return true;
+    }
+    false
+}
+
+/// A wrapped fetch_add(TYPE::MAX, ...) decrement with no Drop impl anywhere
+/// in this file: balance-drop-only must still see it once the call's own
+/// arguments, not just the receiver, have wrapped onto their own lines.
+pub struct Permits {
+    count: AtomicU32,
+}
+impl Permits {
+    pub fn release_wrapped(&self) {
+        self.count.fetch_add(
+            u32::MAX,
+            Ordering::Relaxed,
+        );
+    }
+}
+
+/// Every new single-snapshot-publish spelling: swap, compare_and_swap, and
+/// rcu, none of which mention `.store(`.
+pub struct Holder {
+    table: ArcSwap<u8>,
+}
+impl Holder {
+    pub fn publish_via_swap(&self, next: Arc<u8>) {
+        self.table.swap(next);
+    }
+    pub fn publish_via_cas(&self, current: &Arc<u8>, next: Arc<u8>) {
+        self.table.compare_and_swap(current, next);
+    }
+    pub fn publish_via_rcu(&self, add: u8) {
+        self.table.rcu(|old| **old + add);
+    }
+}
+
+/// Reassigning an existing ArcSwap-typed place with a fresh
+/// ArcSwap::from_pointee, rather than binding a new let: also a republish.
+pub struct Reinit {
+    pub table: ArcSwap<u8>,
+}
+impl Reinit {
+    pub fn reinit(&mut self, v: u8) {
+        self.table = ArcSwap::from_pointee(v);
+    }
+}
+RS
+
+# Deliberately violates no-guarded-alias via the two multi-line statement
+# forms: a wrapped pub-use braced list and a wrapped type alias, neither of
+# which puts the guarded name on the same line as `pub use` or `type ... =`.
+cat > "$A/crates/irontraffic-router/src/guarded_alias_multiline_bad.rs" <<'RS'
+//! Deliberately violates no-guarded-alias via wrapped multi-line statements.
+pub use inner::{
+    AndOneMoreForGoodMeasureToForceWrap, CoreCtx, Helper, OtherThing, YetAnotherThing,
+};
+
+pub type AliasedCellWithAVeryLongNameIndeedToPushThisOverTheEdgeOfMaxWidth =
+    std::cell::RefCell<SomeVeryLongGenericParameterNameToForceARustfmtWrapHereForSure>;
+
+mod inner {
+    pub struct Helper;
+    pub struct CoreCtx;
+    pub struct OtherThing;
+    pub struct YetAnotherThing;
+    pub struct AndOneMoreForGoodMeasureToForceWrap;
+}
+RS
+
+# Deliberately uses a direct clock read (rustix::time) outside the seam
+# crate, and blocking std::fs / std::process calls the original
+# no-blocking-in-async list did not name.
+cat > "$A/crates/irontraffic-router/src/axis_two_bad.rs" <<'RS'
+//! Deliberately uses spellings the ORIGINAL patterns for determinism-seam
+//! and no-blocking-in-async did not cover, outside the crates that are
+//! allowed to.
+/// Reads the boot clock directly instead of through irontraffic-time.
+pub fn read_boot_time() -> u64 {
+    let ts = rustix::time::clock_gettime(rustix::time::ClockId::Monotonic);
+    ts.tv_sec as u64
+}
+/// Reads filesystem metadata synchronously, a blocking syscall none of the
+/// original read/write/File/create/remove/copy/rename prefixes named.
+pub fn stat_it(p: &std::path::Path) -> bool {
+    std::fs::metadata(p).is_ok()
+}
+/// Spawns a child process synchronously, blocking the calling thread for
+/// its lifetime; the original list had no representation for this at all.
+pub fn run_it() {
+    let _ = std::process::Command::new("true").status();
+}
+RS
+
+# Deliberately places a real attribute (not a literal decoy) between #[test]
+# and fn, on a test with NO assertion: this must still be caught, proving
+# the fix does not overcorrect into never firing once such tests are finally
+# visible to it.
+cat > "$A/crates/irontraffic-router/src/attributed_test_bad.rs" <<'RS'
+//! Deliberately places an attribute between #[test] and fn on an
+//! assertion-free test.
+#[cfg(test)]
+mod tests {
+    #[test]
+    #[allow(clippy::assertions_on_constants, reason = "no assertion at all here on purpose")]
+    fn attributed_and_empty() {
+        let _x = 1 + 1;
+    }
+}
+RS
+
+# Deliberately reproduces the exact #286 brace-in-literal false NEGATIVE
+# shape, but with genuinely NO assertion, so the fix must still catch a real
+# violation rather than merely stop false-positiving on a good one.
+cat > "$A/crates/irontraffic-router/src/literal_braces_bad.rs" <<'RS'
+//! Deliberately assertion-free tests, each with a decoy brace in a literal
+//! or comment between the test marker and the real body, or inside it.
+use proptest::prelude::*;
+
+proptest! {
+    #[test]
+    fn regex_repetition_decoy(s in "[a-z][a-z0-9-]{0,20}") {
+        let _ = s;
+    }
+
+    #[test]
+    fn unicode_escape_decoy(c in prop_oneof![Just('\u{e9}'), Just('\u{65e5}')]) {
+        let _ = c;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn raw_string_decoy() {
+        let pattern = r"{not a real brace} { still not }";
+        let _ = pattern;
+    }
+
+    #[test]
+    fn comment_decoy() {
+        // a stray brace in a comment: { should not affect depth counting
+        let _ = 1;
+    }
+}
+RS
+
 printf '[workspace.dependencies]\nserde = "1"\n' > "$A/Cargo.toml"
 
 EXPECTED='allow-needs-reason
 balance-drop-only
 constant-time-secrets
 core-ctx-not-stored
+crate-inherits-workspace
 determinism-seam
 dependency-justification
 hot-path-allocation
@@ -541,6 +748,196 @@ impl Holder {
     /// single-snapshot-publish rule exists to keep unique.
     pub fn publish(&self, next: Arc<u8>) {
         self.table.store(next);
+    }
+}
+RS
+
+# A crate manifest that correctly inherits the workspace: [lints] workspace
+# = true, and edition/version spelled as .workspace = true rather than
+# hardcoded. crate-inherits-workspace (#452) must not fire on this.
+cat > "$B/crates/irontraffic-router/Cargo.toml" <<'TOML'
+[package]
+name = "irontraffic-router"
+version.workspace = true
+edition.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+TOML
+
+# The NOT-line-oriented forms added under #453/#456, each written the way
+# rustfmt actually produces them (or the way legitimate code uses the
+# construct), proving none of the fixes above turned into new false
+# positives on real, correct code.
+cat > "$B/crates/irontraffic-router/src/multiline_ok.rs" <<'RS'
+//! The correct, rustfmt-produced shape of every construct
+//! crates/irontraffic-router/src/multiline_bad.rs in the bad corpus
+//! violates, proving the fixes do not false-positive on legitimate code.
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::Arc;
+use arc_swap::ArcSwap;
+
+/// A multi-line #[allow(...)] IS how rustfmt renders a long lint path plus
+/// a real reason once the attribute exceeds roughly 70 characters. The
+/// reason is present, just not on the attribute's own first line.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "one cohesive dispatch loop that threads every per-connection parameter through by design"
+)]
+pub fn many_lints_with_reason(
+    a: u8, b: u8, c: u8, d: u8, e: u8, f: u8, g: u8, h: u8, i: u8,
+) -> u8 {
+    a + b + c + d + e + f + g + h + i
+}
+
+/// A wrapped assert!(matches!(...)) whose second argument is a REAL pattern,
+/// not `_`: this can fail, so it is not vacuous, and must not be flagged
+/// merely for having wrapped onto multiple lines.
+pub fn check_shape(some_moderately_long_expression_result_value_here: Option<u8>) {
+    assert!(matches!(
+        some_moderately_long_expression_result_value_here,
+        Some(_)
+    ));
+}
+
+/// A wrapped fetch_add(TYPE::MAX, ...) decrement that DOES release through
+/// Drop in this same file: balance-drop-only must not fire just because the
+/// call's arguments wrapped onto their own lines.
+pub struct Permits {
+    count: AtomicU32,
+}
+impl Permits {
+    pub fn acquire(&self) {
+        self.count.fetch_add(
+            1,
+            Ordering::Relaxed,
+        );
+    }
+}
+impl Drop for Permits {
+    fn drop(&mut self) {
+        self.count.fetch_add(u32::MAX, Ordering::Relaxed);
+    }
+}
+
+/// False-positive guard: mem::swap is a free function, never a method call,
+/// and must not be mistaken for an ArcSwap publish.
+pub fn uses_mem_swap(a: &mut u64, b: &mut u64) {
+    std::mem::swap(a, b);
+}
+
+/// False-positive guard: slice::swap always takes two plain index
+/// arguments, never one, so it must not be mistaken for ArcSwap::swap.
+pub fn uses_slice_swap(v: &mut [u64]) {
+    v.swap(0, 1);
+}
+
+/// False-positive guard: a plain atomic integer's swap always takes an
+/// Ordering as its second argument (the very call PR #449 substituted for a
+/// store precisely because this rule, before this fix, banned .store(
+/// outright with no way to spell a plain atomic swap either); it must not
+/// be mistaken for ArcSwap::swap, which takes exactly one argument.
+pub struct Counter {
+    value: AtomicU64,
+}
+impl Counter {
+    pub fn set(&self, v: u64) -> u64 {
+        self.value.swap(v, Ordering::Relaxed)
+    }
+}
+
+/// False-positive guard: the deprecated atomic compare_and_swap always
+/// takes three arguments (current, new, Ordering), never two, so it must
+/// not be mistaken for ArcSwap::compare_and_swap.
+pub fn uses_atomic_cas(a: &AtomicU64) -> u64 {
+    a.compare_and_swap(0, 1, Ordering::Relaxed)
+}
+
+/// False-positive guard: binding a brand new ArcSwap with `let` is ordinary
+/// construction, not a republish of an existing place.
+pub fn build_fresh() -> ArcSwap<u64> {
+    let fresh = ArcSwap::from_pointee(0);
+    fresh
+}
+RS
+
+# no-guarded-alias's two multi-line forms, applied to names that are NOT
+# guarded, proving the new statement-span scan does not turn "this name
+# appears somewhere in a wrapped pub-use or type alias" into a false
+# positive on an ordinary one.
+cat > "$B/crates/irontraffic-router/src/guarded_alias_multiline_ok.rs" <<'RS'
+//! Wrapped multi-line pub-use and type-alias statements naming NOTHING
+//! guarded, proving the new statement-span scan is not simply "any name in
+//! a wrapped statement".
+pub use inner::{
+    AndOneMoreForGoodMeasureToForceWrap, Helper, NotGuardedEither, OtherThing, YetAnotherThing,
+};
+
+pub type AliasedRegistryWithAVeryLongNameIndeedToPushThisOverTheEdgeOfMaxWidth =
+    std::collections::HashMap<SomeVeryLongGenericParameterNameToForceARustfmtWrapHereOk, u8>;
+
+mod inner {
+    pub struct Helper;
+    pub struct OtherThing;
+    pub struct YetAnotherThing;
+    pub struct AndOneMoreForGoodMeasureToForceWrap;
+    pub struct NotGuardedEither;
+}
+RS
+
+# An attribute between #[test] and fn on a test that DOES assert, proving
+# such a test is now correctly recognized as passing (not merely "not
+# flagged"), matching what test-census.sh must also now count.
+cat > "$B/crates/irontraffic-router/src/attributed_test_ok.rs" <<'RS'
+//! An attribute between #[test] and fn on a test that genuinely asserts.
+#[cfg(test)]
+mod tests {
+    #[test]
+    #[allow(clippy::assertions_on_constants, reason = "tests a documented constant")]
+    fn attributed_and_asserting() {
+        assert_eq!(1 + 1, 2);
+    }
+}
+RS
+
+# The exact #286 brace-in-literal shapes, each WITH a genuine assertion:
+# proves each of the four forms is counted correctly rather than read as an
+# empty body from a decoy brace.
+cat > "$B/crates/irontraffic-router/src/literal_braces_ok.rs" <<'RS'
+//! The four #286 brace-in-literal shapes, each with a real assertion.
+use proptest::prelude::*;
+
+fn intern(s: &str) -> String {
+    s.to_string()
+}
+
+proptest! {
+    #[test]
+    fn regex_repetition_present(s in "[a-z][a-z0-9-]{0,20}") {
+        let interned = intern(&s);
+        assert_eq!(interned, s);
+    }
+
+    #[test]
+    fn unicode_escape_present(c in prop_oneof![Just('\u{e9}'), Just('\u{65e5}')]) {
+        assert!(c == '\u{e9}' || c == '\u{65e5}');
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn raw_string_present() {
+        let pattern = r"{not a real brace} { still not }";
+        assert_eq!(pattern.len(), 33);
+    }
+
+    #[test]
+    fn comment_present() {
+        // a stray brace in a comment: { should not affect depth counting
+        assert_eq!(1 + 1, 2);
     }
 }
 RS

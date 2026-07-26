@@ -45,17 +45,70 @@ jobs:
           components: rustfmt
       - run: cargo fmt --all --check
 
+  # Reads scripts/feature-matrix.sh's declaration of which crates have
+  # mutually exclusive feature groups (irontraffic-tls's three crypto-*
+  # providers today) and turns it into the JSON that feature-matrix's own
+  # job below consumes as a dynamic `strategy.matrix`. This is the ONLY place
+  # that shape conversion happens; clippy/test/msrv below only need the bare
+  # crate NAMES to exclude, which scripts/feature-matrix.sh matrixed-names
+  # gives them directly without going through this job.
+  feature-matrix-discover:
+    name: discover the feature matrix
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.discover.outputs.matrix }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Restore scripts/feature-matrix.sh from the BASE branch
+        # THE JUDGE MAY NOT BE EDITED BY THE DEFENDANT (same reasoning as the
+        # invariants job below): this script decides WHICH feature
+        # combinations the gate accepts as sufficient, so a pull request must
+        # not be able to edit it and have that edit judge the very same run.
+        run: |
+          set -euo pipefail
+          git fetch --depth=1 origin "${{ github.base_ref || github.ref_name }}"
+          if git cat-file -e "FETCH_HEAD:scripts/feature-matrix.sh" 2>/dev/null; then
+            git checkout FETCH_HEAD -- scripts/feature-matrix.sh
+          fi
+          chmod +x scripts/feature-matrix.sh
+      - id: discover
+        run: |
+          set -euo pipefail
+          echo "matrix=$(scripts/feature-matrix.sh json)" >> "$GITHUB_OUTPUT"
+
   clippy:
     name: clippy (pedantic, -D warnings)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      - name: Restore scripts/feature-matrix.sh from the BASE branch
+        run: |
+          set -euo pipefail
+          git fetch --depth=1 origin "${{ github.base_ref || github.ref_name }}"
+          if git cat-file -e "FETCH_HEAD:scripts/feature-matrix.sh" 2>/dev/null; then
+            git checkout FETCH_HEAD -- scripts/feature-matrix.sh
+          fi
+          chmod +x scripts/feature-matrix.sh
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
+      - name: clippy (workspace, minus any crate with a feature matrix)
+        # A crate with mutually exclusive features cannot compile under
+        # --all-features at all (that is what "mutually exclusive" means), so
+        # it is excluded here and checked once per valid combination by the
+        # feature-matrix job below instead, never skipped. With nothing
+        # matrixed this is `cargo clippy --workspace --all-targets
+        # --all-features -- -D warnings`, unchanged.
+        run: |
+          set -euo pipefail
+          exclude=()
+          while IFS= read -r name; do
+            [ -n "$name" ] && exclude+=(--exclude "$name")
+          done < <(scripts/feature-matrix.sh matrixed-names)
+          cargo clippy --locked --workspace "${exclude[@]}" --all-targets --all-features -- -D warnings
 
   test:
     name: test (ubuntu-latest)
@@ -63,17 +116,99 @@ jobs:
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v4
+      - name: Restore scripts/feature-matrix.sh from the BASE branch
+        run: |
+          set -euo pipefail
+          git fetch --depth=1 origin "${{ github.base_ref || github.ref_name }}"
+          if git cat-file -e "FETCH_HEAD:scripts/feature-matrix.sh" 2>/dev/null; then
+            git checkout FETCH_HEAD -- scripts/feature-matrix.sh
+          fi
+          chmod +x scripts/feature-matrix.sh
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - name: tests (workspace, all features)
-        run: cargo test --locked --workspace --all-features
+      - name: tests (workspace, all features, minus any crate with a feature matrix)
+        run: |
+          set -euo pipefail
+          exclude=()
+          while IFS= read -r name; do
+            [ -n "$name" ] && exclude+=(--exclude "$name")
+          done < <(scripts/feature-matrix.sh matrixed-names)
+          cargo test --locked --workspace "${exclude[@]}" --all-features
       - name: doctests
-        run: cargo test --locked --workspace --all-features --doc
+        run: |
+          set -euo pipefail
+          exclude=()
+          while IFS= read -r name; do
+            [ -n "$name" ] && exclude+=(--exclude "$name")
+          done < <(scripts/feature-matrix.sh matrixed-names)
+          cargo test --locked --workspace "${exclude[@]}" --all-features --doc
       - name: default features build (the edge and k3s profile must not rot)
         # The data-plane-only build is what runs on constrained edge and k3s
         # nodes. It is built on every PR so that a dependency added to the
-        # control plane cannot silently land in the data plane.
+        # control plane cannot silently land in the data plane. Feature
+        # exclusivity has no bearing on a --no-default-features build (it
+        # activates none of the exclusive features either), so this line is
+        # deliberately not excluded from anything.
         run: cargo check --locked --workspace --no-default-features
+
+  feature-matrix:
+    name: feature matrix (${{ matrix.crate }}, ${{ matrix.features }})
+    needs: feature-matrix-discover
+    if: needs.feature-matrix-discover.outputs.matrix != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.feature-matrix-discover.outputs.matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: clippy
+        run: cargo clippy --locked -p "${{ matrix.crate }}" --all-targets --no-default-features --features "${{ matrix.features }}" -- -D warnings
+      - name: test
+        run: cargo test --locked -p "${{ matrix.crate }}" --no-default-features --features "${{ matrix.features }}"
+      - name: doctests
+        run: cargo test --locked -p "${{ matrix.crate }}" --no-default-features --features "${{ matrix.features }}" --doc
+
+  # A required-checks branch protection rule names jobs, not matrix cells, and
+  # a matrix job with zero entries (feature-matrix-discover finding nothing to
+  # matrix) reports no runs at all rather than a single green one -- which,
+  # exactly like the `if:` skip this file's own header warns about, GitHub
+  # would otherwise treat as vacuously satisfied. This job always runs and
+  # fails closed if the declared matrix and what actually executed disagree,
+  # so branch protection has one steady job name to require regardless of how
+  # many crates are matrixed today.
+  feature-matrix-gate:
+    name: feature matrix gate
+    needs: [feature-matrix-discover, feature-matrix]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - run: |
+          set -euo pipefail
+          declared='${{ needs.feature-matrix-discover.outputs.matrix }}'
+          n=$(python3 -c "import json,sys; print(len(json.loads(sys.argv[1])))" "$declared")
+          result='${{ needs.feature-matrix.result }}'
+          echo "declared matrix cells: $n"
+          echo "feature-matrix job result: $result"
+          if [ "$n" -eq 0 ]; then
+            if [ "$result" != "skipped" ]; then
+              echo "FAIL: nothing was declared but feature-matrix did not report skipped"
+              exit 1
+            fi
+            echo "ok: no crate declares an exclusive-features group"
+            exit 0
+          fi
+          if [ "$result" != "success" ]; then
+            echo "FAIL: $n feature-matrix cell(s) were declared but the job did not succeed"
+            exit 1
+          fi
+          echo "ok: all $n declared feature-matrix cell(s) ran and passed"
 
   msrv:
     name: msrv (1.85)
@@ -86,9 +221,37 @@ jobs:
       RUSTUP_TOOLCHAIN: "1.85"
     steps:
       - uses: actions/checkout@v4
+      - name: Restore scripts/feature-matrix.sh from the BASE branch
+        run: |
+          set -euo pipefail
+          git fetch --depth=1 origin "${{ github.base_ref || github.ref_name }}"
+          if git cat-file -e "FETCH_HEAD:scripts/feature-matrix.sh" 2>/dev/null; then
+            git checkout FETCH_HEAD -- scripts/feature-matrix.sh
+          fi
+          chmod +x scripts/feature-matrix.sh
       - uses: dtolnay/rust-toolchain@1.85
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --locked --workspace --all-features --all-targets
+      - name: check (workspace, minus any crate with a feature matrix)
+        run: |
+          set -euo pipefail
+          exclude=()
+          while IFS= read -r name; do
+            [ -n "$name" ] && exclude+=(--exclude "$name")
+          done < <(scripts/feature-matrix.sh matrixed-names)
+          cargo check --locked --workspace "${exclude[@]}" --all-features --all-targets
+      - name: check (crates with a feature matrix, once per combination)
+        run: |
+          set -euo pipefail
+          while IFS= read -r manifest; do
+            [ -n "$manifest" ] || continue
+            scripts/feature-matrix.sh has-matrix "$manifest" || continue
+            name=$(awk -F'"' '/^\[package\]/{p=1;next} /^\[/{p=0} p && /^name[[:space:]]*=/{print $2; exit}' "$manifest")
+            while IFS= read -r feat; do
+              [ -n "$feat" ] || continue
+              echo "== msrv check: $name --features $feat =="
+              cargo check --locked -p "$name" --no-default-features --features "$feat" --all-targets
+            done < <(scripts/feature-matrix.sh runs "$manifest" | grep -v -- '--all-features')
+          done < <(git ls-files -- 'crates/*/Cargo.toml')
 
   musl:
     name: musl static build
@@ -133,6 +296,24 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          # actions/checkout defaults to fetch-depth: 1, a single commit with
+          # no history in common with origin/main. scripts/test-census.sh
+          # (invoked below) needs a real merge base between HEAD and the base
+          # branch to diff against, and git merge-base finds nothing between
+          # two disconnected single-commit graphs. That was the entire cause
+          # of this job failing on every open pull request: not a bug in the
+          # census logic, a missing history.
+          #
+          # Full history is the correct fix, not a partial fetch of just the
+          # base ref: a partial fetch would need to guess how deep to go, and
+          # guessing wrong reintroduces this exact failure the day a PR sits
+          # open through more commits than the guess covers. This repository
+          # is small enough today that fetch-depth 0 costs a few extra seconds
+          # per run. If that ever changes, the alternative is fetching only
+          # the base ref with `git fetch origin <base>` and no depth limit
+          # (equivalent correctness, less data), not a shallow depth guess.
+          fetch-depth: 0
       - name: Restore every gate script and lint config from the BASE branch
         # THE JUDGE MAY NOT BE EDITED BY THE DEFENDANT.
         #
@@ -154,7 +335,8 @@ jobs:
           git fetch --depth=1 origin "${{ github.base_ref || github.ref_name }}"
           for f in scripts/invariant-lints.sh scripts/invariant-lints-selftest.sh \
                    scripts/dash-scan.sh scripts/pr-scope-check.sh scripts/test-census.sh \
-                   scripts/gate-fast.sh scripts/gate.sh opencode.json \
+                   scripts/test-census-selftest.sh \
+                   scripts/gate-fast.sh scripts/gate.sh scripts/feature-matrix.sh opencode.json \
                    clippy.toml deny.toml rustfmt.toml; do
             if git cat-file -e "FETCH_HEAD:$f" 2>/dev/null; then
               git checkout FETCH_HEAD -- "$f"
@@ -185,6 +367,13 @@ jobs:
         env:
           BASE_REF: ${{ github.base_ref || github.ref_name }}
         run: scripts/test-census.sh
+      - name: test census self-test
+        # Same reasoning as the invariant lint self-test above, for the
+        # census instead of the greps: it used to be blind to a test with an
+        # attribute between #[test] and fn, and separately blind to a
+        # file's assertion count dropping all the way to zero. Both are
+        # regression-tested here against the shipped script.
+        run: scripts/test-census-selftest.sh
       - name: governance files present
         # These files are trust infrastructure. This lint ensures they cannot
         # be silently removed, renamed, or emptied.
@@ -250,6 +439,37 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+      - name: Restore pr-scope-check.sh from the BASE branch
+        # THE JUDGE MAY NOT BE EDITED BY THE DEFENDANT, the same rule the
+        # invariants job applies to the other gate scripts, and it was NOT
+        # actually being applied here.
+        #
+        # The invariants job's restore step lists scripts/pr-scope-check.sh
+        # among the files it checks out from the base branch, but that job
+        # never runs pr-scope-check.sh. It only restores the file into ITS OWN
+        # job workspace, on its own runner, and then does nothing further with
+        # it. The actual execution of pr-scope-check.sh happens here, in this
+        # separate job, on a separate runner with a separate checkout, and
+        # this job had no restore step of its own. So a PR could rewrite
+        # scripts/pr-scope-check.sh to exit 0 unconditionally, or to widen its
+        # allowlist to match anything, and that rewritten copy is exactly what
+        # would have judged it, unnoticed, because the invariants job's
+        # restore of the same filename created the appearance of protection
+        # without providing it.
+        #
+        # A PR may still PROPOSE a change to this script, same as any other
+        # gate script; it takes effect on the next PR once a human has
+        # reviewed it, not on the PR that introduces it.
+        run: |
+          set -euo pipefail
+          git fetch --depth=1 origin "${{ github.base_ref || github.ref_name }}"
+          if git cat-file -e "FETCH_HEAD:scripts/pr-scope-check.sh" 2>/dev/null; then
+            git checkout FETCH_HEAD -- scripts/pr-scope-check.sh
+            echo "restored from base: scripts/pr-scope-check.sh"
+          else
+            echo "not on base yet (new file, will be judged from head): scripts/pr-scope-check.sh"
+          fi
+          chmod +x scripts/pr-scope-check.sh
       - name: Compare the changed files against the issue's Files table
         env:
           GH_TOKEN: ${{ github.token }}
