@@ -16,5 +16,17 @@ tokio = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 thiserror = { workspace = true }
+# BytesMut pooled read chunks and the exactly-sized Bytes compaction rules.
+bytes = { workspace = true }
+# CachePadded for the outstanding/allocations/over_cap_releases statics.
+crossbeam-utils = { workspace = true }
+# CoarseMono, the wrap-safe clock type maybe_decay compares against.
+irontraffic-time = { path = "../irontraffic-time", version = "0.1.0" }
 
 [dev-dependencies]
+proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "buffer"
+harness = false
