@@ -33,12 +33,26 @@
 //!
 //! The `HOT PATH` marker above puts this whole file, every function in it,
 //! under `scripts/invariant-lints.sh`'s `hot-path-allocation` and
-//! `hot-path-lock` rules: a text scan of the entire production-code body for
-//! every call that can allocate or lock, run in CI on every pull request.
-//! That is a single, shared definition of what counts as an allocation
-//! instead of a hand-rolled, per-crate reimplementation of the same
-//! vocabulary. `no_allocations_in_normalize` in the test module below relies
-//! on that scan rather than re-deriving it.
+//! `hot-path-lock` rules, run in CI on every pull request. Read what that
+//! buys accurately, because this file previously claimed more: those rules
+//! are a text scan for a fixed list of call spellings, so they are a
+//! best-effort net and NOT a proof that nothing here allocates. The list is
+//! shared and reviewed in one place instead of being reimplemented per crate,
+//! which is the real benefit, but it does not know Rust's types, it cannot
+//! see a call nobody put on the list, and it cannot follow a call into a
+//! callee. It shipped for months without the single most likely mistake in
+//! this file on it (issue #539: lowercasing the presented name into a fresh
+//! owned string was CLEAN, while an equivalent copy correctly failed), and
+//! the ASCII case conversions still cannot be listed at all, because the byte
+//! form allocates nothing and is spelled identically to the string form
+//! (issue #563).
+//!
+//! What actually makes this function allocation free is its signature and its
+//! body: it takes a caller-owned `[u8; MAX_NAME_LEN]`, returns a borrow of
+//! it, and constructs no owned value on any path. The lint is a guard against
+//! a later edit reintroducing one, not the reason the property holds today.
+//! `no_allocations_in_normalize` in the test module below guards only the
+//! marker line itself, and says so.
 
 use siphasher::sip128::{Hasher128, SipHasher13};
 
@@ -612,32 +626,43 @@ mod tests {
         // `normalize` over "API.Example.COM.", "a.b", and a 253-byte name. That
         // does not compile in this tree: `GlobalAlloc` is declared as an `unsafe
         // trait`, so even a pure counter that forwards straight to
-        // `std::alloc::System` needs the keyword this repository denies with no
-        // exception an implementer may grant (AGENTS.md, and the `no-unsafe` rule
-        // in `scripts/invariant-lints.sh`, which scans every tracked `.rs` file,
-        // tests included, and has no escape hatch for this rule). A process-wide
-        // global allocator is also unsound independent of that ban: it counts
-        // allocations made by every other test thread running in parallel in the
-        // same binary, which is exactly the flakiness a thread-local counter would
-        // have been built to avoid, except the allocator itself cannot compile
-        // here regardless.
+        // `std::alloc::System` needs the keyword this repository denies (AGENTS.md,
+        // and the `no-unsafe` rule in `scripts/invariant-lints.sh`, which scans
+        // every tracked `.rs` file, tests included). Be precise about why that is
+        // binding, because this comment previously was not: the ban is a POLICY
+        // one, and no implementer may grant themselves an exception to it. It is
+        // not that the mechanism lacks an override. `no-unsafe` goes through the
+        // same `scan()` helper as most rules here, and `scan()` pipes its hits
+        // through `drop_escaped`, so `// it-allow: no-unsafe reason: ...` on the
+        // offending line would suppress it exactly as it does for any other rule.
+        // The reason not to write that line is that the policy forbids it and a
+        // reviewer would reject it, which is a different and weaker thing than
+        // being unable to. A process-wide global allocator is also unsound
+        // independent of the ban: it counts allocations made by every other test
+        // thread running in parallel in the same binary, which is exactly the
+        // flakiness a thread-local counter would have been built to avoid.
         //
         // This module instead carries the `//! HOT PATH` marker, which puts the
         // whole file, normalize, parent, wildcard_parent, label_count and
         // NameHasher::hash, under scripts/invariant-lints.sh's
-        // hot-path-allocation rule: an exhaustive text scan for every call that
-        // can allocate, run on every pull request. That is a property of the
-        // source text over every possible input, not a sample over 10,000 calls
-        // through three fixed inputs. This test's only job is to guard against
-        // the marker line itself being deleted, which would silently drop this
-        // module out of that CI-enforced net.
+        // hot-path-allocation rule. That rule is a text scan for a FIXED LIST of
+        // call spellings, and this comment used to call it exhaustive, which it
+        // has never been: issue #539 records a reviewer proving by injection that
+        // lowercasing the presented name into a fresh owned string passed the
+        // rule cleanly, while an equivalent copy failed it. The list is wider
+        // now, and it is still a best-effort net rather than a proof, so this
+        // test claims only what it can: it guards the marker line itself against
+        // deletion, which would drop this module out of that net entirely. The
+        // reason normalize does not allocate is its signature and its body, not
+        // this test and not that lint.
         let source = include_str!("name.rs");
         assert!(
             source.lines().any(|line| line == HOT_PATH_MARKER),
             "crates/irontraffic-tls/src/name.rs must carry a line that is exactly \
              `{HOT_PATH_MARKER}` so scripts/invariant-lints.sh's hot-path-allocation \
-             rule scans this module; without it, normalize and every function it \
-             calls could allocate with nothing in this repository catching it"
+             rule scans this module at all; that rule is a best-effort text scan for \
+             a fixed list of allocating calls rather than a proof, but without this \
+             marker not even that much runs against normalize or anything it calls"
         );
     }
 

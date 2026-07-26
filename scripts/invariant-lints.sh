@@ -1113,12 +1113,83 @@ hot_scan() {
     | sed 's|^\./||' | drop_escaped "$rule" || true
 }
 
-hits="$(hot_scan hot-path-allocation '(\bformat!\s*\(|\.to_string\(\)|\.to_owned\(\)|\.to_vec\(\)|\bvec!\s*\[|Vec::new\(\)|String::new\(\)|String::from\(|Box::new\(|HashMap::new\(|\.collect::<(Vec|String|HashMap)|\.clone\(\))')"
+# WHAT THIS RULE IS, STATED HONESTLY (issue #539). It is a deny list of call
+# spellings, matched as text. It is a best-effort net, NOT a proof, and the
+# explain text below now says so, because it previously did not and a reader
+# reasonably took a clean run as an allocation proof.
+#
+# HOW THE GAP WAS FOUND. A reviewer of PR #528 checked the mechanism by
+# EXECUTION rather than by reading, with a positive control: injecting
+# `raw.to_owned()` into `normalize` failed this rule (so the file really was in
+# the scan set and the rule really was live), while injecting
+# `raw.to_lowercase()`, and separately `String::with_capacity` plus `push_str`,
+# left the run CLEAN. The original list was twelve tokens and simply did not
+# name them. Issue #113's own Context calls `sni.to_lowercase()` the most
+# common implementation mistake in exactly the function this file's HOT PATH
+# marker was protecting.
+#
+# EVERY TOKEN BELOW IS SELF-TESTED BY LINE. Adding a token here without a
+# selftest case that watches it fire is precisely how the hole survived, so
+# scripts/invariant-lints-selftest.sh no longer settles for "the rule fired
+# somewhere in corpus A": it asserts that the reported hits name the specific
+# corpus line carrying each token. A token added here and not added there is a
+# selftest failure, not a silent widening that may or may not work.
+#
+# WHAT IS DELIBERATELY ABSENT, AND WHY THAT IS NOT AN OVERSIGHT.
+#   * `to_ascii_lowercase` / `to_ascii_uppercase` (#563). `str::to_ascii_lowercase`
+#     allocates a String and `<[u8]>::to_ascii_lowercase` allocates a Vec, but
+#     `u8::to_ascii_lowercase` and `char::to_ascii_lowercase` allocate nothing
+#     and are spelled identically at the call site. This tree's own hot path
+#     uses the byte form three times, in
+#     crates/irontraffic-router/src/normalize.rs, which is correct code. A
+#     receiver-blind text scan cannot separate the two, so listing the token
+#     would reject correct non-allocating code and teach implementers to route
+#     around the rule with an escape marker, which is worse than the gap.
+#   * `extend` / `extend_from_slice` / `insert` / `entry` / `reserve`.
+#     Appending into a buffer the CALLER already owns is the idiom this rule
+#     exists to steer code toward, and `Option::insert` never allocates at all.
+#     Flagging them would contradict the advice the failure message gives.
+#   * `format_args!`. It does not allocate; it is the correct non-allocating
+#     alternative to `format!`, and it cannot be bound to a local anyway.
+# These absences are reported by this rule's own text rather than left for the
+# next reviewer to rediscover by injection.
+#
+# KNOWN FALSE POSITIVE, NOT FIXED HERE (#562). This is a plain grep, so a covered
+# call quoted in a comment or a string literal inside a HOT PATH module fires
+# the rule on the documentation. The odds of that were low at twelve tokens
+# and are materially higher now, and it is not hypothetical: two ordinary doc
+# comments in the selftest's own clean corpus tripped it while that corpus was
+# being written, and had to be reworded to describe a call rather than quote
+# it. hot-path-lock has exactly the same property. The fix is to run both hot
+# path rules through rslex.finditer_real, the way constant-time-secrets and
+# the assertion rules already do, so literal and comment regions are opaque.
+# That is a change to how BOTH rules select their input rather than a wider
+# token list, so it is filed separately rather than bundled into this one.
+hits="$(hot_scan hot-path-allocation '(\bformat!\s*\(|\.to_string\(\)|\.to_owned\(\)|\.into_owned\(\)|\.to_vec\(\)|\bvec!\s*\[|(Vec|String|HashMap|HashSet|BTreeMap|BTreeSet|VecDeque|BinaryHeap|LinkedList)::new\(|::with_capacity\(|(String|Vec|Box)::from\(|(Box|Arc|Rc)::new\(|Box::pin\(|\.collect(::<|\(\))|\.clone\(\)|\.to_lowercase\(\)|\.to_uppercase\(\)|\.push_str\(|\.repeat\(|\.join\(([^)]|$)|\.into_boxed_(slice|str)\(\))')"
 [ -n "$hits" ] && fail hot-path-allocation \
 "This module is marked //! HOT PATH, so it runs once per request and must not
 allocate. Borrow instead of cloning, use bytes::Bytes for shared buffers, write
 into a reused buffer instead of formatting a new String, and take slices rather
-than owned collections." "$hits"
+than owned collections.
+
+THIS RULE IS A BEST-EFFORT NET, NOT A PROOF, and a clean run is not evidence
+that this module never allocates. It greps for a fixed list of call spellings.
+It does not know Rust's types, it never sees a call nobody added to the list,
+and it cannot follow a call into a callee. Taking the function's address defeats
+it outright: \`let f = str::to_lowercase; f(s)\` allocates and matches nothing
+here. Two calls it could not cover without rejecting correct code are absent on
+purpose: \`to_ascii_lowercase\` and \`to_ascii_uppercase\` (identical spelling
+on a byte, where they allocate nothing, and on a str, where they allocate), and
+\`extend_from_slice\` and \`insert\` (appending into a caller-owned buffer is
+the idiom this message recommends). It is also a plain text scan, so a listed
+call quoted in a comment or a string literal fires it: describe the call rather
+than quoting it, or use the escape below. Read a clean run as \"none of the
+listed calls appear in this file\", which is all it means. Issue #461 tracks
+whether a genuine allocation proof is reachable at all in a tree that bans
+unsafe, which is what rules out a counting global allocator.
+
+If a listed call is genuinely correct here, say why on the same line:
+  // it-allow: hot-path-allocation reason: <why this line cannot allocate>" "$hits"
 
 hits="$(hot_scan hot-path-lock '(Mutex|RwLock|\.lock\(\)|\.read\(\)\.|\.write\(\)\.)')"
 [ -n "$hits" ] && fail hot-path-lock \
