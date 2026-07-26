@@ -16,6 +16,7 @@
 
 pub mod model;
 pub mod newtypes;
+pub mod v1;
 
 pub use model::{
     BootstrapDoc, DEFAULT_BACKLOG, DEFAULT_CONNECT_MS, DEFAULT_CONTROL_WORKERS,
@@ -24,6 +25,11 @@ pub use model::{
     TimeoutSection, UpstreamSection,
 };
 pub use newtypes::{Backlog, BindAddr, FieldError, ListenerName, Millis, ModeSpec, UpstreamAddr};
+pub use v1::{
+    DYNAMIC_API_VERSION, Extensions, Hostname, MAX_ERROR_ECHO_BYTES, MAX_EXTENSION_DEPTH,
+    MAX_EXTENSION_KEY_BYTES, MAX_EXTENSION_KEYS, MAX_EXTENSIONS_BYTES, MAX_REF_BYTES, NameError,
+    Named, Namespace, ProviderName, ResourceName, ResourceRef, Weight,
+};
 
 /// The only supported `apiVersion` value.
 pub const API_VERSION: &str = "irontraffic.io/v1";

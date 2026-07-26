@@ -82,6 +82,11 @@ siphasher = "1.0.3"
 # Deterministic concurrency model checker for the leased-semaphore CAS
 # protocol in irontraffic-resilience, behind `--cfg loom` only.
 loom = { version = "0.7" }
+# JSON Schema generation for the config layer 1 newtypes, derived straight from
+# the Rust types so the schema and the validator can never disagree. No
+# integration feature needed: every newtype spells `#[schemars(with = "...")]`
+# rather than deriving a schema from its private field.
+schemars = { version = "1.2.1" }
 
 [workspace.lints.rust]
 # A proxy parses attacker-controlled bytes on every request. There is no
