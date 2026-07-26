@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "irontraffic-time"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Clock types for IronTraffic."
+
+[lints]
+workspace = true
+
+[dependencies]
+
+[dev-dependencies]
+proptest = { workspace = true }
