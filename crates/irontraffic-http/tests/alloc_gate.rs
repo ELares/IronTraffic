@@ -184,3 +184,72 @@ fn authority_parse_into_allocates_only_the_declared_split_off() {
          call; found {split_off_count} occurrences in its body"
     );
 }
+
+/// `request-framing-resolution` (#27)'s zero-allocation gate for
+/// `resolve_request_framing`.
+///
+/// The issue's own design called for proving this at run time: 1000 calls
+/// over each of the three benchmark inputs through a `count_allocs` helper
+/// from `field-validation-tables` (#23), each expected to report exactly 0
+/// allocations. There is no `count_allocs` helper anywhere in this crate to
+/// call, and one cannot be written here for the exact reason explained in
+/// the module doc comment above: `GlobalAlloc` is an `unsafe trait`, this
+/// package's `[lints] workspace = true` applies the workspace's
+/// `unsafe_code = "deny"` to every target including this one, and a
+/// process-wide counting allocator would in any case count allocations made
+/// by every other test running in parallel in the same binary.
+///
+/// This proves the same property statically, the identical substitution
+/// `validate_allocates_nothing` above already makes for `validate_value`:
+/// `resolve_request_framing`'s entire call graph inside this crate is
+/// itself, `tokenize_transfer_encoding`, `parse_content_length`, and
+/// `field::trim_ows`, so a text scan of exactly those four function bodies
+/// for the same allocating-call vocabulary is exhaustive over every
+/// possible input, not just the three benchmark inputs the issue's design
+/// named.
+#[test]
+fn framing_allocates_nothing() {
+    let framing_source = include_str!("../src/framing.rs");
+    let field_source = include_str!("../src/field.rs");
+
+    let resolve_body = extract_fn_body(framing_source, "pub fn resolve_request_framing(").expect(
+        "`fn resolve_request_framing` not found in src/framing.rs; has it moved or been \
+             renamed?",
+    );
+    let tokenize_body = extract_fn_body(framing_source, "pub fn tokenize_transfer_encoding<")
+        .expect(
+            "`fn tokenize_transfer_encoding` not found in src/framing.rs; has it moved or been \
+             renamed?",
+        );
+    let parse_cl_body = extract_fn_body(framing_source, "pub fn parse_content_length(").expect(
+        "`fn parse_content_length` not found in src/framing.rs; has it moved or been renamed?",
+    );
+    let trim_ows_body = extract_fn_body(field_source, "pub fn trim_ows(value: &[u8]) -> &[u8] {")
+        .expect("`fn trim_ows` not found in src/field.rs; has it moved or been renamed?");
+
+    for call in ALLOCATING_CALLS {
+        assert!(
+            !resolve_body.contains(call),
+            "resolve_request_framing's body contains `{call}`, which can allocate; \
+             resolve_request_framing is documented to never allocate"
+        );
+        assert!(
+            !tokenize_body.contains(call),
+            "tokenize_transfer_encoding's body contains `{call}`, which can allocate; it is \
+             one of resolve_request_framing's callees and resolve_request_framing is \
+             documented to never allocate"
+        );
+        assert!(
+            !parse_cl_body.contains(call),
+            "parse_content_length's body contains `{call}`, which can allocate; it is one of \
+             resolve_request_framing's callees and resolve_request_framing is documented to \
+             never allocate"
+        );
+        assert!(
+            !trim_ows_body.contains(call),
+            "trim_ows's body contains `{call}`, which can allocate; it is one of \
+             resolve_request_framing's callees and resolve_request_framing is documented to \
+             never allocate"
+        );
+    }
+}

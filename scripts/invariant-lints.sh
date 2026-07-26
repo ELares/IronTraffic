@@ -1672,6 +1672,43 @@ hardcoding either, so this crate cannot silently drift from what
 implementer is authorized to make; raise it on the issue instead." "$hits"
 
 # ---------------------------------------------------------------------------
+# 24. framing-fields-confined: KnownHeader::ContentLength and
+#     KnownHeader::TransferEncoding decide where a message's body ends.
+#     `request-framing-resolution` (#27) is the ONE place permitted to turn
+#     that decision into a RequestFraming, and a second, unreviewed reader of
+#     either variant is a second framing decision that can disagree with it,
+#     which is exactly the shape of a request-smuggling bug.
+#
+#     The allowlist is exactly six files, named literally rather than
+#     derived, because a grep with the wrong allowlist either passes
+#     vacuously (too wide) or fails on correct code (too narrow):
+#       known.rs      declares the variants and their canonical spellings.
+#       framing.rs    resolves request framing (#27, this rule's own issue).
+#       response.rs   resolves response framing (#28); applies the identical
+#                      rules on the response side.
+#       strip.rs      removes both fields from the section after framing has
+#                      been resolved.
+#       h1/serialize.rs regenerates them from the body actually being sent.
+#       h1/chunked.rs (#36) never reads either variant, but its
+#                      TRAILER_DENIED array must name both so a trailer can
+#                      never introduce framing; a deny-list has to spell the
+#                      names it denies, so it earns the sixth allowlist slot
+#                      even though it never reads them.
+#     Four of the six (response.rs, strip.rs, h1/serialize.rs, h1/chunked.rs)
+#     do not exist on `main` yet. The allowlist names them now so this rule
+#     does not need to widen again the moment each one merges.
+# ---------------------------------------------------------------------------
+hits="$(scan framing-fields-confined 'KnownHeader::(ContentLength|TransferEncoding)' rust_files \
+  | grep -vE '^crates/irontraffic-http/src/(known|framing|response|strip|h1/serialize|h1/chunked)\.rs:' || true)"
+[ -n "$hits" ] && fail framing-fields-confined \
+"KnownHeader::ContentLength and KnownHeader::TransferEncoding may be read only
+in known.rs, framing.rs, response.rs, strip.rs, h1/serialize.rs and
+h1/chunked.rs. Reading either variant anywhere else is a second, unreviewed
+framing decision that can disagree with resolve_request_framing, which is the
+exact shape of a request-smuggling bug:
+  // it-allow: framing-fields-confined reason: <why this file must read it>" "$hits"
+
+# ---------------------------------------------------------------------------
 if [ "$FAILED" -ne 0 ]; then
   printf '\ninvariant-lints: FAILED. Each block above names the rule, explains why it\n'
   printf 'exists, and lists the offending lines. Fix the code; do not silence a lint\n'

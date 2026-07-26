@@ -45,6 +45,7 @@
 pub mod authority;
 pub mod error;
 pub mod field;
+pub mod framing;
 pub mod hlist;
 pub mod known;
 pub mod limits;

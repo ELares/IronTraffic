@@ -439,6 +439,20 @@ mod tests {
 }
 RS
 
+# Deliberately reads a framing-confined field from a file that is NOT one of
+# the six allowed by framing-fields-confined, to exercise that rule.
+mkdir -p "$A/crates/irontraffic-http/src"
+cat > "$A/crates/irontraffic-http/src/rogue_reader.rs" <<'RS'
+//! Deliberately violates framing-fields-confined: reads a framing-confined
+//! field outside the six-file allowlist.
+use crate::known::KnownHeader;
+
+/// Not one of the six files permitted to read a framing-confined field.
+pub fn is_content_length(k: KnownHeader) -> bool {
+    k == KnownHeader::ContentLength
+}
+RS
+
 printf '[workspace.dependencies]\nserde = "1"\n' > "$A/Cargo.toml"
 
 EXPECTED='allow-needs-reason
@@ -448,6 +462,7 @@ core-ctx-not-stored
 crate-inherits-workspace
 determinism-seam
 dependency-justification
+framing-fields-confined
 hot-path-allocation
 hot-path-lock
 interior-mutability
@@ -973,6 +988,20 @@ mod tests {
         // a stray brace in a comment: { should not affect depth counting
         assert_eq!(1 + 1, 2);
     }
+}
+RS
+
+# A legitimate reader, confined to the allowlist, proving framing-fields-confined
+# does not false-positive on the one file this whole rule exists to permit.
+mkdir -p "$B/crates/irontraffic-http/src"
+cat > "$B/crates/irontraffic-http/src/framing.rs" <<'RS'
+//! The one legitimate reader: framing.rs is on the framing-fields-confined
+//! allowlist.
+use crate::known::KnownHeader;
+
+/// Confined to the allowlist; must not trip framing-fields-confined.
+pub fn is_transfer_encoding(k: KnownHeader) -> bool {
+    k == KnownHeader::TransferEncoding
 }
 RS
 
