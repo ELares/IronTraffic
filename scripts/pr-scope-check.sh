@@ -103,7 +103,9 @@ lines = text.splitlines()
 out, in_files = [], False
 for line in lines:
     s = line.strip()
-    if s.startswith("## "):
+    # Reset on ANY heading. An issue may put an `### ` subsection inside
+    # `## Files` with its own backticked table; those rows are not file rows.
+    if s.startswith("#"):
         in_files = s.lower().startswith("## files")
         continue
     if not in_files or not s.startswith("|"):
@@ -116,7 +118,12 @@ for line in lines:
     # validator uses the identical rule; if these two ever disagree, CI rejects
     # a diff the author was told was in scope.
     m = re.search(r"`([^`]+)`", cells[0])
-    path = (m.group(1) if m else cells[0]).strip()
+    # Every legitimate Files row backticks its path. An unbackticked first cell
+    # means this row belongs to some OTHER table nested in the Files section, so
+    # skip it rather than declaring a bogus path in scope.
+    if not m:
+        continue
+    path = m.group(1).strip()
     # Skip the header row and the --- separator row.
     if not path or path.lower() == "path" or set(path) <= set("-: "):
         continue
