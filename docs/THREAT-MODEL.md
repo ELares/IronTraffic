@@ -300,3 +300,35 @@ and one upstream descriptor. `serve-and-smoke-test` (#21) is where that total is
 **What is not defended here.** Per-source-IP connection limits do not exist in M1, so one source can
 occupy the whole connection cap. That is recorded in the accept-and-admission section rather than
 duplicated here.
+
+## Connection admission and accept-error handling
+
+### What a connection flood costs us
+
+A connection that is accepted and cannot be admitted is closed immediately, never queued, and holds
+no buffer, so a flood at the cap costs one socket and one compare-exchange each, and the accept loop
+pauses 1 millisecond per rejection so it cannot spin. A connection that is admitted holds one socket,
+one task, one `ConnGuard`, and zero buffers until its first readable event.
+
+### What bounds the flood
+
+One number: `limits.max_connections` (default 10,000). Through it, at most `2 x max_connections`
+descriptors and at most `2 x max_connections x 32 KiB` of read buffers.
+
+### The residual risk, stated plainly: there is no per-source-IP limit in M1
+
+One source address can occupy the entire connection cap, and because M1 does not parse HTTP there is
+no header-read deadline to reap a client that connects and says nothing, only the idle deadline. A
+client that sends one byte per idle period holds its slot indefinitely; at the default cap that costs
+an attacker roughly 170 bytes per second in total to deny service to everyone else. The levers that
+exist today are `limits.max_connections` (bounds the damage), `timeouts.idle_ms` (reaps silent
+connections), and `timeouts.max_lifetime_ms` (an absolute per-connection ceiling, unset by default).
+Per-source connection limits and a header-read deadline arrive with the rate-limiting and HTTP
+milestones respectively. Do not describe M1 as slowloris-resistant.
+
+### Accept errors are classified, never retried blindly
+
+`EMFILE`, `ENFILE`, and `ENOBUFS` back off with doubling to a ceiling; `ECONNABORTED`, `EINTR`, and
+`EAGAIN` retry immediately; anything else stops that one shard loudly. Without the classification,
+descriptor exhaustion is a 100% CPU spin that serves nothing, which is a denial of service an
+attacker reaches by opening connections.
