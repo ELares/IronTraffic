@@ -1,0 +1,4 @@
+# One package name per line. A name here means "this package is permitted to declare a
+# preinstall/install/postinstall script, and the gate will run `npm rebuild` for it".
+# Adding a line requires a written justification in the pull request.
+# This file is intentionally empty below this header.
