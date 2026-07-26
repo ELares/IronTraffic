@@ -405,30 +405,123 @@ jobs:
       - uses: dtolnay/rust-toolchain@nightly
       - uses: Swatinem/rust-cache@v2
       - name: Run every declared fuzz target briefly
-        # FAILS CLOSED. Once fuzz/Cargo.toml exists, every declared target must
-        # run. A parser crate that ships without a fuzz target is caught by the
-        # second check below, so "no targets" can never mean "nothing to do".
+        # RUSTUP_TOOLCHAIN is set because rust-toolchain.toml pins 1.97.0 and
+        # that pin OUTRANKS the toolchain action above. Installing nightly is
+        # not the same as using it: without this the action installs nightly,
+        # the pin quietly wins, and cargo-fuzz dies on "the option Z is only
+        # accepted on the nightly compiler" while the job looks correctly
+        # configured. The musl job hit the same trap from the other direction
+        # and documents it: the pin is what cargo actually honours, so a lane
+        # that needs a different toolchain has to say so explicitly rather than
+        # assume the action decided it.
+        env:
+          RUSTUP_TOOLCHAIN: nightly
+        # FAILS CLOSED, same property as before, different location. A fuzz
+        # crate is its own workspace root and cargo-fuzz expects it beside the
+        # crate it fuzzes, so every real target in this repository lives at
+        # crates/<name>/fuzz/, never at a root fuzz/ that this repository does
+        # not have and will not add. See issue #509.
+        #
+        # Every branch below that could report success for having found or run
+        # nothing instead fails, the same discipline already applied to the
+        # census, the feature matrix, and the hot path rules: a lane that scans
+        # zero and reports green is the one defect class every one of those
+        # was rewritten to stop being.
         run: |
           set -euo pipefail
-          if [ ! -f fuzz/Cargo.toml ]; then
-            echo "No fuzz directory yet. Asserting no parser crate has shipped without one."
-            if ls -d crates/irontraffic-http crates/irontraffic-config 2>/dev/null | grep -q .; then
-              echo "FAIL: a crate that parses untrusted input exists but fuzz/ does not."
-              exit 1
-            fi
-            echo "ok: no parser crates yet, no fuzz targets required"
-            exit 0
-          fi
-          cargo install cargo-fuzz --locked
-          targets=$(cargo fuzz list)
-          if [ -z "$targets" ]; then
-            echo "FAIL: fuzz/Cargo.toml exists but declares no targets."
+
+          # Discover every per-crate fuzz project actually in the tree.
+          fuzz_manifests=()
+          while IFS= read -r m; do
+            [ -n "$m" ] && fuzz_manifests+=("$m")
+          done < <(find crates -mindepth 3 -maxdepth 3 -type f -name Cargo.toml -path '*/fuzz/Cargo.toml' | sort)
+
+          # The list of crates that MUST have one of the above is derived, not
+          # hardcoded. CONTRIBUTING.md's "threat-model rule (mandatory)"
+          # already requires every PR that ships a new parser over untrusted
+          # input to name that surface's crate in docs/THREAT-MODEL.md, in the
+          # same PR, reviewer-blocked if it does not. That makes the threat
+          # model the one place this list is curated by a rule this lane does
+          # not have to duplicate. Reading it here means this check ages with
+          # the document a human is already required to keep current, instead
+          # of a second, silent copy of the same fact that only this workflow
+          # remembers to update. It is a strictly better source than the two
+          # names it replaces: one of those two, irontraffic-config, is not
+          # even a crate that exists in this repository.
+          named_in_threat_model=()
+          while IFS= read -r n; do
+            [ -n "$n" ] && named_in_threat_model+=("$n")
+          done < <(grep -oE '`irontraffic[a-zA-Z0-9_-]*`' docs/THREAT-MODEL.md | tr -d '`' | sort -u)
+
+          parser_crates=()
+          for name in "${named_in_threat_model[@]:-}"; do
+            [ -n "$name" ] || continue
+            [ -d "crates/$name" ] && parser_crates+=("$name")
+          done
+          echo "parser crates named in docs/THREAT-MODEL.md that exist under crates/: ${parser_crates[*]:-none}"
+
+          # FAILS CLOSED (1 of 4): every parser crate on record must have its
+          # own fuzz project. This is the direct replacement for the old
+          # single, root-relative, two-name check.
+          missing=()
+          for name in "${parser_crates[@]:-}"; do
+            [ -f "crates/$name/fuzz/Cargo.toml" ] || missing+=("$name")
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "FAIL: parser crate(s) with no crates/<name>/fuzz/Cargo.toml: ${missing[*]}"
             exit 1
           fi
-          for t in $targets; do
-            echo "== fuzzing $t =="
-            cargo fuzz run "$t" -- -max_total_time=60 -timeout=10
+
+          # FAILS CLOSED (2 of 4): discovery itself must not go blind. Zero
+          # fuzz projects found anywhere while a parser crate is on record is
+          # the vacuous-success shape this whole lane exists to refuse, no
+          # matter whether it is check 1 above finding nothing or a bug in the
+          # find call it shares data with.
+          if [ "${#fuzz_manifests[@]}" -eq 0 ]; then
+            if [ "${#parser_crates[@]}" -gt 0 ]; then
+              echo "FAIL: a parser crate is on record (${parser_crates[*]}) but no crates/*/fuzz/Cargo.toml exists."
+              exit 1
+            fi
+            echo "ok: no parser crate is on record yet and no fuzz project exists. Nothing to fuzz."
+            exit 0
+          fi
+
+          cargo install cargo-fuzz --locked
+
+          ran_names=()
+          for manifest in "${fuzz_manifests[@]}"; do
+            fuzz_dir="$(dirname "$manifest")"
+            echo "== discovering targets in $fuzz_dir =="
+            targets="$(cargo fuzz list --fuzz-dir "$fuzz_dir")"
+            # FAILS CLOSED (3 of 4): a fuzz project that declares zero targets
+            # is the other vacuous-success shape, an empty fuzz/ that exists
+            # only to satisfy check 1 above without ever running anything.
+            if [ -z "$targets" ]; then
+              echo "FAIL: $manifest exists but declares no targets."
+              exit 1
+            fi
+            while IFS= read -r t; do
+              [ -n "$t" ] || continue
+              echo "== fuzzing $fuzz_dir :: $t =="
+              cargo fuzz run --fuzz-dir "$fuzz_dir" "$t" -- -max_total_time=60 -timeout=10
+              ran_names+=("$fuzz_dir :: $t")
+            done <<< "$targets"
           done
+
+          echo "fuzz: ran ${#ran_names[@]} target(s):"
+          for n in "${ran_names[@]:-}"; do
+            [ -n "$n" ] && echo "  - $n"
+          done
+
+          # FAILS CLOSED (4 of 4): belt and suspenders on the count itself, so
+          # a future edit to the loop above that skips appending to ran_names
+          # cannot silently drop to zero runs and still exit 0. The count and
+          # every name are printed above regardless, so a drop is visible in
+          # the log even on a passing exit code.
+          if [ "${#ran_names[@]}" -eq 0 ] && [ "${#parser_crates[@]}" -gt 0 ]; then
+            echo "FAIL: zero fuzz targets ran but a parser crate is on record (${parser_crates[*]})."
+            exit 1
+          fi
 
   scope:
     name: PR scope check (the diff matches the issue)
