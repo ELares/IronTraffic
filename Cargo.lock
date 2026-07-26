@@ -816,7 +816,7 @@ dependencies = [
 name = "irontraffic-rand"
 version = "0.1.0"
 dependencies = [
- "getrandom 0.3.4",
+ "getrandom 0.4.3",
  "proptest",
  "thiserror",
 ]
