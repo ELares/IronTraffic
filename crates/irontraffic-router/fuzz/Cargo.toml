@@ -1,0 +1,37 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# Not a workspace member: the empty [workspace] table below is required so
+# that Cargo treats this manifest as its own independent workspace root
+# instead of trying to join the ancestor workspace at the repository root
+# (the root Cargo.toml's [workspace] exclude entry only stops implicit glob
+# discovery from picking this directory up; it does not, by itself, stop
+# Cargo from treating a nested-but-unlisted manifest as wanting to join that
+# ancestor workspace, which fails with "current package believes it's in a
+# workspace when it's not"). This is the standard cargo-fuzz layout: a
+# cargo-fuzz project pins its own toolchain-sensitive edition and is built
+# with `cargo fuzz`, never `cargo build --workspace`. Exactly two later
+# issues in this milestone extend this manifest: path-regex-multipattern
+# (#61) appends one [[bin]] block, and differential-oracle-and-fuzz (#66)
+# appends three plus the `arbitrary` dependency their derived generators
+# need. Nothing else in this manifest changes for either.
+[package]
+name = "irontraffic-router-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+irontraffic-router = { path = ".." }
+
+[[bin]]
+name = "parse_authority"
+path = "fuzz_targets/parse_authority.rs"
+test = false
+doc = false
+bench = false

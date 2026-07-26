@@ -121,6 +121,56 @@ Later issues append one subsection per surface here: `path-normalization` (#29),
 `desync-corpus-and-reject-table` (#47) adds a section 6 that ties every named attack to its corpus
 entry.
 
+## Authority normalization
+
+**Parses:** the `Host` header (HTTP/1) or the `:authority` pseudo-header (HTTP/2, HTTP/3), via
+`irontraffic-router`'s `normalize_authority`. Every byte of it comes from the downstream client:
+the attacker chooses the case, the length, whether a port is present, whether a trailing dot is
+present, and whether the IPv6 bracket form is used.
+
+**Equivalence classes collapsed.** `normalize_authority` maps every one of the following spellings
+to the same output, so that a route configured under one spelling matches a request made under any
+other:
+
+- ASCII case: `EXAMPLE.com`, `example.com` and `Example.COM` all become `example.com`.
+- Any port, including an empty one and the IPv6 bracket form: `example.com:443`, `example.com:80`
+  and `example.com:` all become `example.com`; `[::1]:8443` becomes `[::1]`.
+- One trailing dot, the DNS root label: `example.com.` becomes `example.com`.
+
+Case folding is ASCII only. Unicode case folding has locale-dependent behaviour (the Turkish
+dotless-i class), and Gateway API's `Hostname` CRD pattern cannot match a non-ASCII byte, so a
+non-ASCII authority is refused rather than mapped. `normalize_authority` never performs IDNA,
+punycode, NFC or NFKC normalization: decision ledger entry 16 rejects mapping a non-ASCII authority
+at request time, because a mapping proxy in front of a non-mapping origin is a virtual-host
+confusion primitive in its own right.
+
+**What is refused, and with which error:**
+
+- A byte at or above 0x80 (`AuthorityError::NonAscii`).
+- `*`, or any byte outside the accepted authority byte class (`AuthorityError::InvalidByte`); this
+  is also why an `Exact` host pattern can never contain a wildcard.
+- Percent-encoding anywhere except inside an IPv6 zone id (`AuthorityError::InvalidByte`); `%` is
+  never decoded.
+- An empty label, an unclosed IPv6 bracket, or a leading dot (`AuthorityError::Malformed`).
+- More than `MAX_AUTHORITY_BYTES` (255) bytes after the port is stripped, or more than 1024 bytes
+  before it is even parsed (`AuthorityError::TooLong`); the earlier, cheaper cap exists so that
+  finding the port cannot itself scan an unbounded buffer.
+
+**Structural control: one function, both call sites.** `normalize_authority` is the ONLY authority
+normalization in the product. The route builder calls it, through `normalize_host_pattern`, when a
+`HostPattern` is admitted; the request path calls the identical function on every request's
+authority before consulting the host trie. There is no second implementation of this grammar
+anywhere in the tree to drift out of sync with the first: a hostname configured as `Example.COM.`
+and a request to `example.com:443` are therefore provably the same lookup key, not merely expected
+to be by convention. Two independent encodings of one grammar in one system is exactly how a build
+path and a match path disagree, and a build/match disagreement here is a virtual-host confusion
+bug: a request would match a route its author never configured it to reach.
+
+**Residual risk.** An authority that `normalize_authority` accepts but that matches no configured
+`HostPattern` falls through to the listener's catch-all group, the same as any other unmatched
+authority on that listener. Accepting an authority is not a claim that it is meaningful, only that
+it is well-formed enough to look up; a listener with no catch-all route simply has nothing for it
+to fall through to.
 ### Authority (`authority-parsing-and-reconciliation`, #30)
 
 **Parses:** the `Host` field and the `:authority` pseudo-header, both attacker chosen. The authority
