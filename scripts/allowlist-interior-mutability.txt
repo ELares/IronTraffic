@@ -13,4 +13,10 @@
 # explaining why that specific file is a legitimate exception, added in the
 # same PR that needs it.
 #
-# Empty in M1: no exception has landed yet.
+# The M1 thread-local buffer pool. The RefCell borrow is taken and released
+# entirely inside a synchronous closure passed to BufPool::with_current, which
+# cannot await, so it cannot be held across a task migration point; a per-core
+# atomic cannot express the pool's Vec<BytesMut> free list, which is why this
+# is a RefCell exception rather than a rewrite to atomics like the balance
+# counters beside it.
+crates/irontraffic-io/src/buffer.rs
