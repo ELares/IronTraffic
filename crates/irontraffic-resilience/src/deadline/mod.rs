@@ -356,6 +356,23 @@ mod tests {
     }
 
     #[test]
+    fn deadline_wraps_across_millis_horizon() {
+        // `now` is 50 ms before the `Millis` wrap at `u32::MAX`, so `d.at` (100 ms
+        // later) wraps around to `Millis(49)`. `remaining_ms` must read the same as
+        // an equivalent non-wrapping deadline: 100, then 50, then 0 at and after the
+        // deadline, never a huge value from treating the wrapped `at` as "far in the
+        // future".
+        let now = Millis(u32::MAX - 50);
+        let d = Deadline::from_now(now, 100);
+        assert_eq!(d.remaining_ms(now), 100);
+        assert_eq!(d.remaining_ms(now.add_ms(50)), 50);
+        assert_eq!(d.remaining_ms(now.add_ms(100)), 0);
+        assert_eq!(d.remaining_ms(now.add_ms(150)), 0);
+        assert!(d.expired(now.add_ms(100)));
+        assert!(!d.expired(now.add_ms(99)));
+    }
+
+    #[test]
     fn expired_boundary() {
         let now = Millis(0);
         let d = Deadline::from_now(now, 100);
