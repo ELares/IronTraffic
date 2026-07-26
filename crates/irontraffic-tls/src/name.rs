@@ -631,6 +631,70 @@ mod tests {
         );
     }
 
+    /// The DNS identity of `raw`, computed by a route that deliberately never
+    /// calls [`normalize`]: strip one trailing dot, split on `.`, and
+    /// ASCII-lowercase each label. Used only by `prop_dns_equal_iff_same_key`
+    /// (issue #542) to check the anti-collision property against a second,
+    /// independently written implementation instead of against `normalize`
+    /// itself, since a check phrased in terms of the function under test
+    /// cannot fail no matter what that function does. Unlike `normalize`
+    /// this enforces no length limit, no label-count limit, no LDH byte
+    /// class, and no hyphen-edge rule: none of that is needed to answer "is
+    /// this the same DNS name", which is the only question this function
+    /// exists to answer.
+    fn independent_dns_identity(raw: &str) -> Vec<String> {
+        let stripped = raw.strip_suffix('.').unwrap_or(raw);
+        stripped.split('.').map(str::to_ascii_lowercase).collect()
+    }
+
+    #[test]
+    fn normalize_unicode_confusables_rejected() {
+        // Each character below is a Unicode confusable that a
+        // `to_lowercase()`-based normalizer could fold onto an ASCII letter
+        // or onto '.', creating exactly the certificate-identity collision
+        // this module exists to prevent (see the module doc and issue
+        // #542). `normalize` never calls `to_lowercase()` and only ever
+        // accepts ASCII bytes, so every one of these must be rejected as
+        // NameError::IllegalByte rather than silently folded. The first
+        // three are the ones a `to_lowercase()`-based implementation
+        // collides on.
+        let confusables = [
+            (
+                '\u{212A}',
+                "U+212A KELVIN SIGN folds to 'k' under to_lowercase()",
+            ),
+            (
+                '\u{017F}',
+                "U+017F LATIN SMALL LETTER LONG S folds to 's' under to_lowercase()",
+            ),
+            (
+                '\u{0130}',
+                "U+0130 LATIN CAPITAL LETTER I WITH DOT ABOVE folds toward 'i' under to_lowercase()",
+            ),
+            (
+                '\u{FF21}',
+                "U+FF21 FULLWIDTH LATIN CAPITAL LETTER A is confusable with 'a'",
+            ),
+            (
+                '\u{3002}',
+                "U+3002 IDEOGRAPHIC FULL STOP is confusable with '.'",
+            ),
+            (
+                '\u{FF0E}',
+                "U+FF0E FULLWIDTH FULL STOP is confusable with '.'",
+            ),
+        ];
+        for (c, why) in confusables {
+            let raw = format!("a{c}b.example.com");
+            let mut buf = [0u8; MAX_NAME_LEN];
+            assert_eq!(
+                normalize(&raw, &mut buf),
+                Err(NameError::IllegalByte),
+                "{c:?} must be rejected rather than folded: {why}"
+            );
+        }
+    }
+
     proptest! {
         #[test]
         fn prop_normalize_idempotent(raw in "[a-zA-Z0-9.-]{0,300}") {
@@ -697,11 +761,36 @@ mod tests {
             // asserted, because a hash collision between UNEQUAL names is not
             // a bug this module is responsible for ruling out.
             let mut buf3 = [0u8; MAX_NAME_LEN];
-            if let Ok(other_n) = normalize(&other, &mut buf3)
-                && other_n != base
-            {
-                prop_assert_ne!(other_n, base.as_str());
-            }
+            let Ok(other_n) = normalize(&other, &mut buf3) else {
+                // `other`'s generator uses the same alnum-edged, LDH-only
+                // pattern as `valid`'s, so this should not happen; if it
+                // ever does there is nothing to check, matching the `valid`
+                // case above.
+                return Ok(());
+            };
+
+            // The anti-collision property, checked against an identity
+            // computed by a route that never calls `normalize`: strip one
+            // trailing dot, split on '.', ASCII-lowercase each label. Issue
+            // #542: the previous version of this check guarded the
+            // assertion with its own negation (`if other_n != base { assert
+            // other_n != base }`), which cannot fail for any input and so
+            // tested nothing. Comparing `normalize`'s output to a second,
+            // independently written notion of "the same DNS name" instead
+            // means a future change to `normalize` that starts merging two
+            // distinct names, or splitting one name into two, has something
+            // in this suite that can actually fail.
+            let same_normalized_form = other_n == base.as_str();
+            let same_independent_identity =
+                independent_dns_identity(&other) == independent_dns_identity(&valid);
+            prop_assert_eq!(
+                same_normalized_form,
+                same_independent_identity,
+                "normalize() and the independently computed DNS identity disagree \
+                 about whether {other:?} and {valid:?} are the same name",
+                other = other,
+                valid = valid
+            );
         }
 
         #[test]
