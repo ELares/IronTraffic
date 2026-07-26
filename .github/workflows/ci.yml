@@ -503,7 +503,51 @@ jobs:
             while IFS= read -r t; do
               [ -n "$t" ] || continue
               echo "== fuzzing $fuzz_dir :: $t =="
-              cargo fuzz run --fuzz-dir "$fuzz_dir" "$t" -- -max_total_time=60 -timeout=10
+              # crates/irontraffic-conn/fuzz (issue #573): cargo-fuzz's default
+              # sanitizer is address, and building this fuzz crate's only
+              # dependency, irontraffic-conn, pulls in tokio with
+              # rt-multi-thread for the crate's real accept loop. Compiling
+              # tokio's multi-thread runtime under ASan plus sancov coverage
+              # plus -Ccodegen-units=1 on this job's nightly toolchain hits a
+              # deterministic rustc ICE (rustc_codegen_ssa/mir/operand.rs:291,
+              # "not immediate" on tokio's Notified<Arc<Handle>> type),
+              # reproduced identically on two independent runs, so it is a
+              # compiler defect, not flakiness. Filed upstream-shaped detail
+              # in issue #573; not filed against rust-lang/rust yet because a
+              # minimal reproduction outside this workspace has not been
+              # built.
+              #
+              # `--sanitizer none` costs nothing here specifically because of
+              # what this crate's fuzz targets actually exercise: every
+              # `fuzz_target!` closure in crates/irontraffic-conn/fuzz calls
+              # only synchronous, `#![forbid(unsafe_code)]`-covered functions
+              # (ConnBudget::new/on_frame/tokens as of issue #40) that never
+              # construct or enter a tokio runtime. Tokio's multi-thread
+              # runtime code is linked in, and is what the compiler was
+              # crashing on, but no fuzz input in this crate can ever reach
+              # it, so ASan was never able to find anything there for these
+              # targets to begin with. Coverage-guided mutation (sancov) is
+              # unaffected by this flag and stays fully active. This is
+              # scoped to this one fuzz crate, not a blanket change: every
+              # other fuzz crate in this workspace keeps the default ASan
+              # build.
+              #
+              # If a future fuzz target is added to this crate that DOES
+              # construct or exercise a tokio runtime, this exception stops
+              # being free and needs re-justifying, not silently inherited.
+              sanitizer_args=()
+              if [ "$fuzz_dir" = "crates/irontraffic-conn/fuzz" ]; then
+                sanitizer_args=(--sanitizer none)
+              fi
+              # `${sanitizer_args[@]+"${sanitizer_args[@]}"}`, not the plain
+              # `"${sanitizer_args[@]}"` this started as: under `set -u`, an
+              # empty array expands to an "unbound variable" error on bash
+              # older than 4.4 even when quoted, which this script cannot
+              # assume it will never run under. Verified directly (both the
+              # empty and the populated case) before trusting it, the same
+              # way the invariant lints and the scope check's merge-base
+              # fallback in this repository were.
+              cargo fuzz run --fuzz-dir "$fuzz_dir" ${sanitizer_args[@]+"${sanitizer_args[@]}"} "$t" -- -max_total_time=60 -timeout=10
               ran_names+=("$fuzz_dir :: $t")
             done <<< "$targets"
           done
