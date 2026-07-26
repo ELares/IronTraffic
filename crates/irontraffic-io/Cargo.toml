@@ -16,6 +16,7 @@ tokio = { workspace = true }
 hyper = { workspace = true }
 hyper-util = { workspace = true }
 thiserror = { workspace = true }
+socket2 = { workspace = true }
 # BytesMut pooled read chunks and the exactly-sized Bytes compaction rules.
 bytes = { workspace = true }
 # CachePadded for the outstanding/allocations/over_cap_releases statics.

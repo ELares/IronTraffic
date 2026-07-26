@@ -734,6 +734,7 @@ dependencies = [
  "hyper-util",
  "irontraffic-time",
  "proptest",
+ "socket2",
  "thiserror",
  "tokio",
 ]
