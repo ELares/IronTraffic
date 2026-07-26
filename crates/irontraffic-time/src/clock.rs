@@ -50,7 +50,6 @@ impl CoarseMono {
     /// privacy refuses it at compile time instead of relying on review.
     #[must_use]
     #[rustfmt::skip]
-    #[allow(dead_code, reason = "constructed only by tests until time-source-seam (#5) adds a real caller in this crate")]
     pub(crate) const fn from_millis_since_start(ms: u32) -> Self {
         Self(ms)
     }
@@ -118,7 +117,6 @@ impl CoarseWall {
     /// public.
     #[must_use]
     #[rustfmt::skip]
-    #[allow(dead_code, reason = "constructed only by tests until time-source-seam (#5) adds a real caller in this crate")]
     pub(crate) const fn from_unix_millis(ms: u64) -> Self {
         Self(ms)
     }
@@ -156,7 +154,6 @@ impl Boot {
     /// public.
     #[must_use]
     #[rustfmt::skip]
-    #[allow(dead_code, reason = "constructed only by tests until time-source-seam (#5) adds a real caller in this crate")]
     pub(crate) const fn from_boottime_nanos(ns: u64) -> Self {
         Self(ns)
     }
@@ -188,7 +185,6 @@ impl PreciseMono {
     /// public.
     #[must_use]
     #[rustfmt::skip]
-    #[allow(dead_code, reason = "constructed only by tests until time-source-seam (#5) adds a real caller in this crate")]
     pub(crate) const fn from_measurement_nanos(ns: u64) -> Self {
         Self(ns)
     }
