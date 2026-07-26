@@ -12,6 +12,6 @@ pub mod cache;
 pub mod clock;
 pub mod source;
 
-pub use cache::CoarseCache;
+pub use cache::{AtomicCoarseCache, CoarseCache};
 pub use clock::{Boot, CoarseMono, CoarseWall, PreciseMono};
 pub use source::{SharedTime, SystemTimeSource, TestTimeSource, TimeSource};
