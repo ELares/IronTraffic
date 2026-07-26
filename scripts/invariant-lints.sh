@@ -1555,6 +1555,21 @@ for path in sys.argv[1:]:
     lines = text.splitlines()
     secs = sections(lines)
 
+    # A manifest that declares its own [workspace] table IS a workspace root, so
+    # by definition it has no outer workspace to inherit from and `.workspace =
+    # true` would not even parse. cargo-fuzz generates exactly this shape: a
+    # nested crate under crates/<name>/fuzz/ carrying an empty [workspace] table
+    # precisely so it is excluded from the parent workspace.
+    #
+    # This rule matched them because `git ls-files -- 'crates/*/Cargo.toml'` uses
+    # git pathspec globbing, where `*` DOES cross a slash, so the pattern reaches
+    # crates/<name>/fuzz/Cargo.toml as well as the direct children it was written
+    # for. Filtering on the declaration rather than on directory depth is the
+    # right fix: it also covers any future nested workspace, and it cannot be
+    # defeated by moving a crate one level deeper.
+    if any(name == 'workspace' for name, _s, _e in secs):
+        continue
+
     lints_ok = False
     for name, s, e in secs:
         if name == 'lints':
