@@ -19,10 +19,13 @@ crossbeam-utils.workspace = true
 proptest.workspace = true
 criterion.workspace = true
 
+[target.'cfg(loom)'.dev-dependencies]
+loom = { workspace = true }
+
 [[bench]]
 name = "primitives"
 harness = false
 
 [[bench]]
-name = "deadline"
+name = "limits"
 harness = false
