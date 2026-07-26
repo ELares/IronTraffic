@@ -19,6 +19,7 @@
 use std::sync::Arc;
 
 use crate::ids::{ActionId, GroupId, NodeId, RouteId, SENTINEL};
+use crate::intern::CompiledNameSet;
 use crate::precedence::{PathKind, Precedence};
 
 pub mod node;
@@ -226,6 +227,8 @@ pub struct RouteTable {
     groups: Box<[Arc<Group>]>,
     generation: u64,
     needs_query: bool,
+    header_names: CompiledNameSet,
+    query_names: CompiledNameSet,
 }
 
 // I17: RouteTable is Send + Sync because every field is, and it has no interior
@@ -263,6 +266,26 @@ impl RouteTable {
         self.needs_query
     }
 
+    /// The interned header-name set. Header parsing calls `lookup` on it once per
+    /// header.
+    #[must_use]
+    pub fn header_names(&self) -> &CompiledNameSet {
+        &self.header_names
+    }
+
+    /// The interned query-parameter-name set.
+    #[must_use]
+    pub fn query_names(&self) -> &CompiledNameSet {
+        &self.query_names
+    }
+
+    /// Number of interned header names, which is the length `MatchScratch` sizes its
+    /// slot array to.
+    #[must_use]
+    pub fn interned_header_count(&self) -> usize {
+        self.header_names.count()
+    }
+
     /// Structural self-check. Returns every violation found, empty on success.
     /// Called behind `debug_assert!` at the end of `build()` and unconditionally by
     /// tests. O(N + C + P); never call it on the request path.
@@ -289,6 +312,8 @@ impl RouteTable {
             groups: parts.groups.into_iter().map(Arc::new).collect(),
             generation: parts.generation,
             needs_query: parts.needs_query,
+            header_names: parts.header_names,
+            query_names: parts.query_names,
         }
     }
 }
@@ -333,6 +358,10 @@ pub struct TableParts {
     pub generation: u64,
     /// Whether any predicate inspects a query parameter.
     pub needs_query: bool,
+    /// The interned header-name set. Defaults to `CompiledNameSet::empty()`.
+    pub header_names: CompiledNameSet,
+    /// The interned query-parameter-name set. Defaults to `CompiledNameSet::empty()`.
+    pub query_names: CompiledNameSet,
 }
 
 /// A structural violation found by `RouteTable::validate`.
@@ -1240,6 +1269,7 @@ pub(crate) mod tests {
             groups: vec![wellformed_group()],
             generation: 7,
             needs_query: true,
+            ..Default::default()
         });
         assert_eq!(table.generation(), 7);
         assert_eq!(table.group_count(), 1);
