@@ -6,6 +6,7 @@
 
 pub mod ids;
 pub mod limits;
+pub mod normalize;
 pub mod precedence;
 pub mod request;
 pub mod spec;
@@ -14,6 +15,10 @@ pub mod testutil;
 
 pub use ids::{
     ActionId, CertId, GroupId, ListenerId, MethodMask, NameId, NodeId, RouteId, SENTINEL,
+};
+pub use normalize::{
+    AuthorityError, HOST_KEY_BUF_BYTES, HostKind, host_key, normalize_authority,
+    normalize_host_pattern,
 };
 pub use precedence::{MatchOrdinalKey, OrdinalError, PathKind, Precedence, assign_ordinals};
 pub use request::RequestView;
