@@ -21,3 +21,8 @@ workspace = true
 
 [dev-dependencies]
 proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "http_hot"
+harness = false
