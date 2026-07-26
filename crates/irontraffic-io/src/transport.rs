@@ -128,35 +128,43 @@ impl Transport for TcpTransport {
 
 #[cfg(test)]
 mod tests {
-    use std::io::Write;
 
     use super::*;
 
     #[tokio::test]
     async fn nodelay_is_set_by_from_tokio() {
-        // Bind a loopback listener and connect a plain std socket so we can
-        // hand the accepted tokio stream to TcpTransport and inspect the option.
+        // Wrap the CONNECTING side with Nagle explicitly enabled first, so the
+        // assertion proves `from_tokio` turned Nagle off rather than observing a
+        // platform default that happens to agree. That is what the issue asks
+        // for, and the distinction is not academic: on an ACCEPTED socket the
+        // default differs between platforms, so the earlier version of this test
+        // asserted the right thing for the wrong reason on Linux.
+        //
+        // It was also racy. The client ran on its own thread and wrote, then
+        // shut down, while the main thread inspected the option and dropped the
+        // transport. When the drop won the race the peer saw a reset, the
+        // client's `shutdown` returned ENOTCONN, and the thread panicked, taking
+        // `join().unwrap()` with it. Linux resets faster than macOS, which is
+        // why this only ever failed in CI. There is no traffic here now: the
+        // peer socket is accepted and simply held alive, so there is nothing
+        // left to race.
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let accepter = std::thread::spawn(move || listener.accept().unwrap());
 
-        let client = std::thread::spawn(move || {
-            let mut s = std::net::TcpStream::connect(addr).unwrap();
-            // A freshly connected std socket has Nagle enabled; from_tokio must turn it off.
-            s.write_all(b"x").unwrap();
-            s.shutdown(std::net::Shutdown::Write).unwrap();
-            // Keep the socket alive until the server has inspected the option.
-            let _ = done_rx.recv();
-        });
+        let client = std::net::TcpStream::connect(addr).unwrap();
+        client.set_nodelay(false).unwrap();
+        assert!(
+            !client.nodelay().unwrap(),
+            "precondition: Nagle must be ON before from_tokio, or this test proves nothing"
+        );
+        client.set_nonblocking(true).unwrap();
 
-        let (stream, _) = listener.accept().unwrap();
-        stream.set_nonblocking(true).unwrap();
-        let tokio_stream = tokio::net::TcpStream::from_std(stream).unwrap();
+        let tokio_stream = tokio::net::TcpStream::from_std(client).unwrap();
         let transport = TcpTransport::from_tokio(tokio_stream).unwrap();
-        let nodelay = transport.io.inner().nodelay();
-        assert!(nodelay.unwrap());
-        drop(transport);
-        done_tx.send(()).unwrap();
-        client.join().unwrap();
+        assert!(transport.io.inner().nodelay().unwrap());
+
+        // Hold the accepted peer until the assertion is done, then drop both.
+        let _peer = accepter.join().unwrap();
     }
 }
