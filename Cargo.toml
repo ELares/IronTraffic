@@ -13,7 +13,7 @@
 
 [workspace]
 resolver = "3"
-members = ["crates/irontraffic", "crates/irontraffic-filter", "crates/irontraffic-http", "crates/irontraffic-io", "crates/irontraffic-limits", "crates/irontraffic-rand", "crates/irontraffic-resilience", "crates/irontraffic-router", "crates/irontraffic-runtime", "crates/irontraffic-time"]
+members = ["crates/irontraffic", "crates/irontraffic-filter", "crates/irontraffic-http", "crates/irontraffic-io", "crates/irontraffic-k8s", "crates/irontraffic-limits", "crates/irontraffic-rand", "crates/irontraffic-resilience", "crates/irontraffic-router", "crates/irontraffic-runtime", "crates/irontraffic-time"]
 
 [workspace.package]
 version = "0.1.0"
@@ -64,6 +64,10 @@ tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
 proptest = { version = "1.5" }
 # Benchmarks.
 criterion = { version = "0.7" }
+# Kubernetes client. Only in the control-plane crate.
+kube = { version = "4.2.0", default-features = false, features = ["client"] }
+# Kubernetes API types. `latest` matches the bundled OpenAPI spec.
+k8s-openapi = { version = "0.28.0", features = ["latest"] }
 
 [workspace.lints.rust]
 # A proxy parses attacker-controlled bytes on every request. There is no
