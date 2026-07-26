@@ -1,0 +1,16 @@
+# Files permitted to call ArcSwap::store. See the single-snapshot-publish
+# rule in scripts/invariant-lints.sh for why this list should normally hold
+# exactly one entry: ArcSwap::store may be called in exactly one function in
+# the whole workspace, because a second publication site reintroduces torn
+# configuration (a request could see a route from generation N and a filter
+# chain from N+1).
+#
+# One repository-relative path per file, exactly as it appears in `git
+# ls-files`. Matching is EXACT path equality only: never a prefix, a suffix,
+# a glob, or a directory. Blank lines and lines starting with `#` are
+# ignored. Every entry must be justified with a comment on the line above it
+# explaining why that specific file is the designated publisher, added in
+# the same PR that needs it.
+#
+# Empty in M1: no ArcSwap exists yet, so this ships empty on purpose, ahead
+# of the config plane that will need it.

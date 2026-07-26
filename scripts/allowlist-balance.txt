@@ -1,0 +1,16 @@
+# Files permitted to call fetch_sub on an atomic in a hot-path crate
+# (irontraffic-io, irontraffic-runtime, irontraffic-conn, irontraffic-upstream,
+# irontraffic-dataplane) WITHOUT that same file also containing an
+# `impl Drop for`. See the balance-drop-only rule in
+# scripts/invariant-lints.sh for why that pairing is required by default: a
+# lost decrement is capacity that never comes back for the life of the
+# process, and a balance release belongs in Drop.
+#
+# One repository-relative path per file, exactly as it appears in `git
+# ls-files`. Matching is EXACT path equality only: never a prefix, a suffix,
+# a glob, or a directory. Blank lines and lines starting with `#` are
+# ignored. Every entry must be justified with a comment on the line above it
+# explaining why that specific file is a legitimate exception, added in the
+# same PR that needs it.
+#
+# Empty in M1: no ArcSwap-adjacent balance exception exists yet.
