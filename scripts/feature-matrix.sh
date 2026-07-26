@@ -156,7 +156,27 @@ matrix_runs() {
 # `[{"crate":"...","features":"..."}, ...]` that a GitHub Actions dynamic
 # `strategy.matrix` consumes via `fromJson`. `[]` when nothing is matrixed.
 json() {
-  python3 - <<'PY'
+  # `python3 - <<PY ... PY` looks like it reads the reshaped rows from the
+  # matrix_runs pipe on stdin, but a heredoc attached to THIS command
+  # redirects fd 0 to the heredoc's own content for the duration of the
+  # command: python3 consumes the heredoc as the program text ("-" tells it
+  # to read its script from stdin), and by the time the script's own
+  # `for line in sys.stdin` runs, stdin is the same, now-exhausted heredoc,
+  # not the pipe from matrix_runs. The upstream data is never delivered:
+  # `matrix_runs | json` silently produced `[]` regardless of what
+  # matrix_runs actually wrote, which is exactly the same shape of bug this
+  # whole file exists to prevent (a mechanism that LOOKS wired up and
+  # produces nothing). Caught by actually running the piped command CI
+  # invokes (`scripts/feature-matrix.sh json`) against a real matrixed
+  # crate, not just the lower-level `matrix-runs`/`runs` subcommands, which
+  # never touch stdin and so never showed this.
+  #
+  # Fixed by giving the script its own file, so nothing steals fd 0 from the
+  # `python3 "$script"` invocation and it inherits the real pipe.
+  local script
+  script="$(mktemp)"
+  trap 'rm -f "$script"' RETURN
+  cat > "$script" <<'PY'
 import json, sys
 
 rows = []
@@ -168,6 +188,7 @@ for line in sys.stdin:
     rows.append({"crate": crate, "features": feat})
 print(json.dumps(rows))
 PY
+  python3 "$script"
 }
 
 # selftest -- proves the one invariant this file exists to guarantee: no
@@ -248,6 +269,25 @@ TOML
       ok=0
     fi
   done
+
+  # The `json` function is the ONE place matrix_runs' output actually goes
+  # through a pipe rather than being read straight from a function return, and
+  # that pipe is exactly what CI's feature-matrix-discover job depends on
+  # (`echo "matrix=$(scripts/feature-matrix.sh json)"`). A python3 invocation
+  # that reads its OWN script from a heredoc on stdin can silently steal stdin
+  # away from the piped data a caller expects it to read, collapsing every
+  # declared combination down to `[]` while still exiting 0 -- indistinguishable
+  # from "nothing is matrixed" without checking the actual JSON produced. Proven
+  # directly against `json`'s real stdin-consuming shape, not just runs_for/
+  # has_matrix, which never touch stdin and so never exercised this.
+  three_json="$(printf 'demo-crate\tcrypto-a\ndemo-crate\tcrypto-b\n' | json)"
+  three_n="$(printf '%s' "$three_json" | python3 -c 'import json,sys; print(len(json.loads(sys.stdin.read())))')"
+  if [ "$three_n" -ne 2 ]; then
+    echo "  FAIL: json over a 2-line pipe produced $three_n row(s), wanted 2 (got: $three_json)"
+    ok=0
+  else
+    printf '  ok: json over a piped 2-line input -> %s row(s)\n' "$three_n"
+  fi
 
   if has_matrix "$work/none/Cargo.toml"; then
     echo "  FAIL: no declaration must not read as having a matrix"

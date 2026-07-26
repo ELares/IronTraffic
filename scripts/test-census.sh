@@ -212,6 +212,7 @@ def finditer_real(pattern, text):
 
 TEST_ATTR = re.compile(r'#\[\s*(?:tokio::)?test\b')
 ASSERT = re.compile(r'\bassert\w*!')
+ASSERT_STRICT = re.compile(r'\bassert_(?:eq|ne)!')
 
 
 def find_test_names(text):
@@ -252,13 +253,39 @@ def count_real_asserts(text):
     """Counts assert*! occurrences that are not inside a string, char
     literal, or comment."""
     return sum(1 for _ in finditer_real(ASSERT, text))
+
+
+def count_real_strict_asserts(text):
+    """Counts assert_eq!/assert_ne! occurrences that are not inside a
+    string, char literal, or comment. Same literal- and comment-aware
+    scanner as count_real_asserts, restricted to the two comparison-style
+    macros: a doc comment or string that merely MENTIONS assert_eq! must
+    not inflate this count any more than it inflates the total one."""
+    return sum(1 for _ in finditer_real(ASSERT_STRICT, text))
 PYLEX
 
 # Census a whole tree at a revision: one line per test, "path\tname", plus a
-# per-file assertion count.
+# per-file TOTAL assertion count and a per-file STRICT assertion count.
+#
+# The strict count exists because the total count alone misses a real
+# weakening: `assert_eq!(x, 42)` becoming `assert!(x.is_ok())` is a straight
+# one-for-one swap of one assert-family macro invocation for another, so the
+# total per file is unchanged before and after. `assert_eq!`/`assert_ne!`
+# compare two concrete values; a bare `assert!` can be satisfied by almost
+# anything, including a check that proves far less than the one it replaced.
+# Tracking the count of the comparison-style macros separately, and failing on
+# a drop in EITHER metric, catches the same-count substitution the total alone
+# is blind to. This was found by actually running the probe described in
+# issue #454, not by inspection: the total-only version of this script passed
+# a real assert_eq-to-assert weakening silently.
+#
+# The strict count goes through the same rslex scanner as the total count,
+# not a second, plainer regex: a doc comment or string that merely mentions
+# assert_eq! must not inflate the strict count any more than it inflates the
+# total one, for the same false-negative reason explained above.
 census() {
-  local rev="$1" out="$2" counts="$3"
-  : > "$out"; : > "$counts"
+  local rev="$1" out="$2" counts="$3" strict="$4"
+  : > "$out"; : > "$counts"; : > "$strict"
   # No pathspec: `git ls-tree -r --name-only <rev> -- '*.rs'` matches NOTHING,
   # because ls-tree pathspecs are anchored and a bare *.rs never matches a
   # nested path. That silently produced a census of zero tests, which is a
@@ -293,6 +320,19 @@ n = rslex.count_real_asserts(text)
 # the most complete form of removal there is.
 print(f"{path}\t{n}")
 ' "$f" >> "$counts"
+    printf '%s' "$body" | python3 -c '
+import os, sys
+sys.path.insert(0, os.environ["WORK"])
+import rslex
+path = sys.argv[1]
+text = sys.stdin.read()
+n = rslex.count_real_strict_asserts(text)
+# Printed UNCONDITIONALLY, same reasoning as the total count above: a file
+# whose last assert_eq!/assert_ne! was swapped for a bare assert! must read
+# as "0 strict assertions" rather than vanish from this file and read as
+# "file gone".
+print(f"{path}\t{n}")
+' "$f" >> "$strict"
   done
 }
 
@@ -304,8 +344,8 @@ print(f"{path}\t{n}")
 # commit against itself and pass every uncommitted deletion. In CI the checkout
 # and the commit agree, so reading the filesystem is correct in both settings.
 census_worktree() {
-  local out="$1" counts="$2"
-  : > "$out"; : > "$counts"
+  local out="$1" counts="$2" strict="$3"
+  : > "$out"; : > "$counts"; : > "$strict"
   git ls-files -- '*.rs' | while read -r f; do
     [ -f "$f" ] || continue
     python3 -c '
@@ -335,11 +375,24 @@ n = rslex.count_real_asserts(text)
 # the most complete form of removal there is.
 print(f"{path}\t{n}")
 ' "$f" >> "$counts"
+    python3 -c '
+import os, sys
+sys.path.insert(0, os.environ["WORK"])
+import rslex
+path = sys.argv[1]
+text = open(path, encoding="utf-8", errors="replace").read()
+n = rslex.count_real_strict_asserts(text)
+# Printed UNCONDITIONALLY, same reasoning as the total count above: a file
+# whose last assert_eq!/assert_ne! was swapped for a bare assert! must read
+# as "0 strict assertions" rather than vanish from this file and read as
+# "file gone".
+print(f"{path}\t{n}")
+' "$f" >> "$strict"
   done
 }
 
-census "$MERGE_BASE" "$WORK/base.tests" "$WORK/base.asserts"
-census_worktree      "$WORK/head.tests" "$WORK/head.asserts"
+census "$MERGE_BASE" "$WORK/base.tests" "$WORK/base.asserts" "$WORK/base.strict"
+census_worktree      "$WORK/head.tests" "$WORK/head.asserts" "$WORK/head.strict"
 
 LC_ALL=C sort -o "$WORK/base.tests" "$WORK/base.tests"
 LC_ALL=C sort -o "$WORK/head.tests" "$WORK/head.tests"
@@ -379,13 +432,17 @@ EOF
 fi
 
 # ---------------------------------------------------------------------------
-# 2. No file may lose assertions.
+# 2. No file may lose assertions, by TOTAL count or by STRICT count.
 #
-# Catches the subtle form: the test survives, but assert_eq! on a value becomes
-# assert! on an Option. Compared per file so that moving tests between files
-# does not trip it as long as the total in a surviving file does not drop.
+# The total catches assertions deleted outright. It does NOT catch the subtle
+# form: `assert_eq!(x, 42)` becoming `assert!(x.is_ok())` is one assert-family
+# macro invocation replaced by another, so the total per file is unchanged.
+# The strict count (assert_eq!/assert_ne! only) catches exactly that swap,
+# because it drops from 1 to 0 even while the total holds steady. Both are
+# compared per file so that moving tests between files does not trip either
+# one as long as the total in a surviving file does not drop.
 # ---------------------------------------------------------------------------
-WEAKENED="$(python3 - "$WORK/base.asserts" "$WORK/head.asserts" <<'PY'
+WEAKENED="$(python3 - "$WORK/base.asserts" "$WORK/head.asserts" "$WORK/base.strict" "$WORK/head.strict" <<'PY'
 import sys
 def load(p):
     d = {}
@@ -398,12 +455,19 @@ def load(p):
         pass
     return d
 base, head = load(sys.argv[1]), load(sys.argv[2])
+base_strict, head_strict = load(sys.argv[3]), load(sys.argv[4])
 for path, n in sorted(base.items()):
     m = head.get(path)
     if m is None:      # whole file gone; rule 1 reports the tests it held
         continue
     if m < n:
         print(f"{path}: {n} -> {m} assertions ({n - m} fewer)")
+for path, n in sorted(base_strict.items()):
+    m = head_strict.get(path)
+    if m is None:      # whole file gone; rule 1 reports the tests it held
+        continue
+    if m < n:
+        print(f"{path}: {n} -> {m} assert_eq!/assert_ne! ({n - m} fewer, even if the total assertion count held steady)")
 PY
 )"
 

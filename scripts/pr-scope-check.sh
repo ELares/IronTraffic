@@ -28,6 +28,14 @@ REPO="${GITHUB_REPOSITORY:-$(gh repo view --json nameWithOwner --jq .nameWithOwn
 
 # Files every PR may touch without declaring them, because they are process
 # artifacts rather than implementation.
+#
+# Cargo.lock is DELIBERATELY NOT here. A lockfile pins exact versions of every
+# transitive dependency, and `cargo update` can rewrite it with no manifest
+# change at all, silently repinning an existing dependency to a different
+# build. That is precisely the kind of undeclared change this check exists to
+# catch, so it is not safe to blanket-allow. See the narrower rule below,
+# applied inside the main loop, that allows Cargo.lock only alongside a
+# Cargo.toml the issue actually declared.
 ALWAYS_ALLOWED='^(CHANGELOG\.md)$'
 
 pr_json="$(gh api "repos/$REPO/pulls/$PR_NUMBER")"
@@ -159,10 +167,39 @@ changed="$(git diff --name-only "$MERGE_BASE" "$HEAD_SHA")"
 echo "declared in issue #$issue:"; printf '  %s\n' $declared
 echo "changed by this PR:"; printf '  %s\n' $changed
 
+# Cargo.lock exemption: allowed WITHOUT its own Files row, but only when this
+# same diff also touches a Cargo.toml that the issue DID declare. That ties
+# the lockfile change to a manifest edit a human already reviewed, rather than
+# exempting Cargo.lock outright, which would also wave through a bare
+# `cargo update` that repins an existing dependency with no manifest change at
+# all. This does not prove every entry that moved in Cargo.lock belongs to the
+# declared manifest edit, only that the diff has a plausible legitimate
+# trigger; `cargo deny check` runs separately over the resulting tree and
+# would catch a banned licence, source, or known advisory pulled in this way.
+# It would NOT catch a quiet repin to an older, merely undesirable version, so
+# this is a narrowing of the false-positive, not a claim that Cargo.lock
+# content is fully verified here.
+cargo_lock_exempt=0
+for f in $changed; do
+  case "$f" in
+    Cargo.toml|*/Cargo.toml) : ;;
+    *) continue ;;
+  esac
+  for d in $declared; do
+    case "$d" in
+      */) case "$f" in "$d"*) cargo_lock_exempt=1;; esac ;;
+      *)  [ "$f" = "$d" ] && cargo_lock_exempt=1 ;;
+    esac
+    [ "$cargo_lock_exempt" -eq 1 ] && break
+  done
+  [ "$cargo_lock_exempt" -eq 1 ] && break
+done
+
 # A declared entry may name a directory (trailing slash) to cover a tree.
 undeclared=""
 for f in $changed; do
   if printf '%s' "$f" | grep -qE "$ALWAYS_ALLOWED"; then continue; fi
+  if [ "$f" = "Cargo.lock" ] && [ "$cargo_lock_exempt" -eq 1 ]; then continue; fi
   ok=0
   for d in $declared; do
     case "$d" in

@@ -9,9 +9,12 @@
 # #[allow(..., reason = "...")]) between #[test] and fn: such a test was
 # invisible to the census entirely, so deleting it left the census reporting
 # clean. It was also blind to an assertion count that a decorative comment or
-# string literal inflated or hid. A census that cannot see what it is meant
-# to guard is worse than no census: it reports success while proving
-# nothing. This builds two small throwaway git histories (a base commit and
+# string literal inflated or hid, and separately blind to a same-total swap
+# (assert_eq!(x, 42) becoming assert!(x > 0), one assert-family macro
+# invocation for another, leaving the total count per file unchanged). A
+# census that cannot see what it is meant to guard is worse than no census:
+# it reports success while proving nothing. This builds two small throwaway
+# git histories (a base commit and
 # a head state) and runs the real script against them, so it tests the
 # shipped script, not a description of it.
 set -euo pipefail
@@ -182,6 +185,56 @@ else
   echo "FAIL: a doc comment mentioning assert_eq!/#[test] as prose changed the"
   echo "      counted totals for an otherwise-unchanged file. Got:"
   echo "$OUT5" | sed 's/^/    /'
+  FAILED=1
+fi
+
+# ---------------------------------------------------------------------------
+# 6. Same-total swap: assert_eq!(x, 42) becoming assert!(x > 0) is one
+#    assert-family macro invocation replaced by another, so the TOTAL count
+#    for this file is unchanged (1 -> 1) and case 3 above would not catch it.
+#    This is issue #454's bug, independent of case 3's drop-to-zero bug: the
+#    strict assert_eq!/assert_ne!-only count must still drop (1 -> 0) and be
+#    reported, even though the total holds steady. Confirmed present in the
+#    total-only version of this script by running it against this exact
+#    fixture and getting a clean report.
+# ---------------------------------------------------------------------------
+D6="$WORK/same-total-swap"
+base_commit "$D6" '//! Base revision: one comparison-style assertion.
+pub fn add(a: u8, b: u8) -> u8 { a + b }
+
+#[cfg(test)]
+mod tests {
+    use super::add;
+
+    #[test]
+    fn adds_two_numbers() {
+        assert_eq!(add(2, 3), 5);
+    }
+}
+'
+printf '%s' '//! Head: assert_eq! swapped for a bare assert!, one-for-one. The total
+//! assert-family count for this file is unchanged; only the strict
+//! assert_eq!/assert_ne! count drops.
+pub fn add(a: u8, b: u8) -> u8 { a + b }
+
+#[cfg(test)]
+mod tests {
+    use super::add;
+
+    #[test]
+    fn adds_two_numbers() {
+        assert!(add(2, 3) > 0);
+    }
+}
+' > "$D6/src/lib.rs"
+echo "== same-total swap: assert_eq! -> assert! must be reported even though the total holds steady =="
+OUT6="$(run_census "$D6")"
+if echo "$OUT6" | grep -q 'FAIL \[assertions-weakened\]' && echo "$OUT6" | grep -q 'assert_eq!/assert_ne!'; then
+  note "the same-total assert_eq!-to-assert! swap is caught by the strict count"
+else
+  echo "FAIL: swapping assert_eq! for assert! one-for-one did not trip"
+  echo "      assertions-weakened via the strict count. Got:"
+  echo "$OUT6" | sed 's/^/    /'
   FAILED=1
 fi
 
