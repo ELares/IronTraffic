@@ -27,9 +27,9 @@ name = "primitives"
 harness = false
 
 [[bench]]
-name = "limits"
+name = "timer_wheel"
 harness = false
 
 [[bench]]
-name = "outlier_stats"
+name = "limits"
 harness = false
