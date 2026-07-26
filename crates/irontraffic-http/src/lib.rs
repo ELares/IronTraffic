@@ -42,6 +42,7 @@
 //! with a bare `+`, `*` or `-`; the crate root denies
 //! `clippy::arithmetic_side_effects` to enforce that.
 
+pub mod authority;
 pub mod error;
 pub mod field;
 pub mod hlist;

@@ -15,10 +15,20 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 irontraffic-http = { path = ".." }
+# fuzz_authority builds the caller-supplied BytesMut Authority::parse_into
+# writes into; version matches the workspace's bytes = "1.10" pin.
+bytes = "1.10"
 
 [[bin]]
 name = "fuzz_field_validate"
 path = "fuzz_targets/fuzz_field_validate.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_authority"
+path = "fuzz_targets/fuzz_authority.rs"
 test = false
 doc = false
 bench = false

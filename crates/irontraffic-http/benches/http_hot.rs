@@ -19,9 +19,11 @@
 //! to microtune. Criterion does not enforce a budget itself; compare the
 //! reported throughput against these numbers by hand.
 
+use bytes::BytesMut;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use irontraffic_http::WireVersion;
+use irontraffic_http::authority::Authority;
 use irontraffic_http::field::{validate_name, validate_value};
+use irontraffic_http::{Limits, Scheme, WireVersion};
 use std::hint::black_box;
 
 /// Sixteen (name, value) pairs, 40 bytes each (an 8-byte name, a 32-byte
@@ -82,5 +84,42 @@ fn bench_field_validate(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_field_validate);
+/// Benchmarks `Authority::parse_into` on the three inputs the design budgets
+/// (reference runner, same as above): under 70 ns each. `Authority::parse_into`
+/// runs once per request and shares the head-parse budget with field
+/// validation above; criterion does not enforce the budget itself, so
+/// compare the reported time against it by hand.
+///
+/// Each case reuses one `BytesMut` across iterations and calls `reserve`
+/// before every `parse_into` call, the exact contract `parse_into`'s own doc
+/// comment states for a caller building several values from one buffer: the
+/// per-iteration cost this measures is the parse itself, not a buffer grow
+/// that a correctly written caller would never pay for repeatedly either.
+fn bench_authority_parse(c: &mut Criterion) {
+    let cases: [(&str, &[u8]); 3] = [
+        ("reg_name", b"example.com"),
+        ("reg_name_with_port", b"example.com:8443"),
+        ("ipv6_bracketed_with_port", b"[2001:db8::1]:8443"),
+    ];
+
+    let mut group = c.benchmark_group("bench_authority_parse");
+    for (label, raw) in cases {
+        group.throughput(Throughput::Bytes(raw.len() as u64));
+        let mut out = BytesMut::with_capacity(raw.len());
+        group.bench_function(label, |b| {
+            b.iter(|| {
+                out.reserve(raw.len());
+                black_box(Authority::parse_into(
+                    black_box(raw),
+                    Scheme::Https,
+                    &Limits::DEFAULT.clamped(),
+                    &mut out,
+                ))
+            });
+        });
+    }
+    group.finish();
+}
+
+criterion_group!(benches, bench_field_validate, bench_authority_parse);
 criterion_main!(benches);

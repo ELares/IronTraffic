@@ -121,6 +121,38 @@ Later issues append one subsection per surface here: `path-normalization` (#29),
 `desync-corpus-and-reject-table` (#47) adds a section 6 that ties every named attack to its corpus
 entry.
 
+### Authority (`authority-parsing-and-reconciliation`, #30)
+
+**Parses:** the `Host` field and the `:authority` pseudo-header, both attacker chosen. The authority
+selects the virtual host, the route table and the TLS policy for the request.
+
+**Structural controls:**
+
+- **No IDNA, ever.** `Authority::parse_into` never performs IDNA `ToASCII`, IDNA2003, IDNA2008,
+  UTS-46 transitional or non-transitional processing, or Unicode NFC, NFD, NFKC or NFKD
+  normalization. Any byte at or above `0x80` is refused with `AuthorityNonAscii`. UTS-46's two
+  processing modes disagree on four characters and IDNA2003 disagrees with IDNA2008 on more, so a
+  proxy that maps and an origin that does not (or maps with a different table version) is a
+  virtual-host confusion primitive: two different requests reach two different vhosts depending on
+  which library version each side compiled against. This type is never that proxy.
+- **Zone identifiers are refused.** A bracketed IPv6 literal may contain only hex digits, `:` and
+  `.`. An RFC 6874 zone identifier (`[fe80::1%25eth0]`, encoded or not) is refused with
+  `AuthorityInvalidByte`: it names a local network interface, is meaningless to route on, and would
+  let a remote peer choose a link-local scope on a connect path. There is no configuration that
+  accepts it.
+- **The bound is `max_authority_bytes`** (`Limits::max_authority_bytes`, default 255, hard ceiling
+  `Limits::CEILING.max_authority_bytes`). Longer input is refused with `AuthorityTooLong` before any
+  other validation runs, and before the whole input is even scanned byte by byte.
+- **A `Host` that disagrees with `:authority` is refused, not resolved.** `reconcile_authority`
+  refuses with `AuthorityMismatch` when both are present and disagree after scheme-based
+  normalization (RFC 3986 Section 6.2.3: drop the scheme's default port). RFC 9113 Section 8.3.1
+  states this as a SHOULD; IronTraffic makes it a MUST.
+- **Bytes, not addresses.** `Authority` canonicalizes the BYTES of the host, never the ADDRESS it
+  might denote. `127.0.0.1`, `127.1`, `0177.0.0.1` and `2130706433` all resolve to loopback and are
+  four distinct `Authority` values; `[::1]` and `[0:0:0:0:0:0:0:1]` are two distinct values. Any
+  policy that means to match an IP address (an SSRF deny-list, an internal-range check, an
+  "is this upstream local" test) MUST parse the host into an `IpAddr` and compare addresses;
+  comparing `Authority::host` bytes against a literal is a bypass waiting to be written.
 ## Listening sockets and socket options
 
 **What the listening socket exposes.** A TCP port reachable by anyone who can route to the bound
