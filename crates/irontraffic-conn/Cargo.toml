@@ -1,0 +1,27 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "irontraffic-conn"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "One SO_REUSEPORT socket per worker, converted into acceptors, with an explicit single-socket fallback."
+
+[lints]
+workspace = true
+
+[dependencies]
+# bind_listener, Caps, and SockOpts: the only way this crate ever touches a
+# raw socket option.
+irontraffic-io = { path = "../irontraffic-io", version = "0.1.0" }
+# ListenerName, BindAddr, and Backlog: the validated newtypes bind() takes.
+irontraffic-config = { path = "../irontraffic-config", version = "0.1.0" }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# The reactor-dependent tests (into_acceptors and the accept tests) need a
+# real tokio runtime; this crate's own src/ never names tokio, enforced by
+# the transport-seam invariant lint.
+tokio = { workspace = true }
