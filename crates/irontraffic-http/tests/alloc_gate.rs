@@ -513,3 +513,65 @@ fn forwarded_chain_parse_into_allocates_only_through_the_declared_sites() {
          it fires at most once per parse rather than on every push past it"
     );
 }
+
+/// `h1-head-parser` (#34)'s zero-allocation gate for `H1Parser::parse_request_head`.
+///
+/// The issue's own design called for proving this at run time: 1000 parses of a
+/// 400-byte typical head through a `count_allocs` helper, asserting the count is
+/// exactly 0, and 1000 parses of a 100-field head asserting the count is exactly
+/// 1000 (one `SmallVec` spill per parse and nothing else). That does not compile
+/// in this workspace, for the exact reason explained in the module doc comment
+/// above: `GlobalAlloc` is an `unsafe trait`, this package's `[lints] workspace =
+/// true` applies the workspace's `unsafe_code = "deny"` to every target
+/// including this one, and a process-wide counting allocator would in any case
+/// count allocations made by every other test running in parallel in the same
+/// binary. There is no `count_allocs` helper anywhere in this crate to call.
+///
+/// This proves the checkable half of the same claim statically, the same
+/// substitution the two tests above already make: `parse_request_head`'s own
+/// body contains no call from `ALLOCATING_CALLS`, so it cannot itself touch the
+/// allocator; the actual field storage lives in `parse_field_lines` (the
+/// private helper `parse_request_head` and `parse_response_head` share), whose
+/// body ALSO contains no call from `ALLOCATING_CALLS` other than its one
+/// declared `SmallVec::reserve`, appearing exactly once in the source. That
+/// `reserve` is the "one `SmallVec` spill per parse" the issue's own design
+/// names: `SmallVec<[RawField; 32]>` never allocates for the inline 32 entries,
+/// and this is what proves the ONLY way a parse can ever touch the heap is
+/// through that one, single-occurrence call.
+#[test]
+fn parse_request_head_allocates_only_the_declared_reserve() {
+    let parser_source = include_str!("../src/h1/parser.rs");
+
+    let parse_request_head_body = extract_fn_body(parser_source, "pub fn parse_request_head<'b>(")
+        .expect(
+            "`fn parse_request_head` not found in src/h1/parser.rs; has it moved or been renamed?",
+        );
+    for call in ALLOCATING_CALLS {
+        assert!(
+            !parse_request_head_body.contains(call),
+            "parse_request_head's body contains `{call}`, which can allocate; \
+             parse_request_head is documented to allocate only through the one \
+             declared SmallVec::reserve inside parse_field_lines"
+        );
+    }
+
+    let parse_field_lines_body = extract_fn_body(parser_source, "fn parse_field_lines(").expect(
+        "`fn parse_field_lines` not found in src/h1/parser.rs; has it moved or been renamed?",
+    );
+    for call in ALLOCATING_CALLS {
+        assert!(
+            !parse_field_lines_body.contains(call),
+            "parse_field_lines's body contains `{call}`, which can allocate; \
+             parse_field_lines is documented to allocate only through its one \
+             declared SmallVec::reserve"
+        );
+    }
+
+    let reserve_count = parse_field_lines_body.matches(".reserve(").count();
+    assert_eq!(
+        reserve_count, 1,
+        "parse_field_lines must call SmallVec::reserve exactly once, the one declared \
+         allocation for a head that spills past 32 fields; found {reserve_count} \
+         occurrences in its body"
+    );
+}

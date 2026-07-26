@@ -18,6 +18,11 @@ irontraffic-http = { path = ".." }
 # fuzz_authority builds the caller-supplied BytesMut Authority::parse_into
 # writes into; version matches the workspace's bytes = "1.10" pin.
 bytes = "1.10"
+# fuzz_h1_differential's oracle: a good, fast HTTP/1 tokenizer that tolerates
+# input H1Parser must refuse (bare LF, obs-fold), used ONLY here to prove we
+# are never laxer than it, never in the library (see h1::parser's module doc
+# for why it is not the framing decision maker). Dev/fuzz-only dependency.
+httparse = "1"
 
 [[bin]]
 name = "fuzz_field_validate"
@@ -36,6 +41,20 @@ bench = false
 [[bin]]
 name = "fuzz_forwarded"
 path = "fuzz_targets/fuzz_forwarded.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_h1_head"
+path = "fuzz_targets/fuzz_h1_head.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_h1_differential"
+path = "fuzz_targets/fuzz_h1_differential.rs"
 test = false
 doc = false
 bench = false

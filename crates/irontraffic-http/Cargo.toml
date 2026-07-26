@@ -32,10 +32,15 @@ bytes = { workspace = true }
 # `BytesMut`, the join buffer `hlist::CookieAccumulator::join_into` writes
 # into. Never `Vec<u8>` in the data plane.
 # Inline, non-heap-allocated crumb index (`SmallVec<[(u32, u32); 8]>`) in
-# `hlist::CookieAccumulator`, so the common one- or two-crumb cookie never
-# allocates. `memchr` stays out of this manifest: still referenced by
-# nothing in src/ (see the removed D6 note this replaces).
+# `hlist::CookieAccumulator`, and the inline-32 `SmallVec<[RawField; 32]>`
+# field list in `h1::parser::RawHead`/`RawResponseHead`, so the common one-
+# or two-crumb cookie and the common sub-32-field head never allocate.
 smallvec = { workspace = true }
+# SIMD-accelerated search for the head terminator (`\r\n\r\n`) and per-line
+# CRLF boundaries in `h1::parser`. Pure Rust, musl safe. First used by
+# `h1-head-parser` (#34); see D6's note above for why it was removed from
+# this manifest until a real caller existed.
+memchr = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
