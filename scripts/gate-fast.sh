@@ -17,7 +17,7 @@
 #
 #   omitted here            covered by
 #   ----------------------  ---------------------------------------------
-#   MSRV 1.85               milestone sweep
+#   MSRV 1.89               milestone sweep
 #   musl static build       milestone sweep
 #   cargo-deny              milestone sweep (and deny.toml rarely moves)
 #   --no-default-features   milestone sweep

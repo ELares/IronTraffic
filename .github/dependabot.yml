@@ -10,6 +10,6 @@ updates:
     schedule:
       interval: weekly
     ignore:
-      # The @1.85 reference IS the MSRV policy, not a dependency version. MSRV
+      # The @1.89 reference IS the MSRV policy, not a dependency version. MSRV
       # bumps are deliberate pull requests with a changelog entry.
       - dependency-name: dtolnay/rust-toolchain
