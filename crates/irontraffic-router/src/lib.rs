@@ -13,6 +13,7 @@ pub mod spec;
 pub mod table;
 #[cfg(test)]
 pub mod testutil;
+pub mod trace;
 
 pub use ids::{
     ActionId, CertId, GroupId, ListenerId, MethodMask, NameId, NodeId, RouteId, SENTINEL,
@@ -32,3 +33,4 @@ pub use table::TableParts;
 pub use table::{
     Cand, Group, HostNode, MatchOutcome, PathNode, Pred, PredOp, RouteTable, ValidateError,
 };
+pub use trace::{ExplainStep, NoTrace, RecordTrace, RejectReason, RouteTrace};
