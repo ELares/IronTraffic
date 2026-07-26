@@ -18,3 +18,8 @@ test-util = []
 
 [dev-dependencies]
 proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "build"
+harness = false
