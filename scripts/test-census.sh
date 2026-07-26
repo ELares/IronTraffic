@@ -47,6 +47,212 @@ MERGE_BASE="$(git merge-base "$BASE_REV" HEAD)" || {
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
+export WORK
+
+# rslex.py: the same literal- and comment-aware Rust scanner
+# scripts/invariant-lints.sh uses, with two census-specific helpers added at
+# the bottom. Kept as an independent copy (not a shared file read via a
+# relative path) because this script, like invariant-lints.sh, must remain
+# fully self-contained: nothing here may assume the current directory still
+# has a scripts/ next to it.
+#
+# WHY THE TEST-NAME REGEX CHANGED. `#\[(?:tokio::)?test[^\]]*\]\s*
+# (?:async\s+)?fn\s+(\w+)` required `fn` to follow the test marker with
+# nothing but whitespace in between. Any further attribute placed there --
+# most commonly `#[allow(..., reason = "...")]` on a property test whose
+# generator needs one -- made the whole function invisible to this census.
+# The census is the ONE mechanism that catches a test being deleted,
+# renamed away, or emptied of assertions to reach a green gate; a test it
+# cannot see can be deleted with the census reporting clean. This is fixed
+# the same way as the equivalent bug in invariant-lints.sh's
+# no-test-without-assertion rule: walk past any number of `#[...]`
+# attributes (matched by bracket depth, not a `[^\]]*` guess that a nested
+# `[...]` or a `]` inside a string could defeat) before requiring `fn`.
+#
+# WHY THE ASSERTION COUNT ALSO CHANGED. `len(re.findall(r"\bassert\w*!",
+# text))` counted a match anywhere in the file, including inside a doc
+# comment or a string literal that merely MENTIONS an assertion macro
+# (`/// see assert_eq! above`, or a message string quoting one). That can
+# inflate a file's count independently of its real tests, which is a false
+# NEGATIVE waiting to happen: a real assertion removed on the same diff that
+# also removes an unrelated comment mentioning one would net out to "no
+# change" and pass silently. Counting only occurrences rslex confirms are
+# not inside a literal or comment closes that.
+cat > "$WORK/rslex.py" <<'PYLEX'
+import re
+
+
+def skip_trivia(text, i):
+    n = len(text)
+    if i >= n:
+        return i
+    c = text[i]
+    if c == '/' and i + 1 < n and text[i + 1] == '/':
+        j = text.find('\n', i)
+        return n if j < 0 else j
+    if c == '/' and i + 1 < n and text[i + 1] == '*':
+        depth = 1
+        j = i + 2
+        while j < n and depth > 0:
+            if text[j:j + 2] == '/*':
+                depth += 1
+                j += 2
+            elif text[j:j + 2] == '*/':
+                depth -= 1
+                j += 2
+            else:
+                j += 1
+        return j
+    j = i
+    if text[j] == 'b':
+        j += 1
+    if j < n and text[j] == 'r':
+        k = j + 1
+        hashes = 0
+        while k < n and text[k] == '#':
+            hashes += 1
+            k += 1
+        if k < n and text[k] == '"':
+            k += 1
+            closer = '"' + ('#' * hashes)
+            end = text.find(closer, k)
+            return n if end < 0 else end + len(closer)
+    if c == 'b' and i + 1 < n and text[i + 1] == '"':
+        return _skip_quoted(text, i + 1)
+    if c == 'b' and i + 1 < n and text[i + 1] == "'":
+        end = _skip_char_literal(text, i + 1)
+        if end is not None:
+            return end
+        return i
+    if c == '"':
+        return _skip_quoted(text, i)
+    if c == "'":
+        end = _skip_char_literal(text, i)
+        if end is not None:
+            return end
+        return i + 1
+    return i
+
+
+def _skip_quoted(text, i):
+    n = len(text)
+    j = i + 1
+    while j < n:
+        if text[j] == '\\' and j + 1 < n:
+            j += 2
+            continue
+        if text[j] == '"':
+            return j + 1
+        j += 1
+    return n
+
+
+def _skip_char_literal(text, i):
+    n = len(text)
+    j = i + 1
+    if j >= n:
+        return None
+    if text[j] == '\\':
+        if text[j:j + 2] == '\\u' and j + 2 < n and text[j + 2] == '{':
+            close = text.find('}', j + 3)
+            if close < 0:
+                return None
+            k = close + 1
+        elif text[j:j + 2] == '\\x':
+            k = j + 4
+        else:
+            k = j + 2
+        if k < n and text[k] == "'":
+            return k + 1
+        return None
+    if j + 1 < n and text[j + 1] == "'":
+        return j + 2
+    return None
+
+
+_OPEN_TO_CLOSE = {'(': ')', '[': ']', '{': '}'}
+
+
+def find_matching(text, open_idx):
+    open_ch = text[open_idx]
+    close_ch = _OPEN_TO_CLOSE[open_ch]
+    depth = 0
+    i = open_idx
+    n = len(text)
+    while i < n:
+        skipped = skip_trivia(text, i)
+        if skipped != i:
+            i = skipped
+            continue
+        c = text[i]
+        if c in '([{':
+            depth += 1
+        elif c in ')]}':
+            depth -= 1
+            if c == close_ch and depth == 0:
+                return i
+        i += 1
+    return -1
+
+
+def finditer_real(pattern, text):
+    i, n = 0, len(text)
+    while i < n:
+        skipped = skip_trivia(text, i)
+        if skipped != i:
+            i = skipped
+            continue
+        m = pattern.match(text, i)
+        if m:
+            yield m
+            i = m.end() if m.end() > i else i + 1
+        else:
+            i += 1
+
+
+TEST_ATTR = re.compile(r'#\[\s*(?:tokio::)?test\b')
+ASSERT = re.compile(r'\bassert\w*!')
+
+
+def find_test_names(text):
+    """Yields function names for every #[test] / #[tokio::test] in `text`,
+    tolerant of any number of further #[...] attributes between the test
+    marker and `fn` (bracket-matched, not `[^\\]]*`-guessed, so a nested
+    `[...]` or a `]` inside a string cannot cut the walk short)."""
+    n = len(text)
+    for m in finditer_real(TEST_ATTR, text):
+        attr_open = text.index('[', m.start())
+        attr_close = find_matching(text, attr_open)
+        if attr_close < 0:
+            continue
+        i = attr_close + 1
+        while True:
+            while i < n:
+                skipped = skip_trivia(text, i)
+                if skipped != i:
+                    i = skipped
+                    continue
+                if text[i].isspace():
+                    i += 1
+                    continue
+                break
+            if i < n and text[i] == '#' and i + 1 < n and text[i + 1] == '[':
+                close = find_matching(text, i + 1)
+                if close < 0:
+                    break
+                i = close + 1
+                continue
+            break
+        fm = re.match(r'(?:async\s+)?fn\s+(\w+)', text[i:])
+        if fm:
+            yield fm.group(1)
+
+
+def count_real_asserts(text):
+    """Counts assert*! occurrences that are not inside a string, char
+    literal, or comment."""
+    return sum(1 for _ in finditer_real(ASSERT, text))
+PYLEX
 
 # Census a whole tree at a revision: one line per test, "path\tname", plus a
 # per-file assertion count.
@@ -61,19 +267,31 @@ census() {
     local body
     body="$(git show "$rev:$f" 2>/dev/null)" || continue
     printf '%s' "$body" | python3 -c '
-import re, sys
+import os, sys
+sys.path.insert(0, os.environ["WORK"])
+import rslex
 path = sys.argv[1]
 text = sys.stdin.read()
-for m in re.finditer(r"#\[(?:tokio::)?test[^\]]*\]\s*(?:async\s+)?fn\s+(\w+)", text):
-    print(f"{path}\t{m.group(1)}")
+for name in rslex.find_test_names(text):
+    print(f"{path}\t{name}")
 ' "$f" >> "$out"
     printf '%s' "$body" | python3 -c '
-import re, sys
+import os, sys
+sys.path.insert(0, os.environ["WORK"])
+import rslex
 path = sys.argv[1]
 text = sys.stdin.read()
-n = len(re.findall(r"\bassert\w*!", text))
-if n:
-    print(f"{path}\t{n}")
+n = rslex.count_real_asserts(text)
+# Printed UNCONDITIONALLY, even when n is 0: the comparison below treats a
+# path missing from this file as "the whole file is gone" (rule 1 already
+# reports the tests it held) and skips it, rather than as "this file now
+# has zero assertions". If a file that used to hold one assertion has it
+# deleted while the file itself survives, omitting the zero line here would
+# make that reduction indistinguishable from a deleted file and it would
+# never be reported: assertions-weakened exists specifically to catch an
+# assertion being removed or loosened, and "removed all the way to zero" is
+# the most complete form of removal there is.
+print(f"{path}\t{n}")
 ' "$f" >> "$counts"
   done
 }
@@ -91,19 +309,31 @@ census_worktree() {
   git ls-files -- '*.rs' | while read -r f; do
     [ -f "$f" ] || continue
     python3 -c '
-import re, sys
+import os, sys
+sys.path.insert(0, os.environ["WORK"])
+import rslex
 path = sys.argv[1]
 text = open(path, encoding="utf-8", errors="replace").read()
-for m in re.finditer(r"#\[(?:tokio::)?test[^\]]*\]\s*(?:async\s+)?fn\s+(\w+)", text):
-    print(f"{path}\t{m.group(1)}")
+for name in rslex.find_test_names(text):
+    print(f"{path}\t{name}")
 ' "$f" >> "$out"
     python3 -c '
-import re, sys
+import os, sys
+sys.path.insert(0, os.environ["WORK"])
+import rslex
 path = sys.argv[1]
 text = open(path, encoding="utf-8", errors="replace").read()
-n = len(re.findall(r"\bassert\w*!", text))
-if n:
-    print(f"{path}\t{n}")
+n = rslex.count_real_asserts(text)
+# Printed UNCONDITIONALLY, even when n is 0: the comparison below treats a
+# path missing from this file as "the whole file is gone" (rule 1 already
+# reports the tests it held) and skips it, rather than as "this file now
+# has zero assertions". If a file that used to hold one assertion has it
+# deleted while the file itself survives, omitting the zero line here would
+# make that reduction indistinguishable from a deleted file and it would
+# never be reported: assertions-weakened exists specifically to catch an
+# assertion being removed or loosened, and "removed all the way to zero" is
+# the most complete form of removal there is.
+print(f"{path}\t{n}")
 ' "$f" >> "$counts"
   done
 }

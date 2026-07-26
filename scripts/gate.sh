@@ -14,17 +14,53 @@ cd "$(git rev-parse --show-toplevel)"
 echo "==> fmt"
 cargo fmt --all --check
 
+# shellcheck source=scripts/feature-matrix.sh
+source scripts/feature-matrix.sh
+
+# A crate with mutually exclusive features (irontraffic-tls's three crypto-*
+# providers, enforced with a compile_error!) cannot compile under
+# --all-features at all, so it is excluded from the workspace-wide runs below
+# and checked separately, once per valid combination, further down. Every
+# other crate is completely unaffected: with nothing matrixed, EXCLUDE_ARGS
+# is empty and these three lines are exactly what they always were.
+EXCLUDE_ARGS=()
+while IFS= read -r name; do
+  [ -n "$name" ] && EXCLUDE_ARGS+=(--exclude "$name")
+done < <(matrixed_names)
+
 echo "==> clippy (pedantic, -D warnings)"
-cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo clippy --workspace "${EXCLUDE_ARGS[@]+"${EXCLUDE_ARGS[@]}"}" --all-targets --all-features -- -D warnings
 
 echo "==> test"
-cargo test --workspace --all-features
+cargo test --workspace "${EXCLUDE_ARGS[@]+"${EXCLUDE_ARGS[@]}"}" --all-features
 
 echo "==> doctests"
-cargo test --workspace --all-features --doc
+cargo test --workspace "${EXCLUDE_ARGS[@]+"${EXCLUDE_ARGS[@]}"}" --all-features --doc
 
 echo "==> data-plane-only build (the edge and k3s profile must not rot)"
 cargo check --workspace --no-default-features
+
+# The crates excluded above, checked once per valid feature combination
+# instead of the single --all-features run that cannot compile them. This is
+# STRICTLY MORE coverage than --all-features ever gave a crate like this: three
+# runs instead of the zero a single unsatisfiable run was worth.
+while IFS= read -r manifest; do
+  [ -n "$manifest" ] || continue
+  has_matrix "$manifest" || continue
+  name="$(crate_name_of "$manifest")"
+  while IFS= read -r feat; do
+    [ -n "$feat" ] || continue
+    echo "==> clippy ($name, --no-default-features --features $feat)"
+    cargo clippy --locked -p "$name" --all-targets --no-default-features --features "$feat" -- -D warnings
+    echo "==> test ($name, --no-default-features --features $feat)"
+    cargo test --locked -p "$name" --no-default-features --features "$feat"
+    echo "==> doctests ($name, --no-default-features --features $feat)"
+    cargo test --locked -p "$name" --no-default-features --features "$feat" --doc
+  done < <(declared_features "$manifest")
+done < <(crate_manifests)
+
+echo "==> feature matrix self-test (the matrix cannot silently collapse to zero runs)"
+scripts/feature-matrix.sh selftest
 
 echo "==> invariant lints"
 scripts/invariant-lints.sh
@@ -37,6 +73,9 @@ scripts/dash-scan.sh
 
 echo "==> test census (no test removed, no assertion weakened)"
 scripts/test-census.sh
+
+echo "==> test census self-test (the census still enforces what it claims)"
+scripts/test-census-selftest.sh
 
 echo "==> governance files present"
 for f in LICENSE LICENSE-APACHE LICENSE-MIT COVENANTS.md SECURITY.md \

@@ -57,11 +57,6 @@ if [ ${#PKGS[@]} -eq 0 ]; then
   echo "gate-fast: no crate touched; running the structural checks only"
 fi
 
-SEL=()
-for p in "${PKGS[@]:-}"; do
-  [ -n "$p" ] && SEL+=(-p "$p")
-done
-
 fail() { echo; echo "GATE-FAST FAILED at: $1"; exit 1; }
 
 echo "==> crates in scope: ${PKGS[*]:-none}"
@@ -69,17 +64,44 @@ echo "==> crates in scope: ${PKGS[*]:-none}"
 echo "==> fmt"
 cargo fmt --all --check || fail "cargo fmt --all --check"
 
-if [ ${#SEL[@]} -gt 0 ]; then
-  echo "==> clippy (pedantic, -D warnings) on the touched crates"
-  cargo clippy --locked "${SEL[@]}" --all-targets --all-features -- -D warnings \
-    || fail "cargo clippy on ${PKGS[*]}"
+# shellcheck source=scripts/feature-matrix.sh
+source scripts/feature-matrix.sh
 
-  echo "==> test (touched crates)"
-  cargo test --locked "${SEL[@]}" --all-features || fail "cargo test on ${PKGS[*]}"
+# Every touched crate is checked individually rather than batched into one
+# `-p a -p b --all-features` invocation, because `--all-features` is a
+# per-invocation flag: a crate with mutually exclusive features (see
+# scripts/feature-matrix.sh) can never share an invocation with
+# --all-features at all, so no batching scheme can both include it and use
+# that flag. Looping per crate makes every crate go through the exact same
+# path regardless of whether it declares an exclusive-features group, which
+# is what keeps this from growing a special case that could later become a
+# skip.
+for p in "${PKGS[@]:-}"; do
+  [ -n "$p" ] || continue
+  manifest="crates/$p/Cargo.toml"
+  [ -f "$manifest" ] || fail "no manifest at $manifest for crate $p"
 
-  echo "==> doctests (touched crates)"
-  cargo test --locked "${SEL[@]}" --all-features --doc || fail "doctests on ${PKGS[*]}"
-fi
+  while IFS= read -r run; do
+    [ -n "$run" ] || continue
+    if [ "$run" = "--all-features" ]; then
+      FEATURE_ARGS=(--all-features)
+      label="--all-features"
+    else
+      FEATURE_ARGS=(--no-default-features --features "$run")
+      label="--no-default-features --features $run"
+    fi
+
+    echo "==> clippy (pedantic, -D warnings) on $p [$label]"
+    cargo clippy --locked -p "$p" --all-targets "${FEATURE_ARGS[@]}" -- -D warnings \
+      || fail "cargo clippy on $p [$label]"
+
+    echo "==> test $p [$label]"
+    cargo test --locked -p "$p" "${FEATURE_ARGS[@]}" || fail "cargo test on $p [$label]"
+
+    echo "==> doctests $p [$label]"
+    cargo test --locked -p "$p" "${FEATURE_ARGS[@]}" --doc || fail "doctests on $p [$label]"
+  done < <(runs_for "$manifest")
+done
 
 # The structural checks are greps and cost milliseconds. They are the ones that
 # catch the failure modes an implementer under pressure actually reaches for, so

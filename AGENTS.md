@@ -81,6 +81,9 @@ ready. Do not open it hoping CI is more forgiving; it is the same checks.
 | `cargo fuzz` smoke | parser panics on malformed input; fails closed if a parser crate has no target |
 | invariant lints | the structural rules clippy cannot express |
 | invariant lint self-test | a lint that silently stopped enforcing anything |
+| test census | a test deleted, renamed away, or weakened to reach a green gate |
+| test census self-test | the census silently going blind to a test or an assertion count |
+| feature matrix | a crate with mutually exclusive features (see scripts/feature-matrix.sh) getting fewer feature combinations checked than before, never zero |
 | dash scan | the prose rule |
 | PR scope check | a diff touching files the issue did not declare |
 | governance files | trust infrastructure being quietly deleted |
