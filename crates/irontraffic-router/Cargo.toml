@@ -11,6 +11,9 @@ description = "The compiled, immutable IronTraffic route table."
 [lints]
 workspace = true
 
+[features]
+test-util = []
+
 [dependencies]
 
 [dev-dependencies]

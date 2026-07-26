@@ -10,6 +10,7 @@ pub mod normalize;
 pub mod precedence;
 pub mod request;
 pub mod spec;
+pub mod table;
 #[cfg(test)]
 pub mod testutil;
 
@@ -25,4 +26,9 @@ pub use request::RequestView;
 pub use spec::{
     AdmissionError, AdmissionErrorKind, HeaderMatch, HostPattern, HttpRouteSpec, PathMatch,
     QueryParamMatch, RouteMatchSpec, RouteOrderKey, RouteRuleSpec,
+};
+#[cfg(any(test, feature = "test-util"))]
+pub use table::TableParts;
+pub use table::{
+    Cand, Group, HostNode, MatchOutcome, PathNode, Pred, PredOp, RouteTable, ValidateError,
 };
