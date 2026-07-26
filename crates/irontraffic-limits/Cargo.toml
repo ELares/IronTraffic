@@ -1,0 +1,21 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "irontraffic-limits"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Rate limits, concurrency limits, and admission control for IronTraffic."
+
+[lints]
+workspace = true
+
+[dependencies]
+# The only clock seam in the workspace; rate limiting needs CLOCK_BOOTTIME as a distinct type.
+irontraffic-time = { path = "../irontraffic-time", version = "0.1.0" }
+# Typed errors without hand-written Display impls; already in the workspace spine.
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

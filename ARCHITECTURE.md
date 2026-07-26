@@ -127,7 +127,8 @@ resolution, path normalization, forwarded and PROXY protocol parsing), `irontraf
 (connection budget accounting, the forwarding loop, backpressure, splice).
 
 **Request path.** `irontraffic-router`, `irontraffic-balancer`, `irontraffic-upstream`,
-`irontraffic-resilience`, `irontraffic-limits`, `irontraffic-filter`, `irontraffic-cache`,
+`irontraffic-resilience`, `irontraffic-limits` (the data-plane crate holding rate limits,
+concurrency limits and admission control), `irontraffic-filter`, `irontraffic-cache`,
 `irontraffic-tls`, `irontraffic-l4`, `irontraffic-dataplane`.
 
 **Policy and extension.** `irontraffic-expr` (the compiled expression language that covers most of
