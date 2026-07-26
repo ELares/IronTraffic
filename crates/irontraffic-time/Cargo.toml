@@ -12,6 +12,7 @@ description = "Clock types for IronTraffic."
 workspace = true
 
 [dependencies]
+rustix = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
