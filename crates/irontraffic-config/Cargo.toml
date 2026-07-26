@@ -16,16 +16,26 @@ workspace = true
 serde = { workspace = true }
 # ListenerName is interned, inline up to 23 bytes in the pinned 0.3 line.
 smol_str = { workspace = true }
+# FieldError and LoadError are typed error enums without a hand-written Display impl.
 # FieldError and NameError are typed error enums without a hand-written Display impl.
 thiserror = { workspace = true }
-# From<ModeSpec> for irontraffic_runtime::RuntimeMode: config names the mode,
-# the runtime does not name config. Only RuntimeMode is used from this crate.
+# From<ModeSpec> for irontraffic_runtime::RuntimeMode: config names the mode, the
+# runtime does not name config. Also names MAX_WORKERS, MAX_BLOCKING_THREADS, and
+# RuntimeError::ShardModeUnsupported, which the validator warns and errors against
+# respectively, so the operator sees the same numbers and the same story the
+# runtime itself uses.
 irontraffic-runtime = { path = "../irontraffic-runtime", version = "0.1.0" }
+# `load` parses the JSON form of a bootstrap document and `Loaded::render_json`
+# needs it in a normal build for `validate --print`, so it lives here rather
+# than only in [dev-dependencies].
+serde_json = { workspace = true }
+# `load` parses the YAML form, using the maintained fork rather than the
+# abandoned original, which is published as 0.9.34+deprecated.
+serde_norway = { workspace = true }
 # JSON Schema for every v1 newtype, generated from the Rust type itself.
 schemars = { workspace = true }
 # Extensions is a validating newtype over a BTreeMap<String, serde_json::Value>:
 # the one documented, bounded escape hatch for arbitrary structure in a document.
-serde_json = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

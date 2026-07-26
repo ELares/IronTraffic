@@ -238,6 +238,35 @@ arrives on.
 **What is out of scope here.** Connection admission, rate limiting, and per-source limits are not
 this module's job; it creates the socket and reports what it applied.
 
+## Configuration loading and validation
+
+### Who can supply a document
+
+The operator, through a local path, and in practice a CI pipeline running `irontraffic validate`
+over a file from a pull request. Treat the bytes as untrusted even though the path is trusted.
+
+### What bounds the parse
+
+A 1 MiB byte cap enforced twice (a metadata check and a bounded read, so a growing file cannot slip
+past), a 64-token YAML alias budget that defeats the billion-laughs expansion the byte cap cannot,
+`serde_json`'s own 128-level recursion limit for JSON, and a `deny_unknown_fields` schema that
+rejects anything it does not recognise.
+
+### What bounds validation
+
+`validate` is pure: no filesystem, no network, no subprocess, no clock. Its only super-linear work is
+two duplicate scans that run after the listener count has been proved at most 64, so the whole
+function is bounded at a few thousand comparisons however large the document is. This is the property
+that makes it safe to expose from the admin API in a later milestone, and it is the correction to
+ingress-nginx rendering attacker-controlled input to a temp file and executing the proxy binary on it.
+
+### What is echoed back
+
+`validate --print` writes the resolved document to stdout verbatim. The M1 bootstrap document
+contains no secret, and any future field that does must be redacted by `Loaded::render_json` before
+it is added, not afterwards. An unrecognised argument is echoed to stderr through
+`sanitize_for_terminal`, so an argument carrying an ASCII escape or a newline cannot move an
+operator's cursor or forge a log line.
 ## Request deadlines
 
 **What is attacker-controlled.** Every inbound timeout signal `deadline::establish` reads is set
