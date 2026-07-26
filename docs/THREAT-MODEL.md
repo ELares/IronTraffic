@@ -237,3 +237,23 @@ arrives on.
 
 **What is out of scope here.** Connection admission, rate limiting, and per-source limits are not
 this module's job; it creates the socket and reports what it applied.
+
+## Listener sharding and connection distribution
+
+**The kernel chooses the shard, and an attacker chooses the input to that choice.** The kernel
+selects the receiving socket by hashing the connection 4-tuple. Traffic from one source IP with few
+source ports concentrates on one shard, and a peer can arrange that deliberately. In `balanced`
+mode this is absorbed, because a connection task is stealable by any worker after accept, so kernel
+skew becomes task skew and the work-stealing scheduler resolves it. In a shared-nothing mode it
+would be a real denial of service against one core, which is one of the reasons `balanced` is the
+default and `shard` refuses to start.
+
+**The descriptor budget is `L x W` listening descriptors plus two per connection.** With the
+validator's 64-listener cap and the runtime's 1024-worker cap that is at most 65,536 listening
+descriptors before a single connection is served, and each accepted connection adds one downstream
+and one upstream descriptor. `serve-and-smoke-test` (#21) is where that total is checked against
+`RLIMIT_NOFILE` at startup; this issue's job is to state the arithmetic.
+
+**What is not defended here.** Per-source-IP connection limits do not exist in M1, so one source can
+occupy the whole connection cap. That is recorded in the accept-and-admission section rather than
+duplicated here.
