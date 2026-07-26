@@ -1,0 +1,26 @@
+[package]
+name = "irontraffic-tls"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+# The three crypto provider features are MUTUALLY EXCLUSIVE and enforced with
+# compile_error!, because rustls cannot install two providers as the process
+# default at once. Declaring them here is what tells scripts/feature-matrix.sh to
+# expand this crate into one run PER provider instead of a single --all-features
+# run that cannot compile by construction. Without this declaration the gate is
+# unsatisfiable for this crate; see issue #456.
+[package.metadata.gate]
+exclusive-features = ["crypto-aws-lc-rs", "crypto-ring", "crypto-fips"]
+
+[features]
+default = ["crypto-aws-lc-rs"]
+crypto-aws-lc-rs = ["rustls/aws_lc_rs", "rustls/prefer-post-quantum"]
+crypto-ring = ["rustls/ring"]
+crypto-fips = ["rustls/fips", "rustls/aws_lc_rs", "rustls/prefer-post-quantum"]
+
+[dependencies]
+rustls = { workspace = true }
