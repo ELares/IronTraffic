@@ -55,7 +55,7 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo clippy --locked --workspace --all-targets --all-features -- -D warnings
 
   test:
     name: test (ubuntu-latest)
@@ -66,14 +66,14 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - name: tests (workspace, all features)
-        run: cargo test --workspace --all-features
+        run: cargo test --locked --workspace --all-features
       - name: doctests
-        run: cargo test --workspace --all-features --doc
+        run: cargo test --locked --workspace --all-features --doc
       - name: default features build (the edge and k3s profile must not rot)
         # The data-plane-only build is what runs on constrained edge and k3s
         # nodes. It is built on every PR so that a dependency added to the
         # control plane cannot silently land in the data plane.
-        run: cargo check --workspace --no-default-features
+        run: cargo check --locked --workspace --no-default-features
 
   msrv:
     name: msrv (1.85)
@@ -88,7 +88,7 @@ jobs:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@1.85
       - uses: Swatinem/rust-cache@v2
-      - run: cargo check --workspace --all-features --all-targets
+      - run: cargo check --locked --workspace --all-features --all-targets
 
   musl:
     name: musl static build
@@ -104,7 +104,7 @@ jobs:
         run: rustup target add x86_64-unknown-linux-musl
       - uses: Swatinem/rust-cache@v2
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - run: cargo build --release --target x86_64-unknown-linux-musl -p irontraffic
+      - run: cargo build --locked --release --target x86_64-unknown-linux-musl -p irontraffic
       - name: Verify the binary is genuinely static
         run: |
           set -euo pipefail
@@ -133,6 +133,36 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+      - name: Restore every gate script and lint config from the BASE branch
+        # THE JUDGE MAY NOT BE EDITED BY THE DEFENDANT.
+        #
+        # These scripts are executed BY this job, and until this step existed
+        # they were executed from the pull request head. That meant a
+        # contributor (in this repository, an autonomous coding agent) could
+        # rewrite scripts/invariant-lints.sh to `exit 0`, rewrite its self-test
+        # to agree, and pass every structural check in one commit. The gate
+        # would report green while enforcing nothing, which is strictly worse
+        # than having no gate, because the badge asserts a guarantee that is
+        # not being provided.
+        #
+        # So: check the gate out of the base branch and run THAT. A PR may
+        # still PROPOSE a change to a gate script; it simply cannot have that
+        # change judge itself. The proposed version is reviewed by a human and
+        # takes effect on the next PR, which is the correct order.
+        run: |
+          set -euo pipefail
+          git fetch --depth=1 origin "${{ github.base_ref || github.ref_name }}"
+          for f in scripts/invariant-lints.sh scripts/invariant-lints-selftest.sh \
+                   scripts/dash-scan.sh scripts/pr-scope-check.sh scripts/test-census.sh \
+                   clippy.toml deny.toml rustfmt.toml; do
+            if git cat-file -e "FETCH_HEAD:$f" 2>/dev/null; then
+              git checkout FETCH_HEAD -- "$f"
+              echo "restored from base: $f"
+            else
+              echo "not on base yet (new file, will be judged from head): $f"
+            fi
+          done
+          chmod +x scripts/*.sh
       - name: invariant lints (the structural rules clippy cannot express)
         run: scripts/invariant-lints.sh
       - name: invariant lint self-test
@@ -144,6 +174,16 @@ jobs:
         run: scripts/invariant-lints-selftest.sh
       - name: dash scan (no em dashes, no en dashes)
         run: scripts/dash-scan.sh
+      - name: test census (tests may be added, never silently removed or weakened)
+        # The 15 invariant lints are all PRESENT-TENSE greps over the current
+        # tree, so they are structurally blind to deletion: removing a test
+        # leaves a cleaner tree and passes every one of them. Weakening an
+        # assertion passes too, since those lints check for presence rather
+        # than strength. This compares the set of test function names, and the
+        # assertion count per test file, against the base branch.
+        env:
+          BASE_REF: ${{ github.base_ref || github.ref_name }}
+        run: scripts/test-census.sh
       - name: governance files present
         # These files are trust infrastructure. This lint ensures they cannot
         # be silently removed, renamed, or emptied.

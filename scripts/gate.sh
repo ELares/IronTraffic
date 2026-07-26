@@ -35,6 +35,9 @@ scripts/invariant-lints-selftest.sh
 echo "==> dash scan"
 scripts/dash-scan.sh
 
+echo "==> test census (no test removed, no assertion weakened)"
+scripts/test-census.sh
+
 echo "==> governance files present"
 for f in LICENSE LICENSE-APACHE LICENSE-MIT COVENANTS.md SECURITY.md \
          CONTRIBUTING.md AGENTS.md ARCHITECTURE.md \

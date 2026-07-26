@@ -43,7 +43,7 @@ author="$(printf '%s' "$pr_json" | jq -r '.user.login // ""')"
 BOT_ALLOWED='^(Cargo\.toml|Cargo\.lock|\.github/workflows/[^/]+\.ya?ml|\.github/dependabot\.yml|packages/[^/]+/package(-lock)?\.json)$'
 case "$author" in
   dependabot\[bot\]|renovate\[bot\]|github-actions\[bot\])
-    changed_now="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
+    changed_now="$(git diff --name-only "$(git merge-base "$BASE_SHA" "$HEAD_SHA" || echo "$BASE_SHA")" "$HEAD_SHA")"
     offending=""
     for f in $changed_now; do
       printf '%s' "$f" | grep -qE "$BOT_ALLOWED" || offending="$offending$f
@@ -148,7 +148,13 @@ EOF
   exit 1
 fi
 
-changed="$(git diff --name-only "$BASE_SHA" "$HEAD_SHA")"
+# THREE dots, not two. `git diff A B` is a two-dot diff and shows everything
+# that differs between the tips, so once other pull requests merge into main the
+# base sha advances and THEIR files appear in THIS diff, producing a false scope
+# violation the author cannot act on. The three-dot form diffs against the merge
+# base, which is what "the files this branch changed" actually means.
+MERGE_BASE="$(git merge-base "$BASE_SHA" "$HEAD_SHA")" || MERGE_BASE="$BASE_SHA"
+changed="$(git diff --name-only "$MERGE_BASE" "$HEAD_SHA")"
 
 echo "declared in issue #$issue:"; printf '  %s\n' $declared
 echo "changed by this PR:"; printf '  %s\n' $changed
