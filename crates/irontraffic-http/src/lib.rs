@@ -43,6 +43,7 @@
 //! `clippy::arithmetic_side_effects` to enforce that.
 
 pub mod error;
+pub mod field;
 pub mod limits;
 pub mod scalar;
 
