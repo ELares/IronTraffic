@@ -563,9 +563,28 @@ jobs:
         # A PR may still PROPOSE a change to this script, same as any other
         # gate script; it takes effect on the next PR once a human has
         # reviewed it, not on the PR that introduces it.
+        #
+        # Fetch the EXACT base commit (issue #535), not the base branch NAME.
+        # This job only ever runs on `pull_request` (the job level `if` above),
+        # so `github.event.pull_request.base.sha` is always set. The step below
+        # that actually compares files uses that identical SHA as `BASE_SHA`.
+        # Fetching by branch name instead used to mean this step and that
+        # comparison could silently disagree the moment another pull request
+        # merged into the base branch in between: this fetch would pick up
+        # whatever the base branch's tip happened to be at that instant, which
+        # is not necessarily the commit `BASE_SHA` names once the base branch
+        # has moved past it. `git merge-base` then has no path to a shared
+        # ancestor for a commit it never actually fetched, and
+        # scripts/pr-scope-check.sh's own fallback silently substituted
+        # `BASE_SHA` for the merge base, producing a two dot diff that blamed
+        # this pull request for whatever DID land on the base branch in that
+        # window (found on PR #512, which was told it changed files belonging
+        # to issue #113's already merged SNI normalization work). Fetching the
+        # SHA directly ties both steps to the same immutable commit no matter
+        # how many merges land on the base branch in between.
         run: |
           set -euo pipefail
-          git fetch --depth=1 origin "${{ github.base_ref || github.ref_name }}"
+          git fetch --depth=1 origin "${{ github.event.pull_request.base.sha }}"
           if git cat-file -e "FETCH_HEAD:scripts/pr-scope-check.sh" 2>/dev/null; then
             git checkout FETCH_HEAD -- scripts/pr-scope-check.sh
             echo "restored from base: scripts/pr-scope-check.sh"

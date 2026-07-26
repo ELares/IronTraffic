@@ -161,7 +161,33 @@ fi
 # base sha advances and THEIR files appear in THIS diff, producing a false scope
 # violation the author cannot act on. The three-dot form diffs against the merge
 # base, which is what "the files this branch changed" actually means.
-MERGE_BASE="$(git merge-base "$BASE_SHA" "$HEAD_SHA")" || MERGE_BASE="$BASE_SHA"
+#
+# A FAILED merge-base is a FAILURE, not a two-dot diff wearing a fallback
+# (issue #535). This used to be `|| MERGE_BASE="$BASE_SHA"`, which silently
+# turned exactly the failure the paragraph above describes into the very
+# comparison it exists to avoid: if `git merge-base` cannot find a shared
+# ancestor, that almost always means this checkout never actually fetched the
+# commit `BASE_SHA` names (its own fetch step raced a later commit landing on
+# the base branch), not that no common ancestor exists. Substituting `BASE_SHA`
+# then diffs against a commit this branch may never have descended from at
+# all, and reports every file whatever else landed on the base branch in that
+# window as an undeclared change in THIS pull request, exactly what happened
+# to PR #512 (blamed for issue #113's already merged SNI normalization files).
+# `scripts/test-census.sh` already gets this right for its own merge base:
+# fail loudly and let the run be investigated or re-tried, never guess.
+if ! MERGE_BASE="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"; then
+  cat >&2 <<EOF
+FAIL: could not compute a merge base between BASE_SHA ($BASE_SHA) and HEAD_SHA
+($HEAD_SHA). This almost always means the checkout does not actually have the
+commit BASE_SHA names, not that the two commits share no history. Falling back
+to a two-dot diff against BASE_SHA would compare against a commit this branch
+may not descend from at all once other pull requests have merged into the base
+branch since this branch's last rebase, and would misreport every file those
+merges touched as an undeclared change in THIS pull request. Re-run this check
+rather than trust a result computed without a real merge base.
+EOF
+  exit 1
+fi
 changed="$(git diff --name-only "$MERGE_BASE" "$HEAD_SHA")"
 
 echo "declared in issue #$issue:"; printf '  %s\n' $declared
