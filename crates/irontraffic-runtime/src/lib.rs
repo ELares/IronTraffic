@@ -4,5 +4,9 @@
 //! This crate and `irontraffic-io` are the only crates permitted to name `tokio`.
 
 pub mod cgroup;
+pub mod plane;
 
 pub use cgroup::{MAX_WORKERS, QuotaSource, WorkerDerivation, derive_workers, host_parallelism};
+pub use plane::{
+    ControlPlane, DataPlane, MAX_BLOCKING_THREADS, RuntimeConfig, RuntimeError, RuntimeMode,
+};

@@ -648,7 +648,9 @@ dependencies = [
 name = "irontraffic-runtime"
 version = "0.1.0"
 dependencies = [
+ "irontraffic-io",
  "thiserror",
+ "tokio",
  "tracing",
 ]
 
