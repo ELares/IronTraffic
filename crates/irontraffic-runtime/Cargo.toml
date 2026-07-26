@@ -12,7 +12,9 @@ description = "Runtime construction for IronTraffic."
 workspace = true
 
 [dependencies]
-# Used by `runtime-dataplane-build` (#12) for the runtime startup log.
+# Used by `runtime-dataplane-build` (#12) for the runtime startup log, and by
+# `runtime-core-scope` (#13) to log the observed migration outcome in the
+# forced-migration test rather than printing to stdout/stderr.
 tracing = { workspace = true }
 # Used by `runtime-dataplane-build` (#12) for typed error enums.
 thiserror = { workspace = true }
@@ -21,5 +23,22 @@ thiserror = { workspace = true }
 tokio = { workspace = true }
 # Used by `runtime-dataplane-build` (#12): `DataPlane::spawner` and
 # `ControlPlane::spawner` return `irontraffic_io::Spawner`, the only way out
-# of this crate into task spawning.
+# of this crate into task spawning. `runtime-core-scope` (#13) also calls
+# `irontraffic_io::buffer::BufPool::with_current` from `turn_tick`.
 irontraffic-io = { path = "../irontraffic-io", version = "0.1.0" }
+# CachePadded for the per-core state array (`runtime-core-scope`, #13).
+crossbeam-utils = { workspace = true }
+# The cached coarse clock (`AtomicCoarseCache`) `turn_tick` refreshes and
+# `CoreCtx::now_mono`/`now_wall` read (`runtime-core-scope`, #13).
+irontraffic-time = { path = "../irontraffic-time", version = "0.1.0" }
+# `wyrand_step` and `split_mix64`, the pure functions that let the per-core
+# RNG state live in an atomic (`runtime-core-scope`, #13).
+irontraffic-rand = { path = "../irontraffic-rand", version = "0.1.0" }
+
+[dev-dependencies]
+proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "core_scope"
+harness = false
