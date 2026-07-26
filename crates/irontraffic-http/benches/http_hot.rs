@@ -20,12 +20,13 @@
 //! reported throughput against these numbers by hand.
 
 use bytes::BytesMut;
-use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use irontraffic_http::authority::Authority;
 use irontraffic_http::field::{validate_name, validate_value};
 use irontraffic_http::framing::{OtherCodings, resolve_request_framing};
 use irontraffic_http::known::{self, KnownHeader};
 use irontraffic_http::section::{FieldSection, FieldSectionBuilder};
+use irontraffic_http::strip;
 use irontraffic_http::{Limits, Method, Scheme, WireVersion};
 use std::hint::black_box;
 
@@ -246,6 +247,27 @@ fn typical_framing_section() -> FieldSection {
     builder.finish(&mut arena)
 }
 
+/// Builds the "typical section" input for `bench_strip_ingress`: 16 fields,
+/// one `connection: keep-alive`.
+#[allow(
+    clippy::unwrap_used,
+    reason = "bench harness setup, not request-path code: every name/value here is a \
+              short fixed literal well inside Limits::DEFAULT, so push cannot fail"
+)]
+fn typical_strip_section() -> FieldSection {
+    let limits = Limits::DEFAULT.clamped();
+    let mut arena = BytesMut::new();
+    let mut builder = FieldSectionBuilder::new(&arena, &limits);
+    for i in 0_u32..15 {
+        let name = format!("x-typical-{i:02}");
+        builder.push(&mut arena, name.as_bytes(), b"v").unwrap();
+    }
+    builder
+        .push(&mut arena, b"connection", b"keep-alive")
+        .unwrap();
+    builder.finish(&mut arena)
+}
+
 /// Builds the "chunked section" input for [`bench_resolve_framing`]: 16
 /// fields under `Limits::DEFAULT`, the last of which is
 /// `transfer-encoding: chunked`.
@@ -264,6 +286,46 @@ fn chunked_framing_section() -> FieldSection {
     }
     builder
         .push(&mut arena, b"transfer-encoding", b"chunked")
+        .unwrap();
+    builder.finish(&mut arena)
+}
+
+/// Builds the "adversarial section" input for `bench_strip_ingress`: 100
+/// fields, two `connection` lines naming 32 tokens combined
+/// (`x-adv-00..x-adv-31`), of which only the first 16 (`x-adv-00..x-adv-15`)
+/// match a field actually present. The other 16 name nothing, so the
+/// `O(h * w)` match pass cannot short circuit once every real field has
+/// already been found.
+#[allow(
+    clippy::unwrap_used,
+    reason = "bench harness setup, not request-path code: every name/value here is a \
+              short fixed literal well inside Limits::DEFAULT, so push cannot fail"
+)]
+fn adversarial_strip_section() -> FieldSection {
+    let limits = Limits::DEFAULT.clamped();
+    let mut arena = BytesMut::new();
+    let mut builder = FieldSectionBuilder::new(&arena, &limits);
+    for i in 0_u32..16 {
+        let name = format!("x-adv-{i:02}");
+        builder.push(&mut arena, name.as_bytes(), b"v").unwrap();
+    }
+    for i in 0_u32..82 {
+        let name = format!("x-fill-{i:02}");
+        builder.push(&mut arena, name.as_bytes(), b"v").unwrap();
+    }
+    let first_line = (0_u32..16)
+        .map(|i| format!("x-adv-{i:02}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    let second_line = (16_u32..32)
+        .map(|i| format!("x-adv-{i:02}"))
+        .collect::<Vec<_>>()
+        .join(",");
+    builder
+        .push(&mut arena, b"connection", first_line.as_bytes())
+        .unwrap();
+    builder
+        .push(&mut arena, b"connection", second_line.as_bytes())
         .unwrap();
     builder.finish(&mut arena)
 }
@@ -351,6 +413,52 @@ fn bench_resolve_framing(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmarks `strip::strip_ingress` on the two inputs the design budgets
+/// (reference runner, same methodology as the rest of this file): under
+/// 400 ns for the typical 16-field section and under 6 microseconds for the
+/// adversarial 100-field, 32-token section, the `O(h * w)` worst case this
+/// benchmark exists to keep visible. Criterion does not enforce the budget
+/// itself; compare the reported time against it by hand.
+///
+/// `strip_ingress` mutates its section in place by removing fields, so each
+/// iteration is measured with `iter_batched`: reusing one section across
+/// iterations would strip it once on the first call and time an
+/// already-stripped section on every call after that.
+fn bench_strip_ingress(c: &mut Criterion) {
+    let limits = Limits::DEFAULT.clamped();
+    let mut group = c.benchmark_group("bench_strip_ingress");
+
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("typical_16_fields", |b| {
+        b.iter_batched(
+            typical_strip_section,
+            |mut section| {
+                black_box(strip::strip_ingress(
+                    black_box(&mut section),
+                    black_box(&limits),
+                ))
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("adversarial_100_fields_32_tokens", |b| {
+        b.iter_batched(
+            adversarial_strip_section,
+            |mut section| {
+                black_box(strip::strip_ingress(
+                    black_box(&mut section),
+                    black_box(&limits),
+                ))
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_authority_parse,
@@ -358,5 +466,6 @@ criterion_group!(
     bench_header_lookup,
     bench_known_classify,
     bench_resolve_framing,
+    bench_strip_ingress,
 );
 criterion_main!(benches);

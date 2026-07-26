@@ -51,6 +51,7 @@ pub mod known;
 pub mod limits;
 pub mod scalar;
 pub mod section;
+pub mod strip;
 
 pub use error::RejectReason;
 pub use limits::{ClampedLimits, Limits};
