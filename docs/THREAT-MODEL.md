@@ -238,6 +238,49 @@ arrives on.
 **What is out of scope here.** Connection admission, rate limiting, and per-source limits are not
 this module's job; it creates the socket and reports what it applied.
 
+## Request deadlines
+
+**What is attacker-controlled.** Every inbound timeout signal `deadline::establish` reads is set
+by the connecting peer: `grpc-timeout` on every connection (it is a standard gRPC header, never
+stripped by the forwarding trust policy), `x-envoy-expected-rq-timeout-ms` when
+`respect_expected_rq_timeout` is enabled, and `x-envoy-upstream-rq-timeout-ms` on a connection the
+forwarding trust policy has marked trusted-internal. The last of those is stripped at ingress on
+every other connection by the trust policy (decision ledger entry 20), but `establish` still
+requires `trusted_internal` before honouring it, because "trusted-internal" means "another one of
+our hops", not "will never send a hostile value".
+
+**Structural control: an untrusted peer may only shorten its budget.** `grpc-timeout` is not part
+of the `x-envoy-*` family and is never stripped, so an anonymous client can set it on any route.
+Without a further rule, a route configured for a 1 second timeout would hand any client a 60
+second budget for the price of one header, a 60x multiplier on how long that request pins a
+downstream stream slot, an upstream connection, an upstream stream slot, a replay buffer, and a
+queue entry, across every concurrent request that does it. `establish` caps any budget that came
+from an inbound header, on a connection that is not trusted-internal, at the route's own
+configured timeout: `budget = min(budget, route_timeout_ms)`. A client-supplied deadline shorter
+than the route's is still honoured exactly, because honouring it only ever frees resources sooner.
+`deadline_inbound_clipped_to_route` is incremented whenever this clip changes the value, so an
+operator can see clients asking for more than the route allows.
+
+**The `[min_timeout_ms, max_timeout_ms]` clamp.** Every established budget, regardless of which
+signal produced it, is clamped to `[min_timeout_ms, max_timeout_ms]` (defaults 1 and 60_000)
+before it becomes a `Deadline`. An unbounded client-supplied timeout is a resource-exhaustion
+vector on its own: a connection, a stream slot, an upstream connection, and a replay buffer all
+stay pinned for however long the attacker's header claims.
+
+**The saturating narrowing that stops a wrapping cast.** A legal `grpc-timeout` value can exceed
+`u32::MAX` milliseconds by four orders of magnitude (`99999999H` is about 11,415 years). Narrowing
+it to the `u32` the rest of this module works in uses `u32::try_from(..).unwrap_or(u32::MAX)`,
+never `as u32`. A wrapping cast reduces a huge value modulo 2^32 and can land anywhere in the u32
+range, including below `max_timeout_ms`, which would silently hand the client a budget unrelated
+to what it asked for; saturating to `u32::MAX` instead guarantees the value is still clamped down
+to `max_timeout_ms` afterward, exactly as if the client had asked for the largest timeout the
+route allows.
+
+**Bounded parse cost.** `parse_grpc_timeout` scans at most 9 bytes (8 digits plus one unit byte)
+and `parse_u32_ms` scans at most 10 bytes (the longest a `u32` can print as decimal); both reject
+immediately on a longer value rather than scanning it. Neither parser allocates or calls
+`core::str::from_utf8`: a header value is arbitrary bytes, and the digit and unit checks operate
+on them directly.
 ## Listener sharding and connection distribution
 
 **The kernel chooses the shard, and an attacker chooses the input to that choice.** The kernel

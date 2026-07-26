@@ -1,0 +1,28 @@
+[package]
+name = "irontraffic-resilience-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+# An EMPTY workspace table. This is load bearing: without it, cargo sees a manifest inside
+# a workspace member directory that is not listed in the root `[workspace] members` and
+# fails every build in the repository with "current package believes it's in a workspace
+# when it's not". The empty table makes the fuzz crate its own one-member workspace, which
+# is what `cargo fuzz init` generates and what the rest of this repository already does
+# (see `config-load-and-validate` (#15) and `forward-bidirectional` (#20)). Because it is
+# its own workspace it cannot use `edition.workspace = true`, hence the literal edition.
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+arbitrary = { version = "1", features = ["derive"] }
+irontraffic-resilience = { path = ".." }
+
+[[bin]]
+name = "fuzz_deadline_headers"
+path = "fuzz_targets/fuzz_deadline_headers.rs"
+test = false
+doc = false

@@ -22,3 +22,7 @@ criterion.workspace = true
 [[bench]]
 name = "primitives"
 harness = false
+
+[[bench]]
+name = "deadline"
+harness = false
