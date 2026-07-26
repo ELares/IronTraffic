@@ -120,3 +120,38 @@ Later issues append one subsection per surface here: `path-normalization` (#29),
 `mplex-pseudo-header-validation` (#38) and `proxy-protocol-parser` (#43) each add one, and
 `desync-corpus-and-reject-table` (#47) adds a section 6 that ties every named attack to its corpus
 entry.
+
+## Listening sockets and socket options
+
+**What the listening socket exposes.** A TCP port reachable by anyone who can route to the bound
+address. Binding `0.0.0.0` exposes it on every interface including ones the operator may not have
+considered; binding a specific address is the safer default when the deployment allows it.
+
+**`SO_REUSEPORT` and who may join the group.** On Linux the kernel requires every socket in a
+reuseport group to have the same effective UID as the socket that created the group, and it hashes
+inbound connections across every socket currently in the group, so a local process running as the
+same user can join the group and receive a share of inbound connections; a process running as a
+different user cannot. That UID check is a Linux behaviour and is not guaranteed on other platforms.
+On BSD-derived kernels, including macOS, a same-UID join is not a share: measured against the real
+`bind_listener` with `SockOpts::default()`, an ordinary unprivileged same-UID `python3` process that
+joined our group received every inbound connection while we received none (`ours=0 attacker=40` over
+40 connections), and when that process never called `accept`, every one of those connections was
+silently dropped rather than refused (`0/20` accepted by us, `20/20` black-holed), with no error and
+no signal visible on our own socket. `SockOpts::default()` sets `reuse_port: true`, so this
+precondition is already in effect for every listener created with default options; it is not
+something an operator opts into. Consequence: run the proxy as a dedicated, unshared user account so
+no untrusted local process can ever share its effective UID, and set `reuse_port: false` on any host
+where that cannot be guaranteed. On Linux, failing to do so risks a share of inbound connections going
+to the untrusted process; on a BSD-derived host it risks the whole listener being silently redirected
+to that process or black-holed outright, with nothing in `BindOutcome` or any log line to distinguish
+either outcome from a healthy, fully-shared group.
+
+**`SO_REUSEADDR` and address specificity.** With `SO_REUSEADDR` set on both sides, a second local
+process can bind a more specific address on the same port (for example `127.0.0.1:8080` while we
+hold `0.0.0.0:8080`), and the kernel delivers matching connections to the more specific socket. That
+is a local traffic-hijack path with the same "same host, same or greater privilege" precondition as
+the reuseport case. Same mitigation, plus: prefer binding the specific address the traffic actually
+arrives on.
+
+**What is out of scope here.** Connection admission, rate limiting, and per-source limits are not
+this module's job; it creates the socket and reports what it applied.
