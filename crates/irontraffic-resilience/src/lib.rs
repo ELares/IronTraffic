@@ -10,6 +10,7 @@
 pub mod clock;
 pub mod config;
 pub mod deadline;
+pub mod health;
 pub mod ids;
 pub mod limits;
 pub mod outlier;

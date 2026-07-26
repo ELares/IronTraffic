@@ -27,6 +27,10 @@ name = "primitives"
 harness = false
 
 [[bench]]
+name = "timer_wheel"
+harness = false
+
+[[bench]]
 name = "limits"
 harness = false
 
