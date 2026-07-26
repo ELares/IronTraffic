@@ -23,6 +23,7 @@ use bytes::BytesMut;
 use criterion::{BatchSize, Criterion, Throughput, criterion_group, criterion_main};
 use irontraffic_http::authority::Authority;
 use irontraffic_http::field::{validate_name, validate_value};
+use irontraffic_http::forwarded::ForwardedChain;
 use irontraffic_http::framing::{OtherCodings, resolve_request_framing};
 use irontraffic_http::known::{self, KnownHeader};
 use irontraffic_http::section::{FieldSection, FieldSectionBuilder};
@@ -459,6 +460,77 @@ fn bench_strip_ingress(c: &mut Criterion) {
     group.finish();
 }
 
+/// Benchmarks `ForwardedChain::parse_into` on the three inputs the design
+/// budgets (reference runner, same as above): under 90 ns for the
+/// single-entry `X-Forwarded-For` case, under 300 ns for the `Forwarded`
+/// case, and under 2.5 microseconds for the 32-entry case. Each case reuses
+/// one `BytesMut` across iterations, exactly as `bench_authority_parse`
+/// does: `parse_into` only ever writes a `host` claim into it, and that
+/// write is taken back out with `split_off` at the end of every call, so the
+/// buffer never grows across iterations regardless of whether a `host` was
+/// present.
+fn bench_forwarded_parse(c: &mut Criterion) {
+    let mut group = c.benchmark_group("bench_forwarded_parse");
+
+    let xff_single: &[u8] = b"203.0.113.7";
+    group.throughput(Throughput::Bytes(xff_single.len() as u64));
+    let mut out_single = BytesMut::new();
+    group.bench_function("xff_single_entry", |b| {
+        b.iter(|| {
+            black_box(ForwardedChain::parse_into(
+                core::iter::empty(),
+                core::iter::once(black_box(xff_single)),
+                core::iter::empty(),
+                &Limits::DEFAULT.clamped(),
+                &mut out_single,
+            ))
+        });
+    });
+
+    let forwarded_case: &[u8] = b"for=203.0.113.7;proto=https;host=a.example, for=198.51.100.2";
+    group.throughput(Throughput::Bytes(forwarded_case.len() as u64));
+    let mut out_forwarded = BytesMut::new();
+    group.bench_function("forwarded_two_elements", |b| {
+        b.iter(|| {
+            black_box(ForwardedChain::parse_into(
+                core::iter::once(black_box(forwarded_case)),
+                core::iter::empty(),
+                core::iter::empty(),
+                &Limits::DEFAULT.clamped(),
+                &mut out_forwarded,
+            ))
+        });
+    });
+
+    // 32 XFF entries across 4 lines: the cap.
+    let xff_lines: [Vec<u8>; 4] = core::array::from_fn(|_| {
+        let mut line = Vec::new();
+        for i in 0..8_u32 {
+            if i > 0 {
+                line.extend_from_slice(b", ");
+            }
+            line.extend_from_slice(b"203.0.113.7");
+        }
+        line
+    });
+    let total_bytes: u64 = xff_lines.iter().map(|line| line.len() as u64).sum();
+    group.throughput(Throughput::Bytes(total_bytes));
+    let mut out_capped = BytesMut::new();
+    group.bench_function("xff_32_entries_across_4_lines", |b| {
+        b.iter(|| {
+            black_box(ForwardedChain::parse_into(
+                core::iter::empty(),
+                black_box(xff_lines.iter().map(Vec::as_slice)),
+                core::iter::empty(),
+                &Limits::DEFAULT.clamped(),
+                &mut out_capped,
+            ))
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_authority_parse,
@@ -467,5 +539,6 @@ criterion_group!(
     bench_known_classify,
     bench_resolve_framing,
     bench_strip_ingress,
+    bench_forwarded_parse
 );
 criterion_main!(benches);
