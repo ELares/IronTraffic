@@ -1,0 +1,17 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+
+//! The transport seam. This crate is the ONLY place in the workspace permitted to
+//! name `tokio`, enforced by the `transport-seam` rule in `scripts/invariant-lints.sh`.
+
+#![deny(missing_docs)]
+
+pub mod acceptor;
+pub mod spawn;
+pub mod timer;
+pub mod transport;
+
+pub use acceptor::{Acceptor, TcpAcceptor};
+pub use hyper::rt::{Read, ReadBuf, ReadBufCursor, Sleep, Timer, Write};
+pub use spawn::{NoRuntime, Spawner, TaskError, TaskHandle};
+pub use timer::{SystemTimer, TimedOut, sleep, with_timeout};
+pub use transport::{TcpTransport, Transport};
