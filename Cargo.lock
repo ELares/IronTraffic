@@ -367,6 +367,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "irontraffic-router"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+]
+
+[[package]]
 name = "irontraffic-runtime"
 version = "0.1.0"
 dependencies = [

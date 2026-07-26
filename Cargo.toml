@@ -13,7 +13,7 @@
 
 [workspace]
 resolver = "3"
-members = ["crates/irontraffic", "crates/irontraffic-http", "crates/irontraffic-io", "crates/irontraffic-rand", "crates/irontraffic-resilience", "crates/irontraffic-runtime", "crates/irontraffic-time"]
+members = ["crates/irontraffic", "crates/irontraffic-http", "crates/irontraffic-io", "crates/irontraffic-rand", "crates/irontraffic-resilience", "crates/irontraffic-router", "crates/irontraffic-runtime", "crates/irontraffic-time"]
 
 [workspace.package]
 version = "0.1.0"
