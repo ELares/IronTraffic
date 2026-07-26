@@ -145,11 +145,21 @@ jobs:
       - name: default features build (the edge and k3s profile must not rot)
         # The data-plane-only build is what runs on constrained edge and k3s
         # nodes. It is built on every PR so that a dependency added to the
-        # control plane cannot silently land in the data plane. Feature
-        # exclusivity has no bearing on a --no-default-features build (it
-        # activates none of the exclusive features either), so this line is
-        # deliberately not excluded from anything.
-        run: cargo check --locked --workspace --no-default-features
+        # control plane cannot silently land in the data plane. A matrixed
+        # crate (irontraffic-tls's three crypto-* providers today) activates
+        # NONE of its exclusive features under --no-default-features, and
+        # zero providers is itself a compile_error! by design, not an
+        # accident: the crate requires exactly one. So this lane excludes
+        # matrixed crates for the same reason the --all-features lanes above
+        # do, and the feature-matrix job below already covers each of them
+        # under this exact flag combination, once per valid provider.
+        run: |
+          set -euo pipefail
+          exclude=()
+          while IFS= read -r name; do
+            [ -n "$name" ] && exclude+=(--exclude "$name")
+          done < <(scripts/feature-matrix.sh matrixed-names)
+          cargo check --locked --workspace "${exclude[@]}" --no-default-features
 
   feature-matrix:
     name: feature matrix (${{ matrix.crate }}, ${{ matrix.features }})
