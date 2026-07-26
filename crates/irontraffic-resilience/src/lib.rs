@@ -12,5 +12,6 @@ pub mod config;
 pub mod deadline;
 pub mod ids;
 pub mod limits;
+pub mod outlier;
 pub mod pressure;
 pub mod rng;
