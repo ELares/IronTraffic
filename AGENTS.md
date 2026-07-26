@@ -75,7 +75,7 @@ ready. Do not open it hoping CI is more forgiving; it is the same checks.
 | `cargo clippy --workspace --all-targets --all-features -- -D warnings` at `pedantic` | the whole class of "compiles but is wrong" |
 | `cargo test --workspace --all-features` plus doctests | behavior |
 | `cargo check --no-default-features` | a control-plane dependency leaking into the edge build |
-| msrv (1.85) | using a language feature newer than the floor |
+| msrv (1.89) | using a language feature newer than the floor |
 | musl static build | a C dependency breaking the single static binary promise |
 | `cargo deny check` | licenses, advisories, duplicate and unvetted sources |
 | `cargo fuzz` smoke | parser panics on malformed input; fails closed if a parser crate has no target |
@@ -87,6 +87,29 @@ ready. Do not open it hoping CI is more forgiving; it is the same checks.
 | dash scan | the prose rule |
 | PR scope check | a diff touching files the issue did not declare |
 | governance files | trust infrastructure being quietly deleted |
+
+## MSRV policy
+
+The workspace floor is Rust 1.89 (`Cargo.toml` `[workspace.package].rust-version`, mirrored in
+`clippy.toml`'s `msrv` key and the `msrv` CI job). It did not start there: 1.85 was the original floor,
+chosen only because it is the first release with edition 2024. The floor moved to 1.89 because the
+pinned Kubernetes client, `kube` 4.2.0, declares `rust-version = "1.89.0"`, and a workspace cannot build
+below the highest floor any of its dependencies declare.
+
+That conflict, a pinned dependency needing a newer toolchain than the workspace promises, will happen
+again. When it does, it is a specification-versus-specification conflict, not an implementation error,
+and it is not yours to resolve unilaterally: comment on the issue and stop, per rule 1. The owner's
+options are the same three every time: raise the workspace floor (a compatibility cost that lands on
+every crate and every future issue, not only the one that needed it), avoid or downgrade the dependency,
+or exempt the one crate from the MSRV lane. The third option is permanently rejected. It was considered
+and refused the first time this came up (issue #464) precisely because it would be the first per-crate
+gate exemption in the repository, and an exemption mechanism that exists gets reached for by the next
+implementer on whatever hard lint is inconvenient that day, not only on a genuine MSRV conflict.
+
+A floor change is also not a one-line version bump. It can invalidate reasoning stated elsewhere in the
+corpus (an issue that rejected a crate or a design partly on MSRV grounds may need its stated reasoning
+rewritten even if its conclusion still holds), so raising it means searching for and correcting every
+place that reasoning was used, not just updating the number.
 
 ## Rust specifics that bite in this codebase
 

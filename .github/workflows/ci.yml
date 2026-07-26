@@ -211,14 +211,14 @@ jobs:
           echo "ok: all $n declared feature-matrix cell(s) ran and passed"
 
   msrv:
-    name: msrv (1.85)
+    name: msrv (1.89)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     env:
       # rust-toolchain.toml pins a newer stable and outranks `rustup default`,
       # which would silently turn this lane into a no-op. RUSTUP_TOOLCHAIN
-      # outranks the toolchain file, so the check genuinely runs under 1.85.
-      RUSTUP_TOOLCHAIN: "1.85"
+      # outranks the toolchain file, so the check genuinely runs under 1.89.
+      RUSTUP_TOOLCHAIN: "1.89"
     steps:
       - uses: actions/checkout@v4
       - name: Restore scripts/feature-matrix.sh from the BASE branch
@@ -229,7 +229,7 @@ jobs:
             git checkout FETCH_HEAD -- scripts/feature-matrix.sh
           fi
           chmod +x scripts/feature-matrix.sh
-      - uses: dtolnay/rust-toolchain@1.85
+      - uses: dtolnay/rust-toolchain@1.89
       - uses: Swatinem/rust-cache@v2
       - name: check (workspace, minus any crate with a feature matrix)
         run: |

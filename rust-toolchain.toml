@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: MIT OR Apache-2.0
 #
 # Pinned toolchain, so a local build and a CI build are the same build. The
-# workspace MSRV (Cargo.toml rust-version) is 1.85, the edition-2024 floor,
-# matching the sibling Iron projects; CI runs a separate job against 1.85 to
-# prove the floor still holds.
+# workspace MSRV (Cargo.toml rust-version) is 1.89: edition 2024 only requires
+# 1.85, but the pinned Kubernetes client (kube 4.2.0) requires rustc 1.89.0,
+# and that is the binding constraint now. CI runs a separate job against 1.89
+# to prove the floor still holds.
 [toolchain]
 channel = "1.97.0"
 components = ["rustfmt", "clippy"]
