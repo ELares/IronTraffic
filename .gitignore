@@ -5,6 +5,8 @@
 /fuzz/artifacts
 node_modules/
 packages/*/dist/
+packages/dashboard/.vite/
+playwright-report/
 .DS_Store
 *.profraw
 /bench-results/

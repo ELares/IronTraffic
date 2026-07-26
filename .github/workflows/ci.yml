@@ -487,3 +487,20 @@ jobs:
           BASE_SHA: ${{ github.event.pull_request.base.sha }}
           HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: scripts/pr-scope-check.sh
+
+  dashboard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version-file: packages/dashboard/.nvmrc
+          cache: npm
+          cache-dependency-path: packages/dashboard/package-lock.json
+      - run: ./scripts/dashboard-gate.sh --selftest
+      - run: ./scripts/dashboard-gate.sh

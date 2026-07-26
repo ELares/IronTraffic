@@ -1,0 +1,17 @@
+{
+  "name": "@irontraffic/dashboard",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "24.11.0"
+  },
+  "scripts": {
+    "gate": "npm run -s format:check",
+    "format": "prettier --write .",
+    "format:check": "prettier --check ."
+  },
+  "devDependencies": {
+    "prettier": "3.9.6"
+  }
+}
