@@ -4,6 +4,7 @@
 
 //! The compiled, immutable IronTraffic route table.
 
+pub mod build;
 pub mod ids;
 pub mod limits;
 pub mod normalize;
@@ -15,6 +16,7 @@ pub mod table;
 pub mod testutil;
 pub mod trace;
 
+pub use build::{CandInput, GroupParts, TrieBuildError, build_group};
 pub use ids::{
     ActionId, CertId, GroupId, ListenerId, MethodMask, NameId, NodeId, RouteId, SENTINEL,
 };
