@@ -137,7 +137,8 @@ what people write plugins for), `irontraffic-wasm` (feature gated).
 **API management.** `irontraffic-apim`, `irontraffic-schema`.
 
 **Control plane.** `irontraffic-config`, `irontraffic-store`, `irontraffic-cluster`,
-`irontraffic-admin`, `irontraffic-k8s` (feature gated), `irontraffic-dashboard`.
+`irontraffic-quota` (durable quota store), `irontraffic-admin`, `irontraffic-k8s`
+(feature gated), `irontraffic-dashboard`.
 
 **Binaries.** `irontraffic`, `irtctl`.
 
