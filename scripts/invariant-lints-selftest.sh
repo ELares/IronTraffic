@@ -767,6 +767,32 @@ workspace = true
 [dependencies]
 TOML
 
+# A cargo-fuzz crate. It sits at crates/<name>/fuzz/Cargo.toml and carries its
+# OWN empty [workspace] table, which is exactly how cargo-fuzz excludes it from
+# the parent workspace. Being a workspace root, it has nothing to inherit FROM
+# and `.workspace = true` would not parse, so crate-inherits-workspace must skip
+# it entirely.
+#
+# This fixture exists because the rule DID fire on one. Its selector is
+# `git ls-files -- 'crates/*/Cargo.toml'`, and git pathspec globbing lets `*`
+# cross a slash, so the pattern reached one directory deeper than it was written
+# for. The fix filters on the [workspace] declaration rather than on directory
+# depth, so it also covers any future nested workspace and cannot be defeated by
+# moving a crate a level down.
+mkdir -p "$B/crates/irontraffic-router/fuzz"
+cat > "$B/crates/irontraffic-router/fuzz/Cargo.toml" <<'TOML'
+[package]
+name = "irontraffic-router-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+TOML
+
 # The NOT-line-oriented forms added under #453/#456, each written the way
 # rustfmt actually produces them (or the way legitimate code uses the
 # construct), proving none of the fixes above turned into new false
