@@ -154,6 +154,7 @@ jobs:
           git fetch --depth=1 origin "${{ github.base_ref || github.ref_name }}"
           for f in scripts/invariant-lints.sh scripts/invariant-lints-selftest.sh \
                    scripts/dash-scan.sh scripts/pr-scope-check.sh scripts/test-census.sh \
+                   scripts/gate-fast.sh scripts/gate.sh \
                    clippy.toml deny.toml rustfmt.toml; do
             if git cat-file -e "FETCH_HEAD:$f" 2>/dev/null; then
               git checkout FETCH_HEAD -- "$f"
