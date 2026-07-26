@@ -7,6 +7,7 @@
 
 pub mod acceptor;
 pub mod buffer;
+pub mod net;
 pub mod shutdown;
 pub mod spawn;
 pub mod sys;
@@ -18,6 +19,7 @@ pub use buffer::{
     BufPool, CHUNK_SIZE, DEFAULT_POOL_CHUNKS, PoolStats, PooledBuf, acquire, compact_exact, stats,
 };
 pub use hyper::rt::{Read, ReadBuf, ReadBufCursor, Sleep, Timer, Write};
+pub use net::connect_tcp;
 pub use shutdown::{Phase, ShutdownController, ShutdownToken, accept_or_drain};
 pub use spawn::{NoRuntime, Spawner, TaskError, TaskHandle};
 pub use sys::{BindError, BindOutcome, Caps, SockOpts, bind_listener};

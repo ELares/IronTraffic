@@ -208,3 +208,19 @@ async fn with_timeout_reports_budget() {
     let result = with_timeout(Duration::from_millis(20), pending::<()>()).await;
     assert_eq!(result, Err(TimedOut { millis: 20 }));
 }
+
+#[tokio::test]
+async fn connect_tcp_reaches_a_listener() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let acceptor = TcpAcceptor::from_std(listener).unwrap();
+
+    let connecting = tokio::spawn(async move { irontraffic_io::net::connect_tcp(addr).await });
+
+    let (_accepted, _peer) = std::future::poll_fn(|cx| acceptor.poll_accept(cx))
+        .await
+        .unwrap();
+
+    let connected = connecting.await.unwrap().unwrap();
+    assert_eq!(connected.peer_addr().unwrap(), addr);
+}
