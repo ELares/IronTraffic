@@ -48,9 +48,11 @@
 #![deny(missing_docs)]
 
 pub mod accept;
+pub mod budget;
 pub mod listener;
 pub mod registry;
 
 pub use accept::{AcceptConfig, AcceptOutcome, BoxFut, ConnHandler, MAX_BACKOFF_MS, accept_loop};
+pub use budget::{ConnBudget, EnhanceYourCalm, FrameCosts, FrameEvent, TooManyStreams};
 pub use listener::{ListenError, ListenerReport, ShardedListener};
 pub use registry::{ConnGuard, ConnRegistry, RegistryStats};
