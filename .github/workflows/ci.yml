@@ -411,90 +411,33 @@ jobs:
           done
           echo "governance: ok"
 
-  fuzz:
-    name: fuzz (smoke, fails closed on a missing corpus)
+  fuzz-discover:
+    name: discover the fuzz matrix
     runs-on: ubuntu-latest
-    # 45, not the 25 this was, because 25 was not a budget anyone chose: it was
-    # a ceiling this job had been growing into for its whole life and finally
-    # crossed. The step below fuzzes EVERY declared target SERIALLY at
-    # -max_total_time=60, so its wall clock is a straight line in the target
-    # count, about one minute per target plus one cargo-fuzz install and one
-    # build per fuzz crate. At 20 targets it ran 24m31s against a 25m ceiling
-    # and passed with 29 seconds to spare. The 21st target, added by #686,
-    # took it to 25m17s and the job was cancelled, which is how a timeout
-    # reports here: not as a failure with a message naming the deadline, but
-    # as `cancelled`, indistinguishable at a glance from a superseded run.
-    # That cost real time to diagnose, because the run LOOKS like GitHub
-    # cancelling a stale push rather than the gate running out of clock.
-    #
-    # It broke main, not just one PR. Every branch cut after #686 inherits a
-    # fuzz lane that cannot finish, so every PR is blocked on a required check
-    # that can never turn green again, and the repository has no way to merge
-    # its way out.
-    #
-    # Deliberately NOT fixed by lowering -max_total_time. That number is the
-    # gate's actual strength, and trading assurance for clock is the exact
-    # move this lane's four fail-closed checks exist to prevent. Raising the
-    # ceiling changes nothing about what runs: same targets, same 60 seconds
-    # each, same failures caught. It only costs CI minutes.
-    #
-    # This buys room for roughly 20 more targets, so it is a reprieve and not
-    # a cure. The real fix is to shard this job per fuzz crate the way the
-    # feature matrix already shards, which makes the wall clock the slowest
-    # single crate instead of the sum of all of them and stops the deadline
-    # from being a function of how much the project has been fuzzed. That is
-    # tracked separately, and it has to keep this job's exact name, because
-    # that string is a required status check and branch protection waits on it
-    # forever if a redesign renames it.
-    timeout-minutes: 45
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.discover.outputs.matrix }}
+      parsers: ${{ steps.discover.outputs.parsers }}
     steps:
       - uses: actions/checkout@v7
-      - uses: dtolnay/rust-toolchain@nightly
-      - uses: Swatinem/rust-cache@v2
-      - name: Run every declared fuzz target briefly
-        # RUSTUP_TOOLCHAIN is set because rust-toolchain.toml pins 1.97.0 and
-        # that pin OUTRANKS the toolchain action above. Installing nightly is
-        # not the same as using it: without this the action installs nightly,
-        # the pin quietly wins, and cargo-fuzz dies on "the option Z is only
-        # accepted on the nightly compiler" while the job looks correctly
-        # configured. The musl job hit the same trap from the other direction
-        # and documents it: the pin is what cargo actually honours, so a lane
-        # that needs a different toolchain has to say so explicitly rather than
-        # assume the action decided it.
-        env:
-          RUSTUP_TOOLCHAIN: nightly
-        # FAILS CLOSED, same property as before, different location. A fuzz
-        # crate is its own workspace root and cargo-fuzz expects it beside the
-        # crate it fuzzes, so every real target in this repository lives at
-        # crates/<name>/fuzz/, never at a root fuzz/ that this repository does
-        # not have and will not add. See issue #509.
-        #
-        # Every branch below that could report success for having found or run
-        # nothing instead fails, the same discipline already applied to the
-        # census, the feature matrix, and the hot path rules: a lane that scans
-        # zero and reports green is the one defect class every one of those
-        # was rewritten to stop being.
+      - id: discover
+        # FAILS CLOSED (1 and 2 of 4), unchanged in meaning from the serial job
+        # this replaces. The other two live in the shard, because they are per
+        # crate, and the aggregate is re-checked in the gate.
         run: |
           set -euo pipefail
 
-          # Discover every per-crate fuzz project actually in the tree.
           fuzz_manifests=()
           while IFS= read -r m; do
             [ -n "$m" ] && fuzz_manifests+=("$m")
           done < <(find crates -mindepth 3 -maxdepth 3 -type f -name Cargo.toml -path '*/fuzz/Cargo.toml' | sort)
 
-          # The list of crates that MUST have one of the above is derived, not
-          # hardcoded. CONTRIBUTING.md's "threat-model rule (mandatory)"
-          # already requires every PR that ships a new parser over untrusted
-          # input to name that surface's crate in docs/THREAT-MODEL.md, in the
-          # same PR, reviewer-blocked if it does not. That makes the threat
-          # model the one place this list is curated by a rule this lane does
-          # not have to duplicate. Reading it here means this check ages with
-          # the document a human is already required to keep current, instead
-          # of a second, silent copy of the same fact that only this workflow
-          # remembers to update. It is a strictly better source than the two
-          # names it replaces: one of those two, irontraffic-config, is not
-          # even a crate that exists in this repository.
+          # The curated list of crates that MUST have a fuzz project is derived
+          # from docs/THREAT-MODEL.md, not hardcoded here. See the long note in
+          # the history of this file: CONTRIBUTING.md already requires every PR
+          # shipping a parser over untrusted input to name that crate there, so
+          # the threat model is the one place the list is maintained by a rule
+          # this workflow does not have to duplicate.
           named_in_threat_model=()
           while IFS= read -r n; do
             [ -n "$n" ] && named_in_threat_model+=("$n")
@@ -507,11 +450,18 @@ jobs:
           done
           echo "parser crates named in docs/THREAT-MODEL.md that exist under crates/: ${parser_crates[*]:-none}"
 
-          # FAILS CLOSED (1 of 4): every parser crate on record must have its
-          # own fuzz project. This is the direct replacement for the old
-          # single, root-relative, two-name check.
+          # FAILS CLOSED (1 of 4): every parser crate on record must have its own
+          # fuzz project.
           missing=()
           for name in "${parser_crates[@]:-}"; do
+            # `[ -n "$name" ] || continue` is NOT decoration. Under `set -u` an
+            # empty array expands via `${a[@]:-}` to ONE empty-string element, so
+            # without this guard a zero-parser tree produces `missing=("")`,
+            # `${#missing[@]}` is 1, and discovery hard-fails with a message that
+            # names no crate at all. The loop above has this guard; this one did
+            # not, which made main's own "no parser crate is on record yet"
+            # exit-0 branch unreachable for as long as it has existed.
+            [ -n "$name" ] || continue
             [ -f "crates/$name/fuzz/Cargo.toml" ] || missing+=("$name")
           done
           if [ "${#missing[@]}" -gt 0 ]; then
@@ -519,115 +469,265 @@ jobs:
             exit 1
           fi
 
-          # FAILS CLOSED (2 of 4): discovery itself must not go blind. Zero
-          # fuzz projects found anywhere while a parser crate is on record is
-          # the vacuous-success shape this whole lane exists to refuse, no
-          # matter whether it is check 1 above finding nothing or a bug in the
-          # find call it shares data with.
-          if [ "${#fuzz_manifests[@]}" -eq 0 ]; then
-            if [ "${#parser_crates[@]}" -gt 0 ]; then
-              echo "FAIL: a parser crate is on record (${parser_crates[*]}) but no crates/*/fuzz/Cargo.toml exists."
+          # FAILS CLOSED (2 of 4): discovery must not go blind. Zero fuzz projects
+          # while a parser crate is on record is the vacuous-success shape this
+          # whole lane exists to refuse.
+          if [ "${#fuzz_manifests[@]}" -eq 0 ] && [ "${#parser_crates[@]}" -gt 0 ]; then
+            echo "FAIL: a parser crate is on record (${parser_crates[*]}) but no crates/*/fuzz/Cargo.toml exists."
+            exit 1
+          fi
+
+          dirs=()
+          for manifest in "${fuzz_manifests[@]:-}"; do
+            [ -n "$manifest" ] && dirs+=("$(dirname "$manifest")")
+          done
+          # NOT `| grep -v '^$' |`. grep exits 1 when it selects nothing, and
+          # under `set -o pipefail` that kills the job before the matrix is ever
+          # written, so a legitimately empty tree died instead of emitting `[]`.
+          # The python filter already drops blank lines, so grep was redundant as
+          # well as fatal.
+          matrix="$(printf '%s\n' "${dirs[@]:-}" | python3 -c 'import json,sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))')"
+          echo "fuzz matrix: $matrix"
+          echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          echo "parsers=${#parser_crates[@]}" >> "$GITHUB_OUTPUT"
+
+  fuzz-shard:
+    name: fuzz ${{ matrix.dir }}
+    needs: fuzz-discover
+    if: needs.fuzz-discover.outputs.matrix != '[]'
+    strategy:
+      # fail-fast MUST stay false, but NOT for the reason first written here.
+      # The original claim was that a cancelled sibling would confuse the gate.
+      # It would not: GitHub aggregates matrix leg conclusions with failure
+      # outranking cancelled, so a failing leg that cancels its siblings still
+      # yields `failure` and the gate refuses for the right reason either way.
+      #
+      # The real reason is coverage of crashes. With fail-fast on you see ONE
+      # crash and must re-run to learn whether the other eight crates also crash,
+      # and surfacing crashes is the entire purpose of this lane. The cost is
+      # that a genuine crash burns the full set of shards rather than stopping
+      # early, which is a fair price for seeing every crash in one run.
+      fail-fast: false
+      matrix:
+        dir: ${{ fromJSON(needs.fuzz-discover.outputs.matrix) }}
+    runs-on: ubuntu-latest
+    # 20 per SHARD, not 45 for the whole lane. The serial job this replaces grew
+    # at 73 seconds per target against one fixed deadline and crossed it at 20
+    # targets (see #697). Sharded, the wall clock is the slowest single crate, so
+    # the deadline stops being a function of how much the project has been fuzzed.
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@nightly
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # KEYED PER SHARD. rust-cache derives its key from GITHUB_JOB, which is
+          # `fuzz-shard` for every matrix leg, so without this all nine shards
+          # computed one identical key, all restored whichever crate happened to
+          # save last, and eight of nine logged "Failed to save: Unable to reserve
+          # cache ... another job may be creating this cache" on every run.
+          # The lane would then permanently hold one arbitrary crate's artifacts
+          # while the other eight rebuilt their instrumented fuzz targets from
+          # scratch, paid straight out of the wall clock this sharding exists to
+          # buy. Measured on the live run of this branch before the fix.
+          key: ${{ matrix.dir }}
+      - name: Run every declared fuzz target in this crate briefly
+        env:
+          RUSTUP_TOOLCHAIN: nightly
+        env:
+          # VIA env, NEVER interpolated into the script body. `${{ }}` is textual
+          # substitution performed BEFORE bash sees the line, so a repository
+          # controlled directory name lands as shell source. In a double-quoted
+          # context that makes `$(...)` and backticks live; in a single-quoted one
+          # a lone quote ends the string and the rest is parsed as commands.
+          FUZZ_DIR: ${{ matrix.dir }}
+        run: |
+          set -euo pipefail
+          fuzz_dir="$FUZZ_DIR"
+          manifest="$fuzz_dir/Cargo.toml"
+          [ -f "$manifest" ] || { echo "FAIL: $manifest vanished between discovery and this shard."; exit 1; }
+
+          cargo install cargo-fuzz --locked
+
+          ran_names=()
+          echo "== discovering targets in $fuzz_dir =="
+          targets="$(cargo fuzz list --fuzz-dir "$fuzz_dir")"
+          # FAILS CLOSED (3 of 4): a fuzz project that declares zero targets is
+          # the other vacuous-success shape, an empty fuzz/ that exists only to
+          # satisfy check 1 without ever running anything.
+          if [ -z "$targets" ]; then
+            echo "FAIL: $manifest exists but declares no targets."
+            exit 1
+          fi
+          while IFS= read -r t; do
+            [ -n "$t" ] || continue
+            echo "== fuzzing $fuzz_dir :: $t =="
+            # crates/irontraffic-conn/fuzz (issue #573): building this fuzz
+            # crate's only dependency, irontraffic-conn, which pulls in
+            # tokio with rt-multi-thread for the crate's real accept loop,
+            # hits a deterministic rustc ICE on this job's nightly toolchain
+            # (rustc_codegen_ssa/mir/operand.rs:291, "not immediate" on
+            # tokio's Notified<Arc<Handle>> type), reproduced identically
+            # across multiple runs, so it is a compiler defect, not
+            # flakiness.
+            #
+            # Any fuzz crate whose dependency graph includes tokio can hit
+            # a deterministic rustc ICE on this job's nightly toolchain
+            # (rustc_codegen_ssa/mir/operand.rs:291, "not immediate" on
+            # tokio's Notified<Arc<Handle>> type) simply by compiling
+            # tokio's multi-thread runtime under this job's default build.
+            # Confirmed independently on two unrelated crates:
+            # crates/irontraffic-conn/fuzz (tokio via its own real accept
+            # loop) and crates/irontraffic-config/fuzz (tokio transitively
+            # via irontraffic-runtime). Detected rather than hand-listed,
+            # because a hand-maintained list already missed the second
+            # case once (see history below) and the workspace has more
+            # crates that transitively depend on tokio, via
+            # irontraffic-runtime or otherwise, than fuzz crates that have
+            # hit this so far.
+            #
+            # History, so the next person does not repeat either mistake:
+            # `--sanitizer none` alone (first attempt, issue #573) was
+            # verified only against a tree where the affected crate's
+            # fuzz/ did not exist yet, a false pass; the real run against
+            # the actual crate hit the identical ICE, and separately, the
+            # same `--sanitizer none`-only fix applied by hand to
+            # crates/irontraffic-config/fuzz (issue #582) hit it too, on
+            # PR #574, the same way. `--strip-dead-code false` is the
+            # corrected attempt: `cargo fuzz run --help` names dead-code
+            # stripping (default on) as a known cause of "unexpected
+            # behavior or even ICEs in the compiler", which matches this
+            # crash's shape (an OperandRef(Uninit ...) on a niche-optimized
+            # type nothing in any of these fuzz targets can ever reach)
+            # better than the sanitizer theory did. `--sanitizer none` is
+            # kept alongside it: still free for every crate this applies
+            # to, because none of their fuzz targets construct or enter a
+            # tokio runtime, so ASan was never able to find anything in
+            # tokio's own compiled code from any of them regardless.
+            #
+            # `cargo tree -p tokio` only resolves dependencies; it does not
+            # compile or codegen anything, so it cannot itself trip the
+            # ICE it is checking for. Exit 0 means tokio is somewhere in
+            # this fuzz crate's graph.
+            extra_fuzz_args=()
+            if cargo tree --manifest-path "$manifest" -p tokio >/dev/null 2>&1; then
+              extra_fuzz_args=(--sanitizer none --strip-dead-code false)
+            fi
+            # `${extra_fuzz_args[@]+"${extra_fuzz_args[@]}"}`, not the plain
+            # `"${extra_fuzz_args[@]}"` this started as: under `set -u`, an
+            # empty array expands to an "unbound variable" error on bash
+            # older than 4.4 even when quoted, which this script cannot
+            # assume it will never run under. Verified directly (both the
+            # empty and the populated case) before trusting it, the same
+            # way the invariant lints and the scope check's merge-base
+            # fallback in this repository were.
+            cargo fuzz run --fuzz-dir "$fuzz_dir" ${extra_fuzz_args[@]+"${extra_fuzz_args[@]}"} "$t" -- -max_total_time=60 -timeout=10
+            ran_names+=("$fuzz_dir :: $t")
+          done <<< "$targets"
+
+          echo "fuzz: ran ${#ran_names[@]} target(s) in $fuzz_dir:"
+          for n in "${ran_names[@]:-}"; do
+            [ -n "$n" ] && echo "  - $n"
+          done
+
+          # FAILS CLOSED (4 of 4), per shard. A future edit to the loop that
+          # skips appending to ran_names cannot silently drop to zero runs and
+          # still exit 0.
+          if [ "${#ran_names[@]}" -eq 0 ]; then
+            echo "FAIL: zero fuzz targets ran in $fuzz_dir."
+            exit 1
+          fi
+
+  fuzz:
+    # THE NAME ON THE NEXT LINE IS LOAD BEARING AND MUST NOT CHANGE.
+    #
+    # It is a required status check in this repository's branch protection.
+    # Branch protection waits forever on a context no job produces, which is not
+    # a visible failure: it presents as "Expected, waiting for status to be
+    # reported" and every pull request silently becomes unmergeable. That exact
+    # failure is live right now for a DIFFERENT context, `msrv (1.85)`, which was
+    # renamed to `msrv (1.89)` and left stale in the protection rule. See #698.
+    # So this is not a hypothetical worry: it is the second time in one file.
+    #
+    # The shards above are named separately and are NOT required checks. This
+    # job is the only thing branch protection sees, and it is a pure aggregator.
+    name: fuzz (smoke, fails closed on a missing corpus)
+    needs: [fuzz-discover, fuzz-shard]
+    # `always()` so this still runs when a shard fails, is skipped, or is never
+    # scheduled. Without it, a skipped shard would skip the gate too, and a
+    # skipped required check reports as neutral rather than failing.
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - env:
+          # EVERY ONE OF THESE COMES IN VIA env, NOT VIA `${{ }}` IN THE SCRIPT.
+          #
+          # `declared` is built from directory names found under crates/, so it is
+          # repository controlled. Interpolated directly it was a shell injection
+          # into the one job branch protection actually reads: a directory named
+          #     x'; exit 0; #
+          # closed the quote and ran `exit 0`, so this required check reported
+          # SUCCESS, having verified nothing, while shards were failing next to
+          # it. That is the vacuous-success shape the comments below say this
+          # lane exists to refuse, in the lane itself.
+          #
+          # An env value is passed through the environment rather than pasted
+          # into the script text, so the shell never parses it as source.
+          DECLARED: ${{ needs.fuzz-discover.outputs.matrix }}
+          PARSERS: ${{ needs.fuzz-discover.outputs.parsers }}
+          DISCOVER_RESULT: ${{ needs.fuzz-discover.result }}
+          SHARD_RESULT: ${{ needs.fuzz-shard.result }}
+        run: |
+          set -euo pipefail
+          declared="$DECLARED"
+          parsers="$PARSERS"
+          discover_result="$DISCOVER_RESULT"
+          shard_result="$SHARD_RESULT"
+          echo "discover result: $discover_result"
+          echo "parser crates on record: $parsers"
+          echo "fuzz-shard result: $shard_result"
+
+          # Discovery itself failing or being cancelled is a gate failure. Without
+          # this, a cancelled discover yields an empty matrix and the zero branch
+          # below would read it as "nothing to fuzz" and pass.
+          if [ "$discover_result" != "success" ]; then
+            echo "FAIL: the discovery job did not succeed (it was $discover_result), so the matrix is not trustworthy."
+            exit 1
+          fi
+
+          # Parsed AFTER the check above, deliberately. When discovery fails its
+          # output is the empty string, and parsing that first died in python with
+          # a traceback: the exit code was right but the log said nothing useful.
+          n=$(python3 -c "import json,sys; print(len(json.loads(sys.argv[1])))" "$declared")
+          echo "declared fuzz crates: $n"
+
+          if [ "$n" -eq 0 ]; then
+            if [ "$parsers" != "0" ]; then
+              echo "FAIL: $parsers parser crate(s) are on record but no fuzz crate was discovered."
+              exit 1
+            fi
+            if [ "$shard_result" != "skipped" ]; then
+              echo "FAIL: nothing was declared but fuzz-shard did not report skipped (it was $shard_result)."
               exit 1
             fi
             echo "ok: no parser crate is on record yet and no fuzz project exists. Nothing to fuzz."
             exit 0
           fi
 
-          cargo install cargo-fuzz --locked
-
-          ran_names=()
-          for manifest in "${fuzz_manifests[@]}"; do
-            fuzz_dir="$(dirname "$manifest")"
-            echo "== discovering targets in $fuzz_dir =="
-            targets="$(cargo fuzz list --fuzz-dir "$fuzz_dir")"
-            # FAILS CLOSED (3 of 4): a fuzz project that declares zero targets
-            # is the other vacuous-success shape, an empty fuzz/ that exists
-            # only to satisfy check 1 above without ever running anything.
-            if [ -z "$targets" ]; then
-              echo "FAIL: $manifest exists but declares no targets."
-              exit 1
-            fi
-            while IFS= read -r t; do
-              [ -n "$t" ] || continue
-              echo "== fuzzing $fuzz_dir :: $t =="
-              # crates/irontraffic-conn/fuzz (issue #573): building this fuzz
-              # crate's only dependency, irontraffic-conn, which pulls in
-              # tokio with rt-multi-thread for the crate's real accept loop,
-              # hits a deterministic rustc ICE on this job's nightly toolchain
-              # (rustc_codegen_ssa/mir/operand.rs:291, "not immediate" on
-              # tokio's Notified<Arc<Handle>> type), reproduced identically
-              # across multiple runs, so it is a compiler defect, not
-              # flakiness.
-              #
-              # Any fuzz crate whose dependency graph includes tokio can hit
-              # a deterministic rustc ICE on this job's nightly toolchain
-              # (rustc_codegen_ssa/mir/operand.rs:291, "not immediate" on
-              # tokio's Notified<Arc<Handle>> type) simply by compiling
-              # tokio's multi-thread runtime under this job's default build.
-              # Confirmed independently on two unrelated crates:
-              # crates/irontraffic-conn/fuzz (tokio via its own real accept
-              # loop) and crates/irontraffic-config/fuzz (tokio transitively
-              # via irontraffic-runtime). Detected rather than hand-listed,
-              # because a hand-maintained list already missed the second
-              # case once (see history below) and the workspace has more
-              # crates that transitively depend on tokio, via
-              # irontraffic-runtime or otherwise, than fuzz crates that have
-              # hit this so far.
-              #
-              # History, so the next person does not repeat either mistake:
-              # `--sanitizer none` alone (first attempt, issue #573) was
-              # verified only against a tree where the affected crate's
-              # fuzz/ did not exist yet, a false pass; the real run against
-              # the actual crate hit the identical ICE, and separately, the
-              # same `--sanitizer none`-only fix applied by hand to
-              # crates/irontraffic-config/fuzz (issue #582) hit it too, on
-              # PR #574, the same way. `--strip-dead-code false` is the
-              # corrected attempt: `cargo fuzz run --help` names dead-code
-              # stripping (default on) as a known cause of "unexpected
-              # behavior or even ICEs in the compiler", which matches this
-              # crash's shape (an OperandRef(Uninit ...) on a niche-optimized
-              # type nothing in any of these fuzz targets can ever reach)
-              # better than the sanitizer theory did. `--sanitizer none` is
-              # kept alongside it: still free for every crate this applies
-              # to, because none of their fuzz targets construct or enter a
-              # tokio runtime, so ASan was never able to find anything in
-              # tokio's own compiled code from any of them regardless.
-              #
-              # `cargo tree -p tokio` only resolves dependencies; it does not
-              # compile or codegen anything, so it cannot itself trip the
-              # ICE it is checking for. Exit 0 means tokio is somewhere in
-              # this fuzz crate's graph.
-              extra_fuzz_args=()
-              if cargo tree --manifest-path "$manifest" -p tokio >/dev/null 2>&1; then
-                extra_fuzz_args=(--sanitizer none --strip-dead-code false)
-              fi
-              # `${extra_fuzz_args[@]+"${extra_fuzz_args[@]}"}`, not the plain
-              # `"${extra_fuzz_args[@]}"` this started as: under `set -u`, an
-              # empty array expands to an "unbound variable" error on bash
-              # older than 4.4 even when quoted, which this script cannot
-              # assume it will never run under. Verified directly (both the
-              # empty and the populated case) before trusting it, the same
-              # way the invariant lints and the scope check's merge-base
-              # fallback in this repository were.
-              cargo fuzz run --fuzz-dir "$fuzz_dir" ${extra_fuzz_args[@]+"${extra_fuzz_args[@]}"} "$t" -- -max_total_time=60 -timeout=10
-              ran_names+=("$fuzz_dir :: $t")
-            done <<< "$targets"
-          done
-
-          echo "fuzz: ran ${#ran_names[@]} target(s):"
-          for n in "${ran_names[@]:-}"; do
-            [ -n "$n" ] && echo "  - $n"
-          done
-
-          # FAILS CLOSED (4 of 4): belt and suspenders on the count itself, so
-          # a future edit to the loop above that skips appending to ran_names
-          # cannot silently drop to zero runs and still exit 0. The count and
-          # every name are printed above regardless, so a drop is visible in
-          # the log even on a passing exit code.
-          if [ "${#ran_names[@]}" -eq 0 ] && [ "${#parser_crates[@]}" -gt 0 ]; then
-            echo "FAIL: zero fuzz targets ran but a parser crate is on record (${parser_crates[*]})."
+          # ANYTHING THAT IS NOT `success` REFUSES, which is the whole point of
+          # aggregating. `failure` is the obvious one. `cancelled` is what a job
+          # timeout looks like here, and it is visually identical to a superseded
+          # push. `skipped` is what a shard that never ran reports. A matrix gate
+          # that checks only `failure()` reports green when a shard never ran,
+          # and that is precisely the vacuous-success shape the four checks above
+          # were written to refuse.
+          if [ "$shard_result" != "success" ]; then
+            echo "FAIL: $n fuzz crate(s) were declared but the shard job did not succeed (it was $shard_result)."
+            echo "  A cancelled or skipped shard is as unmet as a failed one."
             exit 1
           fi
+          echo "ok: all $n declared fuzz crate(s) ran and passed"
 
   scope:
     name: PR scope check (the diff matches the issue)
