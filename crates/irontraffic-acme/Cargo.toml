@@ -1,13 +1,10 @@
-# SPDX-License-Identifier: MIT OR Apache-2.0
-
 [package]
 name = "irontraffic-acme"
 version.workspace = true
 edition.workspace = true
+rust-version.workspace = true
 license.workspace = true
-
-[lints]
-workspace = true
+repository.workspace = true
 
 [features]
 default = []
@@ -28,3 +25,6 @@ irontraffic-tls = { path = "../irontraffic-tls", version = "0.1.0" }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true
