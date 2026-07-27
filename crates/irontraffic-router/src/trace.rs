@@ -31,10 +31,21 @@
 //! and #60 explicitly DEFERS the instruction-count proof ("deferred to the
 //! milestone-7 benchmark harness issue"); its `## Files` table contains no path
 //! under `.github/` or `scripts/`, so it could not add the check even when it
-//! lands. The owner is #423, open, milestone M17. `git grep -ri gungraun`
-//! returns nothing. This module's obligation is only to make the check
-//! ACHIEVABLE, which is why every method below takes only `Copy` scalar
-//! arguments and nothing borrowed. A method that took a `&[u8]` or built a
+//! lands, and the milestone-7 issue it defers to does not exist (M7 is
+//! "Configuration plane and zero-downtime").
+//!
+//! NO ISSUE CURRENTLY DECLARES THIS CHECK. #423 (open, M17) is where the
+//! instruction-count machinery it would need is built, but #423 gates four
+//! named benchmarks against absolute budgets and never compares a traced
+//! build against a trace-free copy, so it does not own this identity either.
+//! No instruction-count dependency, bench target or CI job for it exists in
+//! this tree. (Stated as a proposition rather than as a grep, because the
+//! previous wording named a command that this very sentence then made
+//! return a hit.)
+//!
+//! This module's obligation is only to make the check ACHIEVABLE, which is
+//! why every method below takes only `Copy` scalar arguments and nothing
+//! borrowed. A method that took a `&[u8]` or built a
 //! struct would leave a trace of itself in the optimized code even with an
 //! empty body, because computing the argument is work the caller would still
 //! pay for.
