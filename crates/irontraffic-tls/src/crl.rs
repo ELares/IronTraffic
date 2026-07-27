@@ -11,11 +11,15 @@
 //! `VerifiedCrl`, which can only be produced by `verify_signature`. That makes
 //! "verify before you spend O(r) memory" a compile-time property.
 
-#![allow(clippy::struct_field_names, reason = "issuer_dn and serials are named by the RFC and the issue")]
+#![allow(
+    clippy::integer_division,
+    clippy::struct_field_names,
+    reason = "integer division: BLOOM_BLOCK_BYTES and 64 are compile-time constants; struct_field_names: issuer_dn and serials are named by the RFC and the issue"
+)]
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use siphasher::sip128::{Hasher128, SipHasher13};
 
@@ -35,8 +39,7 @@ const OID_DELTA_CRL_INDICATOR: der::asn1::ObjectIdentifier =
 /// value is the serial a peer presented, and a Bloom false positive costs one binary
 /// search rather than an unbounded scan.
 const CRL_BLOOM_KEY: [u8; 16] = [
-    0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0,
-    0x0f, 0xed, 0xcb, 0xa9, 0x87, 0x65, 0x43, 0x21,
+    0x12, 0x34, 0x56, 0x78, 0x9a, 0xbc, 0xde, 0xf0, 0x0f, 0xed, 0xcb, 0xa9, 0x87, 0x65, 0x43, 0x21,
 ];
 
 /// Bloom filter floor, in bytes.
@@ -55,16 +58,16 @@ const BLOOM_K: u64 = 7;
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 pub struct CrlConfig {
-    /// Refuse a CRL larger than this. Default 268_435_456 (256 MiB).
+    /// Refuse a CRL larger than this. Default `268_435_456` (256 MiB).
     #[serde(default = "d_max_bytes")]
     pub max_bytes: usize,
-    /// Refuse a CRL with more entries than this. Default 8_000_000.
+    /// Refuse a CRL with more entries than this. Default `8_000_000`.
     #[serde(default = "d_max_entries")]
     pub max_entries: usize,
-    /// Keep using a CRL this long past `nextUpdate`, with a warning. Default 86_400.
+    /// Keep using a CRL this long past `nextUpdate`, with a warning. Default `86_400`.
     #[serde(default = "d_stale_grace")]
     pub stale_grace_secs: u32,
-    /// Validity assumed for a CRL with no `nextUpdate`. Default 86_400.
+    /// Validity assumed for a CRL with no `nextUpdate`. Default `86_400`.
     #[serde(default = "d_no_next")]
     pub no_next_update_ttl_secs: u32,
     /// Clock skew tolerance on both timestamps. Default 300.
@@ -291,8 +294,13 @@ fn normalize_serial(mut bytes: &[u8]) -> &[u8] {
 fn read_sequence_content(bytes: &[u8]) -> Result<&[u8], CrlError> {
     let mut reader = der::SliceReader::new(bytes).map_err(|_| CrlError::Parse)?;
     let header = der::Header::decode(&mut reader).map_err(|_| CrlError::Parse)?;
-    header.tag.assert_eq(der::Tag::Sequence).map_err(|_| CrlError::Parse)?;
-    reader.read_slice(header.length).map_err(|_| CrlError::Parse)
+    header
+        .tag
+        .assert_eq(der::Tag::Sequence)
+        .map_err(|_| CrlError::Parse)?;
+    reader
+        .read_slice(header.length)
+        .map_err(|_| CrlError::Parse)
 }
 
 /// Parse a CRL.
@@ -335,8 +343,13 @@ fn read_sequence_content_from_reader<'a>(
     reader: &mut der::SliceReader<'a>,
 ) -> Result<&'a [u8], CrlError> {
     let header = der::Header::decode(reader).map_err(|_| CrlError::Parse)?;
-    header.tag.assert_eq(der::Tag::Sequence).map_err(|_| CrlError::Parse)?;
-    reader.read_slice(header.length).map_err(|_| CrlError::Parse)
+    header
+        .tag
+        .assert_eq(der::Tag::Sequence)
+        .map_err(|_| CrlError::Parse)?;
+    reader
+        .read_slice(header.length)
+        .map_err(|_| CrlError::Parse)
 }
 
 fn read_next_tlv<'a>(reader: &mut der::SliceReader<'a>) -> Result<&'a [u8], CrlError> {
@@ -409,9 +422,7 @@ fn read_time(reader: &mut der::SliceReader<'_>) -> Result<UnixSeconds, CrlError>
     }
 }
 
-fn read_optional_time(
-    reader: &mut der::SliceReader<'_>,
-) -> Result<Option<UnixSeconds>, CrlError> {
+fn read_optional_time(reader: &mut der::SliceReader<'_>) -> Result<Option<UnixSeconds>, CrlError> {
     let header = reader.peek_header().map_err(|_| CrlError::Parse)?;
     if header.tag == der::Tag::UtcTime || header.tag == der::Tag::GeneralizedTime {
         Ok(Some(read_time(reader)?))
@@ -420,9 +431,7 @@ fn read_optional_time(
     }
 }
 
-fn read_revoked_certificates<'a>(
-    reader: &mut der::SliceReader<'a>,
-) -> Result<&'a [u8], CrlError> {
+fn read_revoked_certificates<'a>(reader: &mut der::SliceReader<'a>) -> Result<&'a [u8], CrlError> {
     let header = reader.peek_header().map_err(|_| CrlError::Parse)?;
     if header.tag != der::Tag::Sequence {
         return Ok(&[]);
@@ -510,7 +519,8 @@ pub fn verify_signature<'a>(
     }
 
     let spki = &issuer.tbs_certificate.subject_public_key_info;
-    let spki_alg_der = x509_cert::der::Encode::to_der(&spki.algorithm).map_err(|_| CrlError::Parse)?;
+    let spki_alg_der =
+        x509_cert::der::Encode::to_der(&spki.algorithm).map_err(|_| CrlError::Parse)?;
     let public_key_bytes = spki.subject_public_key.raw_bytes();
 
     let provider = crate::provider::provider().ok_or(CrlError::ProviderNotInstalled)?;
@@ -659,7 +669,9 @@ impl RevocationIndex {
     pub fn freshness(&self, now: UnixSeconds, cfg: &CrlConfig) -> Freshness {
         let effective_next = match self.next_update {
             Some(n) => n,
-            None => self.this_update.saturating_add_secs(u64::from(cfg.no_next_update_ttl_secs)),
+            None => self
+                .this_update
+                .saturating_add_secs(u64::from(cfg.no_next_update_ttl_secs)),
         };
         if now <= effective_next {
             return Freshness::Fresh;
