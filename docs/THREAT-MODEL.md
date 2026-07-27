@@ -382,6 +382,69 @@ parser returns (`RequestLineMalformed`, `BareCr`, `BareLf`, `ObsFold`, `Whitespa
 response bytes, so a client cannot use the specific refusal reason to distinguish this parser's
 behaviour from another's on the same malformed input.
 
+### Chunked body and trailers (`h1-chunked-and-trailers`, #36)
+
+**Parses:** HTTP/1 chunked transfer coding, `ChunkedDecoder`, and the trailer section that follows the
+terminal `0`-size chunk. Every byte of the framing (chunk size, chunk extensions, the trailer
+section's field lines) is attacker chosen; chunk **data** bytes are never inspected at all, which is
+the structural property this decoder exists around, not merely an optimization.
+
+**Unlike the head parser, this decoder keeps state across calls.** `h1-head-parser` (#34) can afford
+to re-run from the start of a bounded buffer on every call because a head is capped at roughly 74 KB;
+a chunked body is unbounded (a legitimate upload is gigabytes), so re-scanning it on every read wakeup
+would be quadratic in the body size rather than in the (small, fixed) head size. `ChunkedDecoder` is
+therefore an explicit state machine fed incrementally, and state-machine resumption bugs are exactly
+where chunked parsers break in the wild: every value that can be observed mid-token (a partial
+chunk-size, a partial chunk extension including mid-quoted-string, a partial trailer field) is a real,
+persisted case, never an assumption that a whole token arrives in one read.
+
+**The bounds, each with a defined refusal:**
+
+- **Chunk size:** at most 16 hex digits, parsed into a `u64` with `checked_mul`/`checked_add`
+  overflow rejection (`ChunkSizeOverflow`). No sign, no leading or trailing whitespace, no `0x` prefix
+  (`ChunkSizeInvalid`). A 16-digit value of `u64::MAX` is itself accepted as a size; the body then
+  never arriving is a body-size-limit and throughput-floor problem for the connection layer, not a
+  framing one.
+- **Chunk extensions:** capped at `max_chunk_ext_bytes` (default 256) per chunk (`ChunkExtTooLong`).
+  Parsed only enough to bound and discard: an empty extension name, an unterminated quoted-string, or
+  any byte outside the token and quoted-string grammars is `ChunkExtInvalid`. Extensions are never
+  interpreted or forwarded; RFC 9112 Section 7.1.1 requires only that a recipient ignore unrecognized
+  ones, and this decoder ignores all of them uniformly.
+- **The trailer section gets a FRESH `max_header_list_bytes` and `max_field_count`**, a completely
+  separate `HeaderListBudget` from the one the head already spent: a message with a trailer section
+  costs up to twice the header budget, by design, rather than sharing one budget across both and
+  letting a large head starve the trailer section's own legitimate use of it (or vice versa).
+- **The trailer section's own re-scan is bounded by `HeadScanBudget::MAX_BYTES` (4 MiB),** the same
+  budget and the same quadratic risk `h1-head-parser` (#34) already documents for the head: a trailer
+  line that arrives split across many reads must be re-searched for its terminating CRLF on every
+  call until it completes, so a peer drip-feeding one byte per read can otherwise buy an amount of
+  re-search work quadratic in the eventual line length. `ChunkedDecoder` carries its own
+  `trailer_scan: u64` counter, charged with the bytes actually searched (not the bytes consumed) on
+  every pass, and refuses with `FieldLineTooLong` once the cumulative search for one trailer section
+  exceeds the budget. Real trailer sections arrive in one or two reads and never come close to it; a
+  drip-feeder is cut off after a bounded amount of CPU instead of looping until a deadline fires.
+
+**Trailers are never merged into the header section.** RFC 9110 Section 6.5.1 lists the field
+categories a recipient must not let a trailer override: message framing (`transfer-encoding`,
+`content-length`), routing (`host`), request modifiers (`expect`, `max-forwards`, `cache-control`,
+every `if-*` field, `range`, `te`), authentication (`authorization`, `proxy-authorization`, `cookie`,
+`set-cookie`), and response control (`trailer`). `TRAILER_DENIED` refuses exactly those 18 field names
+outright with `TrailerFieldForbidden`, never a silent drop: a request that passed an
+`Authorization`-based policy on its headers must not be able to smuggle in a `Content-Length` or a
+`Host` by moving it to a trailer, and a client sending one of the 18 anyway is either broken or
+probing, so the message is refused rather than quietly repaired. The validated trailer section is
+reachable only through `ChunkedDecoder::trailers`, a separate `FieldSection` from whatever the caller
+built for the request's own header section; there is no method anywhere in this crate that merges the
+two, which closes the bypass structurally rather than by convention.
+
+**The exact end of the message is reported, not assumed.** After the terminal CRLF of the trailer
+section (or of an empty trailer section, `0\r\n\r\n`), any following bytes are the first bytes of
+whatever comes next on the connection: a legitimate pipelined request on keepalive, or garbage. The
+decoder reports `Done { consumed }` with `consumed` naming exactly where the message ended, and
+leaves the decision of what the trailing bytes mean to the caller, which owns the "is this a valid
+next request" question; the decoder never assumes trailing bytes are either safe or an error on its
+own.
+
 ## Listening sockets and socket options
 
 **What the listening socket exposes.** A TCP port reachable by anyone who can route to the bound
