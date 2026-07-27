@@ -779,13 +779,16 @@ dependencies = [
 name = "irontraffic-conn"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "criterion",
  "crossbeam-utils",
  "irontraffic-config",
+ "irontraffic-http",
  "irontraffic-io",
  "irontraffic-runtime",
  "irontraffic-time",
  "proptest",
+ "smallvec",
  "thiserror",
  "tokio",
  "tracing",

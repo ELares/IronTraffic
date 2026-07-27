@@ -27,6 +27,11 @@ irontraffic-time = { path = "../irontraffic-time", version = "0.1.0" }
 crossbeam-utils = { workspace = true }
 tracing = { workspace = true }
 thiserror = { workspace = true }
+bytes = { workspace = true }
+smallvec = { workspace = true }
+# ParseStatus and RejectReason have exactly one definition, used by the PROXY
+# protocol parser this crate gains in a later issue.
+irontraffic-http = { path = "../irontraffic-http", version = "0.1.0" }
 
 [dev-dependencies]
 # The reactor-dependent tests (into_acceptors and the accept tests) need a
@@ -40,4 +45,8 @@ criterion = { workspace = true }
 
 [[bench]]
 name = "registry"
+harness = false
+
+[[bench]]
+name = "conn_hot"
 harness = false
