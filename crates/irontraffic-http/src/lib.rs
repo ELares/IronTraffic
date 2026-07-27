@@ -44,6 +44,7 @@
 
 pub mod authority;
 pub mod error;
+pub mod expect;
 pub mod field;
 pub mod forwarded;
 pub mod framing;
@@ -51,6 +52,7 @@ pub mod h1;
 pub mod hlist;
 pub mod known;
 pub mod limits;
+pub mod response;
 pub mod scalar;
 pub mod section;
 pub mod strip;
