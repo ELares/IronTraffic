@@ -4,9 +4,9 @@
 
 use std::fmt;
 
+use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
 use serde::Deserialize;
 
 /// Maximum contacts on an account.
@@ -129,12 +129,15 @@ impl AcmeConfig {
         }
 
         if let Some(profile) = &self.profile {
-            if profile.is_empty() || profile.len() > 64 || !profile.bytes().all(is_printable_ascii) {
+            if profile.is_empty() || profile.len() > 64 || !profile.bytes().all(is_printable_ascii)
+            {
                 return Err(crate::AcmeError::DirectoryUrl);
             }
         }
 
-        let _ = self.directory_ttl_secs.clamp(MIN_DIRECTORY_TTL, MAX_DIRECTORY_TTL);
+        let _ = self
+            .directory_ttl_secs
+            .clamp(MIN_DIRECTORY_TTL, MAX_DIRECTORY_TTL);
         Ok(())
     }
 
@@ -358,10 +361,7 @@ mod tests {
 
     #[test]
     fn acme_insecure_directory_non_loopback_rejected() {
-        for url in [
-            "http://acme.example.com/dir",
-            "http://10.0.0.5/dir",
-        ] {
+        for url in ["http://acme.example.com/dir", "http://10.0.0.5/dir"] {
             let cfg = config_with_directory_and_flag(url);
             assert_eq!(cfg.validate(), Err(AcmeError::DirectoryUrl));
         }
