@@ -353,6 +353,27 @@ arrives on.
 **What is out of scope here.** Connection admission, rate limiting, and per-source limits are not
 this module's job; it creates the socket and reports what it applied.
 
+## The forwarding data plane
+
+**Everything here is attacker-controlled bytes.** Both peers of a proxied connection can send
+arbitrary bytes at arbitrary rates with arbitrary framing, and either can stall or reset at any
+moment. The loop never interprets a byte; it moves them.
+
+**Memory is bounded structurally, not by policy.** At most one 32 KiB buffer per direction, held
+only between a read that produced bytes and the completion of the write of those bytes. A client
+reading at one byte per second cannot make us buffer an upstream response, because we do not poll
+the read side while the write side has bytes pending. An idle connection holds zero buffers. There
+is no watermark, no queue, and no channel to tune or to get wrong.
+
+**Time is bounded by three deadlines**, and every connection has at least one owning timer at all
+times: `idle` (no progress in either direction), `half_close` (one direction ended and the other did
+not finish), and the optional `max_lifetime` (an absolute ceiling regardless of progress). With
+`max_lifetime` unset, a peer that makes one byte of progress per idle period holds its connection
+slot indefinitely; that residual risk and its lever are recorded in the admission section.
+
+**What is not inspected.** No HTTP parsing, so no request framing is enforced and a
+request-smuggling payload is forwarded verbatim. Do not place this version where an HTTP-aware
+security control is assumed to exist.
 ## Configuration loading and validation
 
 ### Who can supply a document

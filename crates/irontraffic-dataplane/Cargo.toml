@@ -1,0 +1,49 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "irontraffic-dataplane"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The forwarding data plane: one task, one buffer per direction, structural backpressure."
+
+[lints]
+workspace = true
+
+[dependencies]
+# The transport seam this loop is generic over (`Transport`, `Read`/`Write`,
+# `ReadBuf`, `Sleep`/`Timer`), the pooled buffer it acquires and releases
+# through, and the `ShutdownToken` it checks once per round.
+irontraffic-io = { path = "../irontraffic-io", version = "0.1.0" }
+# The per-core counters this loop bumps once per connection with the bytes
+# actually written.
+irontraffic-runtime = { path = "../irontraffic-runtime", version = "0.1.0" }
+# Not called directly by this loop: it never reads a clock, and this is the
+# crate that makes that a workspace-enforced fact rather than a convention.
+# The two deadlines this loop owns arrive through the injected
+# `hyper::rt::Timer` instead.
+irontraffic-time = { path = "../irontraffic-time", version = "0.1.0" }
+# Typed error enum for ForwardError.
+thiserror = { workspace = true }
+# Lifecycle logging seam. This loop logs nothing per buffer, per read, or per
+# write, so nothing here calls it yet; declared per the crate's dependency
+# contract for the caller that wires connection-level lifecycle logging in.
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+proptest = { workspace = true }
+criterion = { workspace = true }
+# Seeds the pseudorandom 8 MiB payload in the byte-identity integration test.
+irontraffic-rand = { path = "../irontraffic-rand", version = "0.1.0" }
+
+[features]
+# The in-memory `DuplexTransport` double: benches, the fuzz target, and one
+# integration test need it; production builds never enable it.
+test-support = []
+
+[[bench]]
+name = "forward"
+harness = false
+required-features = ["test-support"]

@@ -964,6 +964,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "irontraffic-dataplane"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "irontraffic-io",
+ "irontraffic-rand",
+ "irontraffic-runtime",
+ "irontraffic-time",
+ "proptest",
+ "thiserror",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "irontraffic-filter"
 version = "0.1.0"
 dependencies = [
