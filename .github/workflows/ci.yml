@@ -518,61 +518,66 @@ jobs:
             while IFS= read -r t; do
               [ -n "$t" ] || continue
               echo "== fuzzing $fuzz_dir :: $t =="
-              # crates/irontraffic-conn/fuzz (issue #573): cargo-fuzz's default
-              # sanitizer is address, and building this fuzz crate's only
-              # dependency, irontraffic-conn, pulls in tokio with
-              # rt-multi-thread for the crate's real accept loop. Compiling
-              # tokio's multi-thread runtime under ASan plus sancov coverage
-              # plus -Ccodegen-units=1 on this job's nightly toolchain hits a
-              # deterministic rustc ICE (rustc_codegen_ssa/mir/operand.rs:291,
-              # "not immediate" on tokio's Notified<Arc<Handle>> type),
-              # reproduced identically on two independent runs, so it is a
-              # compiler defect, not flakiness. Filed upstream-shaped detail
-              # in issue #573; not filed against rust-lang/rust yet because a
-              # minimal reproduction outside this workspace has not been
-              # built.
+              # crates/irontraffic-conn/fuzz (issue #573): building this fuzz
+              # crate's only dependency, irontraffic-conn, which pulls in
+              # tokio with rt-multi-thread for the crate's real accept loop,
+              # hits a deterministic rustc ICE on this job's nightly toolchain
+              # (rustc_codegen_ssa/mir/operand.rs:291, "not immediate" on
+              # tokio's Notified<Arc<Handle>> type), reproduced identically
+              # across multiple runs, so it is a compiler defect, not
+              # flakiness.
               #
-              # `--sanitizer none` costs nothing here specifically because of
-              # what this crate's fuzz targets actually exercise: every
-              # `fuzz_target!` closure in crates/irontraffic-conn/fuzz calls
-              # only synchronous, `#![forbid(unsafe_code)]`-covered functions
-              # (ConnBudget::new/on_frame/tokens as of issue #40) that never
-              # construct or enter a tokio runtime. Tokio's multi-thread
-              # runtime code is linked in, and is what the compiler was
-              # crashing on, but no fuzz input in this crate can ever reach
-              # it, so ASan was never able to find anything there for these
-              # targets to begin with. Coverage-guided mutation (sancov) is
-              # unaffected by this flag and stays fully active. This is
-              # scoped to this one fuzz crate, not a blanket change: every
-              # other fuzz crate in this workspace keeps the default ASan
-              # build.
+              # Any fuzz crate whose dependency graph includes tokio can hit
+              # a deterministic rustc ICE on this job's nightly toolchain
+              # (rustc_codegen_ssa/mir/operand.rs:291, "not immediate" on
+              # tokio's Notified<Arc<Handle>> type) simply by compiling
+              # tokio's multi-thread runtime under this job's default build.
+              # Confirmed independently on two unrelated crates:
+              # crates/irontraffic-conn/fuzz (tokio via its own real accept
+              # loop) and crates/irontraffic-config/fuzz (tokio transitively
+              # via irontraffic-runtime). Detected rather than hand-listed,
+              # because a hand-maintained list already missed the second
+              # case once (see history below) and the workspace has more
+              # crates that transitively depend on tokio, via
+              # irontraffic-runtime or otherwise, than fuzz crates that have
+              # hit this so far.
               #
-              # If a future fuzz target is added to this crate that DOES
-              # construct or exercise a tokio runtime, this exception stops
-              # being free and needs re-justifying, not silently inherited.
+              # History, so the next person does not repeat either mistake:
+              # `--sanitizer none` alone (first attempt, issue #573) was
+              # verified only against a tree where the affected crate's
+              # fuzz/ did not exist yet, a false pass; the real run against
+              # the actual crate hit the identical ICE, and separately, the
+              # same `--sanitizer none`-only fix applied by hand to
+              # crates/irontraffic-config/fuzz (issue #582) hit it too, on
+              # PR #574, the same way. `--strip-dead-code false` is the
+              # corrected attempt: `cargo fuzz run --help` names dead-code
+              # stripping (default on) as a known cause of "unexpected
+              # behavior or even ICEs in the compiler", which matches this
+              # crash's shape (an OperandRef(Uninit ...) on a niche-optimized
+              # type nothing in any of these fuzz targets can ever reach)
+              # better than the sanitizer theory did. `--sanitizer none` is
+              # kept alongside it: still free for every crate this applies
+              # to, because none of their fuzz targets construct or enter a
+              # tokio runtime, so ASan was never able to find anything in
+              # tokio's own compiled code from any of them regardless.
               #
-              # crates/irontraffic-config/fuzz (issue #582): same ICE at
-              # rustc_codegen_ssa/mir/operand.rs:291, triggered by compiling
-              # tokio under ASan + sancov when the config fuzz crate pulls
-              # in irontraffic-runtime (which depends on tokio). Same
-              # reasoning applies: every fuzz_target! in this crate calls
-              # only synchronous, I/O-free functions that never construct
-              # or enter a tokio runtime. Scoped to this one crate, not a
-              # blanket change, consistent with every other crate above.
-              sanitizer_args=()
-              if [ "$fuzz_dir" = "crates/irontraffic-conn/fuzz" ] || \
-                 [ "$fuzz_dir" = "crates/irontraffic-config/fuzz" ]; then
-                sanitizer_args=(--sanitizer none)
+              # `cargo tree -p tokio` only resolves dependencies; it does not
+              # compile or codegen anything, so it cannot itself trip the
+              # ICE it is checking for. Exit 0 means tokio is somewhere in
+              # this fuzz crate's graph.
+              extra_fuzz_args=()
+              if cargo tree --manifest-path "$manifest" -p tokio >/dev/null 2>&1; then
+                extra_fuzz_args=(--sanitizer none --strip-dead-code false)
               fi
-              # `${sanitizer_args[@]+"${sanitizer_args[@]}"}`, not the plain
-              # `"${sanitizer_args[@]}"` this started as: under `set -u`, an
+              # `${extra_fuzz_args[@]+"${extra_fuzz_args[@]}"}`, not the plain
+              # `"${extra_fuzz_args[@]}"` this started as: under `set -u`, an
               # empty array expands to an "unbound variable" error on bash
               # older than 4.4 even when quoted, which this script cannot
               # assume it will never run under. Verified directly (both the
               # empty and the populated case) before trusting it, the same
               # way the invariant lints and the scope check's merge-base
               # fallback in this repository were.
-              cargo fuzz run --fuzz-dir "$fuzz_dir" ${sanitizer_args[@]+"${sanitizer_args[@]}"} "$t" -- -max_total_time=60 -timeout=10
+              cargo fuzz run --fuzz-dir "$fuzz_dir" ${extra_fuzz_args[@]+"${extra_fuzz_args[@]}"} "$t" -- -max_total_time=60 -timeout=10
               ran_names+=("$fuzz_dir :: $t")
             done <<< "$targets"
           done
