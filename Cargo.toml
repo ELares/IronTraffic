@@ -13,7 +13,8 @@
 
 [workspace]
 resolver = "3"
-members = ["crates/irontraffic", "crates/irontraffic-config", "crates/irontraffic-conn", "crates/irontraffic-filter", "crates/irontraffic-http", "crates/irontraffic-io", "crates/irontraffic-k8s", "crates/irontraffic-limits", "crates/irontraffic-rand", "crates/irontraffic-resilience", "crates/irontraffic-router", "crates/irontraffic-runtime", "crates/irontraffic-time", "crates/irontraffic-tls", "crates/irontraffic-upstream"]
+members = ["crates/irontraffic", "crates/irontraffic-config", "crates/irontraffic-conn", "crates/irontraffic-filter", "crates/irontraffic-http", "crates/irontraffic-io", "crates/irontraffic-k8s", "crates/irontraffic-limits", "crates/irontraffic-quota", "crates/irontraffic-rand", "crates/irontraffic-resilience", "crates/irontraffic-router", "crates/irontraffic-runtime", "crates/irontraffic-time", "crates/irontraffic-tls", "crates/irontraffic-upstream"]
+# The fuzz crate is intentionally not a workspace member: cargo-fuzz projects
 # The fuzz crates are intentionally not workspace members: cargo-fuzz projects
 # pin their own toolchain-sensitive edition and are built with `cargo fuzz`,
 # never `cargo build --workspace`.
@@ -68,6 +69,8 @@ tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
 proptest = { version = "1.5" }
 # Benchmarks.
 criterion = { version = "0.8" }
+# Calendar arithmetic with a bundled IANA tzdb. Used by `irontraffic-quota`.
+jiff = { version = "0.2.34" }
 # Kubernetes client. Only in the control-plane crate.
 kube = { version = "4.2.0", default-features = false, features = ["client"] }
 # Kubernetes API types. `latest` matches the bundled OpenAPI spec.

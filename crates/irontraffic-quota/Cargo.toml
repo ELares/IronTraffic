@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "irontraffic-quota"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Quota period arithmetic for IronTraffic."
+
+[lints]
+workspace = true
+
+[dependencies]
+# Calendar arithmetic with a bundled IANA tzdb. This is what makes a "calendar
+# month in the customer's timezone" expressible; Envoy's reference rate limit
+# service hardcodes a month to 30 days because it has no such library.
+jiff = { workspace = true }
+# The wall-clock newtype. Quota periods are the ONLY place in this subsystem that
+# reads wall time, and the distinct type is what stops it reaching rate state.
+irontraffic-time = { path = "../irontraffic-time", version = "0.1.0" }
+# Keyed hash for subject anchoring, seeded from configuration so a period
+# boundary is identical on every node and across restarts.
+siphasher = { workspace = true }
+# Typed errors without hand-written Display impls.
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
