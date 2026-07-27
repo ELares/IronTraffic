@@ -189,16 +189,22 @@ pub fn resolve_backoff(
     };
 
     if let Some(p) = pushback {
-        let need_ms = p.saturating_add(inputs.min_attempt_estimate_ms);
+        // A zero pushback is floored with jitter to break a synchronized herd:
+        // draw the jittered value FIRST, then gate on what we would actually
+        // sleep. Gating on the pre-jitter `p == 0` and only then drawing the
+        // jitter, without re-checking it against the deadline, let a tiny
+        // remaining budget be overrun by the drawn value; the fix is to make
+        // the deadline check see the real sleep in both branches.
+        let sleep_ms = if p == 0 {
+            rng.bounded_u32(backoff.base_interval_ms().saturating_add(1))
+        } else {
+            p
+        };
+        let need_ms = sleep_ms.saturating_add(inputs.min_attempt_estimate_ms);
         if !inputs.deadline.permits(inputs.now, need_ms) {
             return BackoffDecision::DoNotRetry(NoRetryReason::PushbackExceedsDeadline);
         }
-        if p == 0 {
-            // Zero pushback is floored with jitter to break a synchronized herd.
-            let jittered = rng.bounded_u32(backoff.base_interval_ms().saturating_add(1));
-            return BackoffDecision::Sleep(jittered);
-        }
-        return BackoffDecision::Sleep(p);
+        return BackoffDecision::Sleep(sleep_ms);
     }
 
     let own = backoff.next(rng);
@@ -469,7 +475,7 @@ fn parse_four_digits(v: &[u8]) -> Option<u32> {
 mod tests {
     use super::*;
     use crate::retry::BackoffConfig;
-    use proptest::prelude::{ProptestConfig, any, proptest};
+    use proptest::prelude::{Just, ProptestConfig, Strategy, any, proptest};
 
     const NOV_1994_MS: u64 = 784_111_777_000;
 
@@ -675,6 +681,58 @@ mod tests {
         );
     }
 
+    /// #103's headline property: server pushback always overrides the computed
+    /// backoff, never just on the first attempt. A mutation that gates the
+    /// override on `backoff.attempt() == 0` would honour the server once and
+    /// then silently ignore every later pushback, which is the exact
+    /// amplification this property exists to prevent for a struggling origin
+    /// that keeps asking to be left alone.
+    #[test]
+    fn resolve_pushback_overrides_backoff_past_first_attempt() {
+        let mut inputs = base_inputs();
+        let mut backoff = FullJitterBackoff::new(BackoffConfig::default());
+        let mut rng = Rng::from_seed(0xabc);
+        for _ in 0..5 {
+            backoff.next(&mut rng);
+        }
+        assert_eq!(backoff.attempt(), 5);
+
+        // 500ms is above FullJitterBackoff's default 250ms cap, so no computed
+        // backoff at any attempt could ever produce it: only the pushback
+        // path can return it.
+        inputs.grpc_pushback = Some(b"500");
+        let decision = resolve_backoff(inputs, &mut backoff, &mut rng);
+        assert_eq!(decision, BackoffDecision::Sleep(500));
+        assert_eq!(
+            backoff.attempt(),
+            5,
+            "the pushback path must not consume an attempt"
+        );
+    }
+
+    /// #103's headline property, other half: a pushback smaller than what our
+    /// own curve would draw still wins verbatim. The "max(pushback, own)"
+    /// mutation feels safer but is exactly the second-guessing the design
+    /// forbids. Sweep enough seeds that the computed backoff (uniform on
+    /// `[0, 25]` at attempt 1) draws something above 1 at least once, which
+    /// `max` would then have picked instead of the pushback.
+    #[test]
+    fn resolve_pushback_smaller_than_backoff_still_wins() {
+        for seed in 0..200u64 {
+            let mut inputs = base_inputs();
+            inputs.grpc_pushback = Some(b"1");
+            let mut backoff = FullJitterBackoff::new(BackoffConfig::default());
+            let mut rng = Rng::from_seed(seed);
+            let decision = resolve_backoff(inputs, &mut backoff, &mut rng);
+            assert_eq!(decision, BackoffDecision::Sleep(1), "seed {seed}");
+            assert_eq!(
+                backoff.attempt(),
+                0,
+                "the pushback path must not consume an attempt (seed {seed})"
+            );
+        }
+    }
+
     #[test]
     fn resolve_pushback_exceeds_deadline() {
         let mut inputs = base_inputs();
@@ -771,6 +829,51 @@ mod tests {
         assert!(saw_nonzero);
     }
 
+    /// Regression for the exact scenario #715 measured: a zero pushback is
+    /// floored with jitter drawn from `[0, base_interval_ms]` (up to 25ms by
+    /// default), so a deadline with only 2ms of remaining budget is smaller
+    /// than the jitter can be. Drawing the jitter and returning it without
+    /// re-gating against the deadline let it Sleep past the budget (measured
+    /// 1642 violations across an earlier 2000-case sweep, for example
+    /// `budget=2 raw="0" -> Sleep(12)`). Every one of the three routes to a
+    /// zero pushback named in #103 (a literal zero, an HTTP-date at or before
+    /// now, and a zero gRPC pushback) must now either sleep within budget or
+    /// refuse the retry; it may never overrun.
+    #[test]
+    fn resolve_zero_pushback_never_overruns_a_tight_deadline() {
+        /// One of the three routes to a zero pushback: `(grpc_pushback, retry_after)`.
+        type Route = (Option<&'static [u8]>, Option<&'static [u8]>);
+
+        const BUDGET_MS: u32 = 2;
+        let cases: [Route; 3] = [
+            (None, Some(b"0".as_slice())),
+            (None, Some(b"Sun, 06 Nov 1994 08:49:37 GMT".as_slice())),
+            (Some(b"0".as_slice()), None),
+        ];
+        for seed in 0..2000u64 {
+            for (grpc, retry) in cases {
+                let mut inputs = base_inputs();
+                inputs.deadline = Deadline::from_now(Millis(0), BUDGET_MS);
+                inputs.grpc_pushback = grpc;
+                inputs.retry_after = retry;
+                let mut backoff = FullJitterBackoff::new(BackoffConfig::default());
+                let mut rng = Rng::from_seed(seed);
+                let decision = resolve_backoff(inputs, &mut backoff, &mut rng);
+                match decision {
+                    BackoffDecision::Sleep(v) => assert!(
+                        inputs.deadline.permits(inputs.now, v),
+                        "seed {seed} grpc={grpc:?} retry={retry:?}: Sleep({v}) overruns a {BUDGET_MS}ms deadline"
+                    ),
+                    BackoffDecision::DoNotRetry(reason) => assert_eq!(
+                        reason,
+                        NoRetryReason::PushbackExceedsDeadline,
+                        "seed {seed} grpc={grpc:?} retry={retry:?}"
+                    ),
+                }
+            }
+        }
+    }
+
     #[test]
     fn parse_length_capped() {
         // A value whose first 64 bytes are a valid `Retry-After: 120` followed
@@ -799,16 +902,47 @@ mod tests {
         }
     }
 
+    /// A header-value generator for `prop_resolve_respects_deadline` that can
+    /// actually reach the zero-pushback branch. Fully arbitrary bytes almost
+    /// never spell out `b"0"` (or any other short digit string), so a
+    /// generator built only from `vec(any::<u8>(), 0..=64)` cannot exercise
+    /// the branch invariant 4 exists to guard; that gap is exactly why this
+    /// property test passed against the deadline-overrun defect #715 found.
+    /// Mixing in literal small values keeps the fully-arbitrary case (for
+    /// general parser robustness) while making the triggering input reachable.
+    fn pushback_value_strategy() -> impl Strategy<Value = Vec<u8>> {
+        proptest::prop_oneof![
+            4 => proptest::collection::vec(any::<u8>(), 0..=64),
+            1 => Just(b"0".to_vec()),
+            1 => Just(b"-1".to_vec()),
+            1 => (0u32..=3).prop_map(|n| n.to_string().into_bytes()),
+        ]
+    }
+
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(1024))]
         #[test]
         fn prop_resolve_respects_deadline(
-            grpc in proptest::option::of(proptest::collection::vec(any::<u8>(), 0..=64)),
-            retry in proptest::option::of(proptest::collection::vec(any::<u8>(), 0..=64)),
+            grpc in proptest::option::of(pushback_value_strategy()),
+            retry in proptest::option::of(pushback_value_strategy()),
             now: u32,
-            deadline_budget: u32,
+            // A fully uniform u32 lands under, say, 30 with probability
+            // 30/2^32: essentially never. Mix in a small-budget lane so a
+            // deadline tight enough to matter is actually reachable, not just
+            // a value a full-range generator could theoretically produce.
+            deadline_budget in proptest::prop_oneof![
+                1 => 0u32..=30,
+                3 => any::<u32>(),
+            ],
             now_wall_ms: u64,
-            min_attempt_estimate_ms: u32,
+            // Same reasoning as `deadline_budget`: the gate gets summed with
+            // this before the deadline check, so it needs a reachable small
+            // lane too, or the small-budget lane above is defeated by an
+            // arbitrarily huge estimate almost every time.
+            min_attempt_estimate_ms in proptest::prop_oneof![
+                1 => 0u32..=10,
+                3 => any::<u32>(),
+            ],
             seed: u64,
         ) {
             let inputs = BackoffInputs {

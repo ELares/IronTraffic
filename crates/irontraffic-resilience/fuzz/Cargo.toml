@@ -20,6 +20,10 @@ cargo-fuzz = true
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
 irontraffic-resilience = { path = ".." }
+# fuzz_pushback_headers seeds its own Rng the same way resolve_backoff's real
+# callers do, so it needs the crate declared here too, same as the sibling
+# path deps above.
+irontraffic-rand = { path = "../../irontraffic-rand" }
 
 [[bin]]
 name = "fuzz_deadline_headers"
