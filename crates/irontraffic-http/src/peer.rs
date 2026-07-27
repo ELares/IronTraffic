@@ -19,8 +19,19 @@
 //! obvious reading of "the client is the first one in the list". The
 //! leftmost entry is 100% attacker controlled: it is whatever the client
 //! typed. This module always walks from the RIGHT, peeling off hops it
-//! trusts, because a client can only ever pad the LEFT end of the chain; a
-//! walk that starts from the right is invariant under that padding.
+//! trusts, because a client can only ever pad the LEFT end of a single
+//! family's own elements; a walk that starts from the right is invariant
+//! under that padding.
+//!
+//! **A chain mixing `Forwarded` and `X-Forwarded-For` is refused, not
+//! walked** ([`chain_mixes_families`]), because that padding invariant does
+//! not hold across families: `ForwardedChain::parse_into` places every
+//! `Forwarded` element before every `X-Forwarded-For` element regardless of
+//! arrival order, so a client sending one family while a trusted proxy
+//! speaks the other would otherwise land its own entry on the trusted right
+//! end (issue #657). Issue #32 does not specify this case; treating it as a
+//! fail-closed refusal, the same as any other input the walk already
+//! declines to guess about, is a judgement call recorded on that issue.
 //!
 //! **`peer_trusted` is a separate, narrower claim.** It answers "was the
 //! immediate socket peer's address checked against a configured prefix list
@@ -140,6 +151,36 @@ fn nearest_proto(elements: &[ForwardedElement], start: usize) -> Option<Scheme> 
         .get(start..)?
         .iter()
         .find_map(|element| element.proto)
+}
+
+/// True when `elements` contains at least one element parsed from a
+/// `Forwarded` line AND at least one parsed from an `X-Forwarded-For` line.
+///
+/// **Issue #657.** `forwarded.rs::parse_into` places every `Forwarded`
+/// element before every `X-Forwarded-For` element regardless of which family
+/// actually arrived first on the wire (`from_xff` is retained on
+/// [`ForwardedElement`] precisely so a consumer can tell the two apart). The
+/// walk below trusts the RIGHT end of the chain, on the documented premise
+/// that a client can only ever pad the LEFT end. That premise holds only
+/// within a single family: when both are present, whichever family a client
+/// chooses to send always lands to the right of whichever family the proxy
+/// in front of us happens to speak, regardless of which one that client
+/// actually sent last. A trusted proxy speaking `Forwarded` while the client
+/// speaks `X-Forwarded-For` would then let the client's own entry occupy the
+/// end this walk treats as most trustworthy, which is exactly the identity
+/// forgery this module exists to prevent.
+///
+/// Issue #32 does not name a mechanism for this case (see the comment left
+/// on that issue), so this refusal is a judgement call, not a specified
+/// requirement: it fails CLOSED, treating a mixed chain the same as any
+/// other input the design already refuses to guess about, rather than
+/// trying to guess which family is the trustworthy one. A deployment that
+/// needs both families honoured is not supported by a single `TrustPolicy`
+/// today.
+fn chain_mixes_families(elements: &[ForwardedElement]) -> bool {
+    let has_forwarded = elements.iter().any(|element| !element.from_xff);
+    let has_xff = elements.iter().any(|element| element.from_xff);
+    has_forwarded && has_xff
 }
 
 /// Narrows a hop count that can never exceed
@@ -276,6 +317,13 @@ pub fn resolve_identity(
         // reading an element.
         TrustPolicy::HopCount(n) => {
             let elements = chain.elements();
+            // Issue #657: a chain mixing `Forwarded` and `X-Forwarded-For`
+            // elements is unusable, because the family boundary, not
+            // arrival order, decides which end of the combined chain is
+            // rightmost. Fail closed exactly as a too-short chain would.
+            if chain_mixes_families(elements) {
+                return fail_closed;
+            }
             let n_usize = usize::from(*n);
             // `checked_sub` returning `None` here IS "chain.len() < n"
             // (design step 4b): the two conditions are the same fact.
@@ -308,6 +356,13 @@ pub fn resolve_identity(
             if !peer_trusted || chain.is_empty() {
                 return fail_closed;
             }
+            // Issue #657: as in the `HopCount` arm above, a chain mixing
+            // both families cannot be walked safely, because the RIGHT end
+            // this walk trusts is decided by family, not by which hop
+            // actually appended last.
+            if chain_mixes_families(chain.elements()) {
+                return fail_closed;
+            }
             match walk_trusted_cidrs(chain.elements(), cidrs) {
                 WalkOutcome::FailClosed => fail_closed,
                 WalkOutcome::Client {
@@ -332,6 +387,34 @@ pub fn resolve_identity(
 // Egress: exactly one synthesized `Forwarded` element, and the matching
 // `X-Forwarded-*` field values.
 // ---------------------------------------------------------------------------
+
+/// Configuration for what we emit upstream, from issue #32's Design section.
+///
+/// This is a plain declaration of what a caller may choose to emit; it does
+/// not itself decide anything. The caller that assembles the outbound field
+/// section reads these two flags to decide whether to call
+/// [`write_forwarded_element`], [`write_x_forwarded`], both or neither. This
+/// crate deliberately does not wire that decision itself: this issue's job
+/// is the writers and the identity walk, not the not-yet-written caller that
+/// holds a listener's configuration.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct ForwardEmit {
+    /// Emit the RFC 7239 `Forwarded` element. Default true.
+    pub emit_forwarded: bool,
+    /// Also emit `X-Forwarded-For`, `-Proto`, `-Host` and `-Port`. Default
+    /// true, because most origins read those and not `Forwarded`.
+    pub emit_x_forwarded: bool,
+}
+
+impl Default for ForwardEmit {
+    /// Both families on: `emit_forwarded: true, emit_x_forwarded: true`.
+    fn default() -> Self {
+        ForwardEmit {
+            emit_forwarded: true,
+            emit_x_forwarded: true,
+        }
+    }
+}
 
 /// Renders `v`'s decimal digits least-significant-digit first into a fixed
 /// 10-byte buffer (wide enough for any `u32`, so this serves both a `u16`
@@ -372,37 +455,156 @@ fn write_decimal(v: u32, out: &mut BytesMut) -> usize {
     count
 }
 
-/// The fixed byte length of the uncompressed, zero-padded 8-group hex form
-/// this module writes for an IPv6 address: 8 groups of 4 hex digits plus 7
-/// colon separators (8 * 4 + 7). This module deliberately does not replicate
-/// `Display`'s RFC 5952 `::` run-length compression: any well-formed hex
-/// rendering of the same 128 bits re-parses to the same `Ipv6Addr` through
-/// `Ipv6Addr::from_str`, which is all `forwarded_element_len_is_exact` (test
-/// 9) requires, and a fixed length free of a compression decision is simpler
-/// to keep provably in agreement between the writer and the length
-/// computation than a variable one would be.
-const IPV6_ADDR_LEN: usize = 39;
-
 const HEX_DIGITS: [u8; 16] = *b"0123456789abcdef";
 
-/// Writes `addr`'s 8-group hex form (see [`IPV6_ADDR_LEN`]) into `out`.
-/// Always writes exactly `IPV6_ADDR_LEN` bytes: the loop below is
-/// unconditional (no branch can make it write more or fewer), so returning
-/// the same constant [`forwarded_element_len`] and its callees use is not a
-/// second, divergent calculation, it is the same fact stated twice.
-fn write_ipv6_hex(addr: std::net::Ipv6Addr, out: &mut BytesMut) -> usize {
-    for (i, group) in addr.segments().iter().enumerate() {
-        if i > 0 {
-            out.put_u8(b':');
-        }
-        for shift in [12_u32, 8, 4, 0] {
-            let nibble = (u32::from(*group) >> shift) & 0xF;
-            let index = usize::try_from(nibble).unwrap_or(0);
-            let ch = HEX_DIGITS.get(index).copied().unwrap_or(b'0');
-            out.put_u8(ch);
+/// The (start, length) of the run RFC 5952 Section 4.2.2/4.2.3 requires this
+/// writer to compress into `::`: the LONGEST run of two or more consecutive
+/// zero 16-bit groups, ties broken toward the leftmost run ("the first run of
+/// zero fields MUST be shortened"), or `None` when no run of length 2 or more
+/// exists. A run of exactly one zero group is never compressed ("the symbol
+/// `::` MUST NOT be used to shorten just one 16-bit 0 field").
+///
+/// Shared by [`write_ipv6_canonical`] and [`ipv6_canonical_len`] so the two
+/// can never disagree about which run, if any, gets elided: a review of PR
+/// 651 (issue #657) named this specifically, because a fixed 39-byte
+/// uncompressed form disagrees with every other proxy's `X-Forwarded-For`
+/// rendering and breaks a string-compare allowlist even though it still
+/// re-parses to the same address.
+fn zero_run(segments: [u16; 8]) -> Option<(usize, usize)> {
+    let mut best: Option<(usize, usize)> = None;
+    let mut current_start = 0_usize;
+    let mut current_len = 0_usize;
+    for (i, &group) in segments.iter().enumerate() {
+        if group == 0 {
+            if current_len == 0 {
+                current_start = i;
+            }
+            current_len = current_len.saturating_add(1);
+        } else {
+            if current_len >= 2 && best.is_none_or(|(_, best_len)| current_len > best_len) {
+                best = Some((current_start, current_len));
+            }
+            current_len = 0;
         }
     }
-    IPV6_ADDR_LEN
+    if current_len >= 2 && best.is_none_or(|(_, best_len)| current_len > best_len) {
+        best = Some((current_start, current_len));
+    }
+    best
+}
+
+/// The number of hex digits [`write_group_hex`] writes for `group`: 1 to 4,
+/// with no leading zeros, except a single `0` for the value zero itself.
+fn group_hex_len(group: u16) -> usize {
+    if group < 0x10 {
+        // Covers zero itself too: it is written as a single `0` digit, not
+        // as no digits at all.
+        1
+    } else if group < 0x100 {
+        2
+    } else if group < 0x1000 {
+        3
+    } else {
+        4
+    }
+}
+
+/// Writes `group`'s hex digits (no leading zeros, lower case) into `out`.
+/// Always writes exactly [`group_hex_len`]`(group)` bytes.
+fn write_group_hex(group: u16, out: &mut BytesMut) -> usize {
+    let nibbles = [
+        (group >> 12) & 0xF,
+        (group >> 8) & 0xF,
+        (group >> 4) & 0xF,
+        group & 0xF,
+    ];
+    let first_nonzero = nibbles.iter().position(|&n| n != 0).unwrap_or(3);
+    let mut written = 0_usize;
+    for &nibble in nibbles.get(first_nonzero..).unwrap_or(&[]) {
+        let index = usize::from(nibble);
+        let ch = HEX_DIGITS.get(index).copied().unwrap_or(b'0');
+        out.put_u8(ch);
+        written = written.saturating_add(1);
+    }
+    written
+}
+
+/// Writes `addr`'s RFC 5952 canonical hex form into `out`: lower case, no
+/// leading zeros within a group, and the leftmost longest run of two or more
+/// zero groups replaced by `::`. `2001:db8::1`, not the uncompressed,
+/// zero-padded `2001:0db8:0000:0000:0000:0000:0000:0001`, so a value this
+/// writer emits string-compares equal to what every other RFC 5952
+/// conforming proxy emits for the same address.
+///
+/// Shares its control flow exactly with [`ipv6_canonical_len`] (same `run`
+/// input, same "just wrote `::`, suppress the next separator" state), so the
+/// two cannot silently drift apart the way two independently written
+/// calculations could.
+fn write_ipv6_canonical(addr: std::net::Ipv6Addr, out: &mut BytesMut) -> usize {
+    let segments = addr.segments();
+    let run = zero_run(segments);
+    let mut written = 0_usize;
+    let mut wrote_a_group = false;
+    let mut idx = 0_usize;
+    while idx < 8 {
+        if let Some((start, run_len)) = run
+            && idx == start
+        {
+            out.extend_from_slice(b"::");
+            written = written.saturating_add(2);
+            // `zero_run` only ever returns a run of length 2 or more (its
+            // own doc comment), so `run_len.max(1)` never changes this
+            // program's behaviour today. It stays here anyway: `idx`
+            // advancing by zero on this branch would spin forever on the
+            // request path (this writer runs at egress, once per resolved
+            // IPv6 client), and hand-written mutation testing on this exact
+            // function confirmed the hang by forcing `zero_run` to return a
+            // length-0 run. A single `.max(1)` turns a future regression in
+            // `zero_run` into wrong output instead of an outage.
+            idx = idx.saturating_add(run_len.max(1));
+            wrote_a_group = false;
+            continue;
+        }
+        if wrote_a_group {
+            out.put_u8(b':');
+            written = written.saturating_add(1);
+        }
+        let group = segments.get(idx).copied().unwrap_or(0);
+        written = written.saturating_add(write_group_hex(group, out));
+        wrote_a_group = true;
+        idx = idx.saturating_add(1);
+    }
+    written
+}
+
+/// The byte length [`write_ipv6_canonical`] will write for `addr`. Mirrors
+/// that function's own loop exactly (see its doc comment) rather than
+/// deriving the total from a separate formula.
+fn ipv6_canonical_len(addr: std::net::Ipv6Addr) -> usize {
+    let segments = addr.segments();
+    let run = zero_run(segments);
+    let mut len = 0_usize;
+    let mut wrote_a_group = false;
+    let mut idx = 0_usize;
+    while idx < 8 {
+        if let Some((start, run_len)) = run
+            && idx == start
+        {
+            len = len.saturating_add(2);
+            // See the matching guard in `write_ipv6_canonical`.
+            idx = idx.saturating_add(run_len.max(1));
+            wrote_a_group = false;
+            continue;
+        }
+        if wrote_a_group {
+            len = len.saturating_add(1);
+        }
+        let group = segments.get(idx).copied().unwrap_or(0);
+        len = len.saturating_add(group_hex_len(group));
+        wrote_a_group = true;
+        idx = idx.saturating_add(1);
+    }
+    len
 }
 
 /// The byte length [`write_addr_text`] will write for `addr`.
@@ -415,12 +617,12 @@ fn addr_text_len(addr: IpAddr) -> usize {
             }
             len
         }
-        IpAddr::V6(_) => IPV6_ADDR_LEN,
+        IpAddr::V6(v6) => ipv6_canonical_len(v6),
     }
 }
 
-/// Writes `addr`'s text form (dotted-decimal for IPv4, the 8-group hex form
-/// for IPv6, neither bracketed nor quoted) into `out`.
+/// Writes `addr`'s text form (dotted-decimal for IPv4, the RFC 5952
+/// canonical hex form for IPv6, neither bracketed nor quoted) into `out`.
 fn write_addr_text(addr: IpAddr, out: &mut BytesMut) -> usize {
     match addr {
         IpAddr::V4(v4) => {
@@ -434,7 +636,7 @@ fn write_addr_text(addr: IpAddr, out: &mut BytesMut) -> usize {
             }
             written
         }
-        IpAddr::V6(v6) => write_ipv6_hex(v6, out),
+        IpAddr::V6(v6) => write_ipv6_canonical(v6, out),
     }
 }
 
@@ -688,6 +890,24 @@ mod tests {
             &mut out,
         )
         .expect("well formed Forwarded chain fixture")
+    }
+
+    /// A chain built from BOTH a `Forwarded` line and an `X-Forwarded-For`
+    /// line at once: reproduces issue #657, where `forwarded.rs::parse_into`
+    /// places every `Forwarded` element before every `X-Forwarded-For`
+    /// element regardless of which one actually arrived first on the wire.
+    fn mixed_chain(forwarded_entries: &[&str], xff_entries: &[&str]) -> ForwardedChain {
+        let forwarded_joined = forwarded_entries.join(", ");
+        let xff_joined = xff_entries.join(", ");
+        let mut out = BytesMut::new();
+        ForwardedChain::parse_into(
+            core::iter::once(forwarded_joined.as_bytes()),
+            core::iter::once(xff_joined.as_bytes()),
+            core::iter::empty(),
+            &Limits::DEFAULT.clamped(),
+            &mut out,
+        )
+        .expect("well formed mixed-family chain fixture")
     }
 
     fn attacker_32_chain() -> ForwardedChain {
@@ -1044,6 +1264,54 @@ mod tests {
     }
 
     #[test]
+    fn mixed_family_chain_fails_closed() {
+        // Issue #657. `forwarded.rs::parse_into` places every `Forwarded`
+        // element before every `X-Forwarded-For` element regardless of
+        // arrival order (pinned there by
+        // `forwarded::tests::forwarded_elements_precede_xff`), so a client
+        // that sends its own `X-Forwarded-For` while the trusted proxy in
+        // front speaks RFC 7239 `Forwarded` lands on the RIGHT end of the
+        // chain, which is exactly the end this walk trusts. The chain
+        // below is the reviewer's own reproduction: a trusted proxy wrote
+        // `Forwarded: for=203.0.113.9` and the client wrote
+        // `X-Forwarded-For: 10.0.0.1`. Trusting either family alone here
+        // would be a guess; refusing the whole chain and falling back to
+        // the socket peer is the fail-closed answer.
+        let socket_peer = sock("198.51.100.1:9000");
+        let chain = mixed_chain(&["for=203.0.113.9"], &["10.0.0.1"]);
+
+        let got = resolve_identity(socket_peer, None, &chain, &TrustPolicy::HopCount(1));
+        assert_eq!(
+            got.source,
+            IdentitySource::Socket,
+            "a mixed-family chain must never resolve via ForwardedChain"
+        );
+        assert_eq!(
+            got.client,
+            socket_peer.ip(),
+            "the client must not be able to pick its own identity by adding \
+             X-Forwarded-For behind a proxy that speaks Forwarded"
+        );
+        assert_eq!(got.trusted_hops, 0);
+
+        // Same shape under TrustedCidrs (the reviewer's second
+        // reproduction): a trusted base with a mixed chain must also fail
+        // closed rather than resolve to the client's own XFF entry.
+        let socket_peer2 = sock("10.1.2.3:2222");
+        let policy = TrustPolicy::TrustedCidrs(vec![cidr("10.0.0.0", 8)]);
+        let chain2 = mixed_chain(&["for=203.0.113.9"], &["1.2.3.4"]);
+        let got2 = resolve_identity(socket_peer2, None, &chain2, &policy);
+        assert_eq!(got2.source, IdentitySource::Socket);
+        assert_eq!(got2.client, socket_peer2.ip());
+        assert_eq!(got2.trusted_hops, 0);
+        assert!(
+            got2.peer_trusted,
+            "peer_trusted still reflects the checked base address, which is \
+             a separate question from whether the chain was usable"
+        );
+    }
+
+    #[test]
     fn none_never_reads_the_chain() {
         let socket_peer = sock("198.51.100.1:9000");
         let chain = attacker_32_chain();
@@ -1089,6 +1357,236 @@ mod tests {
         let got = resolve_identity(socket_peer, None, &chain, &TrustPolicy::HopCount(3));
         assert_eq!(got.client, addr("1.1.1.1"));
         assert_eq!(got.forwarded_proto, Some(Scheme::Https));
+    }
+
+    #[test]
+    fn forwarded_proto_never_reads_left_of_the_client_under_hop_count() {
+        // SHOULD_FIX from PR 651's review (issue #657): `proto_falls_back_rightwards`
+        // above uses `HopCount(3)` over a 3-element chain, where the client
+        // index is always 0, so it cannot tell `nearest_proto`'s real bound
+        // (`elements[start..]`) apart from a mutant that scanned the WHOLE
+        // chain from 0 regardless of `start`: hand confirmed, replacing
+        // `nearest_proto` with a version that ignores `start` entirely still
+        // passes the whole existing suite. This chain has FOUR elements
+        // under `HopCount(1)`, so the client index is 3, and only the
+        // LEFTMOST element (fully attacker padded, left of anything any
+        // policy here ever trusts) carries a `proto`.
+        let chain = forwarded_chain(&[
+            "for=9.9.9.9;proto=https",
+            "for=8.8.8.8",
+            "for=7.7.7.7",
+            "for=6.6.6.6",
+        ]);
+        let socket_peer = sock("198.51.100.1:9000");
+        let got = resolve_identity(socket_peer, None, &chain, &TrustPolicy::HopCount(1));
+        assert_eq!(
+            got.client,
+            addr("6.6.6.6"),
+            "index 3, the rightmost element"
+        );
+        assert_eq!(
+            got.forwarded_proto, None,
+            "the leftmost element's proto must never leak into a HopCount(1) \
+             resolution: nothing to the right of index 3 has one"
+        );
+    }
+
+    #[test]
+    fn forwarded_proto_never_reads_left_of_the_client_under_trusted_cidrs() {
+        // As above, for design step 5e (`TrustedCidrs`): the client is the
+        // first untrusted address walking from the right, and its
+        // `forwarded_proto` must come only from itself or a trusted hop to
+        // its right, never from anything further left. Here the leftmost
+        // element (`1.1.1.1`, attacker padding, never verified against
+        // `cidrs`) carries a `proto` that must not leak in, while a
+        // genuinely trusted hop to the client's right does supply one.
+        let chain = forwarded_chain(&[
+            "for=1.1.1.1;proto=https", // left of the client: must be ignored
+            "for=1.2.3.4",             // the client: untrusted, no proto
+            "for=10.0.0.5;proto=http", // trusted hop to the right: must win
+            "for=10.0.0.6",            // trusted hop to the right: no proto
+        ]);
+        let socket_peer = sock("10.1.2.3:2222");
+        let policy = TrustPolicy::TrustedCidrs(vec![cidr("10.0.0.0", 8)]);
+        let got = resolve_identity(socket_peer, None, &chain, &policy);
+        assert_eq!(got.client, addr("1.2.3.4"));
+        assert_eq!(got.trusted_hops, 2);
+        assert_eq!(
+            got.forwarded_proto,
+            Some(Scheme::Http),
+            "must fall back rightward to the trusted hop's own proto claim, \
+             never to the attacker-padded element left of the client"
+        );
+    }
+
+    #[test]
+    fn forward_emit_defaults_to_both_families_on() {
+        // SHOULD_FIX from PR 651's review (issue #657): `ForwardEmit` is
+        // declared in issue #32's Design section (`grep -rn "ForwardEmit"`
+        // previously returned nothing) but was never implemented. Both its
+        // field doc comments say "Default true".
+        let emit = ForwardEmit::default();
+        assert!(emit.emit_forwarded);
+        assert!(emit.emit_x_forwarded);
+
+        // The distinguishing pair: a value that is NOT the default must
+        // compare unequal to it, so `PartialEq` cannot be mistaken for a
+        // constant `true`.
+        let neither = ForwardEmit {
+            emit_forwarded: false,
+            emit_x_forwarded: false,
+        };
+        assert_ne!(neither, ForwardEmit::default());
+    }
+
+    #[test]
+    fn host_value_quoted_for_ipv6_literal_without_port() {
+        // SHOULD_FIX from PR 651's review (issue #657): every existing test
+        // that needs `host=` quoted pairs it with a non-default port, so a
+        // suite built only from those cases cannot tell
+        // `is_ipv6_literal() || port().is_some()` apart from `port().is_some()`
+        // alone: an IPv6-literal authority WITHOUT a port would silently
+        // stop being quoted, producing `host=[2001:db8::1]` (unquoted, with
+        // `[` and `]`, which are not `tchar` per RFC 9110 5.6.2) instead of
+        // the required `host="[2001:db8::1]"`.
+        let limits = Limits::DEFAULT.clamped();
+        let mut authority_out = BytesMut::new();
+        let authority =
+            Authority::parse_into(b"[2001:db8::1]", Scheme::Http, &limits, &mut authority_out)
+                .expect("[2001:db8::1] must parse as a bracketed IPv6 authority");
+        assert!(authority.is_ipv6_literal());
+        assert!(
+            authority.port().is_none(),
+            "this fixture must carry no port, or it would not distinguish \
+             is_ipv6_literal() from port().is_some()"
+        );
+
+        let peer = identity(addr("203.0.113.5"), None);
+        let local = sock("198.51.100.1:443");
+        let mut buf = BytesMut::new();
+        let written = write_forwarded_element(&peer, local, Scheme::Https, &authority, &mut buf);
+        let expected_len = forwarded_element_len(&peer, local, Scheme::Https, &authority);
+        assert_eq!(written, expected_len);
+
+        let text = core::str::from_utf8(&buf).expect("this writer only ever emits ASCII");
+        assert!(
+            text.contains(r#"host="[2001:db8::1]""#),
+            "an IPv6-literal host with no port must still be quoted: {text}"
+        );
+    }
+
+    #[test]
+    fn zero_run_picks_the_longest_and_leftmost_on_ties() {
+        // Direct tests of `zero_run` itself, found necessary by hand-written
+        // mutation testing (`cargo mutants -j 1`, scoped to this file):
+        // replacing the `>` in either of its two "is this run longer than
+        // the best so far" comparisons with `<`, `==` or `>=` survived the
+        // whole existing suite, because every fixture in
+        // `ipv6_written_in_rfc_5952_canonical_form` has at most one run of
+        // length >= 2, and `best.is_none_or(..)` short-circuits to `true` on
+        // the very first one regardless of the comparison.
+        //
+        // A shorter run first (len 2), a longer run second (len 3): the
+        // longer one must win. This is the loop's inner comparison.
+        assert_eq!(zero_run([1, 0, 0, 2, 0, 0, 0, 3]), Some((4, 3)));
+        // A longer run first (len 3), a shorter run second (len 2): the
+        // first (longer) one must still win.
+        assert_eq!(zero_run([1, 0, 0, 0, 2, 0, 0, 3]), Some((1, 3)));
+        // A shorter run followed by a longer TRAILING run: only the
+        // post-loop check (the same comparison, duplicated because the loop
+        // never sees a terminating non-zero group) can catch this one.
+        assert_eq!(zero_run([1, 0, 0, 2, 0, 0, 0, 0]), Some((4, 4)));
+        // Equal-length runs, both ending before the last group: RFC 5952
+        // 4.2.3 requires the leftmost to win, which for equal lengths means
+        // the MID-loop comparison must be strict `>`, not `>=`.
+        assert_eq!(zero_run([1, 0, 0, 2, 0, 0, 3, 4]), Some((1, 2)));
+        // Equal-length runs where the SECOND one reaches the final group:
+        // as above, but this can only be caught by the separate POST-loop
+        // comparison, hand confirmed to survive the whole suite (including
+        // the case directly above) when its `>` is mutated to `>=`.
+        assert_eq!(zero_run([1, 0, 0, 2, 3, 4, 0, 0]), Some((1, 2)));
+        // No run of length >= 2 anywhere: a lone single zero must not count.
+        assert_eq!(zero_run([1, 2, 0, 3, 4, 5, 6, 7]), None);
+        // The whole address is one run, caught entirely by the post-loop
+        // check.
+        assert_eq!(zero_run([0, 0, 0, 0, 0, 0, 0, 0]), Some((0, 8)));
+    }
+
+    #[test]
+    fn group_hex_len_matches_write_group_hex_at_every_boundary() {
+        // Direct tests of `group_hex_len` against `write_group_hex`'s actual
+        // output, one group at a time. Found necessary by hand-written
+        // mutation testing: mutating the `0x1000` branch of `group_hex_len`
+        // from `<` to `>` survives `ipv6_written_in_rfc_5952_canonical_form`
+        // entirely, because that test's "2001:db8::1" fixture has one group
+        // above the boundary (`0x2001`, under-counted by the mutant as 3
+        // digits instead of 4) and one group below it (`0xdb8`,
+        // over-counted as 4 digits instead of 3), and the address-level
+        // total the test checks comes out equal by coincidence: the two
+        // errors cancel. Checking each group in isolation cannot cancel.
+        let groups: [u16; 12] = [
+            0x0, 0x1, 0xF, 0x10, 0x11, 0xFF, 0x100, 0x101, 0xFFF, 0x1000, 0x1001, 0xFFFF,
+        ];
+        for group in groups {
+            let declared = group_hex_len(group);
+            let mut buf = BytesMut::new();
+            let actual = write_group_hex(group, &mut buf);
+            assert_eq!(
+                declared, actual,
+                "group_hex_len({group:#x}) = {declared} but write_group_hex wrote {actual}"
+            );
+            assert_eq!(
+                buf.len(),
+                actual,
+                "write_group_hex({group:#x}) must write exactly what it returns"
+            );
+        }
+    }
+
+    #[test]
+    fn ipv6_written_in_rfc_5952_canonical_form() {
+        // SHOULD_FIX from PR 651's review (issue #657): the writer used to
+        // emit the uncompressed, zero-padded 8-group form
+        // (`2001:0db8:0000:...:0001`), which every other RFC 5952
+        // conforming proxy never emits, breaking a downstream string-compare
+        // allowlist even though the value still re-parses correctly. This
+        // table pins the exact bytes, not just that it re-parses.
+        let cases: [(&str, &str); 7] = [
+            // A run in the middle.
+            ("2001:db8::1", "2001:db8::1"),
+            // A leading run.
+            ("::1", "::1"),
+            // A trailing run.
+            ("1::", "1::"),
+            // The all-zero address: the entire address is one run.
+            ("::", "::"),
+            // No run of length >= 2 anywhere: nothing is compressed.
+            ("2001:db8:1:2:3:4:5:6", "2001:db8:1:2:3:4:5:6"),
+            // A run of exactly one zero group must NOT be compressed
+            // (RFC 5952 4.2.2): only the middle group is zero here.
+            ("2001:db8:0:1:2:3:4:5", "2001:db8:0:1:2:3:4:5"),
+            // Two equal-length runs: RFC 5952 4.2.3 requires the LEFTMOST
+            // one to be shortened.
+            ("1:0:0:2:0:0:3:4", "1::2:0:0:3:4"),
+        ];
+        for (input, expected) in cases {
+            let v6: std::net::Ipv6Addr = input.parse().expect("valid IPv6 literal in a test case");
+            let mut buf = BytesMut::new();
+            let written = write_ipv6_canonical(v6, &mut buf);
+            let len = ipv6_canonical_len(v6);
+            assert_eq!(
+                written, len,
+                "write_ipv6_canonical and ipv6_canonical_len disagree for {input}"
+            );
+            let text = core::str::from_utf8(&buf).expect("this writer only ever emits ASCII");
+            assert_eq!(text, expected, "canonical rendering of {input}");
+            // The rendering must also re-parse to the exact same address,
+            // so compression never changes meaning.
+            let reparsed: std::net::Ipv6Addr = text
+                .parse()
+                .expect("this writer's own output must re-parse");
+            assert_eq!(reparsed, v6, "{text} must re-parse to {input}");
+        }
     }
 
     #[test]

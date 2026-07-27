@@ -299,7 +299,20 @@ Both fail closed to the socket peer, with `IdentitySource::Socket`, on every deg
 produces a `PeerIdentity`. The rejected alternative, trusting the leftmost `X-Forwarded-For` entry,
 is not merely inferior, it is 100% attacker controlled, because the leftmost entry is whatever the
 client itself typed; walking from the right instead is invariant under a client padding its own
-end of the chain, because a client can only ever add entries on the left.
+end of the chain, because a client can only ever add entries on the left of a single family's own
+elements.
+
+**A chain mixing `Forwarded` and `X-Forwarded-For` is refused outright, not walked.** The
+"can only add on the left" premise above holds only within one family. `ForwardedChain::parse_into`
+places every `Forwarded` element before every `X-Forwarded-For` element regardless of which one
+actually arrived on the wire first, so if a trusted proxy speaks `Forwarded` while a client sends
+its own `X-Forwarded-For`, the client's entry lands on the RIGHT end of the combined chain, which
+is the end this walk trusts. `resolve_identity` fails closed to the socket peer whenever a chain
+contains elements from both families, under both `HopCount` and `TrustedCidrs`, exactly as it does
+for a too-short chain. Issue #32 did not specify this case; it is documented on the issue
+(`trust-policy-and-peer-identity`, #32) as a judgement call rather than a settled requirement, and
+a deployment that genuinely needs both families honoured together is not supported by a single
+`TrustPolicy` today.
 
 **`peer_trusted` is verified only under `TrustedCidrs`.** It answers one narrow question: was the
 immediate base address (the PROXY-declared address when present, otherwise the socket peer)
