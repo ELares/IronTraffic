@@ -9,6 +9,7 @@ pub mod acceptor;
 pub mod buffer;
 pub mod net;
 pub mod shutdown;
+pub mod signal;
 pub mod spawn;
 pub mod sys;
 pub mod timer;
@@ -21,6 +22,7 @@ pub use buffer::{
 pub use hyper::rt::{Read, ReadBuf, ReadBufCursor, Sleep, Timer, Write};
 pub use net::connect_tcp;
 pub use shutdown::{Phase, ShutdownController, ShutdownToken, accept_or_drain};
+pub use signal::{ShutdownSignal, next_shutdown_signal, sleep_or_signal};
 pub use spawn::{NoRuntime, Spawner, TaskError, TaskHandle};
 pub use sys::{BindError, BindOutcome, Caps, SockOpts, bind_listener};
 pub use timer::{SystemTimer, TimedOut, sleep, with_timeout};

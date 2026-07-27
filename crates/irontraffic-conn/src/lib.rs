@@ -49,10 +49,12 @@
 
 pub mod accept;
 pub mod budget;
+pub mod drain;
 pub mod listener;
 pub mod registry;
 
 pub use accept::{AcceptConfig, AcceptOutcome, BoxFut, ConnHandler, MAX_BACKOFF_MS, accept_loop};
 pub use budget::{ConnBudget, EnhanceYourCalm, FrameCosts, FrameEvent, TooManyStreams};
+pub use drain::{DrainConfig, DrainReport, jitter_before_close, supervise, supervise_with_trigger};
 pub use listener::{ListenError, ListenerReport, ShardedListener};
 pub use registry::{ConnGuard, ConnRegistry, RegistryStats};
