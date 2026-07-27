@@ -352,6 +352,53 @@ async fn zero_graceful_timeout_escalates_immediately() {
     drop(guard);
 }
 
+// Edge case 8a, tested directly with an extreme value: mutation testing cannot
+// substitute saturating arithmetic for plain arithmetic (a bare `+` and a
+// `saturating_mul` both produce the exact same result on every value a mutation
+// test's own suite happens to exercise, so a mutant swapping one for the other is
+// either caught by some completely unrelated assertion or not caught at all,
+// never because THIS property was checked). `poll_interval: Duration::MAX` makes
+// `clamp_ms(cfg.poll_interval)` return `CoarseMono::MAX_INTERVAL_MS`
+// (about 1.07e9), and `.saturating_mul(20)` on that value overflows `u32`
+// (about 2.1e10 does not fit); a plain `*` would panic in a debug build (this one)
+// and wrap in release. The registry is empty here specifically so step 10's loop
+// body, which contains the actual `sleep(cfg.poll_interval)` call, is never
+// entered (`current > 0` is false on its first check): this test proves the
+// arithmetic that BUILDS the deadline from an extreme `poll_interval` cannot
+// panic, without ever asking tokio's timer to accept a `Duration::MAX` sleep,
+// which is a separate concern this issue does not own.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn poll_interval_max_does_not_overflow_the_grace_deadline() {
+    let registry = ConnRegistry::new(8);
+    let (controller, token) = ShutdownController::new();
+    let time: Arc<dyn TimeSource> = Arc::new(TestTimeSource::new());
+    let cfg = DrainConfig {
+        graceful_timeout: Duration::ZERO,
+        jitter: Duration::from_secs(5),
+        poll_interval: Duration::MAX,
+    };
+
+    let report = with_timeout(
+        Duration::from_secs(2),
+        supervise_with_trigger(
+            controller,
+            Arc::clone(&registry),
+            time,
+            cfg,
+            immediate_term(),
+        ),
+    )
+    .await
+    .expect(
+        "an extreme poll_interval must not panic while building the grace deadline, \
+         and must not hang: the empty registry means step 10's loop body, which is \
+         the only place that duration would actually be slept, is never entered",
+    );
+
+    assert_eq!(report.killed, 0);
+    assert_eq!(token.phase(), Phase::Closing);
+}
+
 #[tokio::test]
 async fn jitter_returns_immediately_when_closing() {
     let (controller, token) = ShutdownController::new();
