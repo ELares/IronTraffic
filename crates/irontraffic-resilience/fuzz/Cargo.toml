@@ -26,3 +26,9 @@ name = "fuzz_deadline_headers"
 path = "fuzz_targets/fuzz_deadline_headers.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fuzz_outlier_stats"
+path = "fuzz_targets/fuzz_outlier_stats.rs"
+test = false
+doc = false
