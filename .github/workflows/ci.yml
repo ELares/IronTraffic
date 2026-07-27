@@ -414,7 +414,39 @@ jobs:
   fuzz:
     name: fuzz (smoke, fails closed on a missing corpus)
     runs-on: ubuntu-latest
-    timeout-minutes: 25
+    # 45, not the 25 this was, because 25 was not a budget anyone chose: it was
+    # a ceiling this job had been growing into for its whole life and finally
+    # crossed. The step below fuzzes EVERY declared target SERIALLY at
+    # -max_total_time=60, so its wall clock is a straight line in the target
+    # count, about one minute per target plus one cargo-fuzz install and one
+    # build per fuzz crate. At 20 targets it ran 24m31s against a 25m ceiling
+    # and passed with 29 seconds to spare. The 21st target, added by #686,
+    # took it to 25m17s and the job was cancelled, which is how a timeout
+    # reports here: not as a failure with a message naming the deadline, but
+    # as `cancelled`, indistinguishable at a glance from a superseded run.
+    # That cost real time to diagnose, because the run LOOKS like GitHub
+    # cancelling a stale push rather than the gate running out of clock.
+    #
+    # It broke main, not just one PR. Every branch cut after #686 inherits a
+    # fuzz lane that cannot finish, so every PR is blocked on a required check
+    # that can never turn green again, and the repository has no way to merge
+    # its way out.
+    #
+    # Deliberately NOT fixed by lowering -max_total_time. That number is the
+    # gate's actual strength, and trading assurance for clock is the exact
+    # move this lane's four fail-closed checks exist to prevent. Raising the
+    # ceiling changes nothing about what runs: same targets, same 60 seconds
+    # each, same failures caught. It only costs CI minutes.
+    #
+    # This buys room for roughly 20 more targets, so it is a reprieve and not
+    # a cure. The real fix is to shard this job per fuzz crate the way the
+    # feature matrix already shards, which makes the wall clock the slowest
+    # single crate instead of the sum of all of them and stops the deadline
+    # from being a function of how much the project has been fuzzed. That is
+    # tracked separately, and it has to keep this job's exact name, because
+    # that string is a required status check and branch protection waits on it
+    # forever if a redesign renames it.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@nightly
