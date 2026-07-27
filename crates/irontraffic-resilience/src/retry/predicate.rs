@@ -485,6 +485,7 @@ impl RetryPolicyConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::sync::atomic::{AtomicU32, Ordering};
     use proptest::prelude::{Just, ProptestConfig, Strategy, any, proptest};
 
     /// A POST-shaped context with the default retry-on set, plenty of deadline budget,
@@ -1112,20 +1113,58 @@ mod tests {
         );
     }
 
+    /// How many cases each property below must actually drive to the branch its
+    /// assertion lives in, before it is allowed to report success.
+    ///
+    /// WHY THIS EXISTS, AND WHY IT IS NOT DECORATION. Both properties here are
+    /// written as `if <the interesting case> { assert!(...) }`. A generator that
+    /// never produces the interesting case makes such a property report `ok`
+    /// while asserting nothing, and NOTHING in this project could tell the two
+    /// apart: `scripts/test-census.sh` says so in its own header, that its
+    /// `no-vacuous-assert` and `no-test-without-assertion` rules "check that an
+    /// assertion is PRESENT, not that it is STRONG".
+    ///
+    /// That is exactly what happened. `attempts_so_far` was drawn from the FULL
+    /// u32 range while `max_attempts` is 1..=10, so the attempts clause vetoed
+    /// with probability about 1 - 10/2^32 and `RetryDecision::Retry` was reached
+    /// 0 times in 258 cases. Deleting the conjunction clause each property exists
+    /// to protect left that property reporting `ok`. Bounding the ranges alone
+    /// was measured insufficient: it reached Retry only 5 times in 256 and the
+    /// clause deletion still passed. The generators are now drawn RELATIVE to the
+    /// bounds they are compared against, and this floor is what stops the whole
+    /// failure recurring silently if someone later widens them again.
+    const MIN_INTERESTING_CASES: u32 = 15;
+
+    /// 2048 rather than proptest's default 256.
+    ///
+    /// Raising the CASE COUNT rather than skewing the generators further is the
+    /// deliberate choice. Each property's interesting branch sits behind four
+    /// independent clauses, so at 256 cases it was reached 7 to 13 times: enough
+    /// to be non-vacuous in principle, too few to be reliably above any floor
+    /// worth setting, and tightening the generators to force it higher would
+    /// have starved the veto paths these same properties also check. More cases
+    /// costs nothing measurable here, since `retryable` is a pure function over
+    /// `Copy` data and the whole file runs in well under a second.
+
     #[test]
     fn prop_never_retries_non_idempotent_without_proof() {
+        let reached_retry = AtomicU32::new(0);
         proptest!(
-            ProptestConfig::default(),
+            ProptestConfig::with_cases(2048),
             |(
                 bits: u16,
                 idempotent: bool,
                 treat_as_idempotent: bool,
-                attempts_so_far: u32,
+                // Relative to `max_attempts` (1..=10), not the full u32 range:
+                // the clause under test is `attempts_so_far >= max_attempts`.
+                attempts_so_far in 0u32..=11,
                 max_attempts in 1u32..=10,
                 now: u32,
-                budget in 0u32..=100_000,
-                backoff_ms: u32,
-                min_attempt_estimate_ms: u32,
+                budget in 0u32..=40_000,
+                // Relative to `budget`: the deadline clause compares
+                // `backoff_ms + min_attempt_estimate_ms` against it.
+                backoff_ms in 0u32..=15_000,
+                min_attempt_estimate_ms in 0u32..=15_000,
                 committed in proptest::option::of(commit_reason_strategy()),
                 failure in failure_kind_strategy(),
             )| {
@@ -1147,6 +1186,7 @@ mod tests {
                 };
                 let decision = retryable(&ctx, failure);
                 if decision == RetryDecision::Retry {
+                    reached_retry.fetch_add(1, Ordering::Relaxed);
                     assert!(
                         ctx.idempotence == MethodIdempotence::Idempotent
                             || ctx.treat_as_idempotent
@@ -1155,22 +1195,36 @@ mod tests {
                 }
             }
         );
+        let n = reached_retry.load(Ordering::Relaxed);
+        assert!(
+            n >= MIN_INTERESTING_CASES,
+            "only {n} of the generated cases reached RetryDecision::Retry, so this \
+             property asserted almost nothing. See MIN_INTERESTING_CASES."
+        );
     }
 
     #[test]
     fn prop_never_retries_after_commit() {
+        // Counts cases where the COMMIT CLAUSE is what stopped the retry, not
+        // merely cases where `committed` was set. Those are different, and only
+        // the first makes this property mean anything: if some earlier clause
+        // would have vetoed anyway, `assert_ne!(decision, Retry)` holds no matter
+        // what the commit clause does, so such a case cannot distinguish a
+        // working commit clause from a deleted one. Measured by re-running the
+        // predicate with `committed` cleared and asking whether THAT retries.
+        let commit_was_load_bearing = AtomicU32::new(0);
         proptest!(
-            ProptestConfig::default(),
+            ProptestConfig::with_cases(2048),
             |(
                 bits: u16,
                 idempotent: bool,
                 treat_as_idempotent: bool,
-                attempts_so_far: u32,
+                attempts_so_far in 0u32..=11,
                 max_attempts in 1u32..=10,
                 now: u32,
-                budget in 0u32..=100_000,
-                backoff_ms: u32,
-                min_attempt_estimate_ms: u32,
+                budget in 0u32..=40_000,
+                backoff_ms in 0u32..=15_000,
+                min_attempt_estimate_ms in 0u32..=15_000,
                 committed in proptest::option::of(commit_reason_strategy()),
                 failure in failure_kind_strategy(),
             )| {
@@ -1193,25 +1247,48 @@ mod tests {
                 let decision = retryable(&ctx, failure);
                 if ctx.committed.is_some() {
                     assert_ne!(decision, RetryDecision::Retry);
+                    let uncommitted = RetryContext {
+                        committed: None,
+                        ..ctx
+                    };
+                    if retryable(&uncommitted, failure) == RetryDecision::Retry {
+                        commit_was_load_bearing.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
+        );
+        let n = commit_was_load_bearing.load(Ordering::Relaxed);
+        assert!(
+            n >= MIN_INTERESTING_CASES,
+            "in only {n} of the generated cases was the commit clause the reason \
+             the retry was refused; in the rest an earlier clause vetoed anyway, \
+             so they cannot tell a working commit clause from a deleted one. See \
+             MIN_INTERESTING_CASES."
         );
     }
 
     #[test]
     fn prop_veto_order_is_stable() {
+        // One counter per veto arm. The DeadlineExhausted arm carries the
+        // deepest ordering assertion in this property (that clause 4 really
+        // precedes clause 5) and it never executed: the old generator drew
+        // `attempts_so_far` across the full u32 range, so clause 4 vetoed first
+        // in every case and DeadlineExhausted was reached 0 times in 258.
+        // Replacing that arm's body with `panic!` left the suite green.
+        let reached_deadline = AtomicU32::new(0);
+        let reached_attempts = AtomicU32::new(0);
         proptest!(
-            ProptestConfig::default(),
+            ProptestConfig::with_cases(2048),
             |(
                 bits: u16,
                 idempotent: bool,
                 treat_as_idempotent: bool,
-                attempts_so_far: u32,
+                attempts_so_far in 0u32..=11,
                 max_attempts in 1u32..=10,
                 now: u32,
-                budget in 0u32..=100_000,
-                backoff_ms: u32,
-                min_attempt_estimate_ms: u32,
+                budget in 0u32..=40_000,
+                backoff_ms in 0u32..=15_000,
+                min_attempt_estimate_ms in 0u32..=15_000,
                 committed in proptest::option::of(commit_reason_strategy()),
                 failure in failure_kind_strategy(),
             )| {
@@ -1248,11 +1325,13 @@ mod tests {
                             assert!(idempotent_or_proven);
                         }
                         RetryVeto::AttemptsExhausted => {
+                            reached_attempts.fetch_add(1, Ordering::Relaxed);
                             assert!(failure.matches(ctx.retry_on));
                             assert!(idempotent_or_proven);
                             assert!(ctx.committed.is_none());
                         }
                         RetryVeto::DeadlineExhausted => {
+                            reached_deadline.fetch_add(1, Ordering::Relaxed);
                             assert!(failure.matches(ctx.retry_on));
                             assert!(idempotent_or_proven);
                             assert!(ctx.committed.is_none());
@@ -1264,6 +1343,19 @@ mod tests {
                     }
                 }
             }
+        );
+        let d = reached_deadline.load(Ordering::Relaxed);
+        let a = reached_attempts.load(Ordering::Relaxed);
+        assert!(
+            d >= MIN_INTERESTING_CASES,
+            "only {d} of the generated cases reached the DeadlineExhausted arm, \
+             which carries this property's deepest ordering assertion (that the \
+             attempts clause precedes the deadline clause). See MIN_INTERESTING_CASES."
+        );
+        assert!(
+            a >= MIN_INTERESTING_CASES,
+            "only {a} of the generated cases reached the AttemptsExhausted arm. \
+             See MIN_INTERESTING_CASES."
         );
     }
 }
