@@ -1206,22 +1206,50 @@ mod tests {
     /// failure recurring silently if someone later widens them again.
     const MIN_INTERESTING_CASES: u32 = 15;
 
-    /// 2048 rather than proptest's default 256.
+    /// 8192 rather than proptest's default 256, and the number is LOAD BEARING,
+    /// not padding. Do not lower it.
     ///
     /// Raising the CASE COUNT rather than skewing the generators further is the
-    /// deliberate choice. Each property's interesting branch sits behind four
-    /// independent clauses, so at 256 cases it was reached 7 to 13 times: enough
-    /// to be non-vacuous in principle, too few to be reliably above any floor
-    /// worth setting, and tightening the generators to force it higher would
-    /// have starved the veto paths these same properties also check. More cases
-    /// costs nothing measurable here, since `retryable` is a pure function over
-    /// `Copy` data and the whole file runs in well under a second.
+    /// deliberate choice: each property's interesting branch sits behind four
+    /// independent clauses, and tightening the generators to force it higher
+    /// would starve the veto paths these same properties also check.
+    ///
+    /// 8192 is set by the clause-2 KILLER population, which is roughly eleven
+    /// times smaller than the Retry population an earlier version of this floor
+    /// counted (measured: 39.9 mean killer against 444 mean Retry over 40 runs
+    /// at 8192). Putting the corrected counter back at 2048 makes the property
+    /// FAIL 11 times in 12, mean counter 9.98 against a floor of 15; at 8192 the
+    /// flake probability is about 1 in 480,000. A future reader who "restores"
+    /// 2048 to save time therefore gets a test that reds most runs, and the
+    /// tempting next step, lowering `MIN_INTERESTING_CASES`, re-opens #666
+    /// exactly.
+    ///
+    /// The cost is real but small and was measured, because this comment used to
+    /// claim the file runs "in well under a second": `cargo test --lib
+    /// retry::predicate:: -- --test-threads=1` is 0.77s before and 3.09s after.
 
     #[test]
     fn prop_never_retries_non_idempotent_without_proof() {
-        let reached_retry = AtomicU32::new(0);
+        // Counts cases where CLAUSE 2 is the reason the retry was refused, which
+        // is exactly the population a deleted clause 2 would turn into a
+        // wrongful Retry. Counting `Retry` instead, as this did originally, is
+        // a PROXY, and a defeatable one: an independent review measured the two
+        // populations side by side over 40 runs at 2048 cases and found the
+        // Retry count averaging 112.5 while the killer population averaged
+        // 10.5, below MIN_INTERESTING_CASES itself. It then defeated the floor
+        // with a one-token generator edit (`bits: u16` -> `bits in
+        // Just(0b1111u16)`, pinning retry_on to the documented default set):
+        // the Retry count rose to 178, eleven times the floor, every floor
+        // stayed green, and this property reported `ok` WITH clause 2 deleted.
+        // That is the state issue #666 blocked on.
+        //
+        // This is the same technique `prop_never_retries_after_commit` already
+        // uses, and which that review verified exact (counted == killer in 40
+        // of 40 runs). Waiving is a one-field change no other clause reads,
+        // exactly as clearing `committed` is there.
+        let clause2_was_load_bearing = AtomicU32::new(0);
         proptest!(
-            ProptestConfig::with_cases(2048),
+            ProptestConfig::with_cases(8192),
             |(
                 bits: u16,
                 idempotent: bool,
@@ -1256,21 +1284,30 @@ mod tests {
                     min_attempt_estimate_ms,
                 };
                 let decision = retryable(&ctx, failure);
+                let disjunction_holds = ctx.idempotence == MethodIdempotence::Idempotent
+                    || ctx.treat_as_idempotent
+                    || failure.proves_not_processed();
                 if decision == RetryDecision::Retry {
-                    reached_retry.fetch_add(1, Ordering::Relaxed);
-                    assert!(
-                        ctx.idempotence == MethodIdempotence::Idempotent
-                            || ctx.treat_as_idempotent
-                            || failure.proves_not_processed()
-                    );
+                    assert!(disjunction_holds);
+                }
+                if !disjunction_holds {
+                    let waived = RetryContext {
+                        treat_as_idempotent: true,
+                        ..ctx
+                    };
+                    if retryable(&waived, failure) == RetryDecision::Retry {
+                        clause2_was_load_bearing.fetch_add(1, Ordering::Relaxed);
+                    }
                 }
             }
         );
-        let n = reached_retry.load(Ordering::Relaxed);
+        let n = clause2_was_load_bearing.load(Ordering::Relaxed);
         assert!(
             n >= MIN_INTERESTING_CASES,
-            "only {n} of the generated cases reached RetryDecision::Retry, so this \
-             property asserted almost nothing. See MIN_INTERESTING_CASES."
+            "in only {n} of the generated cases was the idempotency clause the reason \
+             the retry was refused; in the rest an earlier or later clause vetoed \
+             anyway, so they cannot tell a working clause 2 from a deleted one. See \
+             MIN_INTERESTING_CASES. (If you lowered PROPTEST_CASES, that is why.)"
         );
     }
 
@@ -1285,7 +1322,7 @@ mod tests {
         // predicate with `committed` cleared and asking whether THAT retries.
         let commit_was_load_bearing = AtomicU32::new(0);
         proptest!(
-            ProptestConfig::with_cases(2048),
+            ProptestConfig::with_cases(8192),
             |(
                 bits: u16,
                 idempotent: bool,
@@ -1349,7 +1386,7 @@ mod tests {
         let reached_deadline = AtomicU32::new(0);
         let reached_attempts = AtomicU32::new(0);
         proptest!(
-            ProptestConfig::with_cases(2048),
+            ProptestConfig::with_cases(8192),
             |(
                 bits: u16,
                 idempotent: bool,
