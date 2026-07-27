@@ -612,6 +612,114 @@ mod tests {
     }
 
     #[test]
+    fn on_frame_debits_every_variant_by_its_documented_cost() {
+        // A reviewer found that `cost_table_is_exact` above only calls
+        // `cost_of`, which never touches `tokens`, and that
+        // `prop_budget_monotone`'s sole assertion (`tokens() <= capacity`) is
+        // satisfied just as well by charging LESS as by charging the correct
+        // amount. Neither existing test would fail if `on_frame` silently
+        // treated any variant as free: inserting
+        // `if matches!(ev, FrameEvent::GoawayReceived | FrameEvent::Ping |
+        // FrameEvent::Settings | FrameEvent::SmallWindowUpdate |
+        // FrameEvent::Priority | FrameEvent::Continuation |
+        // FrameEvent::EmptyDataNoEndStream) { return Ok(()); }` immediately
+        // before the debit line leaves all 8 tests, clippy and the census
+        // green. This test debits each of the eleven variants exactly once,
+        // through `on_frame` itself, from a fresh default budget, and
+        // asserts the EXACT resulting `tokens()` against the literal numbers
+        // (independent of `cost_of`, so a bug shared by both functions could
+        // not hide from this and `cost_table_is_exact` at once).
+        let expected: [(FrameEvent, i64); 11] = [
+            (FrameEvent::Ordinary, 9_999),
+            (FrameEvent::HeadersOpen, 9_989),
+            (FrameEvent::Continuation, 9_997),
+            (FrameEvent::EmptyDataNoEndStream, 9_979),
+            (FrameEvent::RstStreamReceived, 9_959),
+            (FrameEvent::RstStreamSent, 9_959),
+            (FrameEvent::Ping, 9_989),
+            (FrameEvent::Settings, 9_979),
+            (FrameEvent::SmallWindowUpdate, 9_989),
+            (FrameEvent::Priority, 9_994),
+            (FrameEvent::GoawayReceived, 9_999),
+        ];
+        for (ev, want) in expected {
+            let mut budget = ConnBudget::new(0);
+            assert_eq!(budget.on_frame(ev, 0), Ok(()));
+            assert_eq!(
+                budget.tokens(),
+                want,
+                "{ev:?} must leave exactly {want} tokens after one on_frame debit"
+            );
+        }
+        // Every variant returned by the exhaustive helper is covered above.
+        assert_eq!(all_events().len(), expected.len());
+    }
+
+    #[test]
+    fn refill_watermark_advances_each_tick() {
+        // A reviewer found that `self.last_refill_ms = now_ms;` inside the
+        // `if gain > 0` block IS the entire rate limit, and that deleting it
+        // leaves every existing test green: `cargo-mutants` cannot generate
+        // this mutation because it removes a statement rather than replacing
+        // a function's return value. Without that assignment, `elapsed` is
+        // computed from the connection's ORIGINAL `last_refill_ms` forever,
+        // so every later refill re-credits the entire time elapsed since
+        // connection start rather than just the time since the last refill.
+        // Every other test in this module keeps `tokens` near `capacity`,
+        // where `min(capacity, ..)` happens to mask the over-credit. This
+        // test uses a capacity 500 times the combined size of the two
+        // refills under test, so the cap cannot hide the difference, and it
+        // drains the bucket with a single custom-cost frame (base and every
+        // other cost zeroed) so the two later ticks can isolate the refill
+        // amount with a zero-cost debit.
+        let capacity = 1_000_000;
+        let refill_per_sec = 1_000;
+        let drain_costs = FrameCosts {
+            base: 0,
+            headers_open: capacity,
+            continuation: 0,
+            empty_data: 0,
+            rst_received: 0,
+            rst_sent: 0,
+            ping: 0,
+            settings: 0,
+            small_window_update: 0,
+            priority: 0,
+            goaway: 0,
+        };
+        let mut budget = ConnBudget::with_params(capacity, refill_per_sec, 128, drain_costs, 0);
+        assert_eq!(budget.on_frame(FrameEvent::HeadersOpen, 0), Ok(()));
+        assert_eq!(
+            budget.tokens(),
+            0,
+            "the drain frame must empty the bucket exactly"
+        );
+
+        // First refill: 1000 ms pass, 1000 tokens per second credited, and a
+        // zero-cost debit isolates the credit amount.
+        assert_eq!(budget.on_frame(FrameEvent::Ordinary, 1_000), Ok(()));
+        assert_eq!(
+            budget.tokens(),
+            1_000,
+            "the first refill must credit exactly 1000 tokens"
+        );
+
+        // Second refill: another 1000 ms pass. If `last_refill_ms` advanced
+        // after the first refill (the correct behaviour), elapsed is 1000 ms
+        // again and this credits exactly 1000 MORE tokens, landing on 2000.
+        // If the assignment under test were deleted, elapsed would instead
+        // be measured from the connection's start (now_ms 0), giving
+        // elapsed = 2000 ms and a credit of 2000 tokens, landing on 3000.
+        assert_eq!(budget.on_frame(FrameEvent::Ordinary, 2_000), Ok(()));
+        assert_eq!(
+            budget.tokens(),
+            2_000,
+            "the second refill must credit exactly 1000 more tokens, not re-credit since \
+             connection start"
+        );
+    }
+
+    #[test]
     fn stream_admission() {
         // Edge case 16: the 128th `open_stream` succeeds (matching the
         // default `max_concurrent_proto`), and the 129th is refused with the

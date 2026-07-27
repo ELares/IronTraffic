@@ -38,12 +38,15 @@ irontraffic-http = { path = "../irontraffic-http", version = "0.1.0" }
 # real tokio runtime; this crate's own src/ never names tokio, enforced by
 # the transport-seam invariant lint.
 tokio = { workspace = true }
+# Test 13, prop_registry_conservation.
 proptest = { workspace = true }
+# The registry benchmarks.
 criterion = { workspace = true }
 
 [[bench]]
-name = "conn_hot"
-# Test 13, prop_registry_conservation.
-# The registry benchmarks.
+name = "registry"
+harness = false
 
+[[bench]]
+name = "conn_hot"
 harness = false
