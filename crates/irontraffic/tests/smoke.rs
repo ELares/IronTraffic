@@ -344,13 +344,31 @@ async fn connection_cap_rejects_the_extra_connection() {
     let mut first = connect(proxy.addr); // held open, sends nothing
 
     let mut second = connect(proxy.addr);
+    // 3s, and the exact value is load bearing in BOTH directions.
+    //
+    // It must stay STRICTLY UNDER `half_close_ms: 5000`. That is the whole reason
+    // this bound exists: with a bound at or past the half close deadline, the
+    // connection would be closed by the half close whether or not the cap did
+    // anything, and the assertion below would pass over a completely broken cap.
+    // #692 tightened this from exactly that hole. Do not "fix" a future flake by
+    // raising this to 5000 or beyond; that silently deletes the test.
+    //
+    // It was 1s, which failed intermittently on loaded CI runners: the same commit
+    // failed and passed on consecutive runs, and it went red on unrelated PRs that
+    // touch neither this crate nor the connection registry (see #710). A required
+    // check that fails at random trains everyone to re-run rather than read, which
+    // is how a real regression eventually gets waved through.
+    //
+    // 3s keeps every discriminating property (the cap is still the only thing that
+    // can produce an EOF this early) while tripling the margin against scheduler
+    // noise.
     second
-        .set_read_timeout(Some(Duration::from_secs(1)))
+        .set_read_timeout(Some(Duration::from_secs(3)))
         .expect("bound the cap-rejection probe's read well under half_close_ms");
     let mut buf = [0_u8; 16];
     let n = second
         .read(&mut buf)
-        .expect("the connection over max_connections must see EOF within 1s, not time out");
+        .expect("the connection over max_connections must see EOF within 3s, not time out");
     assert_eq!(n, 0, "the connection over max_connections must see EOF");
 
     // The first connection, which fit under the cap, must still be open while the
