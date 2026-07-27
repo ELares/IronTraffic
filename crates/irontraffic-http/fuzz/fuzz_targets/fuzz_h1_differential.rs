@@ -17,15 +17,31 @@
 //! version, and the field count must agree, so a divergence in WHAT was
 //! parsed (not merely in whether it parsed) is also caught.
 //!
-//! One narrower exception to "fails if we accept and httparse rejects":
-//! `httparse` validates the request-target's own byte class (rejecting a
-//! control byte or a non-ASCII byte there), and this crate's own issue is
-//! explicit that this parser must NOT parse the target beyond the `#` check,
-//! because target-byte safety is validated exactly once, later, by
-//! `NormalizedPath::parse_into` (invariant P1). A target byte outside
-//! `httparse`'s accepted class is therefore a second, deliberate one-way
-//! divergence, checked for directly against the raw input rather than
-//! assumed; anything else that makes `httparse` reject still fails the case.
+//! Two narrower exceptions to "fails if we accept and httparse rejects", both
+//! byte-class permissiveness this crate's own issue documents as deliberate,
+//! never a framing (where-does-the-message-end) divergence:
+//!
+//! 1. `httparse` validates the request-target's own byte class (rejecting a
+//!    control byte or a non-ASCII byte there), and this crate's own issue is
+//!    explicit that this parser must NOT parse the target beyond the `#`
+//!    check, because target-byte safety is validated exactly once, later, by
+//!    `NormalizedPath::parse_into` (invariant P1). A target byte outside
+//!    `httparse`'s accepted class is therefore a deliberate one-way
+//!    divergence, checked for directly against the raw input rather than
+//!    assumed.
+//! 2. `httparse` validates a field value's byte class too (its
+//!    `HEADER_VALUE_MAP`), while this parser's own reject table (issue #34)
+//!    refuses a field value ONLY for NUL, CR or LF (`field::value_byte_ok`),
+//!    accepting every other byte, including the control bytes `httparse`
+//!    refuses (0x01..=0x08, 0x0B, 0x0C, 0x0E..=0x1F, 0x7F). A field value
+//!    carrying one of those bytes is therefore a second deliberate one-way
+//!    divergence, checked directly against the values this parser itself
+//!    already produced (`RawHead::field_value` is a public accessor, unlike
+//!    the crate-private `target`).
+//!
+//! Anything else that makes `httparse` reject still fails the case: these two
+//! exceptions are narrowly the byte classes named above, not "any divergence
+//! that happens to co-occur with an odd byte somewhere in the message".
 //!
 //! `RawHead::target` is not compared: it has no public accessor (invariant
 //! P1), so it is unreachable from this separate fuzz crate. Comparing the
@@ -40,14 +56,32 @@ use irontraffic_http::h1::H1Parser;
 use irontraffic_http::{Limits, ParseStatus, WireVersion};
 use libfuzzer_sys::fuzz_target;
 
-/// Is `b` a byte `httparse` accepts inside a request-target? Measured directly
-/// against `httparse` 1.x by feeding it `GET <byte> HTTP/1.0\r\n\r\n` for every
-/// byte value: it accepts HTAB (0x09) and 0x21..=0x7E, and rejects everything
-/// else (0x00..=0x08, 0x0B..=0x1F, 0x7F..=0xFF). Used only to recognize the one
-/// documented, deliberate divergence below; this is not a claim about what any
-/// other version of `httparse` does.
+/// Is `b` a byte `httparse` accepts inside a request-target? Measured
+/// directly against `httparse` 1.10.1 by feeding it
+/// `GET /<byte> HTTP/1.0\r\n\r\n` for every one of the 256 byte values and
+/// recording which ones round-tripped as `Ok`: exactly 0x21..=0x7E is
+/// accepted, and everything else is rejected, including HTAB (0x09, `parse_uri`'s
+/// own byte class excludes it even though the reason-phrase grammar allows
+/// it) and every byte at or above 0x80 (`URI_MAP` allows those, but a lone
+/// high byte is never valid UTF-8 and `parse_uri` additionally requires the
+/// whole target to be valid UTF-8, so single-byte probes of 0x80..=0xFF are
+/// rejected in practice). Used only to recognize the one documented,
+/// deliberate divergence below; this is not a claim about what any other
+/// version of `httparse` does.
 fn httparse_accepts_as_target_byte(b: u8) -> bool {
-    b == 0x09 || (0x21..=0x7e).contains(&b)
+    (0x21..=0x7e).contains(&b)
+}
+
+/// Is `b` a byte `httparse` accepts inside a field value? Measured directly
+/// against `httparse` 1.10.1 by feeding it `GET / HTTP/1.0\r\nX: a<byte>b\r\n\r\n`
+/// for every one of the 256 byte values: it accepts HTAB (0x09), 0x20..=0x7E
+/// and every byte at or above 0x80, and rejects exactly the 32 remaining
+/// control bytes (0x00..=0x08, 0x0A..=0x1F, 0x7F). This parser's own reject
+/// table (issue #34) refuses a field value only for NUL, CR or LF
+/// (`field::value_byte_ok`), so every other control byte `httparse` refuses
+/// here is a second, deliberate one-way divergence, not a framing bug.
+fn httparse_accepts_as_header_value_byte(b: u8) -> bool {
+    b == 0x09 || (0x20..=0x7e).contains(&b) || b >= 0x80
 }
 
 /// The request-target slice of a well-formed `METHOD SP TARGET SP VERSION`
@@ -73,25 +107,41 @@ fuzz_target!(|data: &[u8]| {
     let their_result = theirs.parse(data);
 
     match (&ours, &their_result) {
-        (Ok(ParseStatus::Complete { .. }), Err(_)) => {
-            // One documented, deliberate exception (issue #34's own "Do NOT
-            // parse the request target beyond the `#` check" and invariant
-            // P1: target-byte safety is validated exactly once, later, by
-            // `NormalizedPath::parse_into`, issue #29). `httparse` validates
-            // the target's byte class itself and rejects a control byte or a
-            // non-ASCII byte there; this parser is required not to duplicate
-            // that check here, so it will always accept some inputs httparse
-            // refuses for that reason alone, forever, no matter how this
-            // parser is written. That is a different thing from being
-            // laxer on the request line's own grammar (a bare LF, an extra
-            // SP, a malformed method), which this assertion still catches:
-            // the exception fires only when the target itself carries a byte
-            // outside httparse's accepted class, not merely because httparse
-            // rejected for some other reason.
+        (Ok(ParseStatus::Complete { value, .. }), Err(_)) => {
+            // Two documented, deliberate exceptions; see the module doc
+            // comment for both.
+            //
+            // 1) issue #34's own "Do NOT parse the request target beyond the
+            // `#` check" and invariant P1: target-byte safety is validated
+            // exactly once, later, by `NormalizedPath::parse_into` (issue
+            // #29). `httparse` validates the target's byte class itself and
+            // rejects a control byte or a non-ASCII byte there; this parser
+            // is required not to duplicate that check here, so it will
+            // always accept some inputs httparse refuses for that reason
+            // alone, forever, no matter how this parser is written.
             let target_is_the_reason = target_slice_of(data)
                 .is_some_and(|t| t.iter().any(|&b| !httparse_accepts_as_target_byte(b)));
+            // 2) the reject table's field-value row: this parser refuses a
+            // value only for NUL, CR or LF, while `httparse` also refuses
+            // several other control bytes in a value. Checked against the
+            // values THIS parse actually produced, via the public
+            // `field_value` accessor, rather than re-derived from `data`:
+            // `RawHead::field_value` already resolved OWS trimming and line
+            // splitting, so this cannot itself introduce a second, competing
+            // implementation of that logic to drift from the parser's own.
+            let value_is_the_reason = (0..value.field_count()).any(|i| {
+                value
+                    .field_value(i)
+                    .is_some_and(|v| v.iter().any(|&b| !httparse_accepts_as_header_value_byte(b)))
+            });
+            // That is a different thing from being laxer on the message's
+            // own framing (a bare LF, an extra SP, a malformed method, a
+            // miscounted field), which this assertion still catches: the
+            // exception fires only when one of the two byte-class rows above
+            // explains the divergence, not merely because httparse rejected
+            // for some other reason.
             assert!(
-                target_is_the_reason,
+                target_is_the_reason || value_is_the_reason,
                 "we accepted input httparse rejected as {their_result:?}: {data:?}"
             );
         }

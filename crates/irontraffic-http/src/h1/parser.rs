@@ -739,6 +739,7 @@ impl H1Parser {
 mod tests {
     use super::*;
     use crate::limits::Limits;
+    use proptest::strategy::Strategy;
 
     fn parser(underscores: UnderscorePolicy) -> H1Parser {
         H1Parser::new(&Limits::DEFAULT.clamped(), underscores)
@@ -1561,10 +1562,132 @@ mod tests {
         assert_eq!(owner.scanned(), 300);
     }
 
+    /// Exact target bytes for each of the four request-target forms RFC 9112
+    /// Section 3.2 names (origin-form, absolute-form, authority-form and
+    /// asterisk-form), checked against `RawHead::target` directly (this test
+    /// lives inside the crate, so the `pub(crate)` field is visible here,
+    /// same as `prop_never_panics_and_consumed_in_range` above).
+    ///
+    /// This is the assertion issue #584 found missing: every prior check
+    /// only asked `target.of(&input).is_some()`, which a wrong span (for
+    /// example one that starts one byte early, per the issue's own
+    /// `target_start = first_sp` reproduction) still satisfies as long as it
+    /// stays in bounds. Comparing the exact bytes is what a wrong span
+    /// cannot survive.
+    #[test]
+    fn target_span_is_exact_for_every_request_target_form() {
+        let p = default_parser();
+        let cases: &[(&[u8], &[u8])] = &[
+            // Origin-form.
+            (b"GET / HTTP/1.1\r\n\r\n", b"/"),
+            (b"GET /a/b?c=1 HTTP/1.1\r\n\r\n", b"/a/b?c=1"),
+            // Absolute-form.
+            (
+                b"GET http://example.com/a HTTP/1.1\r\n\r\n",
+                b"http://example.com/a",
+            ),
+            (
+                b"GET http://example.com:8080/a/b HTTP/1.1\r\n\r\n",
+                b"http://example.com:8080/a/b",
+            ),
+            // Authority-form (the CONNECT method's target).
+            (
+                b"CONNECT example.com:443 HTTP/1.1\r\n\r\n",
+                b"example.com:443",
+            ),
+            (
+                b"CONNECT 203.0.113.5:8080 HTTP/1.1\r\n\r\n",
+                b"203.0.113.5:8080",
+            ),
+            // Asterisk-form (OPTIONS's target).
+            (b"OPTIONS * HTTP/1.1\r\n\r\n", b"*"),
+        ];
+        for (input, expected_target) in cases {
+            match p.parse_request_head(input) {
+                Ok(ParseStatus::Complete { value, .. }) => {
+                    assert_eq!(
+                        value.target.of(input),
+                        Some(*expected_target),
+                        "target span mismatch for {input:?}"
+                    );
+                }
+                other => panic!("expected Complete for {input:?}, got {other:?}"),
+            }
+        }
+    }
+
+    /// A syntactically plausible HTTP/1.1 request head: a known method, one
+    /// request-target of each of the four forms RFC 9112 Section 3.2 names
+    /// (origin-form, absolute-form, authority-form, asterisk-form), a
+    /// supported version, and zero to four ordinary field lines.
+    ///
+    /// This exists because the OLD generator below (pure random bytes with
+    /// one byte forced to a delimiter) never produces a well-formed head:
+    /// issue #584 replicated it over 20 million samples and measured zero
+    /// `Complete` results, which means every assertion inside
+    /// `prop_never_panics_and_consumed_in_range`'s `Complete` arm, including
+    /// the one that checks `RawHead::target`, was dead code that no CI run
+    /// ever executed. A mostly-valid head is short (tens of bytes) next to
+    /// `mutation_index`'s `0..2048` range, so most of the time the mutation
+    /// below lands out of bounds and is a no-op (`input.get_mut` returns
+    /// `None`), and the still-valid head reaches `Complete`; the times it
+    /// does land in range exercise the same corruption-resilience property
+    /// the old generator was written for, just starting from a realistic
+    /// head instead of noise. Mixed with the old generator via `prop_oneof!`
+    /// below, not a replacement for it: arbitrary bytes remain in the mix
+    /// for the coverage they alone provide over the `Err` and `Partial`
+    /// paths.
+    fn plausible_head() -> impl Strategy<Value = Vec<u8>> {
+        let method = proptest::sample::select(
+            &["GET", "HEAD", "POST", "PUT", "DELETE", "OPTIONS", "CONNECT"][..],
+        );
+        let target = proptest::sample::select(
+            &[
+                // Origin-form.
+                "/",
+                "/a/b?c=1",
+                // Absolute-form.
+                "http://example.com/a",
+                "http://example.com:8080/a/b",
+                // Authority-form.
+                "example.com:443",
+                "203.0.113.5:8080",
+                // Asterisk-form.
+                "*",
+            ][..],
+        );
+        let version = proptest::sample::select(&["HTTP/1.1", "HTTP/1.0"][..]);
+        let field = (
+            proptest::sample::select(&["Host", "X-A", "Accept", "User-Agent"][..]),
+            proptest::sample::select(&["a", "example.com", "", "text/plain"][..]),
+        );
+        let fields = proptest::collection::vec(field, 0..=4);
+        (method, target, version, fields).prop_map(|(method, target, version, fields)| {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(method.as_bytes());
+            buf.push(b' ');
+            buf.extend_from_slice(target.as_bytes());
+            buf.push(b' ');
+            buf.extend_from_slice(version.as_bytes());
+            buf.extend_from_slice(b"\r\n");
+            for (name, value) in fields {
+                buf.extend_from_slice(name.as_bytes());
+                buf.extend_from_slice(b": ");
+                buf.extend_from_slice(value.as_bytes());
+                buf.extend_from_slice(b"\r\n");
+            }
+            buf.extend_from_slice(b"\r\n");
+            buf
+        })
+    }
+
     proptest::proptest! {
         #[test]
         fn prop_never_panics_and_consumed_in_range(
-            input in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..=2048),
+            input in proptest::prop_oneof![
+                proptest::collection::vec(proptest::prelude::any::<u8>(), 0..=2048),
+                plausible_head(),
+            ],
             mutation_index in 0..2048_usize,
             mutation_byte in proptest::sample::select(&[b'\r', b'\n', b':', b' ', b'\t', 0u8][..]),
         ) {
