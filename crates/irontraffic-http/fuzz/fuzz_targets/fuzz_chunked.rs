@@ -25,6 +25,16 @@
 //! fresh `BytesMut::new()` per call compiled and ran cleanly here for a
 //! long time while silently destroying every trailer section this target
 //! ever decoded.
+//!
+//! One exception to "agree on the outcome": the trailer re-scan budget
+//! (`HeadScanBudget::MAX_BYTES` in `chunked.rs`'s `step_trailers`) is
+//! deliberately charged per byte SEARCHED per `decode` call, not per byte
+//! consumed, so a finer split of the identical wire bytes charges it more
+//! and can trip `Err(FieldLineTooLong)` on one run where the other is merely
+//! `Unfinished` or even reaches `Done` with real trailer content. That is
+//! the intended path-dependent cost, not a resumption bug, and the
+//! assertions below are narrowed accordingly: see the comment at the point
+//! of the assertion for exactly what is and is not still checked.
 
 use bytes::BytesMut;
 use irontraffic_http::RejectReason;
@@ -125,12 +135,55 @@ fuzz_target!(|data: &[u8]| {
         whole_data, split_data,
         "split at {split} disagreed with the whole-buffer run on Data bytes for {wire:?}"
     );
-    assert_eq!(
-        whole_outcome, split_outcome,
-        "split at {split} disagreed with the whole-buffer run on the final outcome for {wire:?}"
-    );
-    assert_eq!(
-        whole_trailers, split_trailers,
-        "split at {split} disagreed with the whole-buffer run on the trailer section for {wire:?}"
-    );
+
+    // The resumption property is NOT exact split-invariance of the outcome in
+    // one specific, deliberate case: the trailer re-scan budget
+    // (`HeadScanBudget::MAX_BYTES`, charged in `chunked.rs`'s `step_trailers`)
+    // and the per-line length cap it shares a `RejectReason` with are charged
+    // against bytes SEARCHED per `decode` call, not bytes consumed, precisely
+    // so that a peer drip-feeding one byte per call pays for re-searching the
+    // same incomplete trailer line on every call (see the long comment at
+    // `step_trailers` and the `trailer_rescan_is_bounded` unit test that pins
+    // the resulting call count). Splitting the SAME wire bytes into more
+    // calls therefore charges that budget more, by design: a fine enough
+    // split can turn a whole-buffer `Unfinished`, or even a whole-buffer
+    // `Done` with real trailer content, into a split-run
+    // `Err(FieldLineTooLong)` that never got far enough to see any trailer
+    // fields at all. That is the intended cost asymmetry, not a resumption
+    // bug, so this assertion gives up exact outcome and trailer-content
+    // equality in exactly that one case: when exactly one of the two runs
+    // ended in `Err(FieldLineTooLong)` and the other did not.
+    //
+    // Everything else is kept exactly as before: Data bytes always (already
+    // asserted above, unaffected because the budget only exists inside the
+    // `Trailers` state, entirely after body data delivery), and outcome plus
+    // trailer content whenever NEITHER run hit that budget, including when
+    // BOTH did (their outcomes already agree, so the assertion below is not
+    // skipped, only trivially satisfied). A genuine resumption bug, such as
+    // issue #658's arena mismatch that silently corrupted trailer content
+    // without ever touching Data bytes or the outcome, still fails this
+    // assert exactly as before.
+    let whole_hit_trailer_budget =
+        matches!(whole_outcome, Outcome::Err(RejectReason::FieldLineTooLong));
+    let split_hit_trailer_budget =
+        matches!(split_outcome, Outcome::Err(RejectReason::FieldLineTooLong));
+    if whole_hit_trailer_budget == split_hit_trailer_budget {
+        assert_eq!(
+            whole_outcome, split_outcome,
+            "split at {split} disagreed with the whole-buffer run on the final outcome for {wire:?}"
+        );
+        assert_eq!(
+            whole_trailers, split_trailers,
+            "split at {split} disagreed with the whole-buffer run on the trailer section for {wire:?}"
+        );
+    } else {
+        // Exactly one side was cut off by the path-dependent trailer budget.
+        // Do not compare `whole_trailers` and `split_trailers` here: the
+        // refused side's snapshot is trivially empty (see `run`, which
+        // returns `Vec::new()` on every `Err`), so the comparison would
+        // either pass vacuously (neither run ever reached a trailer field)
+        // or fail on precisely the divergence this branch exists to permit
+        // (the whole-buffer run reached `Done` with real trailer content
+        // that the split run, cut off first, never saw).
+    }
 });
