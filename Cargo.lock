@@ -1153,6 +1153,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "irontraffic-wasm"
+version = "0.1.0"
+dependencies = [
+ "irontraffic-filter",
+ "proptest",
+]
+
+[[package]]
 name = "irontraffic-ws"
 version = "0.1.0"
 dependencies = [
