@@ -1145,6 +1145,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "irontraffic-ws"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "irontraffic-http",
+ "proptest",
+ "thiserror",
+]
+
+[[package]]
 name = "itertools"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

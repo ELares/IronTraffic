@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "irontraffic-ws"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "A validating, sans-IO WebSocket frame codec for a relay: per-frame validation and per-frame forwarding, never reassembly."
+
+# Required by `ci-invariant-lints` (#3), which asserts every crate manifest carries it.
+[lints]
+workspace = true
+
+[dependencies]
+# `http-crate-foundation-types` (#22): this crate's error taxonomy (a closed,
+# payload-light enum with a metric label and a mapped outcome per variant)
+# mirrors the conventions `irontraffic-http` establishes. An explicit version
+# is required alongside the path: a bare path dependency is a wildcard
+# version requirement and cargo-deny refuses it.
+irontraffic-http = { path = "../irontraffic-http", version = "0.1.0" }
+# Typed error enum without a hand-written Display impl.
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+criterion.workspace = true
+
+[[bench]]
+name = "frames"
+harness = false
