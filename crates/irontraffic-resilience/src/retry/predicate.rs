@@ -939,6 +939,77 @@ mod tests {
             retryable(&ctx, FailureKind::ConnectFailure),
             RetryDecision::No(RetryVeto::Committed(CommitReason::ResponseBytesForwarded))
         );
+
+        // THE CASE ABOVE DOES NOT PIN ANY CLAUSE ORDER, despite this test's name.
+        // `ConnectFailure::proves_not_processed()` is true, so the idempotency
+        // clause never vetoes for it, and the answer is `Committed` whichever of
+        // the two clauses runs first. Swapping them leaves it passing.
+        //
+        // WHAT THE NAME ACTUALLY MEANS, because it is easy to misread and I did
+        // misread it: commitment overrides the idempotency ALLOWANCE, not the
+        // idempotency VETO. A failure that PROVES the origin never processed the
+        // request would otherwise be freely retryable; being committed refuses it
+        // anyway. It does NOT mean the commit clause is evaluated first. The
+        // module doc's conjunction is explicit that it is not:
+        //     matches_retry_on AND (idempotent OR proves_not_processed)
+        //                      AND NOT committed AND ...
+        //
+        // So the discriminating case below asserts `NonIdempotent`, and that is
+        // the assertion the review's suggested fix got backwards. Verified by
+        // execution rather than by reading: asserting `Committed` here fails with
+        // `left: No(NonIdempotent)`.
+        //
+        // `UpstreamStatus(503)` does not prove non-processing and `base_ctx()` is
+        // a NonIdempotent method that has not opted into `treat_as_idempotent`,
+        // so BOTH clauses would veto and only their order picks the reported
+        // reason, which is a metric an operator reads:
+        //     idempotency before committed -> NonIdempotent   (what the code does)
+        //     committed before idempotency -> Committed(..)
+        //
+        // GATEWAY_ERROR is enabled explicitly because `RetryOn::default()` is the
+        // conservative proof-of-non-processing set and deliberately excludes it;
+        // against the default a 503 stops at `NotInRetryOn` and never reaches
+        // either clause. Also found by execution, not assumed.
+        let ctx_503 = RetryContext {
+            retry_on: RetryOn::default().union(RetryOn::GATEWAY_ERROR),
+            ..ctx
+        };
+        assert_eq!(
+            retryable(&ctx_503, FailureKind::UpstreamStatus(503)),
+            RetryDecision::No(RetryVeto::NonIdempotent),
+            "the idempotency clause must be evaluated BEFORE the commit clause; \
+             reporting Committed here means they have been reordered"
+        );
+    }
+
+    /// `RetryOn::contains` is `pub` and documented as a SUBSET test ("every bit
+    /// of `other` is set in `self`"). Nothing pinned that: every in-crate call
+    /// site passes a single-bit constant, where the subset form and the
+    /// any-bit-intersection form agree, so rewriting `self.0 & other.0 ==
+    /// other.0` as `self.0 & other.0 != 0` left the entire workspace green
+    /// while silently changing a published API contract.
+    ///
+    /// The negative case is the whole test. `RetryOn::default()` is a multi-bit
+    /// set that CONTAINS `CONNECT_FAILURE`, so the two forms agree in that
+    /// direction; asking the question the other way round, whether a single bit
+    /// contains the whole default set, is where subset and intersection differ.
+    #[test]
+    fn contains_is_a_subset_test_not_an_intersection_test() {
+        assert!(
+            RetryOn::default().contains(RetryOn::CONNECT_FAILURE),
+            "the default set contains CONNECT_FAILURE"
+        );
+        assert!(
+            !RetryOn::CONNECT_FAILURE.contains(RetryOn::default()),
+            "CONNECT_FAILURE alone does not contain the whole default set; if this \
+             passes, `contains` has become an intersection test"
+        );
+        // A set always contains itself, and contains the empty set.
+        assert!(RetryOn::CONNECT_FAILURE.contains(RetryOn::CONNECT_FAILURE));
+        assert!(RetryOn::CONNECT_FAILURE.contains(RetryOn(0)));
+        // The empty set contains nothing but itself.
+        assert!(!RetryOn(0).contains(RetryOn::CONNECT_FAILURE));
+        assert!(RetryOn(0).contains(RetryOn(0)));
     }
 
     #[test]
