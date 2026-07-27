@@ -24,12 +24,15 @@
 //! `grep -nE "Vec::|String::|Box::|to_vec\(|format!" crates/irontraffic-conn/src/budget.rs`
 //! returning nothing.
 
+use bytes::BytesMut;
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use irontraffic_conn::bodybuf::{BufferPool, ByteSize};
 use irontraffic_conn::inflight::InflightGauge;
 use irontraffic_conn::proxyproto::ProxyHeader;
+use irontraffic_conn::proxyproto::encode::{PP2_TYPE_AUTHORITY, Tlv, encode_v2};
 use irontraffic_conn::{ConnBudget, FrameEvent};
 use std::hint::black_box;
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::thread;
 use std::time::Instant;
 
@@ -281,11 +284,60 @@ fn bench_proxyproto_parse(c: &mut Criterion) {
     group.finish();
 }
 
+/// Encodes a v2 IPv4 PROXY header with no TLVs and with one 256-byte authority TLV.
+///
+/// The buffer is pre-reserved and cleared each iteration so the encoder itself does not
+/// reallocate; the measured time is the encode work, not allocation.
+fn bench_proxyproto_encode(c: &mut Criterion) {
+    let src = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 2, 3, 4)), 1);
+    let dst = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(5, 6, 7, 8)), 2);
+    let authority_tlv = Tlv {
+        kind: PP2_TYPE_AUTHORITY,
+        value: &[0u8; 256],
+    };
+
+    let mut group = c.benchmark_group("bench_proxyproto_encode");
+    group.throughput(Throughput::Elements(1));
+
+    group.bench_function("v2_ipv4_no_tlv", |b| {
+        let mut buf = BytesMut::with_capacity(128);
+        b.iter(|| {
+            buf.clear();
+            let n = encode_v2(
+                black_box(&mut buf),
+                black_box(src),
+                black_box(dst),
+                black_box(&[]),
+            )
+            .unwrap_or(0);
+            black_box(n);
+        });
+    });
+
+    group.bench_function("v2_ipv4_one_256_tlv", |b| {
+        let mut buf = BytesMut::with_capacity(512);
+        b.iter(|| {
+            buf.clear();
+            let n = encode_v2(
+                black_box(&mut buf),
+                black_box(src),
+                black_box(dst),
+                black_box(&[authority_tlv]),
+            )
+            .unwrap_or(0);
+            black_box(n);
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_frame_debit,
     bench_buffer_lease,
     bench_admit_release,
-    bench_proxyproto_parse
+    bench_proxyproto_parse,
+    bench_proxyproto_encode
 );
 criterion_main!(benches);

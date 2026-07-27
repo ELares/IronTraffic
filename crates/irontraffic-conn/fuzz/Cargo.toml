@@ -19,6 +19,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 irontraffic-conn = { path = ".." }
+bytes = "1.10"
 
 [[bin]]
 name = "fuzz_budget_events"
@@ -37,6 +38,13 @@ bench = false
 [[bin]]
 name = "fuzz_proxyproto"
 path = "fuzz_targets/fuzz_proxyproto.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_proxyproto_roundtrip"
+path = "fuzz_targets/fuzz_proxyproto_roundtrip.rs"
 test = false
 doc = false
 bench = false
