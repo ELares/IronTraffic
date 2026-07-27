@@ -50,9 +50,9 @@ pub struct Tlv<'v> {
 /// the bytes actually written.
 ///
 /// There is deliberately no second vector and no parallel length computation: Envoy
-/// CVE-2026-47692 was a filtered TLV vector built for the length calculation while the
-/// unfiltered vector was emitted, spilling 65523 attacker-controlled bytes into the
-/// upstream application stream.
+/// CVE-2026-47692 built one TLV collection for the length calculation and emitted a
+/// different one, so the length field advertised 38 bytes while 65561 bytes were written,
+/// spilling 65523 attacker-controlled bytes into the upstream application stream.
 #[derive(Debug)]
 pub struct V2Encoder<'b> {
     buf: &'b mut BytesMut,
