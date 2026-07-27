@@ -323,14 +323,116 @@ rust_non_test_files() {
   rust_files | grep -v -E '(^|/)(tests|benches|examples)/' | grep -v -E '_test\.rs$' || true
 }
 
-# Build, once, a shadow tree of the non-test sources with `#[cfg(test)]` module
-# bodies replaced by blank lines. Same relative paths, same line numbers.
+# Build, once per subshell (see the note on PROD_TREE below), a shadow tree of
+# the non-test sources with `#[cfg(test)]`-attributed code blanked out. Same
+# relative paths, same line numbers.
+#
+# TWO FAILURE MODES FIXED HERE (issue #628), both confirmed against the real
+# upstream-endpoint-registry PR (#68) and, independently, against `main`
+# itself while diagnosing this issue:
+#
+#  1. TRIVIA-BLIND MATCHING. The attribute used to be found with a plain
+#     `CFG.finditer(text)`, not the rslex.finditer_real every OTHER rule in
+#     this file routes through specifically to stay out of comments and
+#     string literals (see allow_reason.py, vacuous_assert.py, no_assert.py,
+#     and the rest, all just above). A doc comment or a `reason = "..."`
+#     string that merely MENTIONS `#[cfg(test)]` in prose therefore matched
+#     identically to a real attribute and triggered the wrong forward search
+#     described below. Measured on `main`: a prose mention in
+#     `irontraffic-http/src/lib.rs`'s crate doc comment blanked the crate's
+#     own `pub mod`/`pub use` declarations out of the shadow tree, and three
+#     prose mentions in `irontraffic-router/src/intern.rs`, all inside a doc
+#     comment explaining this exact hazard, each blanked an always-compiled
+#     helper function's entire body. Fixed by scanning with
+#     rslex.finditer_real, exactly like every other rule here.
+#
+#  2. MOD-SHAPED ASSUMPTION. After finding the attribute, the old code
+#     searched forward for the next real `{` and blanked to its matching
+#     `}`, assuming the attribute always introduces a `mod { ... }`. On a
+#     `#[cfg(test)]`-gated struct field or struct-literal field entry (which
+#     ends in `,`), a `mod name;` file-level declaration (which ends in `;`
+#     with no body in this file at all), or any other construct that is not
+#     itself immediately followed by its own `{`, that search runs straight
+#     past the real, small extent of the attributed item and lands on
+#     whatever unrelated brace pair happens to come next -- blanking
+#     everything in between out of every `-prod` and `hotpath_crate_scan`
+#     rule's view, with no error. Measured on `main`: the one genuine
+#     instance of this shape found there, `#[cfg(test)] pub mod testutil;`
+#     in `irontraffic-router/src/lib.rs`, blanked the crate's unrelated `pub
+#     mod trace;` declaration and part of the following `pub use` alongside
+#     it, purely because both happen to sit before the next real `{`.
+#
+#     Fixed with item_extent() below: after a real attribute match, walk
+#     forward tracking `(`/`[`/`{` depth (trivia-skipped throughout, so a
+#     literal or comment cannot desync it, exactly like every other bracket
+#     walk in this file) and stop at the FIRST of:
+#       - a `{` at depth 0: a genuine brace body. Blank to its matching `}`,
+#         the old behaviour, still correct for `mod tests { ... }`,
+#         `fn ... { ... }`, `thread_local! { ... }`, an `impl`/`struct`
+#         block, or a bare `#[cfg(test)] { ... }` block statement.
+#       - a `;` at depth 0: blank just that statement or declaration
+#         (`mod name;`, `use ...;`, `static ...;`, an expression statement).
+#       - a `,` at depth 0: blank just that one item (a struct field, a
+#         struct-literal field entry, an enum variant, a match arm).
+#       - an unmatched closing `)`/`]`/`}` at depth 0: the attributed item is
+#         the LAST one before an enclosing scope ends with no trailing
+#         comma/semicolon of its own (the common no-trailing-comma-on-the-
+#         last-field shape). Blank up to but not including that bracket.
+#     Reaching end of file with depth still open and none of the above
+#     resolved REFUSES instead of guessing: see the REFUSE note below.
+#
+#     ITEM HEADERS ARE NOT SUBJECT TO THE GAP BELOW (issue #643). A
+#     `#[cfg(test)]`-attributed `fn`/`impl`/`struct`/`enum`/`trait`/`union`/
+#     `mod` (optionally preceded by `pub`, `pub(...)`, `unsafe`, `async`,
+#     `const`, `extern`, or `default`) is recognized by is_item_header() and
+#     is terminable ONLY by `{` or `;`, never by a depth-0 `,`: its own
+#     header can legitimately contain one, in a generic parameter list
+#     (`fn helper<A, B>`, `struct S<A, B>`), a lifetime list
+#     (`fn f<'a, 'b>`), or a trailing where-clause bound list (`impl<T>
+#     Trait for Wrap<T> where T: Send,`). Before this fix all four shapes
+#     terminated at that comma instead of at the item's real body, which
+#     UNDER-blanks (leaves a test-only body visible to no-panic and friends,
+#     which then fire loudly on it) rather than the over-reaching failure
+#     modes 1 and 2 above, but is still a real gap: the escape a weaker
+#     implementer reaches for on a false positive is an `it-allow` marker on
+#     a line of genuinely test-only code, which permanently blinds that line
+#     for every future run.
+#
+#     ACCEPTED GAP, the same shape already documented on no-swallowed-error
+#     above: a FIELD or a standalone STATEMENT (not an item header, so
+#     is_item_header() is false and the comma still ends it, correctly, the
+#     way `#[cfg(test)] scan_steps: Cell<u64>,` must) whose own text contains
+#     a top-level `<`/`>` (a generic parameter list with an internal comma,
+#     as in a field typed `HashMap<K, V>`, or a comparison used as a
+#     struct-literal field's value before its own comma) is not tracked as a
+#     bracket pair here, because `<`/`>` are also comparison and shift
+#     operators and Rust's grammar does not make disambiguating them safe to
+#     fake with a text scanner. The concrete corpus case issue #628 was filed
+#     against (`std::cell::Cell<u64>`) has no internal comma and is handled
+#     correctly; a field type or value that does would need a real parser,
+#     not a bigger regex, and is left as a known limitation rather than a
+#     guess.
+#
+#     REFUSE, DO NOT GUESS: if item_extent() reaches end of file with an
+#     unresolved bracket depth, build_prod_tree.py prints the offending file
+#     and attribute line to stderr and exits nonzero. Every `-prod` and
+#     `hotpath_crate_scan` rule depends on this shadow tree being right, so
+#     a case this cannot resolve must stop the whole gate rather than
+#     continue on data that might already be wrong -- the same "fail closed,
+#     never guess" contract scripts/rebase-issue.sh applies to a Rust merge
+#     conflict it cannot resolve safely. build_prod_tree runs inside a
+#     command-substitution subshell from almost every call site
+#     (`hits="$(scan_prod ...)"` and the like: PROD_TREE itself is therefore
+#     rebuilt once per subshell rather than truly once per run, since a
+#     child shell's assignments never propagate back to this script's own
+#     process; that duplicated work is pre-existing and out of scope for
+#     this fix, but it does mean a plain `exit 1` on refusal would only ever
+#     kill that one subshell and let the run silently carry on with the next
+#     rule). `$$` stays fixed at the top-level script's PID even inside such
+#     a subshell, so signalling it directly is what actually reaches the
+#     real process running this file; see build_prod_tree below.
 PROD_TREE=""
-build_prod_tree() {
-  [ -n "$PROD_TREE" ] && return 0
-  PROD_TREE="$WORK/prod"
-  mkdir -p "$PROD_TREE"
-  rust_non_test_files | python3 -c '
+cat > "$WORK/build_prod_tree.py" <<'PY'
 import os, re, sys
 
 sys.path.insert(0, os.environ["WORK"])
@@ -338,6 +440,124 @@ import rslex
 
 OUT = sys.argv[1]
 CFG = re.compile(r"#\[cfg\(\s*test\s*\)\]")
+
+# issue #643: an item's own HEADER can contain a depth-0 comma that is not
+# the end of the item at all, most commonly a generic parameter list
+# (`fn helper<A, B>`, `struct S<A, B>`), a lifetime list (`fn f<'a, 'b>`), or
+# a trailing where-clause bound list (`impl<T> Trait for Wrap<T> where T:
+# Send,`). None of `<`/`>` are tracked as a bracket pair here (see the
+# ACCEPTED GAP note above build_prod_tree: they are also comparison and
+# shift operators, and Rust's grammar does not make disambiguating them safe
+# to fake with a text scanner), so the naive depth-0-comma-ends-the-item rule
+# stops at the FIRST comma inside `<...>` instead of at the item's real body,
+# silently narrowing what gets blanked. A struct field or a struct-literal
+# field entry (`#[cfg(test)] scan_steps: Cell<u64>,`) has no such header and
+# must still end at its own comma, so this can only apply to an actual item:
+# `fn`/`impl`/`struct`/`enum`/`trait`/`union`/`mod`, optionally preceded by
+# `pub` (optionally with a `(...)` visibility qualifier), `unsafe`, `async`,
+# `const`, `extern`, or `default`, is terminable ONLY by `{` or `;`, never by
+# a depth-0 `,`, because none of those item shapes ends in a bare comma.
+MODIFIER_KEYWORDS = {'pub', 'unsafe', 'async', 'const', 'extern', 'default'}
+ITEM_KEYWORDS = {'fn', 'impl', 'struct', 'enum', 'trait', 'union', 'mod'}
+WORD = re.compile(r'[A-Za-z_]\w*')
+
+
+def is_item_header(text, start):
+    """True if, from `start`, skipping trivia and any further `#[...]`
+    attributes, the next tokens are zero or more modifier keywords (with an
+    optional `(...)` visibility qualifier right after `pub`) followed by an
+    item keyword. See the module-level note above for why this matters."""
+    n = len(text)
+    i = start
+    while True:
+        while i < n:
+            skipped = rslex.skip_trivia(text, i)
+            if skipped != i:
+                i = skipped
+                continue
+            if text[i].isspace():
+                i += 1
+                continue
+            break
+        if i < n and text[i] == '#' and i + 1 < n and text[i + 1] == '[':
+            close = rslex.find_matching(text, i + 1)
+            if close < 0:
+                return False
+            i = close + 1
+            continue
+        break
+    m = WORD.match(text, i)
+    if not m:
+        return False
+    word = m.group(0)
+    if word in ITEM_KEYWORDS:
+        return True
+    if word not in MODIFIER_KEYWORDS:
+        return False
+    i = m.end()
+    if word == 'pub' and i < n and text[i] == '(':
+        close = rslex.find_matching(text, i)
+        if close < 0:
+            return False
+        i = close + 1
+    return is_item_header(text, i)
+
+
+def item_extent(text, start):
+    """From just past a REAL `#[cfg(test)]` match, find where the attribute's
+    own item, field, or statement ends, without assuming it is always a
+    `mod { ... }`. See the header comment above build_prod_tree in
+    invariant-lints.sh for the full rationale. Returns (kind, end):
+      ('brace', end)    -- a genuine `{ ... }` body at depth 0; `end` is one
+                            past its matching `}`.
+      ('semi', end)     -- a depth-0 `;`; `end` is one past it.
+      ('comma', end)    -- a depth-0 `,`; `end` is one past it.
+      ('implicit', end) -- an unmatched closing `)`/`]`/`}` at depth 0: the
+                            attributed item is the last one before an
+                            enclosing scope ends, with no trailing
+                            comma/semicolon of its own; `end` is the position
+                            of that bracket (exclusive).
+      ('eof', None)     -- the scan reached end of file with depth still
+                            open and none of the above resolved. Refuse
+                            rather than guess.
+    """
+    n = len(text)
+    depth = 0
+    i = start
+    # See MODIFIER_KEYWORDS/ITEM_KEYWORDS/is_item_header above (issue #643):
+    # an item's own header can contain a depth-0 comma that is not its end.
+    is_item = is_item_header(text, start)
+    while i < n:
+        skipped = rslex.skip_trivia(text, i)
+        if skipped != i:
+            i = skipped
+            continue
+        c = text[i]
+        if c == '{' and depth == 0:
+            close = rslex.find_matching(text, i)
+            if close < 0:
+                return 'eof', None
+            return 'brace', close + 1
+        if c in '([{':
+            depth += 1
+            i += 1
+            continue
+        if c in ')]}':
+            if depth == 0:
+                return 'implicit', i
+            depth -= 1
+            i += 1
+            continue
+        if depth == 0 and c == ';':
+            return 'semi', i + 1
+        if depth == 0 and c == ',':
+            if is_item:
+                i += 1
+                continue
+            return 'comma', i + 1
+        i += 1
+    return 'eof', None
+
 
 for rel in sys.stdin.read().split("\n"):
     if not rel:
@@ -347,29 +567,52 @@ for rel in sys.stdin.read().split("\n"):
     except (OSError, UnicodeDecodeError):
         continue
     chars = list(text)
-    for m in CFG.finditer(text):
-        # Find the module body that follows the attribute and blank it out,
-        # preserving newlines so reported line numbers stay correct.
-        # find_first_real (not a plain str.find) so a decoy brace inside a
-        # string or comment between the attribute and the module cannot be
-        # mistaken for the module body opening early, and find_matching (not
-        # a plain depth counter) so a brace inside a string, char literal, or
-        # comment ANYWHERE in the test module cannot end the blank region
-        # early, which would leak un-blanked #[cfg(test)] code (unwrap(),
-        # direct clock reads, and the rest) into the shadow tree that every
-        # scan_prod-based rule runs against.
-        i = rslex.find_first_real(text, m.end(), "{")
-        if i < 0:
-            continue
-        j = rslex.find_matching(text, i)
-        if j < 0:
-            j = len(text) - 1
-        rslex.blank_region(chars, m.start(), j + 1)
+    # finditer_real (not CFG.finditer directly) so a decoy `#[cfg(test)]`
+    # spelled out in a comment or a string cannot be mistaken for the real
+    # attribute: failure mode 1 above.
+    for m in rslex.finditer_real(CFG, text):
+        kind, end = item_extent(text, m.end())
+        if kind == 'eof':
+            line = rslex.line_of(text, m.start())
+            sys.stderr.write(
+                f"{rel}:{line}: #[cfg(test)] has no recognizable end (no "
+                "brace body, `;`, or `,` found at depth 0 before end of "
+                "file); build_prod_tree refuses to guess at a later, "
+                "possibly unrelated brace pair rather than blank the wrong "
+                "span\n"
+            )
+            sys.exit(1)
+        # item_extent (not "assume the next real { is a mod body") is what
+        # fixes failure mode 2 above; blank_region itself is unchanged from
+        # before, preserving newlines so line numbers stay correct.
+        rslex.blank_region(chars, m.start(), end)
     dest = os.path.join(OUT, rel)
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     with open(dest, "w", encoding="utf-8") as fh:
         fh.write("".join(chars))
-' "$PROD_TREE"
+PY
+build_prod_tree() {
+  [ -n "$PROD_TREE" ] && return 0
+  PROD_TREE="$WORK/prod"
+  mkdir -p "$PROD_TREE"
+  local err
+  if ! err="$(rust_non_test_files | python3 "$WORK/build_prod_tree.py" "$PROD_TREE" 2>&1)"; then
+    printf '\nFAIL [build-prod-tree]\n' >&2
+    printf '%s\n' "$err" | sed 's/^/  /' >&2
+    printf '  build_prod_tree refuses to guess at this #[cfg(test)] attribute'"'"'s\n' >&2
+    printf '  extent rather than blank an arbitrary, possibly unrelated, later brace\n' >&2
+    printf '  pair: every -prod and hotpath_crate_scan rule depends on this shadow tree\n' >&2
+    printf '  being right. Restructure the attributed item so its extent is unambiguous\n' >&2
+    printf '  (give it its own brace body, or end it with a plain `;` or `,`), then\n' >&2
+    printf '  re-run.\n' >&2
+    # See the header comment above: a plain `exit 1` here would only kill the
+    # subshell this function is running in, since almost every call site
+    # reaches build_prod_tree through a command substitution. $$ is fixed at
+    # the top-level script's PID even from inside one, so this is what
+    # actually stops the whole gate.
+    kill -TERM "$$" 2>/dev/null || true
+    exit 1
+  fi
 }
 
 # Drop hits carrying a justified escape marker for this rule.
