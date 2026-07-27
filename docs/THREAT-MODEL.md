@@ -203,6 +203,49 @@ selects the virtual host, the route table and the TLS policy for the request.
   policy that means to match an IP address (an SSRF deny-list, an internal-range check, an
   "is this upstream local" test) MUST parse the host into an `IpAddr` and compare addresses;
   comparing `Authority::host` bytes against a literal is a bypass waiting to be written.
+### Forwarding chain (`forwarded-element-parsing`, #31)
+
+**Parses:** every `Forwarded`, `X-Forwarded-For` and `X-Forwarded-Proto` field line into one
+ordered `ForwardedChain`. RFC 7239 Section 8.1 is explicit that every byte of this data is
+attacker writable at every hop on the way to this proxy, including by the client itself: "the
+'Forwarded' HTTP header field cannot be relied upon to be correct, as it may be modified, whether
+mistakenly or for malicious reasons, by every node on the way to the server." This parser makes NO
+trust decision; it only records what was claimed, bounded in cost. Picking a client address out of
+the recorded chain is `trust-policy-and-peer-identity` (#32)'s job.
+
+**Structural controls:**
+
+- **Two named bounds, both refusals, never a truncation.** `Limits::max_forwarded_elements`
+  (default 32) caps the number of elements the chain may hold; `Limits::max_forwarded_bytes`
+  (default 4096) caps the total field-value bytes parsed across all three families combined.
+  Exceeding either is `RejectReason::ForwardedElementLimit` or `RejectReason::ForwardedBytesLimit`.
+  Neither cap truncates the chain: a truncated chain would silently change which entry a later
+  trust walk treats as the client, which is a worse failure than refusing the whole message.
+- **An over-cap value is refused before it is scanned.** Each field line's byte length is checked
+  against the remaining byte budget BEFORE a single byte of it is tokenized. A 100,000-entry
+  `X-Forwarded-For` delivered as one field line value costs one length comparison and a refusal,
+  not 100,000 pushes into a growing vector: `forwarded::tests::caps_are_enforced_inside_the_loop`
+  pins this by engineering the oversized value so that scanning it would have produced a
+  *different* error, and asserting the byte-limit error instead.
+- **Anything that is not an address terminates the walk.** RFC 7239's `for=unknown` token and its
+  `_`-prefixed obfuscated identifiers both parse successfully, as `NodeName::Unknown` and
+  `NodeName::Obfuscated`, and both report `terminates_walk() == true`, the fail-closed direction. An
+  absent `for` parameter (`NodeName::Absent`) does too. `NodeName::Addr` is produced only for a
+  value the standard library's `Ipv4Addr`/`Ipv6Addr` parser actually accepted; a bare, unbracketed
+  IPv6 literal and a leading-zero IPv4 octet are both refused as ambiguity primitives rather than
+  guessed at, matching `Authority`'s own "bytes, not addresses" stance one layer up.
+- **Only three field families are read, and adding a fourth is a trust decision, not a one-line
+  change.** `Forwarded`, `X-Forwarded-For` and `X-Forwarded-Proto`, nothing else. In particular this
+  parser never reads `X-Real-IP`: it carries a single address with no chain, so there is no way to
+  tell a trusted hop's value from a client's, and it is unconditionally deleted at ingress by
+  `IDENTITY_STRIP` (`hop-by-hop-strip-set`, #26) before anything downstream could read it either way.
+  `X-Forwarded-Host`, `X-Forwarded-Port`, `True-Client-IP` and `CF-Connecting-IP` are refused the
+  same way: none of the five is read by this parser, however a deployment happens to spell the
+  header name.
+- **A `#list` field split across multiple lines is one list.** RFC 7239 Section 7.1 permits a
+  `Forwarded` or `X-Forwarded-For` value to be split across several field lines that are
+  semantically one comma-joined list; reading only the first or only the last line is a bypass, so
+  `ForwardedChain::parse_into` takes every line, in arrival order, for all three families.
 ## Listening sockets and socket options
 
 **What the listening socket exposes.** A TCP port reachable by anyone who can route to the bound

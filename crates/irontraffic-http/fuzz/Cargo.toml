@@ -32,3 +32,10 @@ path = "fuzz_targets/fuzz_authority.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_forwarded"
+path = "fuzz_targets/fuzz_forwarded.rs"
+test = false
+doc = false
+bench = false
