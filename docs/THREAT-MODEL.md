@@ -277,6 +277,48 @@ the recorded chain is `trust-policy-and-peer-identity` (#32)'s job.
   semantically one comma-joined list; reading only the first or only the last line is a bypass, so
   `ForwardedChain::parse_into` takes every line, in arrival order, for all three families.
 
+### Client identity (`trust-policy-and-peer-identity`, #32)
+
+**Decides:** who the client is, out of a socket peer address, an optional PROXY protocol
+declaration, and the `ForwardedChain` recorded above. `resolve_identity` is the single place this
+product makes that decision; nothing downstream re-derives it from a header.
+
+**Single source, and it is fail closed.** `TrustPolicy::None`, the default, never reads a
+forwarding field at all: every request's client is its socket peer. An operator opts into reading
+the chain by choosing `TrustPolicy::HopCount(n)` (trust exactly `n` hops from the right) or
+`TrustPolicy::TrustedCidrs` (pop trusted addresses from the right until an untrusted one is found).
+Both fail closed to the socket peer, with `IdentitySource::Socket`, on every degenerate input:
+
+- A chain shorter than `HopCount(n)` expects.
+- A non-address entry (`for=unknown`, an obfuscated identifier, or an absent `for`) where the walk
+  needed an address, under either policy.
+- An untrusted socket peer under `TrustedCidrs`: a chain from a peer the policy does not trust is
+  worth nothing, however well formed.
+
+`resolve_identity` has no error type and no fail-open branch: every input, degenerate or not,
+produces a `PeerIdentity`. The rejected alternative, trusting the leftmost `X-Forwarded-For` entry,
+is not merely inferior, it is 100% attacker controlled, because the leftmost entry is whatever the
+client itself typed; walking from the right instead is invariant under a client padding its own
+end of the chain, because a client can only ever add entries on the left.
+
+**`peer_trusted` is verified only under `TrustedCidrs`.** It answers one narrow question: was the
+immediate base address (the PROXY-declared address when present, otherwise the socket peer)
+checked against a configured prefix list and found inside it. Only `TrustedCidrs` has an address
+list to check; `HopCount` and `None` leave it false for every input, because an unverified
+operator assertion ("there are proxies in front") must not grant a capability an external client
+would otherwise not have. `PeerIdentity::trusted_internal` is the one accessor that answers this
+question, and the `x-envoy-*` field family (`IDENTITY_STRIP`, `hop-by-hop-strip-set`, #26) is
+honoured only on a connection this same value marks trusted; there is no second, independently
+configured trust decision anywhere in the product; `TrustedCidrs([0.0.0.0/0])` is a legal
+configuration and an operator explicitly choosing to believe the leftmost entry, which is why it
+is documented on `TrustPolicy` itself rather than treated as a bypass.
+
+**Egress never passes through what was received.** `write_forwarded_element` synthesizes exactly
+one `Forwarded` element from a `PeerIdentity` and the listener's own address; `strip_ingress`
+already deleted every inbound `Forwarded`/`X-Forwarded-*`/`X-Real-IP` field before this runs, so
+there is no received value to append to. This is what makes the upstream's view of client identity
+a function of this proxy's configuration, never of the client's input.
+
 ### HTTP/1 head (`h1-head-parser`, #34)
 
 **Parses:** the request line, the status line, and the field section of an HTTP/1.0 or HTTP/1.1

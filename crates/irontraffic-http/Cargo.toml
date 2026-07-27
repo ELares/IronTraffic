@@ -53,3 +53,7 @@ harness = false
 [[bench]]
 name = "http_priority"
 harness = false
+
+[[bench]]
+name = "http_trust"
+harness = false
