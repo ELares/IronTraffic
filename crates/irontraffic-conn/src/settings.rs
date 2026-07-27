@@ -140,10 +140,10 @@ impl SettingsPolicy {
         if self.max_header_list_size != limits.max_header_list_bytes {
             return Err(RejectReason::HeaderListTooLarge);
         }
-        if table.check_update(self.header_table_size).is_err() {
+        if self.header_table_size != table.advertised_max {
             return Err(RejectReason::HeaderListTooLarge);
         }
-        if table.check_update(self.qpack_max_table_capacity).is_err() {
+        if self.qpack_max_table_capacity != table.advertised_max {
             return Err(RejectReason::HeaderListTooLarge);
         }
         if self.max_concurrent_streams != max_concurrent_proto {
@@ -297,6 +297,10 @@ mod tests {
         }
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one flat perturb-one-field-at-a-time matrix covering edge cases 28 through 33b (including issue #660's under-advertise addition); splitting it would scatter the 1:1 mapping between this test and that numbered list"
+    )]
     #[test]
     fn validate_rejects_inconsistency() {
         let limits = Limits::DEFAULT.clamped();
@@ -413,6 +417,22 @@ mod tests {
         assert_eq!(
             SettingsPolicy {
                 qpack_max_table_capacity: 65_536,
+                ..SettingsPolicy::DEFAULT
+            }
+            .validate(&limits, &table, 128),
+            Err(RejectReason::HeaderListTooLarge)
+        );
+
+        // Issue #660: the under-advertise direction. A policy that
+        // advertises LESS than `table.advertised_max` must be rejected too,
+        // not only the over-advertise direction covered by 33b. A `<=`
+        // check (what `TableSizePolicy::check_update` computes, since it
+        // exists to accept any peer update up to the advertised ceiling)
+        // wrongly accepts this: `validate` must instead require exact
+        // agreement with `table.advertised_max`.
+        assert_eq!(
+            SettingsPolicy {
+                header_table_size: 1024,
                 ..SettingsPolicy::DEFAULT
             }
             .validate(&limits, &table, 128),

@@ -392,6 +392,70 @@ mod tests {
         assert!(got.incremental());
     }
 
+    /// A field whose first member has an unrecognized 4000-byte key (well
+    /// past the 8-byte bound `apply_member` accepts), followed by a valid
+    /// `u=2` member. Built as a fixed array, not a heap buffer, to respect
+    /// this file's no-allocation claim even in a test.
+    fn long_unknown_key_field() -> [u8; 4007] {
+        let mut buf = [b'z'; 4007];
+        buf[4000..4007].copy_from_slice(b"=1, u=2");
+        buf
+    }
+
+    #[test]
+    fn unknown_key_of_unbounded_length_is_ignored_in_bounded_work() {
+        // RFC 9218 Section 4.1 requires an unrecognized dictionary key to be
+        // IGNORED, never rejected outright, and ignoring one must not cost
+        // work proportional to an attacker-chosen key length: `apply_member`
+        // rejects any key past 8 bytes with `key.len() > 8`, which
+        // short-circuits the `||` before the guard ever scans the key's
+        // bytes for lowercase-ness, so the unrecognized member is dropped in
+        // O(1) rather than O(len(key)). This is a functional check that the
+        // 4000-byte unrecognized key does not disturb (or get treated as
+        // part of) the valid `u=2` member that follows it; the O(1)
+        // short-circuit itself is a property of the guard's `||` ordering,
+        // asserted in the code comment above it, not something a wall-clock
+        // unit test could measure without becoming flaky.
+        let field = long_unknown_key_field();
+        let got = parse_priority_field(&field);
+        assert_eq!(
+            got.urgency(),
+            2,
+            "the trailing valid member must still apply"
+        );
+        assert!(!got.incremental());
+    }
+
+    #[test]
+    fn quote_byte_bails_the_whole_field_even_when_the_quote_sits_in_an_ignored_member() {
+        // Step 2 of the module doc's algorithm: a `"` byte ANYWHERE in the
+        // value makes the whole field unparseable, so the caller falls back
+        // to `Priority::DEFAULT`. Edge case 14 (`u=\"1\"`, in `field_corpus`)
+        // cannot actually distinguish whether this bail-out fires, because
+        // the quoted value also fails `parse_restricted_integer` on its own
+        // (a `"` byte is never an ASCII digit), so the `u` member is ignored
+        // either way and the result is `DEFAULT` regardless. Hand mutation
+        // confirmed this directly: deleting the
+        // `if value.contains(&b'"') { return Priority::DEFAULT; }` bail-out
+        // entirely left every test in this module green.
+        //
+        // To actually exercise the bail-out, put the `"` in a SEPARATE
+        // member whose key is already unrecognized (so its own value would
+        // be ignored either way) while a DIFFERENT, well-formed member in
+        // the same field sets urgency away from the default. The only way
+        // the result can still be `DEFAULT` is the field-wide bail-out
+        // actually firing before per-member processing ever ignores that
+        // unrecognized key on its own merits.
+        assert_eq!(parse_priority_field(b"u=5, x=\"z\""), Priority::DEFAULT);
+
+        // Control: the identical shape without the quote parses normally
+        // and DOES pick up urgency 5, proving the quote (not the unknown
+        // key, not the comma) is what changed the outcome above.
+        let control = parse_priority_field(b"u=5, x=z");
+        assert_eq!(control.urgency(), 5);
+        assert!(!control.incremental());
+    }
+
     #[test]
     fn update_frame_corpus() {
         // Edge case 20.
@@ -478,6 +542,34 @@ mod tests {
         }
         assert_eq!(
             parse_priority_update(&full, WireVersion::H3),
+            Ok((5, Priority::DEFAULT))
+        );
+    }
+
+    #[test]
+    fn h2_priority_update_rejects_every_length_below_four_bytes() {
+        // "On H2 the payload must be at least 4 bytes, else
+        // Err(RequestLineMalformed)": edge case 20 covers length 0 and edge
+        // case 21 covers length 4, but nothing in `update_frame_corpus`
+        // covers lengths 1 through 3, the exact boundary the rule is about.
+        // Hand mutation confirmed the gap: changing `read_u32_be`'s fourth
+        // byte read from `*bytes.get(3)?` (propagates `None`, so the whole
+        // function returns `None`, so the caller errors) to
+        // `bytes.get(3).copied().unwrap_or(0)` (defaults a missing fourth
+        // byte to 0 instead of failing) left every existing test green,
+        // because none of them ever construct a length-1, length-2 or
+        // length-3 payload.
+        let full: [u8; 4] = [0x00, 0x00, 0x00, 0x05];
+        for len in 0..full.len() {
+            let prefix = &full[..len];
+            assert_eq!(
+                parse_priority_update(prefix, WireVersion::H2),
+                Err(RejectReason::RequestLineMalformed),
+                "an H2 PRIORITY_UPDATE payload of length {len} must be rejected as truncated"
+            );
+        }
+        assert_eq!(
+            parse_priority_update(&full, WireVersion::H2),
             Ok((5, Priority::DEFAULT))
         );
     }
