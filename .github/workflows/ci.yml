@@ -533,8 +533,13 @@ jobs:
           key: ${{ matrix.dir }}
       - name: Run every declared fuzz target in this crate briefly
         env:
+          # RUSTUP_TOOLCHAIN is set because rust-toolchain.toml pins a stable
+          # version and that pin OUTRANKS the toolchain action above. Installing
+          # nightly is not the same as using it: without this the action installs
+          # nightly, the pin quietly wins, and cargo-fuzz dies on "the option Z is
+          # only accepted on the nightly compiler" while the job looks correctly
+          # configured.
           RUSTUP_TOOLCHAIN: nightly
-        env:
           # VIA env, NEVER interpolated into the script body. `${{ }}` is textual
           # substitution performed BEFORE bash sees the line, so a repository
           # controlled directory name lands as shell source. In a double-quoted
