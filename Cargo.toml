@@ -13,7 +13,7 @@
 
 [workspace]
 resolver = "3"
-members = ["crates/irontraffic", "crates/irontraffic-config", "crates/irontraffic-conn", "crates/irontraffic-dataplane", "crates/irontraffic-filter", "crates/irontraffic-http", "crates/irontraffic-io", "crates/irontraffic-k8s", "crates/irontraffic-limits", "crates/irontraffic-obs", "crates/irontraffic-policy", "crates/irontraffic-quota", "crates/irontraffic-rand", "crates/irontraffic-resilience", "crates/irontraffic-router", "crates/irontraffic-runtime", "crates/irontraffic-time", "crates/irontraffic-tls", "crates/irontraffic-upgrade", "crates/irontraffic-upstream", "crates/irontraffic-ws"]
+members = ["crates/irontraffic", "crates/irontraffic-acme", "crates/irontraffic-config", "crates/irontraffic-conn", "crates/irontraffic-dataplane", "crates/irontraffic-filter", "crates/irontraffic-http", "crates/irontraffic-io", "crates/irontraffic-k8s", "crates/irontraffic-limits", "crates/irontraffic-obs", "crates/irontraffic-policy", "crates/irontraffic-quota", "crates/irontraffic-rand", "crates/irontraffic-resilience", "crates/irontraffic-router", "crates/irontraffic-runtime", "crates/irontraffic-time", "crates/irontraffic-tls", "crates/irontraffic-upgrade", "crates/irontraffic-upstream", "crates/irontraffic-ws"]
 # The fuzz crate is intentionally not a workspace member: cargo-fuzz projects
 # The fuzz crates are intentionally not workspace members: cargo-fuzz projects
 # The fuzz crate is intentionally not a workspace member: cargo-fuzz projects
@@ -159,6 +159,12 @@ zeroize = { version = "1.8", features = ["zeroize_derive"] }
 # `crypto-aws-lc-rs` feature; this adds a direct dev-dependency entry so the
 # differential test can name it in a `use`.
 aws-lc-rs = "1"
+# Zeroize secrets on drop; used for the ACME account key and EAB HMAC key.
+# MIT OR Apache-2.0, pure Rust, no C build.
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
+# ACME protocol client (RFC 8555). Pure Rust, rustls-native, no C build.
+# MIT OR Apache-2.0.
+instant-acme = "0.8.5"
 
 [workspace.lints.rust]
 # A proxy parses attacker-controlled bytes on every request. There is no
