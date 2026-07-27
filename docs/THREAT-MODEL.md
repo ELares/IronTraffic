@@ -734,6 +734,79 @@ milestones respectively. Do not describe M1 as slowloris-resistant.
 descriptor exhaustion is a 100% CPU spin that serves nothing, which is a denial of service an
 attacker reaches by opening connections.
 
+## Retry safety
+
+**The conjunction.** `retry::predicate::retryable` decides whether one failed attempt may be
+retried:
+
+```text
+retryable(req, failure) =
+      matches_configured_retry_on(failure)
+  AND ( idempotent(req.method) OR proves_not_processed(failure) )
+  AND NOT committed(req)
+  AND attempts_remaining(req)
+  AND deadline_permits(req)
+  AND budget.withdraw()
+```
+
+The second clause is the one that matters. Retrying a request the origin already processed
+duplicates a side effect, a double charge, a double order, a double write, and that is a
+CORRECTNESS bug rather than a performance one: a 503 does not prove the origin did not apply the
+mutation before it failed to serialize the response, so an implementation that retries every POST
+on any 5xx double-applies it silently, with no test failure that does not assert on side effects.
+`proves_not_processed` is therefore the load-bearing predicate in this whole subsystem, and it
+fails CLOSED: every unproven or uncertain state, including a per-try timeout, is NOT retryable,
+because "we do not know what happened" is not "it did not happen".
+
+**Three of the five proofs are upstream ASSERTIONS, not our own observations.**
+`proves_not_processed` is true for exactly five things: a TCP connect or TLS handshake failure, an
+HTTP/2 `RST_STREAM(REFUSED_STREAM)`, an HTTP/2 `GOAWAY` with `last_stream_id` strictly below our
+stream id, an HTTP/3 `H3_REQUEST_REJECTED`, and our own connection reset before any request byte
+was accepted by a write syscall for this stream. Of those, `RefusedStream`, `GoAwayUnprocessed`,
+and `H3RequestRejected` are ASSERTIONS BY THE UPSTREAM, delivered in a frame the upstream chose to
+send; `ConnectFailure` / `TlsHandshakeFailure` and `ResetBeforeRequest` are OUR OWN observations,
+derived from what the transport actually handed to the kernel rather than from what we intended to
+write.
+
+**The accepted risk: a dishonest or buggy upstream can induce double-application.** RFC 9113
+places the obligation on the server: "A server MUST NOT indicate that a stream has not been
+processed unless it can guarantee that fact." We rely on that guarantee and on nothing else. An
+upstream that processes a POST and then answers `RST_STREAM(REFUSED_STREAM)` (or the `GOAWAY` or
+HTTP/3 equivalent) makes us retry it, and the mutation is applied twice. Nothing in this proxy can
+detect that, and no configuration prevents it: the whole mechanism is "believe the peer when it
+says it did not act". This is why the upstream origin is inside the trust boundary for retry
+correctness, and it is the reason the proof set is never extended with anything softer, in
+particular why a 503, a `RST_STREAM(INTERNAL_ERROR)`, and every 4xx (409 and 429 included) can
+never prove non-processing: there is no `retriable-4xx` and there never will be, because a 409 is
+proof the server DID process the request.
+
+**The `treat_as_idempotent` escape hatch and its blast radius.** `treat_as_idempotent` is a
+per-route boolean, defaulting to false, that lets an operator assert a non-idempotent method is
+safe to retry anyway (RFC 9110 Section 9.2.2 contemplates exactly this: a client "SHOULD NOT
+automatically retry a request with a non-idempotent method unless it has some means to know that
+the request semantics are actually idempotent"). It is per route, never per cluster or global, and
+it is the only knob in this subsystem that can cause a correctness bug when misused: turning it on
+for an endpoint that is not actually idempotent will double-charge customers. The server emits a
+startup warning naming every route that enables it.
+
+**The trusted-connection rule for the inbound attempt count.** `retry_only_first_hop` refuses to
+retry a request that arrived with `x-envoy-attempt-count` above 1, on the theory that someone
+upstream of us is already retrying it. That header is in the `x-envoy-*` family stripped at
+ingress on any connection the forwarding trust policy has not classified as trusted-internal, so
+the attempt machine MUST treat the inbound count as 1 on an untrusted connection rather than
+reading a header value from it. Both directions of getting this wrong matter: honouring a
+client-supplied HIGH count would let an untrusted peer disable our retries for its own request, and
+honouring a client-supplied LOW count on a request that has genuinely been retried several times
+upstream defeats the only mechanism that bounds cross-layer amplification.
+
+**The commit point is the whole property, and it is one-way.** `committed(req)` becomes true, and
+is NEVER cleared again, once any response byte has been forwarded downstream, once the buffered
+request body exceeds `retry_buffer_limit` (we release the buffer rather than buffering to disk or
+stalling the upload), once an `Expect: 100-continue` interim response has been seen, or once the
+request is a WebSocket, CONNECT, or other bidirectional upgrade. The instant any byte of the
+request body reaches the upstream, or any byte of the response reaches the client, the proof that
+the origin never processed the request is gone; there is no way to retract a byte already on a
+socket.
 ## PROXY protocol
 
 **A PROXY protocol header declares a client identity, so it is a trust plane, not merely a

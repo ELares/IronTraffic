@@ -15,4 +15,5 @@ pub mod ids;
 pub mod limits;
 pub mod outlier;
 pub mod pressure;
+pub mod retry;
 pub mod rng;
