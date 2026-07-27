@@ -81,6 +81,10 @@ impl HealthCheckConfig {
     ///
     /// # Errors
     /// Returns a [`ConfigError`] naming the first rejected field.
+    #[allow(
+        clippy::integer_division,
+        reason = "the horizon-with-jitter check divides by the policy-defined 10_000 basis-point denominator; both operands are already bounded by the range checks above, so this only loses fractional precision the same way the rest of this module's basis-point arithmetic does"
+    )]
     pub fn validate(&self) -> Result<(), ConfigError> {
         in_range_u32(
             "health.interval_ms",
@@ -127,6 +131,36 @@ impl HealthCheckConfig {
             1,
             1000,
         )?;
+        // `fire_at` computes its jitter span as `interval_for(state) * jitter_bp /
+        // 10_000` and adds it to `nominal`. `Millis::since` (clock.rs, outside this
+        // issue's Files table) reads a wrapping difference greater than
+        // `Millis::HORIZON_MS` as "in the past", so a fire time that is legitimately
+        // MORE than `HORIZON_MS` beyond the reference instant is misread as past and
+        // clamped to `now + 1`, defeating the rate cap entirely (issue #709,
+        // SHOULD_FIX 6). Each of the four interval fields is checked, not only
+        // `interval_ms`, because `fire_at` reads whichever field `interval_for`
+        // selects for the endpoint's current state, and the same overflow is
+        // reachable through `Edge`, `Down`, or `NoTraffic` exactly as it is through
+        // `Steady`. `u64` keeps the product from overflowing `u32` before the
+        // division; both operands are already bounded (interval by the range check
+        // just above, jitter_bp by the one before it), so this can only reject, never
+        // panic.
+        for (field, interval) in [
+            ("health.interval_ms", self.interval_ms),
+            ("health.edge_interval_ms", self.edge_interval_ms),
+            ("health.unhealthy_interval_ms", self.unhealthy_interval_ms),
+            ("health.no_traffic_interval_ms", self.no_traffic_interval_ms),
+        ] {
+            let horizon_with_jitter =
+                u64::from(interval) * (10_000 + u64::from(self.jitter_bp)) / 10_000;
+            if horizon_with_jitter > u64::from(Millis::HORIZON_MS) {
+                return Err(ConfigError::new(
+                    field,
+                    &interval.to_string(),
+                    "combined with jitter_bp must not be able to schedule a fire time beyond Millis::HORIZON_MS from nominal",
+                ));
+            }
+        }
         Ok(())
     }
 
@@ -557,6 +591,87 @@ mod tests {
         assert_eq!(c.interval_for(IntervalState::Edge), 500);
     }
 
+    // Issue #709 BLOCKING 2. `rate_cap_floors_every_state` sets all four interval
+    // fields to 1, so under the rate cap every arm collapses to the same floored
+    // value and no arm's raw field is distinguishable from any other. This test
+    // keeps `rate_cap_floors_every_state` exactly as it is (it tests the floor, a
+    // different property) and instead uses `max_checks_per_endpoint_per_sec =
+    // 1000`, whose 1 ms floor cannot mask four pairwise-distinct field values, to
+    // prove each arm of `interval_for` reads its OWN config field rather than
+    // `interval_ms`. Without this, `Edge => self.interval_ms...` (dropping
+    // HAProxy's `fastinter`) and `Down => self.interval_ms...` (dropping
+    // `downinter`) both leave the full 28-test suite green.
+    #[test]
+    fn interval_for_reads_its_own_field() {
+        let mut cfg = HealthCheckConfig::default();
+        cfg.max_checks_per_endpoint_per_sec = 1000;
+        cfg.interval_ms = 2000;
+        cfg.edge_interval_ms = 501;
+        cfg.unhealthy_interval_ms = 4001;
+        cfg.no_traffic_interval_ms = 60001;
+
+        assert_eq!(cfg.interval_for(IntervalState::Steady), cfg.interval_ms);
+        assert_eq!(cfg.interval_for(IntervalState::Edge), cfg.edge_interval_ms);
+        assert_eq!(
+            cfg.interval_for(IntervalState::Down),
+            cfg.unhealthy_interval_ms
+        );
+        assert_eq!(
+            cfg.interval_for(IntervalState::NoTraffic),
+            cfg.no_traffic_interval_ms
+        );
+    }
+
+    // Issue #709 SHOULD_FIX 6. `fire_at` reads whichever field `interval_for`
+    // selects for `self.interval_state`, but at interval_ms = HORIZON_MS the raw
+    // per-field range check alone (interval <= HORIZON_MS) still accepts a
+    // config whose jitter span pushes a legitimate fire time more than
+    // HORIZON_MS beyond the reference instant, which `Millis::since` (clock.rs,
+    // outside this issue) then misreads as being in the past. Chosen fix:
+    // tighten `validate()` rather than touch `clock.rs`, which is not in this
+    // issue's Files table. Applied to all four interval fields, not only
+    // `interval_ms`, because `fire_at` can select any of them depending on
+    // `interval_state`.
+    #[test]
+    fn validate_rejects_interval_overflowing_horizon_with_jitter() {
+        // ~17.4 days: within the plain per-field bound (<= HORIZON_MS) on its
+        // own, but at the maximum legal jitter_bp of 5_000 (50%), interval *
+        // 1.5 exceeds HORIZON_MS. Checked at compile time, not with a runtime
+        // assert, so this fixture invariant cannot itself be reported as an
+        // assertion on constants.
+        const OVERFLOWING_INTERVAL_MS: u32 = 1_500_000_000;
+        const _: () = assert!(
+            OVERFLOWING_INTERVAL_MS <= Millis::HORIZON_MS,
+            "fixture must stay inside the plain per-field bound to prove the new check, not the pre-existing one"
+        );
+
+        let mut c = HealthCheckConfig::default();
+        c.jitter_bp = 5_000;
+        c.interval_ms = OVERFLOWING_INTERVAL_MS;
+        assert_eq!(c.validate().unwrap_err().field, "health.interval_ms");
+
+        let mut c = HealthCheckConfig::default();
+        c.jitter_bp = 5_000;
+        c.edge_interval_ms = OVERFLOWING_INTERVAL_MS;
+        assert_eq!(c.validate().unwrap_err().field, "health.edge_interval_ms");
+
+        let mut c = HealthCheckConfig::default();
+        c.jitter_bp = 5_000;
+        c.unhealthy_interval_ms = OVERFLOWING_INTERVAL_MS;
+        assert_eq!(
+            c.validate().unwrap_err().field,
+            "health.unhealthy_interval_ms"
+        );
+
+        let mut c = HealthCheckConfig::default();
+        c.jitter_bp = 5_000;
+        c.no_traffic_interval_ms = OVERFLOWING_INTERVAL_MS;
+        assert_eq!(
+            c.validate().unwrap_err().field,
+            "health.no_traffic_interval_ms"
+        );
+    }
+
     #[test]
     fn phase_in_range_and_deterministic() {
         for e in 0..10_000 {
@@ -598,6 +713,53 @@ mod tests {
             }
         }
         assert!(collisions < 5, "{collisions} collisions");
+    }
+
+    // Issue #709 BLOCKING 3, #92 edge case 1. Computing the phase from
+    // `cfg.interval_ms` instead of the rate-cap-stretched effective interval
+    // leaves every other test green, because the existing herd simulation
+    // (`herd_hash_phase_beats_random_jitter`) calls the free function `phase_ms`
+    // directly and never goes through `EndpointSchedule::init`, so it cannot see
+    // which interval `init` actually fed it. This test goes through `init` for
+    // several thousand endpoint ids with `interval_ms = 1`: under the mutant,
+    // `phase_ms(_, _, 1)` returns 0 for every endpoint (the only value in
+    // `[0, 1)`), so every `nominal` lands exactly on `t0` and the fleet fires in
+    // the same millisecond, which is precisely the self-inflicted denial of
+    // service #92's Context section exists to prevent. Under the fix, the phase
+    // is computed against the stretched effective interval (250 ms at the
+    // default cap of 4) and spreads.
+    #[test]
+    fn init_computes_phase_from_stretched_interval() {
+        let mut cfg = HealthCheckConfig::default();
+        cfg.interval_ms = 1;
+        let t0 = Millis(0);
+
+        let mut max_offset = 0u32;
+        let mut first_offset = None;
+        let mut saw_different = false;
+        for endpoint_id in 0..5_000u64 {
+            let sched = EndpointSchedule::init(t0, 1, endpoint_id, &cfg, true);
+            let offset = sched.nominal.since(t0);
+            assert!(
+                offset < 250,
+                "offset {offset} should be in 0..250, the stretched effective \
+                 interval, not 0..1, the raw configured interval_ms"
+            );
+            max_offset = max_offset.max(offset);
+            match first_offset {
+                None => first_offset = Some(offset),
+                Some(f) if f != offset => saw_different = true,
+                Some(_) => {}
+            }
+        }
+        assert!(
+            saw_different,
+            "every endpoint got the same phase; the herd is not spread"
+        );
+        assert!(
+            max_offset >= 200,
+            "max offset {max_offset} too small for a spread over 0..250"
+        );
     }
 
     #[test]
@@ -777,6 +939,55 @@ mod tests {
         assert!(at.since(Millis(0)) >= 1);
     }
 
+    // Issue #709 SHOULD_FIX 8. Every existing `fire_at` test constructs its
+    // schedule in `Steady`, so a mutant that computes the jitter span from
+    // `cfg.interval_for(IntervalState::Steady)` unconditionally, instead of
+    // `cfg.interval_for(self.interval_state)`, agrees with the correct
+    // implementation on all of them. This test fires from `Down`, with
+    // `unhealthy_interval_ms` deliberately far smaller than `interval_ms` so the
+    // two spans are distinguishable, and a fixed seed so the run cannot flake.
+    #[test]
+    #[allow(
+        clippy::integer_division,
+        clippy::cast_possible_truncation,
+        reason = "test arithmetic mirrors bounded production formulas"
+    )]
+    fn fire_at_uses_current_state_interval_for_jitter_span() {
+        let mut cfg = HealthCheckConfig::default();
+        cfg.jitter_bp = 5_000;
+        cfg.interval_ms = 2000;
+        cfg.unhealthy_interval_ms = 200;
+        let now = Millis(0);
+        let nominal = Millis(10_000);
+        let sched = EndpointSchedule {
+            nominal,
+            interval_state: IntervalState::Down,
+            active_health: EndpointHealth::Unhealthy,
+            consecutive_ok: 0,
+            consecutive_fail: 0,
+            checks_since_reconnect: 0,
+            checks_started: 0,
+        };
+        let down_span = (cfg.interval_for(IntervalState::Down) * u32::from(cfg.jitter_bp)) / 10_000;
+        let steady_span =
+            (cfg.interval_for(IntervalState::Steady) * u32::from(cfg.jitter_bp)) / 10_000;
+        assert!(
+            down_span < steady_span,
+            "fixture must make the two spans distinguishable"
+        );
+
+        let mut rng = Rng::from_seed(0x5eed);
+        for _ in 0..500 {
+            let at = sched.fire_at(now, &cfg, &mut rng);
+            let diff = at.0.abs_diff(sched.nominal.0);
+            assert!(
+                diff <= down_span,
+                "Down-state fire_at diff {diff} exceeds its own span {down_span} \
+                 (would be allowed under the Steady span {steady_span})"
+            );
+        }
+    }
+
     #[test]
     fn advance_nominal_no_drift() {
         let cfg = HealthCheckConfig::default();
@@ -801,6 +1012,44 @@ mod tests {
         sched.advance_nominal(now, &cfg);
         let iv = cfg.interval_for(IntervalState::Steady);
         assert_eq!(sched.nominal, now.add_ms(iv));
+    }
+
+    // Issue #709 BLOCKING 1. Both existing `advance_nominal` tests run in
+    // `Steady`, so `cfg.interval_for(self.interval_state)` replaced with the
+    // constant `cfg.interval_for(IntervalState::Steady)` agrees with the
+    // correct implementation on both and leaves the whole suite green: a
+    // `NoTraffic` cluster would then be probed at the `Steady` interval instead
+    // of `no_traffic_interval_ms`, a 30x amplification at the defaults. Uses
+    // `max_checks_per_endpoint_per_sec = 1000` so the rate-cap floor is 1 ms and
+    // cannot mask four pairwise-distinct interval values.
+    #[test]
+    fn advance_nominal_uses_state_interval() {
+        let mut cfg = HealthCheckConfig::default();
+        cfg.max_checks_per_endpoint_per_sec = 1000;
+        cfg.interval_ms = 2000;
+        cfg.edge_interval_ms = 501;
+        cfg.unhealthy_interval_ms = 4001;
+        cfg.no_traffic_interval_ms = 60001;
+
+        let cases = [
+            (IntervalState::Steady, cfg.interval_ms),
+            (IntervalState::Edge, cfg.edge_interval_ms),
+            (IntervalState::Down, cfg.unhealthy_interval_ms),
+            (IntervalState::NoTraffic, cfg.no_traffic_interval_ms),
+        ];
+        for (state, expected_iv) in cases {
+            let t0 = Millis(0);
+            let mut sched = EndpointSchedule::init(t0, 1, 1, &cfg, true);
+            sched.nominal = t0;
+            sched.interval_state = state;
+            sched.advance_nominal(t0, &cfg);
+            assert_eq!(
+                sched.nominal,
+                t0.add_ms(expected_iv),
+                "state {state:?} should advance by its own interval {expected_iv}, \
+                 not Steady's"
+            );
+        }
     }
 
     #[test]
@@ -864,6 +1113,35 @@ mod tests {
         assert_eq!(sched.active_health, EndpointHealth::Healthy);
     }
 
+    // Issue #709 BLOCKING 5. The Fail-direction counterpart of
+    // `hysteresis_interleaved_resets` above: deleting `self.consecutive_ok = 0;`
+    // from the Fail branch turns a consecutive-pass counter into a lifetime
+    // count, so an `Unhealthy` endpoint flapping Pass, Fail, Pass would be marked
+    // `ToHealthy` on the second, non-consecutive pass at the default
+    // `healthy_threshold` of 2, restoring full traffic to a backend that is still
+    // failing half its probes.
+    #[test]
+    fn hysteresis_interleaved_resets_fail_direction() {
+        let cfg = HealthCheckConfig::default();
+        let mut sched = EndpointSchedule::init(Millis(0), 1, 1, &cfg, true);
+        sched.active_health = EndpointHealth::Unhealthy;
+        sched.interval_state = IntervalState::Down;
+
+        let seq = [
+            CheckOutcome::Pass,
+            CheckOutcome::Fail(FailKind::Status),
+            CheckOutcome::Pass,
+        ];
+        for outcome in seq {
+            assert_eq!(
+                sched.apply_outcome(outcome, &cfg),
+                Transition::None,
+                "a single non-consecutive pass must not cross healthy_threshold"
+            );
+        }
+        assert_eq!(sched.active_health, EndpointHealth::Unhealthy);
+    }
+
     #[test]
     fn retriable_status_sets_edge_but_counts() {
         let cfg = HealthCheckConfig::default();
@@ -909,6 +1187,38 @@ mod tests {
         assert_eq!(sched.interval_state, IntervalState::Steady);
     }
 
+    // Issue #709 BLOCKING 4. Deleting the `self.active_health ==
+    // EndpointHealth::Healthy` conjunct from the Fail branch's threshold check
+    // lets an already-`Unhealthy` endpoint re-cross `unhealthy_threshold` on
+    // every further run of consecutive failures, emitting a spurious
+    // `ToUnhealthy` on a loop and resetting `interval_state` to `Edge` each time:
+    // a 4x sustained probe amplifier aimed at a backend already too broken to
+    // answer. This asserts neither happens as failures keep accumulating past
+    // the threshold.
+    #[test]
+    fn unhealthy_endpoint_does_not_retransition_on_further_fails() {
+        let cfg = HealthCheckConfig::default();
+        let mut sched = EndpointSchedule::init(Millis(0), 1, 1, &cfg, true);
+        sched.active_health = EndpointHealth::Unhealthy;
+        sched.interval_state = IntervalState::Down;
+        sched.consecutive_fail = 0;
+
+        for _ in 0..(cfg.unhealthy_threshold * 2) {
+            let transition = sched.apply_outcome(CheckOutcome::Fail(FailKind::Status), &cfg);
+            assert_eq!(
+                transition,
+                Transition::None,
+                "an already-Unhealthy endpoint must not re-fire ToUnhealthy"
+            );
+            assert_eq!(sched.active_health, EndpointHealth::Unhealthy);
+            assert_eq!(
+                sched.interval_state,
+                IntervalState::Down,
+                "interval_state must not reset to Edge while already Unhealthy"
+            );
+        }
+    }
+
     #[test]
     fn reconnect_counter() {
         let mut cfg = HealthCheckConfig::default();
@@ -939,13 +1249,79 @@ mod tests {
         assert_eq!(sched.interval_state, IntervalState::Edge);
     }
 
+    // Issue #709 SHOULD_FIX 7, Design step 1b. `set_has_traffic(true)` must move
+    // ONLY a `NoTraffic` endpoint to `Edge`; an endpoint already on a traffic
+    // schedule must be left alone. Making the guard unconditional (the mutant
+    // that deletes the `if self.interval_state == IntervalState::NoTraffic`
+    // check) would force every endpoint to `Edge` on every traffic signal,
+    // which this catches.
+    #[test]
+    fn set_has_traffic_true_leaves_non_no_traffic_state_unchanged() {
+        let cfg = HealthCheckConfig::default();
+        let mut sched = EndpointSchedule::init(Millis(0), 1, 1, &cfg, true);
+
+        sched.interval_state = IntervalState::Steady;
+        sched.set_has_traffic(true);
+        assert_eq!(
+            sched.interval_state,
+            IntervalState::Steady,
+            "an already-scheduled endpoint must not be forced to Edge"
+        );
+
+        sched.interval_state = IntervalState::Down;
+        sched.set_has_traffic(true);
+        assert_eq!(sched.interval_state, IntervalState::Down);
+    }
+
+    // Issue #709 SHOULD_FIX 7, Design step 2. `set_has_traffic(false)` moves ANY
+    // state to `NoTraffic` unconditionally, including from `Edge`. Deleting the
+    // `else { NoTraffic }` branch would leave `set_has_traffic(false)` a no-op,
+    // which this catches: an idle cluster would never drop off the edge or
+    // steady schedule onto the 60_000 ms no-traffic interval.
+    #[test]
+    fn set_has_traffic_false_forces_no_traffic_from_any_state() {
+        let cfg = HealthCheckConfig::default();
+        let mut sched = EndpointSchedule::init(Millis(0), 1, 1, &cfg, true);
+
+        sched.interval_state = IntervalState::Edge;
+        sched.set_has_traffic(false);
+        assert_eq!(
+            sched.interval_state,
+            IntervalState::NoTraffic,
+            "going idle must apply immediately even from Edge"
+        );
+
+        sched.interval_state = IntervalState::Steady;
+        sched.set_has_traffic(false);
+        assert_eq!(sched.interval_state, IntervalState::NoTraffic);
+    }
+
+    // Issue #709 SHOULD_FIX 9. Originally covered only `consecutive_ok`. Extended
+    // to `consecutive_fail` (guarding it with `active_health = Unhealthy` so the
+    // ToUnhealthy branch, which legitimately resets the counter to 0, does not
+    // fire and mask the saturation) and `checks_since_reconnect`, whose
+    // saturating_add runs unconditionally on every outcome. The interesting
+    // survivor is `checks_since_reconnect.wrapping_add`, which would silently
+    // disable the forced periodic reconnect.
     #[test]
     fn counters_saturate() {
         let cfg = HealthCheckConfig::default();
+
         let mut sched = EndpointSchedule::init(Millis(0), 1, 1, &cfg, true);
         sched.consecutive_ok = u32::MAX;
         sched.apply_outcome(CheckOutcome::Pass, &cfg);
         assert_eq!(sched.consecutive_ok, u32::MAX);
+
+        let mut sched = EndpointSchedule::init(Millis(0), 1, 1, &cfg, true);
+        sched.active_health = EndpointHealth::Unhealthy;
+        sched.consecutive_fail = u32::MAX;
+        sched.apply_outcome(CheckOutcome::Fail(FailKind::Connect), &cfg);
+        assert_eq!(sched.consecutive_fail, u32::MAX);
+
+        let mut sched = EndpointSchedule::init(Millis(0), 1, 1, &cfg, true);
+        sched.checks_since_reconnect = u32::MAX;
+        sched.apply_outcome(CheckOutcome::Pass, &cfg);
+        assert_eq!(sched.checks_since_reconnect, u32::MAX);
     }
 
     #[test]
