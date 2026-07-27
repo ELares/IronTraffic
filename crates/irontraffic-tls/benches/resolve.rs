@@ -7,21 +7,25 @@
 //! across n) is the important property and is enforced by the unit test
 //! `store::index::tests::resolve_flat_across_n`.
 
-#![allow(missing_docs, reason = "criterion_group! generates this pub item")]
+#![allow(
+    missing_docs,
+    clippy::expect_used,
+    clippy::integer_division,
+    reason = "criterion_group! generates this pub item"
+)]
 
 use std::hint::black_box;
 use std::sync::Arc;
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use irontraffic_tls::{CertIndex, CertIndexBuilder, ClientCaps};
 use irontraffic_tls::store::{ChainInterner, Credentials};
+use irontraffic_tls::{CertIndex, CertIndexBuilder, ClientCaps};
 
 const NS: [usize; 4] = [1, 100, 10_000, 100_000];
 
 fn gen_cred() -> Arc<Credentials> {
     let _ = irontraffic_tls::install_process_provider();
-    let params = rcgen::CertificateParams::new(vec!["example.com".to_owned()])
-        .expect("valid SANs");
+    let params = rcgen::CertificateParams::new(vec!["example.com".to_owned()]).expect("valid SANs");
     let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("keygen");
     let cert = params.self_signed(&key).expect("sign");
     let mut interner = ChainInterner::new();
@@ -35,7 +39,9 @@ fn build_exact_index(n: usize, cred: &Arc<Credentials>) -> CertIndex {
     let mut builder = CertIndexBuilder::new([1u8; 16]);
     for i in 0..n {
         let name = format!("host{i}.example.com");
-        builder.upsert_exact(&name, Arc::clone(cred)).expect("valid");
+        builder
+            .upsert_exact(&name, Arc::clone(cred))
+            .expect("valid");
     }
     builder.build().expect("build")
 }
@@ -56,7 +62,9 @@ fn build_miss_index(n: usize, cred: &Arc<Credentials>) -> CertIndex {
     let mut builder = CertIndexBuilder::new([3u8; 16]);
     for i in 0..n {
         let name = format!("other{i}.example.net");
-        builder.upsert_exact(&name, Arc::clone(cred)).expect("valid");
+        builder
+            .upsert_exact(&name, Arc::clone(cred))
+            .expect("valid");
     }
     builder.build().expect("build")
 }
@@ -102,10 +110,14 @@ fn bench_resolve_exact_hit_253b(c: &mut Criterion) {
     let cred = gen_cred();
     let mut builder = CertIndexBuilder::new([4u8; 16]);
     let name = long_name();
-    builder.upsert_exact(&name, Arc::clone(&cred)).expect("valid");
+    builder
+        .upsert_exact(&name, Arc::clone(&cred))
+        .expect("valid");
     for i in 0..99_999 {
         let filler = format!("host{i}.example.com");
-        builder.upsert_exact(&filler, Arc::clone(&cred)).expect("valid");
+        builder
+            .upsert_exact(&filler, Arc::clone(&cred))
+            .expect("valid");
     }
     let index = builder.build().expect("build");
     c.bench_function("resolve/exact_hit_253b/100000", |b| {
@@ -118,7 +130,9 @@ fn bench_resolve_invalid_sni(c: &mut Criterion) {
     let mut builder = CertIndexBuilder::new([5u8; 16]);
     for i in 0..100_000 {
         let filler = format!("host{i}.example.com");
-        builder.upsert_exact(&filler, Arc::clone(&cred)).expect("valid");
+        builder
+            .upsert_exact(&filler, Arc::clone(&cred))
+            .expect("valid");
     }
     let index = builder.build().expect("build");
     let query = "a".repeat(254);
@@ -147,8 +161,8 @@ fn bench_select_four_types(c: &mut Criterion) {
 }
 
 fn gen_key_cred(alg: &'static rcgen::SignatureAlgorithm) -> Arc<Credentials> {
-    let params = rcgen::CertificateParams::new(vec!["select.example.com".to_owned()])
-        .expect("valid SANs");
+    let params =
+        rcgen::CertificateParams::new(vec!["select.example.com".to_owned()]).expect("valid SANs");
     let key = rcgen::KeyPair::generate_for(alg).expect("keygen");
     let cert = params.self_signed(&key).expect("sign");
     let mut interner = ChainInterner::new();

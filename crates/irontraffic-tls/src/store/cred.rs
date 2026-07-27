@@ -180,7 +180,7 @@ impl From<crate::name::WildcardError> for CertError {
 /// A 128-bit truncated digest has only a 2^64 birthday bound, so equal fingerprints are a
 /// display and lookup convenience, never proof that two credentials are the same certificate
 /// for a trust decision; compare [`Credentials::leaf_der`] for that.
-#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub struct CertFingerprint([u8; 16]);
 
 impl CertFingerprint {

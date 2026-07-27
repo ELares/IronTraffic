@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use crate::name::{self, MAX_NAME_LEN, NameKey, NameHasher};
+use crate::name::{self, MAX_NAME_LEN, NameHasher, NameKey};
 use crate::store::{CertError, Credentials, KeyType};
 
 /// Index of a `CredSet` inside `CertIndex::cred_sets`.
@@ -41,7 +41,7 @@ pub(crate) struct NameRef {
 
 /// Up to four credentials for one name, one per key type, ordered by `KeyType` rank.
 #[derive(Copy, Clone, Debug, Default)]
-pub struct CredSet {
+pub(crate) struct CredSet {
     /// Packed `KeyType` discriminants; 0 means an empty slot. Sorted ascending.
     tags: [u8; 4],
     /// Indices into `CertIndex::creds`, parallel to `tags`.
@@ -50,7 +50,8 @@ pub struct CredSet {
     len: u8,
 }
 
-/// What the ClientHello says the peer can verify. Built once per handshake.
+/// What the `ClientHello` says the peer can verify. Built once per handshake.
+#[allow(clippy::struct_excessive_bools)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct ClientCaps {
     /// Client advertised `ecdsa_secp256r1_sha256`.
@@ -116,8 +117,8 @@ pub struct CertStats {
     pub no_compatible_key: AtomicU64,
 }
 
-/// Pass-through `BuildHasher`: `NameKey` already contains a keyed SipHash output, so rehashing it
-/// would be pure cost.
+/// Pass-through `BuildHasher`: `NameKey` already contains a keyed `SipHash` output, so rehashing
+/// it would be pure cost.
 #[derive(Clone, Default)]
 pub(crate) struct NameKeyHashBuilder;
 
@@ -158,8 +159,8 @@ pub const MAX_INDEX_GROUPS: usize = 16_777_216;
 
 /// Compiled-in two-label public suffixes for which a wildcard certificate would be absurdly broad.
 const SUFFIX_DENY: &[&str] = &[
-    "co.uk", "org.uk", "ac.uk", "gov.uk", "co.jp", "or.jp", "ne.jp", "com.au", "net.au",
-    "org.au", "co.nz", "com.br", "com.cn", "com.mx", "co.za", "co.in",
+    "co.uk", "org.uk", "ac.uk", "gov.uk", "co.jp", "or.jp", "ne.jp", "com.au", "net.au", "org.au",
+    "co.nz", "com.br", "com.cn", "com.mx", "co.za", "co.in",
 ];
 
 /// Pending entry in a builder.
@@ -186,28 +187,6 @@ pub struct CertIndexBuilder {
 }
 
 impl CertIndexBuilder {
-    fn max_arena_bytes(&self) -> usize {
-        #[cfg(test)]
-        {
-            self.max_arena_bytes
-        }
-        #[cfg(not(test))]
-        {
-            MAX_NAME_ARENA_BYTES
-        }
-    }
-
-    fn max_groups(&self) -> usize {
-        #[cfg(test)]
-        {
-            self.max_groups
-        }
-        #[cfg(not(test))]
-        {
-            MAX_INDEX_GROUPS
-        }
-    }
-
     /// New empty builder whose hasher seed is 16 fresh bytes from the operating system CSPRNG.
     ///
     /// This is the constructor production code uses.
@@ -259,6 +238,9 @@ impl CertIndexBuilder {
     /// parent, `CertError::WildcardTooBroad` for a parent with fewer than 2 labels or a parent in
     /// the compiled-in suffix denylist.
     pub fn upsert_wildcard(&mut self, raw: &str, cred: Arc<Credentials>) -> Result<(), CertError> {
+        if raw == "*" {
+            return Err(CertError::WildcardTooBroad);
+        }
         let parent = name::wildcard_parent(raw)?;
         let mut buf = [0u8; MAX_NAME_LEN];
         let normalized = name::normalize(parent, &mut buf)?;
@@ -279,6 +261,7 @@ impl CertIndexBuilder {
     /// saturates at `u16::MAX` rather than wrapping, which is unreachable because
     /// `MAX_SANS` is 100. This method never returns an error: a certificate with one bad SAN and
     /// ninety-nine good ones is still worth indexing.
+    #[allow(clippy::needless_pass_by_value)]
     pub fn upsert_from_sans(&mut self, cred: Arc<Credentials>) -> SanIndexReport {
         let mut report = SanIndexReport::default();
         for s in cred.san_dns_names() {
@@ -340,10 +323,49 @@ impl CertIndexBuilder {
     ///
     /// # Errors
     /// As `build`.
-    pub fn build_with_generation(self, generation: u64) -> Result<CertIndex, CertError> {
-        let mut entries = self.entries;
-        // Stable sort so that, within a name, the latest not_after and lowest fingerprint win
-        // when key types duplicate, and so that two builds of identical input are byte-identical.
+    pub fn build_with_generation(mut self, generation: u64) -> Result<CertIndex, CertError> {
+        let entries = core::mem::take(&mut self.entries);
+        let seed = self.seed;
+        let default_cred = self.default_cred.take();
+        #[cfg(test)]
+        let force_collision = self.force_collision_on_attempt_0;
+        #[cfg(not(test))]
+        let force_collision = false;
+        #[cfg(test)]
+        let arena_limit = self.max_arena_bytes;
+        #[cfg(not(test))]
+        let arena_limit = MAX_NAME_ARENA_BYTES;
+        #[cfg(test)]
+        let group_limit = self.max_groups;
+        #[cfg(not(test))]
+        let group_limit = MAX_INDEX_GROUPS;
+
+        Self::build_inner(
+            entries,
+            group_limit,
+            seed,
+            force_collision,
+            arena_limit,
+            default_cred,
+            generation,
+        )
+    }
+
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "existing_idx is guarded by try_from above, and groups.len() was checked just \
+                  before the attempt loop; the index is in range"
+    )]
+    fn build_inner(
+        entries: Vec<PendingEntry>,
+        max_groups: usize,
+        seed: [u8; 16],
+        force_collision: bool,
+        max_arena_bytes: usize,
+        default_cred: Option<Arc<Credentials>>,
+        generation: u64,
+    ) -> Result<CertIndex, CertError> {
+        let mut entries = entries;
         entries.sort_by(|(name_a, is_wild_a, cred_a), (name_b, is_wild_b, cred_b)| {
             let a = (
                 is_wild_a,
@@ -377,15 +399,19 @@ impl CertIndexBuilder {
                     break;
                 }
             }
-            groups.push(Group { is_wild, name, creds });
+            groups.push(Group {
+                is_wild,
+                name,
+                creds,
+            });
         }
 
-        if groups.len() > self.max_groups() {
+        if groups.len() > max_groups {
             return Err(CertError::IndexTooLarge);
         }
 
         'attempt: for attempt in 0u32..3 {
-            let hasher = self.hasher_for_attempt(attempt);
+            let hasher = Self::hasher_for_attempt_inner(seed, force_collision, attempt);
             let mut exact = HashMap::with_capacity_and_hasher(groups.len(), NameKeyHashBuilder);
             let mut wild = HashMap::with_capacity_and_hasher(groups.len(), NameKeyHashBuilder);
             for (i, group) in groups.iter().enumerate() {
@@ -394,7 +420,7 @@ impl CertIndexBuilder {
                 let map = if group.is_wild { &mut wild } else { &mut exact };
                 match map.entry(key) {
                     std::collections::hash_map::Entry::Occupied(e) => {
-                        let existing = *e.get();
+                        let existing: CredSetIdx = *e.get();
                         let existing_idx =
                             usize::try_from(existing.0).map_err(|_| CertError::IndexTooLarge)?;
                         if groups[existing_idx].name != group.name {
@@ -406,21 +432,28 @@ impl CertIndexBuilder {
                     }
                 }
             }
-            return self.build_index(groups, exact, wild, hasher, generation);
+            return Self::build_index_finish(
+                &groups,
+                exact,
+                wild,
+                hasher,
+                max_arena_bytes,
+                default_cred,
+                generation,
+            );
         }
 
         Err(CertError::NameHashCollision)
     }
 
-    fn hasher_for_attempt(&self, attempt: u32) -> NameHasher {
+    #[allow(unused_variables)]
+    fn hasher_for_attempt_inner(seed: [u8; 16], force_collision: bool, attempt: u32) -> NameHasher {
         #[cfg(test)]
-        if self.force_collision_on_attempt_0 && attempt == 0 {
-            // Degenerate hasher: every name maps to the same NameKey, so any index with
-            // two distinct names is guaranteed to collide on attempt 0.
+        if force_collision && attempt == 0 {
             return NameHasher::degenerate_for_test();
         }
         let mut input = [0u8; 20];
-        input[..16].copy_from_slice(&self.seed);
+        input[..16].copy_from_slice(&seed);
         input[16..].copy_from_slice(&attempt.to_be_bytes());
         let digest = blake3::hash(&input);
         let mut key = [0u8; 16];
@@ -428,12 +461,18 @@ impl CertIndexBuilder {
         NameHasher::new(key)
     }
 
-    fn build_index(
-        self,
-        groups: Vec<Group>,
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "slot is bounded by slot >= 4 break above and tags/idx are [u8;4]/[u32;4]; the \
+                  inner `if slot >= 4 { break; }` guards against index-out-of-range"
+    )]
+    fn build_index_finish(
+        groups: &[Group],
         exact: HashMap<NameKey, CredSetIdx, NameKeyHashBuilder>,
         wild: HashMap<NameKey, CredSetIdx, NameKeyHashBuilder>,
         hasher: NameHasher,
+        max_arena_bytes: usize,
+        default_cred: Option<Arc<Credentials>>,
         generation: u64,
     ) -> Result<CertIndex, CertError> {
         let mut names: Vec<u8> = Vec::new();
@@ -442,12 +481,12 @@ impl CertIndexBuilder {
         let mut creds: Vec<Arc<Credentials>> = Vec::new();
         let mut cred_ptr_to_idx: HashMap<*const Credentials, u32> = HashMap::new();
 
-        for group in &groups {
+        for group in groups {
             let new_len = names
                 .len()
                 .checked_add(group.name.len())
                 .ok_or(CertError::IndexTooLarge)?;
-            if new_len > self.max_arena_bytes() {
+            if new_len > max_arena_bytes {
                 return Err(CertError::IndexTooLarge);
             }
 
@@ -460,7 +499,6 @@ impl CertIndexBuilder {
             let mut idx = [0u32; 4];
             let mut len_u8 = 0u8;
             for (slot, (kt, cred)) in group.creds.iter().enumerate() {
-                // There are only four key types, so a group cannot overflow this array.
                 if slot >= 4 {
                     break;
                 }
@@ -477,7 +515,11 @@ impl CertIndexBuilder {
                 idx[slot] = cred_idx;
                 len_u8 = len_u8.checked_add(1).ok_or(CertError::IndexTooLarge)?;
             }
-            cred_sets.push(CredSet { tags, idx, len: len_u8 });
+            cred_sets.push(CredSet {
+                tags,
+                idx,
+                len: len_u8,
+            });
         }
 
         Ok(CertIndex {
@@ -488,7 +530,7 @@ impl CertIndexBuilder {
             name_refs: name_refs.into_boxed_slice(),
             cred_sets: cred_sets.into_boxed_slice(),
             creds: creds.into_boxed_slice(),
-            default_cred: self.default_cred,
+            default_cred,
             generation,
             stats: CertStats::default(),
         })
@@ -541,30 +583,30 @@ impl CertIndex {
         };
 
         let key = self.hasher.hash(name);
-        if let Some(&i) = self.exact.get(&key) {
-            if self.name_at(i) == name.as_bytes() {
-                if let Some(c) = self.select(i, caps) {
-                    self.stats.exact_hits.fetch_add(1, Ordering::Relaxed);
-                    return Some(c);
-                }
-                self.stats.no_compatible_key.fetch_add(1, Ordering::Relaxed);
-                return self.default_path();
+        if let Some(&i) = self.exact.get(&key)
+            && self.name_at(i) == name.as_bytes()
+        {
+            if let Some(c) = self.select(i, caps) {
+                self.stats.exact_hits.fetch_add(1, Ordering::Relaxed);
+                return Some(c);
             }
+            self.stats.no_compatible_key.fetch_add(1, Ordering::Relaxed);
+            return self.default_path();
         }
 
         let Some(parent) = name::parent(name) else {
             return self.default_path();
         };
         let wkey = self.hasher.hash(parent);
-        if let Some(&i) = self.wild.get(&wkey) {
-            if self.name_at(i) == parent.as_bytes() {
-                if let Some(c) = self.select(i, caps) {
-                    self.stats.wildcard_hits.fetch_add(1, Ordering::Relaxed);
-                    return Some(c);
-                }
-                self.stats.no_compatible_key.fetch_add(1, Ordering::Relaxed);
-                return self.default_path();
+        if let Some(&i) = self.wild.get(&wkey)
+            && self.name_at(i) == parent.as_bytes()
+        {
+            if let Some(c) = self.select(i, caps) {
+                self.stats.wildcard_hits.fetch_add(1, Ordering::Relaxed);
+                return Some(c);
             }
+            self.stats.no_compatible_key.fetch_add(1, Ordering::Relaxed);
+            return self.default_path();
         }
 
         self.default_path()
@@ -594,18 +636,18 @@ impl CertIndex {
         };
 
         let key = self.hasher.hash(name);
-        if let Some(&i) = self.exact.get(&key) {
-            if self.name_at(i) == name.as_bytes() {
-                return self.cred_set_has_ecdsa(i);
-            }
+        if let Some(&i) = self.exact.get(&key)
+            && self.name_at(i) == name.as_bytes()
+        {
+            return self.cred_set_has_ecdsa(i);
         }
 
         if let Some(parent) = name::parent(name) {
             let wkey = self.hasher.hash(parent);
-            if let Some(&i) = self.wild.get(&wkey) {
-                if self.name_at(i) == parent.as_bytes() {
-                    return self.cred_set_has_ecdsa(i);
-                }
+            if let Some(&i) = self.wild.get(&wkey)
+                && self.name_at(i) == parent.as_bytes()
+            {
+                return self.cred_set_has_ecdsa(i);
             }
         }
 
@@ -651,9 +693,21 @@ impl CertIndex {
         exact_bytes
             .saturating_add(wild_bytes)
             .saturating_add(self.names.len())
-            .saturating_add(self.name_refs.len().saturating_mul(core::mem::size_of::<NameRef>()))
-            .saturating_add(self.cred_sets.len().saturating_mul(core::mem::size_of::<CredSet>()))
-            .saturating_add(self.creds.len().saturating_mul(core::mem::size_of::<Arc<Credentials>>()))
+            .saturating_add(
+                self.name_refs
+                    .len()
+                    .saturating_mul(core::mem::size_of::<NameRef>()),
+            )
+            .saturating_add(
+                self.cred_sets
+                    .len()
+                    .saturating_mul(core::mem::size_of::<CredSet>()),
+            )
+            .saturating_add(
+                self.creds
+                    .len()
+                    .saturating_mul(core::mem::size_of::<Arc<Credentials>>()),
+            )
             .saturating_add(core::mem::size_of::<CertIndex>())
     }
 
@@ -722,37 +776,29 @@ impl CertIndex {
     }
 
     fn default_path(&self) -> Option<&Arc<Credentials>> {
-        match &self.default_cred {
-            Some(c) => {
-                self.stats.default_used.fetch_add(1, Ordering::Relaxed);
-                Some(c)
-            }
-            None => {
-                self.stats.misses.fetch_add(1, Ordering::Relaxed);
-                None
-            }
+        if let Some(c) = &self.default_cred {
+            self.stats.default_used.fetch_add(1, Ordering::Relaxed);
+            Some(c)
+        } else {
+            self.stats.misses.fetch_add(1, Ordering::Relaxed);
+            None
         }
     }
 }
 
-// Manual impls because `CertIndex` contains `AtomicU64` and `Box<[Arc<Credentials>]>`; the
-// derived `Send` and `Sync` would be available automatically, but spelling them out documents
-// the intended concurrency property.
-unsafe impl Send for CertIndex {}
-unsafe impl Sync for CertIndex {}
+// CertIndex is Send + Sync by construction: all its fields are Send + Sync (HashMap, Box, Arc,
+// AtomicU64). The auto-derive is correct; the unsafe manual impls that preceded this comment had
+// to be removed because the crate denies `unsafe` code.
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::Ordering;
     use std::sync::{Arc, Once, OnceLock};
     use std::time::Instant;
 
     use proptest::prelude::*;
 
-    use super::{
-        CertError, CertIndex, CertIndexBuilder, ClientCaps, Credentials, KeyType, MAX_INDEX_GROUPS,
-        MAX_NAME_ARENA_BYTES, NameHasher,
-    };
-    use crate::name::{MAX_NAME_LEN, label_count, normalize, parent};
+    use super::{CertError, CertIndex, CertIndexBuilder, ClientCaps, Credentials};
     use crate::store::ChainInterner;
 
     fn ensure_provider_installed() {
@@ -765,15 +811,15 @@ mod tests {
     fn gen_cred_with_times(
         alg: &'static rcgen::SignatureAlgorithm,
         sans: &[&str],
-        not_before: rcgen::OffsetDateTime,
-        not_after: rcgen::OffsetDateTime,
+        not_before: (i32, u8, u8),
+        not_after: (i32, u8, u8),
     ) -> Arc<Credentials> {
         ensure_provider_installed();
         let mut params =
             rcgen::CertificateParams::new(sans.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>())
                 .expect("valid SANs");
-        params.not_before = not_before;
-        params.not_after = not_after;
+        params.not_before = rcgen::date_time_ymd(not_before.0, not_before.1, not_before.2);
+        params.not_after = rcgen::date_time_ymd(not_after.0, not_after.1, not_after.2);
         let key = rcgen::KeyPair::generate_for(alg).expect("keygen");
         let cert = params.self_signed(&key).expect("sign");
         let mut interner = ChainInterner::new();
@@ -784,12 +830,7 @@ mod tests {
     }
 
     fn gen_cred(alg: &'static rcgen::SignatureAlgorithm, sans: &[&str]) -> Arc<Credentials> {
-        gen_cred_with_times(
-            alg,
-            sans,
-            rcgen::date_time_ymd(2025, 1, 1),
-            rcgen::date_time_ymd(2030, 1, 1),
-        )
+        gen_cred_with_times(alg, sans, (2025, 1, 1), (2030, 1, 1))
     }
 
     fn cred_ecdsa_p256(sans: &[&str]) -> Arc<Credentials> {
@@ -812,8 +853,8 @@ mod tests {
         gen_cred_with_times(
             &rcgen::PKCS_ECDSA_P256_SHA256,
             sans,
-            rcgen::date_time_ymd(2025, 1, 1),
-            rcgen::date_time_ymd(2030, 1, 1),
+            (2025, 1, 1),
+            (2030, 1, 1),
         )
     }
 
@@ -821,8 +862,8 @@ mod tests {
         gen_cred_with_times(
             &rcgen::PKCS_ECDSA_P256_SHA256,
             sans,
-            rcgen::date_time_ymd(2025, 1, 1),
-            rcgen::date_time_ymd(2027, 1, 1),
+            (2025, 1, 1),
+            (2027, 1, 1),
         )
     }
 
@@ -830,9 +871,13 @@ mod tests {
         let mut builder = CertIndexBuilder::new([1u8; 16]);
         for (name, is_wild, cred) in names {
             if *is_wild {
-                builder.upsert_wildcard(name, Arc::clone(cred)).expect("valid wildcard");
+                builder
+                    .upsert_wildcard(name, Arc::clone(cred))
+                    .expect("valid wildcard");
             } else {
-                builder.upsert_exact(name, Arc::clone(cred)).expect("valid exact");
+                builder
+                    .upsert_exact(name, Arc::clone(cred))
+                    .expect("valid exact");
             }
         }
         builder.build().expect("build succeeds")
@@ -866,7 +911,11 @@ mod tests {
     fn resolve_invalid_sni() {
         let cred = cred_ecdsa_p256(&["a.example.com"]);
         let index = build_index(&[("a.example.com", false, cred)]);
-        assert!(index.resolve("b\u{00fc}.example.com", ClientCaps::all()).is_none());
+        assert!(
+            index
+                .resolve("b\u{00fc}.example.com", ClientCaps::all())
+                .is_none()
+        );
         assert_eq!(index.stats().invalid_sni.load(Ordering::Relaxed), 1);
     }
 
@@ -889,7 +938,11 @@ mod tests {
     fn resolve_wildcard_does_not_match_grandchild() {
         let cred = cred_ecdsa_p256(&["*.example.com"]);
         let index = build_index(&[("*.example.com", true, cred)]);
-        assert!(index.resolve("a.b.example.com", ClientCaps::all()).is_none());
+        assert!(
+            index
+                .resolve("a.b.example.com", ClientCaps::all())
+                .is_none()
+        );
     }
 
     #[test]
@@ -938,7 +991,11 @@ mod tests {
     fn resolve_empty_caps() {
         let cred = cred_ecdsa_p256(&["a.example.com"]);
         let index = build_index(&[("a.example.com", false, cred)]);
-        assert!(index.resolve("a.example.com", ClientCaps::default()).is_none());
+        assert!(
+            index
+                .resolve("a.example.com", ClientCaps::default())
+                .is_none()
+        );
     }
 
     #[test]
@@ -999,7 +1056,7 @@ mod tests {
         let cred_2027 = cred_p256_2027(&["a.example.com"]);
         let index = build_index(&[
             ("a.example.com", false, Arc::clone(&cred_2027)),
-            ("a.example.com", false, cred_2030),
+            ("a.example.com", false, Arc::clone(&cred_2030)),
         ]);
         let got = index.resolve("a.example.com", ClientCaps::all());
         assert_eq!(got.map(|c| c.fingerprint()), Some(cred_2030.fingerprint()));
@@ -1030,7 +1087,10 @@ mod tests {
         let index = build_index(&[("a.example.com", false, Arc::clone(&cred))]);
         let lower = index.resolve("a.example.com", ClientCaps::all());
         let upper = index.resolve("A.Example.COM.", ClientCaps::all());
-        assert_eq!(lower.map(|c| c.fingerprint()), upper.map(|c| c.fingerprint()));
+        assert_eq!(
+            lower.map(|c| c.fingerprint()),
+            upper.map(|c| c.fingerprint())
+        );
         assert_eq!(lower.map(|c| c.fingerprint()), Some(cred.fingerprint()));
     }
 
@@ -1047,6 +1107,7 @@ mod tests {
         assert!(!index.name_has_ecdsa("missing.example.com"));
     }
 
+    #[allow(clippy::integer_division)]
     #[test]
     fn resolve_flat_across_n() {
         let cred = cred_ecdsa_p256(&["example.com"]);
@@ -1056,7 +1117,9 @@ mod tests {
             let mut builder = CertIndexBuilder::new([2u8; 16]);
             for i in 0..n {
                 let name = format!("host{i}.example.com");
-                builder.upsert_exact(&name, Arc::clone(&cred)).expect("valid");
+                builder
+                    .upsert_exact(&name, Arc::clone(&cred))
+                    .expect("valid");
             }
             let index = builder.build().expect("build");
             let query = format!("host{}.example.com", n / 2);
@@ -1079,11 +1142,15 @@ mod tests {
         let mut builder = CertIndexBuilder::new([3u8; 16]);
         for i in 0..100_000 {
             let name = format!("host{i}.example.com");
-            builder.upsert_exact(&name, Arc::clone(&cred)).expect("valid");
+            builder
+                .upsert_exact(&name, Arc::clone(&cred))
+                .expect("valid");
         }
         for i in 0..1_000 {
             let name = format!("wild{i}.example.com");
-            builder.upsert_wildcard(&format!("*.{name}"), Arc::clone(&cred)).expect("valid");
+            builder
+                .upsert_wildcard(&format!("*.{name}"), Arc::clone(&cred))
+                .expect("valid");
         }
         let index = builder.build().expect("build");
         assert!(index.index_bytes() < 10 * 1024 * 1024);
@@ -1128,7 +1195,9 @@ mod tests {
         builder.force_collision_on_attempt_0();
         for i in 0..100 {
             let name = format!("host{i}.example.com");
-            builder.upsert_exact(&name, Arc::clone(&cred)).expect("valid");
+            builder
+                .upsert_exact(&name, Arc::clone(&cred))
+                .expect("valid");
         }
         let index = builder.build().expect("build succeeds on retry");
         for i in 0..100 {
@@ -1142,9 +1211,15 @@ mod tests {
         let cred = cred_ecdsa_p256(&["a.example.com"]);
         let make_index = || {
             let mut builder = CertIndexBuilder::new([7u8; 16]);
-            builder.upsert_exact("a.example.com", Arc::clone(&cred)).expect("valid");
-            builder.upsert_exact("b.example.com", Arc::clone(&cred)).expect("valid");
-            builder.upsert_wildcard("*.c.example.com", Arc::clone(&cred)).expect("valid");
+            builder
+                .upsert_exact("a.example.com", Arc::clone(&cred))
+                .expect("valid");
+            builder
+                .upsert_exact("b.example.com", Arc::clone(&cred))
+                .expect("valid");
+            builder
+                .upsert_wildcard("*.c.example.com", Arc::clone(&cred))
+                .expect("valid");
             builder.build().expect("build")
         };
         let a = make_index();
@@ -1169,17 +1244,21 @@ mod tests {
         builder.set_max_arena_bytes_for_test(64);
         for i in 0..3 {
             let name = format!("this-is-a-30-byte-name-{i}.example.com");
-            builder.upsert_exact(&name, Arc::clone(&cred)).expect("valid");
+            builder
+                .upsert_exact(&name, Arc::clone(&cred))
+                .expect("valid");
         }
-        assert_eq!(builder.build(), Err(CertError::IndexTooLarge));
+        assert!(matches!(builder.build(), Err(CertError::IndexTooLarge)));
 
         let mut builder = CertIndexBuilder::new([8u8; 16]);
         builder.set_max_groups_for_test(2);
         for i in 0..3 {
             let name = format!("host{i}.example.com");
-            builder.upsert_exact(&name, Arc::clone(&cred)).expect("valid");
+            builder
+                .upsert_exact(&name, Arc::clone(&cred))
+                .expect("valid");
         }
-        assert_eq!(builder.build(), Err(CertError::IndexTooLarge));
+        assert!(matches!(builder.build(), Err(CertError::IndexTooLarge)));
     }
 
     #[test]
@@ -1217,18 +1296,14 @@ mod tests {
         static KEY: OnceLock<Arc<rcgen::KeyPair>> = OnceLock::new();
         KEY.get_or_init(|| {
             ensure_provider_installed();
-            Arc::new(
-                rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
-                    .expect("keygen"),
-            )
+            Arc::new(rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("keygen"))
         })
     }
 
     fn cred_for_san(san: &str) -> Arc<Credentials> {
         let key = shared_key();
-        let params =
-            rcgen::CertificateParams::new(vec![san.to_owned()]).expect("valid SANs");
-        let cert = params.self_signed(key).expect("sign");
+        let params = rcgen::CertificateParams::new(vec![san.to_owned()]).expect("valid SANs");
+        let cert = params.self_signed(&**key).expect("sign");
         let mut interner = ChainInterner::new();
         Arc::new(
             Credentials::load(&[cert.der()], &key.serialize_der(), &mut interner)
@@ -1303,7 +1378,7 @@ mod tests {
             for q in &queries {
                 let expected = naive_resolve(&ref_entries, q);
                 let got = index.resolve(q, ClientCaps::all()).map(|c| c.fingerprint());
-                prop_assert_eq!(got, expected, "query={q}");
+                prop_assert_eq!(got, expected, "query={}", q);
             }
         }
 
@@ -1350,7 +1425,7 @@ mod tests {
                     }
                     let got = index.resolve(&query, ClientCaps::all());
                     prop_assert_ne!(got.map(|c| c.fingerprint()), Some(cred.fingerprint()),
-                        "query={query} parent={parent}");
+                        "query={} parent={}", query, parent);
                 }
             }
         }

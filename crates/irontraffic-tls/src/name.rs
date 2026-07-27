@@ -201,7 +201,7 @@ impl NameHasher {
     /// Test seam that returns a hasher whose `hash` ignores its input and returns `NameKey(0)`.
     ///
     /// This lets the certificate index builder test exercise the collision-retry path without
-    /// computing a real 64-bit SipHash collision.
+    /// computing a real 64-bit `SipHash` collision.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn degenerate_for_test() -> Self {

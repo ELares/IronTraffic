@@ -6,6 +6,8 @@
 //! A process-global counting allocator is correct here because this is a separate integration-test
 //! binary: no other test binary runs in the same process.
 
+#![allow(unsafe_code, clippy::expect_used, clippy::indexing_slicing)]
+
 use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -63,7 +65,9 @@ fn build_exact_index(n: usize, suffix: &str) -> (CertIndex, Arc<Credentials>) {
     let mut builder = CertIndexBuilder::new([1u8; 16]);
     for i in 0..n {
         let name = format!("{i}{suffix}");
-        builder.upsert_exact(&name, Arc::clone(&cred)).expect("valid");
+        builder
+            .upsert_exact(&name, Arc::clone(&cred))
+            .expect("valid");
     }
     let index = builder.build().expect("build");
     (index, cred)
