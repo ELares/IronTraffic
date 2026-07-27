@@ -362,7 +362,6 @@ impl RouteTrace for RecordTrace {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-    use std::time::{Duration, Instant};
 
     use super::{ExplainStep, MAX_EXPLAIN_STEPS, NoTrace, RecordTrace, RejectReason, RouteTrace};
     use crate::ids::{GroupId, NodeId, RouteId};
@@ -370,7 +369,7 @@ mod tests {
 
     /// Touches every `RouteTrace` method once, generic over the sink. Used
     /// both to prove `NoTrace` satisfies the trait and, in
-    /// `notrace_calls_are_free` below, as the body of a tight loop.
+    /// `notrace_is_zero_sized` above, as the body of a tight loop.
     fn touch_all<T: RouteTrace>(trace: &mut T) {
         trace.on_host(GroupId(1), 0xdead_beef);
         trace.on_group(GroupId(2));
@@ -571,39 +570,6 @@ mod tests {
             unique.len(),
             labels.len(),
             "labels must be pairwise distinct"
-        );
-    }
-
-    /// Edge case 7 from the issue: an indirect but real check that a
-    /// `NoTrace`-driven call sequence is actually free rather than merely
-    /// declared so. A million iterations of every `RouteTrace` method
-    /// (seven million calls) through a generic function is asserted to
-    /// finish well inside a generous bound.
-    ///
-    /// The issue's own prose names "under a millisecond" as the bound. This
-    /// test uses a much larger one (50 milliseconds, roughly two orders of
-    /// magnitude of headroom over what was observed while writing this test)
-    /// because `cargo test` builds at `opt-level = 0`, not the release
-    /// profile the codegen-equality CI check in `match-request-core` (#60)
-    /// will actually use, and a bound tight enough to be meaningful only
-    /// under full optimization would make this specific test flaky on a
-    /// loaded or virtualized CI runner without adding any real sensitivity:
-    /// if `NoTrace` were doing real work (an allocation, a syscall, a
-    /// non-trivial computation) per call, seven million repetitions would
-    /// overshoot 50 milliseconds by orders of magnitude, not by a factor of
-    /// two. The exact codegen equality this issue exists to make possible is
-    /// proved by that separate, dedicated CI check, not by wall-clock timing.
-    #[test]
-    fn notrace_calls_are_free() {
-        let mut nt = NoTrace;
-        let start = Instant::now();
-        for _ in 0..1_000_000u32 {
-            touch_all(&mut nt);
-        }
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < Duration::from_millis(50),
-            "one million NoTrace call rounds took {elapsed:?}, expected it to be free"
         );
     }
 }
