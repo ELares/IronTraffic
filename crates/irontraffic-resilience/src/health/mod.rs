@@ -8,6 +8,8 @@
 //! bitmap, the scheduling policy, and the HTTP/TCP checkers) add their own
 //! `pub mod` lines here; this issue creates only the wheel.
 
+pub mod bitmap;
 pub mod wheel;
 
+pub use bitmap::{ClusterHealth, EndpointHealth, HealthBitmap};
 pub use wheel::TimerWheel;

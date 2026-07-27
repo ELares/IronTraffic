@@ -37,3 +37,7 @@ harness = false
 [[bench]]
 name = "outlier_stats"
 harness = false
+
+[[bench]]
+name = "health_bitmap"
+harness = false
