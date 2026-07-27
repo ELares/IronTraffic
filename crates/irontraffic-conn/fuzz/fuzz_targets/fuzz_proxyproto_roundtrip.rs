@@ -70,8 +70,8 @@ fuzz_target!(|data: &[u8]| {
         let dst = SocketAddr::new(IpAddr::V4(dst_ip), dst_port);
         (src, dst, &data[v4_block_len..])
     } else {
-        let src_ip = Ipv6Addr::from(<[u8; 16]>::try_from(&data[1..17]).unwrap());
-        let dst_ip = Ipv6Addr::from(<[u8; 16]>::try_from(&data[17..33]).unwrap());
+        let src_ip = Ipv6Addr::from(<[u8; 16]>::try_from(&data[1..17]).unwrap()); // it-allow: no-panic reason: fuzz target reports a finding by panicking; data.len() >= v6_block_len guarantees 16 bytes
+        let dst_ip = Ipv6Addr::from(<[u8; 16]>::try_from(&data[17..33]).unwrap()); // it-allow: no-panic reason: fuzz target reports a finding by panicking; data.len() >= v6_block_len guarantees 16 bytes
         let src_port = u16::from_be_bytes([data[33], data[34]]);
         let dst_port = u16::from_be_bytes([data[35], data[36]]);
         let src = SocketAddr::new(IpAddr::V6(src_ip), src_port);
@@ -82,11 +82,11 @@ fuzz_target!(|data: &[u8]| {
     let tlvs = tlvs_from_bytes(tlv_bytes);
     let mut buf = BytesMut::with_capacity(65_536);
     let start = buf.len();
-    let written = encode_v2(&mut buf, src, dst, &tlvs).unwrap();
+    let written = encode_v2(&mut buf, src, dst, &tlvs).unwrap(); // it-allow: no-panic reason: fuzz target reports a finding by panicking; encode_v2 succeeds by construction for these inputs
     assert!(written <= 65_551, "header exceeded 65551 bytes: {written}");
     assert_eq!(buf.len() - start, written);
 
-    let parsed = ProxyHeader::parse(&buf[start..]).unwrap();
+    let parsed = ProxyHeader::parse(&buf[start..]).unwrap(); // it-allow: no-panic reason: fuzz target reports a finding by panicking; an encoder-generated header is always parseable
     if let Some((value, consumed)) = parsed.into_complete() {
         assert_eq!(consumed, written);
         assert_eq!(value.src(), Some(src));
@@ -94,6 +94,6 @@ fuzz_target!(|data: &[u8]| {
         let declared = u16::from_be_bytes([buf[start + 14], buf[start + 15]]);
         assert_eq!(usize::from(declared), consumed - 16);
     } else {
-        panic!("parse of a valid encoded header returned Partial");
+        panic!("parse of a valid encoded header returned Partial"); // it-allow: no-panic reason: fuzz target reports a finding by panicking; Partial means the round-trip contract was broken
     }
 });

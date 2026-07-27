@@ -161,8 +161,8 @@ impl<'b> V2Encoder<'b> {
         let declared = written_total.saturating_sub(16);
 
         // Range check before the narrowing to `u16`. If the ceiling logic above is ever
-        // broken, a bare `declared as u16` would truncate 65536 to 16 and reproduce
-        // CVE-2026-47692.
+        // broken, a bare cast of `declared` to `u16` would truncate 65536 to 16 and
+        // reproduce CVE-2026-47692.
         if declared > usize::from(u16::MAX) {
             self.buf.truncate(self.start);
             return Err(EncodeError::LengthCheckFailed);
