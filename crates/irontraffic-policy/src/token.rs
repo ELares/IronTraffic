@@ -208,15 +208,14 @@ impl LexError {
     #[must_use]
     pub const fn at(self) -> u32 {
         match self {
-            LexError::UnexpectedByte { at, .. } => at,
-            LexError::UnterminatedString { at } => at,
-            LexError::BadEscape { at } => at,
-            LexError::BadUnicodeEscape { at } => at,
-            LexError::IntOverflow { at } => at,
-            LexError::SourceTooLong { .. } => 0,
-            LexError::TooManyTokens { .. } => 0,
-            LexError::StringTooLong { at, .. } => at,
-            LexError::NotUtf8 { at } => at,
+            LexError::UnexpectedByte { at, .. }
+            | LexError::UnterminatedString { at }
+            | LexError::BadEscape { at }
+            | LexError::BadUnicodeEscape { at }
+            | LexError::IntOverflow { at }
+            | LexError::StringTooLong { at, .. }
+            | LexError::NotUtf8 { at } => at,
+            LexError::SourceTooLong { .. } | LexError::TooManyTokens { .. } => 0,
         }
     }
 }
@@ -232,7 +231,10 @@ mod tests {
         assert_eq!(s.len(), 0);
         let src = b"hello";
         assert_eq!(s.slice(src), Some(b"".as_slice()));
-        assert_eq!(Span { start: 1, end: 4 }.slice(src), Some(b"ell".as_slice()));
+        assert_eq!(
+            Span { start: 1, end: 4 }.slice(src),
+            Some(b"ell".as_slice())
+        );
         assert_eq!(Span { start: 10, end: 12 }.slice(src), None);
     }
 

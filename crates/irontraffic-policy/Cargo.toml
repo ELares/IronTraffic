@@ -6,7 +6,6 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "ITPL front end: lexer, admission limits, and grammar for IronTraffic."
 
 [lints]
 workspace = true

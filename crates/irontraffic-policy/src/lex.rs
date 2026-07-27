@@ -33,8 +33,8 @@ pub fn lex(src: &[u8], limits: &PolicyLimits) -> Result<TokenStream, LexError> {
     };
 
     let mut out = TokenStream {
-        toks: Vec::with_capacity(src.len() / 4),
-        strings: Vec::with_capacity(src.len() / 4),
+        toks: Vec::with_capacity(src.len() >> 2),
+        strings: Vec::with_capacity(src.len() >> 2),
     };
 
     let lexer = RawTok::lexer(src_str).spanned();
@@ -59,7 +59,7 @@ pub fn lex(src: &[u8], limits: &PolicyLimits) -> Result<TokenStream, LexError> {
             }
             Ok(RawTok::RawStr) => {
                 let arena_start = out.strings.len();
-                decode_string(src, tok_span, &mut out.strings, limits)?;
+                decode_string(src, tok_span, &mut out.strings, limits.max_string_bytes)?;
                 let arena_end = out.strings.len();
                 push_tok(
                     &mut out,
@@ -90,8 +90,13 @@ fn push_tok(out: &mut TokenStream, tok: Tok, span: Span) {
     out.toks.push(Spanned { tok, span });
 }
 
+#[allow(
+    clippy::cast_possible_truncation,
+    reason = "source length is bounded by PolicyLimits::max_source_bytes, which is capped at 65_536"
+)]
 fn offset_to_u32(offset: usize) -> u32 {
-    u32::try_from(offset).unwrap_or(0)
+    debug_assert!(u32::try_from(offset).is_ok());
+    offset as u32
 }
 
 #[derive(logos::Logos, Clone, Copy, PartialEq, Eq, Debug)]
@@ -145,9 +150,6 @@ enum RawTok {
 
 fn raw_to_tok(raw: RawTok) -> Tok {
     match raw {
-        RawTok::RawStr => unreachable!("RawStr handled separately"),
-        RawTok::RawInt => unreachable!("RawInt handled separately"),
-        RawTok::Ident => unreachable!("Ident handled separately"),
         RawTok::LParen => Tok::LParen,
         RawTok::RParen => Tok::RParen,
         RawTok::LBracket => Tok::LBracket,
@@ -165,146 +167,154 @@ fn raw_to_tok(raw: RawTok) -> Tok {
         RawTok::Lt => Tok::Lt,
         RawTok::Ge => Tok::Ge,
         RawTok::Gt => Tok::Gt,
+        RawTok::RawStr | RawTok::RawInt | RawTok::Ident => {
+            // These variants are handled in `lex` before `raw_to_tok` is called.
+            Tok::Bang
+        }
     }
 }
 
 fn keyword_or_ident(src: &[u8], span: Span) -> Tok {
-    let bytes = span.slice(src).unwrap_or(&[]);
-    if bytes == b"true" {
-        Tok::Bool(true)
-    } else if bytes == b"false" {
-        Tok::Bool(false)
-    } else if bytes == b"null" {
-        Tok::Null
-    } else if bytes == b"in" {
-        Tok::In
-    } else {
-        Tok::Ident(span)
+    match span.slice(src) {
+        Some(b"true") => Tok::Bool(true),
+        Some(b"false") => Tok::Bool(false),
+        Some(b"null") => Tok::Null,
+        Some(b"in") => Tok::In,
+        _ => Tok::Ident(span),
     }
 }
 
 fn parse_i64(src: &[u8], span: Span) -> Option<i64> {
     let bytes = span.slice(src)?;
     let s = core::str::from_utf8(bytes).ok()?;
-    i64::from_str_radix(s, 10).ok()
+    s.parse::<i64>().ok()
 }
 
 fn decode_string(
     src: &[u8],
     span: Span,
     out: &mut Vec<u8>,
-    limits: &PolicyLimits,
+    max_string_bytes: u32,
 ) -> Result<(), LexError> {
-    let bytes = span.slice(src).unwrap_or(&[]);
+    let bytes = span
+        .slice(src)
+        .ok_or(LexError::UnterminatedString { at: span.start })?;
     if bytes.len() < 2 {
-        // Should not happen for a valid logos match, but refuse to index.
         return Err(LexError::UnterminatedString { at: span.start });
     }
 
-    let content = &bytes[1..bytes.len() - 1];
+    let content = bytes
+        .get(1..bytes.len().saturating_sub(1))
+        .ok_or(LexError::UnterminatedString { at: span.start })?;
     let quote_offset = span.start;
-    let max = limits.max_string_bytes;
+    let max = usize::try_from(max_string_bytes).unwrap_or(usize::MAX);
 
-    let mut i = 0_usize;
-    while i < content.len() {
-        let b = content.get(i).copied().ok_or(LexError::UnterminatedString { at: quote_offset })?;
-        if b != b'\\' {
-            out.push(b);
-            i = i.checked_add(1).ok_or(LexError::StringTooLong { at: quote_offset, max })?;
-            if out.len() > usize::try_from(max).unwrap_or(usize::MAX) {
-                return Err(LexError::StringTooLong { at: quote_offset, max });
-            }
+    let mut pos = 0_usize;
+    while pos < content.len() {
+        if out.len() >= max {
+            return Err(LexError::StringTooLong {
+                at: quote_offset,
+                max: max_string_bytes,
+            });
+        }
+
+        let byte = content
+            .get(pos)
+            .copied()
+            .ok_or(LexError::UnterminatedString { at: quote_offset })?;
+
+        if byte != b'\\' {
+            out.push(byte);
+            pos = pos.saturating_add(1);
             continue;
         }
 
-        // Backslash must be followed by another byte.
         let slash_offset = quote_offset
-            .checked_add(1)
-            .and_then(|x| x.checked_add(u32::try_from(i).ok()?))
-            .unwrap_or(quote_offset);
+            .saturating_add(1)
+            .saturating_add(u32::try_from(pos).unwrap_or(u32::MAX));
         let esc = content
-            .get(i.checked_add(1).ok_or(LexError::BadEscape { at: slash_offset })?)
+            .get(pos.saturating_add(1))
             .copied()
             .ok_or(LexError::BadEscape { at: slash_offset })?;
 
         match esc {
             b'n' => {
                 out.push(b'\n');
-                i = i.checked_add(2).ok_or(LexError::StringTooLong { at: quote_offset, max })?;
+                pos = pos.saturating_add(2);
             }
             b'r' => {
                 out.push(b'\r');
-                i = i.checked_add(2).ok_or(LexError::StringTooLong { at: quote_offset, max })?;
+                pos = pos.saturating_add(2);
             }
             b't' => {
                 out.push(b'\t');
-                i = i.checked_add(2).ok_or(LexError::StringTooLong { at: quote_offset, max })?;
+                pos = pos.saturating_add(2);
             }
             b'\\' => {
                 out.push(b'\\');
-                i = i.checked_add(2).ok_or(LexError::StringTooLong { at: quote_offset, max })?;
+                pos = pos.saturating_add(2);
             }
             b'"' => {
                 out.push(b'"');
-                i = i.checked_add(2).ok_or(LexError::StringTooLong { at: quote_offset, max })?;
+                pos = pos.saturating_add(2);
             }
             b'\'' => {
                 out.push(b'\'');
-                i = i.checked_add(2).ok_or(LexError::StringTooLong { at: quote_offset, max })?;
+                pos = pos.saturating_add(2);
             }
             b'0' => {
                 out.push(0);
-                i = i.checked_add(2).ok_or(LexError::StringTooLong { at: quote_offset, max })?;
+                pos = pos.saturating_add(2);
             }
             b'x' => {
-                let hi = content
-                    .get(i.checked_add(2).ok_or(LexError::BadEscape { at: slash_offset })?)
-                    .copied();
-                let lo = content
-                    .get(i.checked_add(3).ok_or(LexError::BadEscape { at: slash_offset })?)
-                    .copied();
-                let byte = hex_byte(hi, lo).ok_or(LexError::BadEscape { at: slash_offset })?;
-                out.push(byte);
-                i = i.checked_add(4).ok_or(LexError::StringTooLong { at: quote_offset, max })?;
+                let hi = content.get(pos.saturating_add(2)).copied();
+                let lo = content.get(pos.saturating_add(3)).copied();
+                let decoded = hex_byte(hi, lo).ok_or(LexError::BadEscape { at: slash_offset })?;
+                if out.len() >= max {
+                    return Err(LexError::StringTooLong {
+                        at: quote_offset,
+                        max: max_string_bytes,
+                    });
+                }
+                out.push(decoded);
+                pos = pos.saturating_add(4);
             }
             b'u' => {
-                let a = content
-                    .get(i.checked_add(2).ok_or(LexError::BadEscape { at: slash_offset })?)
-                    .copied();
-                let b = content
-                    .get(i.checked_add(3).ok_or(LexError::BadEscape { at: slash_offset })?)
-                    .copied();
-                let c = content
-                    .get(i.checked_add(4).ok_or(LexError::BadEscape { at: slash_offset })?)
-                    .copied();
-                let d = content
-                    .get(i.checked_add(5).ok_or(LexError::BadEscape { at: slash_offset })?)
-                    .copied();
+                let a = content.get(pos.saturating_add(2)).copied();
+                let b = content.get(pos.saturating_add(3)).copied();
+                let c = content.get(pos.saturating_add(4)).copied();
+                let d = content.get(pos.saturating_add(5)).copied();
                 let code = hex_u16(a, b, c, d).ok_or(LexError::BadEscape { at: slash_offset })?;
                 if (0xD800..=0xDFFF).contains(&code) {
                     return Err(LexError::BadUnicodeEscape { at: slash_offset });
                 }
-                // Encode code point as UTF-8. code is u16, so it is <= 0xFFFF,
-                // which is inside the valid Unicode range except surrogates above.
-                push_utf8(u32::from(code), out);
-                i = i.checked_add(6).ok_or(LexError::StringTooLong { at: quote_offset, max })?;
+                let ch = char::from_u32(u32::from(code))
+                    .ok_or(LexError::BadUnicodeEscape { at: slash_offset })?;
+                let mut buf = [0_u8; 4];
+                let encoded = ch.encode_utf8(&mut buf);
+                for decoded_byte in encoded.as_bytes() {
+                    if out.len() >= max {
+                        return Err(LexError::StringTooLong {
+                            at: quote_offset,
+                            max: max_string_bytes,
+                        });
+                    }
+                    out.push(*decoded_byte);
+                }
+                pos = pos.saturating_add(6);
             }
             _ => return Err(LexError::BadEscape { at: slash_offset }),
-        }
-
-        if out.len() > usize::try_from(max).unwrap_or(usize::MAX) {
-            return Err(LexError::StringTooLong { at: quote_offset, max });
         }
     }
 
     Ok(())
 }
 
-fn hex_digit(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
+fn hex_digit(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
         _ => None,
     }
 }
@@ -321,20 +331,6 @@ fn hex_u16(a: Option<u8>, b: Option<u8>, c: Option<u8>, d: Option<u8>) -> Option
     let c = u16::from(hex_digit(c?)?);
     let d = u16::from(hex_digit(d?)?);
     Some((a << 12) | (b << 8) | (c << 4) | d)
-}
-
-fn push_utf8(code: u32, out: &mut Vec<u8>) {
-    // code is at most 0xFFFF here because it came from a u16.
-    if code <= 0x007F {
-        out.push(code as u8);
-    } else if code <= 0x07FF {
-        out.push((0xC0 | (code >> 6)) as u8);
-        out.push((0x80 | (code & 0x3F)) as u8);
-    } else {
-        out.push((0xE0 | (code >> 12)) as u8);
-        out.push((0x80 | ((code >> 6) & 0x3F)) as u8);
-        out.push((0x80 | (code & 0x3F)) as u8);
-    }
 }
 
 #[cfg(test)]

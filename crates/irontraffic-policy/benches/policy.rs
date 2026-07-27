@@ -6,8 +6,8 @@
 //! `crates/irontraffic-policy/src/lex.rs`.
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
-use irontraffic_policy::lex::lex;
 use irontraffic_policy::PolicyLimits;
+use irontraffic_policy::lex::lex;
 
 fn bench_two_clause_predicate(c: &mut Criterion) {
     let src = b"request.path.startsWith(\"/v1/\") && request.method == \"GET\"";

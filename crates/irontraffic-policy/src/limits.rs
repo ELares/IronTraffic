@@ -27,7 +27,7 @@ pub struct PolicyLimits {
     /// Compiled regexes in one program. Default 8.
     pub max_regex: u16,
     /// Bytes of compiled regex program, passed to `RegexBuilder::size_limit`.
-    /// Default 65_536.
+    /// Default `65_536`.
     pub max_regex_size: u32,
     /// Elements in one list literal. Default 64.
     pub max_list_elems: u16,
@@ -147,13 +147,12 @@ impl PolicyLimits {
     fn check_u16(value: u16, field: &'static str, cap: u32) -> Result<(), LimitError> {
         // cap is guaranteed to fit in u16 for every u16 field, but this avoids a
         // narrowing cast and keeps the comparison in the wider type.
-        let cap_u16 = match u16::try_from(cap) {
-            Ok(c) => c,
-            Err(_) => return Err(LimitError::AboveCap {
+        let Ok(cap_u16) = u16::try_from(cap) else {
+            return Err(LimitError::AboveCap {
                 field,
                 requested: u32::from(value),
                 cap,
-            }),
+            });
         };
         if value == 0 {
             return Err(LimitError::Zero { field });
@@ -169,15 +168,12 @@ impl PolicyLimits {
     }
 
     fn check_u16_regex(value: u16, field: &'static str, cap: u32) -> Result<(), LimitError> {
-        let cap_u16 = match u16::try_from(cap) {
-            Ok(c) => c,
-            Err(_) => {
-                return Err(LimitError::AboveCap {
-                    field,
-                    requested: u32::from(value),
-                    cap,
-                });
-            }
+        let Ok(cap_u16) = u16::try_from(cap) else {
+            return Err(LimitError::AboveCap {
+                field,
+                requested: u32::from(value),
+                cap,
+            });
         };
         // max_regex of 0 is legal and means "no regex operators allowed".
         if value > cap_u16 {
@@ -229,21 +225,11 @@ mod tests {
 
         let mut l = base;
         l.max_depth = 0;
-        assert_eq!(
-            l.validate(),
-            Err(LimitError::Zero {
-                field: "max_depth"
-            })
-        );
+        assert_eq!(l.validate(), Err(LimitError::Zero { field: "max_depth" }));
 
         let mut l = base;
         l.max_ops = 0;
-        assert_eq!(
-            l.validate(),
-            Err(LimitError::Zero {
-                field: "max_ops"
-            })
-        );
+        assert_eq!(l.validate(), Err(LimitError::Zero { field: "max_ops" }));
 
         let mut l = base;
         l.max_consts = 0;
@@ -361,41 +347,33 @@ mod tests {
             }
             assert_eq!(l.validate(), Ok(()), "{field} at cap should validate");
 
-            let requested = if field == "max_regex" {
-                cap.checked_add(1).unwrap()
-            } else if cap == u32::MAX {
-                cap
-            } else {
-                cap.checked_add(1).unwrap()
-            };
+            let requested = cap.checked_add(1).unwrap();
 
-            if field == "max_regex" || cap != u32::MAX {
-                let mut l2 = l;
-                match field {
-                    "max_source_bytes" => l2.max_source_bytes = requested,
-                    "max_tokens" => l2.max_tokens = requested,
-                    "max_string_bytes" => l2.max_string_bytes = requested,
-                    "max_depth" => l2.max_depth = u16::try_from(requested).unwrap(),
-                    "max_ops" => l2.max_ops = u16::try_from(requested).unwrap(),
-                    "max_consts" => l2.max_consts = u16::try_from(requested).unwrap(),
-                    "max_attr_slots" => {
-                        l2.max_attr_slots = u16::try_from(requested).unwrap();
-                    }
-                    "max_regex" => l2.max_regex = u16::try_from(requested).unwrap(),
-                    "max_regex_size" => l2.max_regex_size = requested,
-                    "max_list_elems" => l2.max_list_elems = u16::try_from(requested).unwrap(),
-                    _ => panic!("unknown field {field}"),
+            let mut l2 = l;
+            match field {
+                "max_source_bytes" => l2.max_source_bytes = requested,
+                "max_tokens" => l2.max_tokens = requested,
+                "max_string_bytes" => l2.max_string_bytes = requested,
+                "max_depth" => l2.max_depth = u16::try_from(requested).unwrap(),
+                "max_ops" => l2.max_ops = u16::try_from(requested).unwrap(),
+                "max_consts" => l2.max_consts = u16::try_from(requested).unwrap(),
+                "max_attr_slots" => {
+                    l2.max_attr_slots = u16::try_from(requested).unwrap();
                 }
-                assert_eq!(
-                    l2.validate(),
-                    Err(LimitError::AboveCap {
-                        field,
-                        requested,
-                        cap,
-                    }),
-                    "{field} over cap should fail"
-                );
+                "max_regex" => l2.max_regex = u16::try_from(requested).unwrap(),
+                "max_regex_size" => l2.max_regex_size = requested,
+                "max_list_elems" => l2.max_list_elems = u16::try_from(requested).unwrap(),
+                _ => panic!("unknown field {field}"),
             }
+            assert_eq!(
+                l2.validate(),
+                Err(LimitError::AboveCap {
+                    field,
+                    requested,
+                    cap,
+                }),
+                "{field} over cap should fail"
+            );
         }
     }
 }
