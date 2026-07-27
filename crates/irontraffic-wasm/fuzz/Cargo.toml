@@ -1,0 +1,26 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# Not a workspace member: the empty [workspace] table below is required so
+# that Cargo treats this manifest as its own independent workspace root
+# instead of trying to join the ancestor workspace at the repository root.
+[package]
+name = "irontraffic-wasm-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+irontraffic-wasm = { path = ".." }
+
+[[bin]]
+name = "fuzz_guest_oplist"
+path = "fuzz_targets/fuzz_guest_oplist.rs"
+test = false
+doc = false
+bench = false

@@ -1,0 +1,19 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "irontraffic-wasm"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The ITX core-module WebAssembly ABI: names, return encoding, guest_slice, and the batched op-list decoder."
+
+[lints]
+workspace = true
+
+[dependencies]
+irontraffic-filter = { path = "../irontraffic-filter", version = "0.1.0" }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
