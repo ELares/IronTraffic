@@ -367,7 +367,7 @@ fn merge_slashes(buf: &mut [u8], len: usize) -> usize {
     let mut r = 0usize;
     let mut w = 0usize;
     while r < len {
-        let b = *buf.get(r).unwrap_or(&0); // r < len by the loop guard
+        let b = buf[r]; // r < len by the loop guard
         if let Some(slot) = buf.get_mut(w) {
             *slot = b;
         }
@@ -448,6 +448,8 @@ impl NormalizedPath {
     /// `raw` is the target's path and query, with no scheme or authority. Writes the
     /// normalized bytes into `out` and returns a view over them plus the byte-preserved
     /// query. Shrink-only: the output is never longer than `raw`.
+    ///
+    /// On error, `out` may contain partial writes and should not be used.
     ///
     /// # Errors
     /// `PathEmpty`, `PathTooLong`, `PathInvalidByte`, `PathPercentTruncated`,
