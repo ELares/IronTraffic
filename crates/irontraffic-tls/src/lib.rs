@@ -12,6 +12,8 @@
 
 pub mod name;
 pub mod provider;
+pub mod store;
+pub mod time;
 
 pub use name::{NameHasher, NameKey};
 pub use provider::{

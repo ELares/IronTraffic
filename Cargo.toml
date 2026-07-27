@@ -94,6 +94,13 @@ loom = { version = "0.7" }
 # integration feature needed: every newtype spells `#[schemars(with = "...")]`
 # rather than deriving a schema from its private field.
 schemars = { version = "1.2.1" }
+# content-addressing DER blobs and computing stable certificate fingerprints
+blake3 = "1"
+# X.509 field extraction (validity, SPKI OID, SANs, tlsfeature, serial, issuer DN);
+# pinned on the 0.2 line because x509-ocsp 0.2.1, added by #122, depends on that same line
+x509-cert = "0.2"
+# dev-only: builds certificate fixtures in tests so no key material is committed
+rcgen = "0.14.8"
 
 [workspace.lints.rust]
 # A proxy parses attacker-controlled bytes on every request. There is no
