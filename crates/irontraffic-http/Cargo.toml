@@ -47,6 +47,10 @@ proptest = { workspace = true }
 criterion = { workspace = true }
 
 [[bench]]
+name = "http_chunked"
+harness = false
+
+[[bench]]
 name = "http_hot"
 harness = false
 
