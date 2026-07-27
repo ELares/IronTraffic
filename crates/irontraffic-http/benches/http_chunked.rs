@@ -46,9 +46,13 @@ use std::hint::black_box;
 fn drive_whole(decoder: &mut ChunkedDecoder, wire: &[u8]) -> usize {
     let mut pos = 0usize;
     let mut delivered = 0usize;
+    // One arena for the whole drive, declared outside the loop: decode's
+    // documented precondition (issue #658) is that arena is the SAME
+    // growing buffer across every call for one body, never a fresh one per
+    // call.
+    let mut arena = BytesMut::new();
     loop {
         let buf = wire.get(pos..).unwrap_or(&[]);
-        let mut arena = BytesMut::new();
         match decoder.decode(black_box(buf), &mut arena).unwrap() {
             ChunkedEvent::Data { len, .. } => {
                 delivered = delivered.saturating_add(len);
@@ -78,12 +82,14 @@ fn drive_split(decoder: &mut ChunkedDecoder, wire: &[u8], chunk: usize) -> usize
     let mut pos = 0usize;
     let mut revealed = 0usize;
     let mut delivered = 0usize;
+    // One arena for the whole drive; see drive_whole's identical comment
+    // (issue #658).
+    let mut arena = BytesMut::new();
     loop {
         if revealed < wire.len() {
             revealed = revealed.saturating_add(chunk).min(wire.len());
         }
         let buf = wire.get(pos..revealed).unwrap_or(&[]);
-        let mut arena = BytesMut::new();
         match decoder.decode(black_box(buf), &mut arena).unwrap() {
             ChunkedEvent::Data { len, .. } => {
                 delivered = delivered.saturating_add(len);

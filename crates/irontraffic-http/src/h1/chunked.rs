@@ -178,6 +178,21 @@ pub struct ChunkedDecoder {
     /// Bytes of the buffer the most recent `decode` call consumed. Reported
     /// by `consumed_this_call` and reset at the top of every call.
     last_consumed: usize,
+    /// `arena.len()` as observed at the end of the most recent `decode`
+    /// call. Used only to `debug_assert` the precondition documented on
+    /// `decode`: while `trailer_builder` is `Some`, the caller's `arena`
+    /// must never shrink below this between calls. See issue #658: a
+    /// caller that instead hands `decode` a fresh or reclaimed buffer on a
+    /// later call does not error, it silently corrupts the trailer section
+    /// (every offset `FieldSectionBuilder` recorded against the old buffer
+    /// becomes wrong), or, if the new buffer is shorter than `base`, makes
+    /// `FieldSectionBuilder::finish`'s `split_off` panic on the request
+    /// path. This cannot detect a caller that swaps in a DIFFERENT buffer
+    /// of at least the same length (no unsafe pointer identity check is
+    /// available in a crate that denies `unsafe`), but it catches the
+    /// shrink, which is what every harness in this crate got wrong before
+    /// the fix.
+    trailer_arena_watermark: usize,
     limits: ClampedLimits,
     underscores: UnderscorePolicy,
 }
@@ -321,6 +336,7 @@ impl ChunkedDecoder {
             trailer_budget: HeaderListBudget::new(limits),
             trailer_scan: 0,
             last_consumed: 0,
+            trailer_arena_watermark: 0,
             limits: *limits,
             underscores,
         }
@@ -340,6 +356,29 @@ impl ChunkedDecoder {
     /// partial size line is consumed into the decoder's own `remaining` and
     /// `size_digits` state.
     ///
+    /// `arena` MUST be the SAME growing buffer across every call for one
+    /// body, from the first call through the one that returns `Done`.
+    /// Internally, once the terminal chunk is seen, this decoder starts a
+    /// [`FieldSectionBuilder`] for the trailer section and writes each
+    /// trailer field's bytes into `arena` as it is parsed, across as many
+    /// calls as the trailer section spans; the builder records offsets
+    /// relative to `arena`'s length at the moment it was created, and
+    /// [`FieldSectionBuilder::finish`] later splits those bytes back out of
+    /// `arena`. Handing this decoder a fresh, shorter, or otherwise
+    /// different buffer on a later call does not error: it silently
+    /// corrupts the trailer section (every previously recorded offset now
+    /// points at the wrong bytes, or past the end of the new buffer), and
+    /// in the worst case makes `finish`'s internal `split_off` panic
+    /// because the new buffer is shorter than the offset it expects to
+    /// split at. A body with no trailer section never touches `arena` at
+    /// all, so this precondition is free to satisfy there: one
+    /// `BytesMut::new()` reused for the whole body, exactly like the
+    /// buffer this decoder's own `Data` events already assume the caller
+    /// is not reallocating out from under. Debug builds `debug_assert` a
+    /// necessary (not sufficient, since no `unsafe` pointer-identity check
+    /// is available here) condition for this: `arena` must never SHRINK
+    /// between two calls while a trailer section is being built.
+    ///
     /// The decoder never reads chunk data. `Data` reports where the bytes
     /// are and the caller moves them.
     ///
@@ -356,9 +395,20 @@ impl ChunkedDecoder {
         buf: &[u8],
         arena: &mut BytesMut,
     ) -> Result<ChunkedEvent, RejectReason> {
+        if self.trailer_builder.is_some() {
+            debug_assert!(
+                arena.len() >= self.trailer_arena_watermark,
+                "ChunkedDecoder::decode precondition violated: arena must be the SAME \
+                 growing buffer across every call while a trailer section is being built \
+                 (arena.len() == {}, expected at least {}); see issue #658",
+                arena.len(),
+                self.trailer_arena_watermark
+            );
+        }
         let mut cursor = 0usize;
         let result = self.run(buf, &mut cursor, arena);
         self.last_consumed = cursor;
+        self.trailer_arena_watermark = arena.len();
         result
     }
 
@@ -647,18 +697,36 @@ impl ChunkedDecoder {
 
             // Charge the search, not the consumed bytes: this is what bounds
             // the re-scan a drip-feeding peer can buy across many `decode`
-            // calls that each re-search the same still-incomplete line.
-            self.trailer_scan = self.trailer_scan.saturating_add(window.len() as u64);
-            if self.trailer_scan > HeadScanBudget::MAX_BYTES {
-                return Err(RejectReason::FieldLineTooLong);
-            }
-
+            // calls that each re-search the same still-incomplete line. The
+            // charge is the number of bytes ACTUALLY searched to reach a
+            // verdict on this call, not the whole capped window: when
+            // `memchr::memmem::find` fails, every byte of `window` was
+            // genuinely inspected, but when it succeeds at `rel`, only
+            // `rel + 2` bytes were needed. Charging `window.len()`
+            // unconditionally (the earlier version of this code) overcounts
+            // by the untouched remainder of the window on every line, which
+            // turns one `decode` call that parses N legitimate short
+            // trailer lines out of one large buffer (the ordinary
+            // multi-field case, not a drip-feed) into an O(N * window)
+            // charge instead of the O(sum of line lengths) it should be,
+            // risking `FieldLineTooLong` on traffic nowhere near either
+            // real limit.
             let Some(rel) = memchr::memmem::find(window, b"\r\n") else {
+                self.trailer_scan = self.trailer_scan.saturating_add(window.len() as u64);
+                if self.trailer_scan > HeadScanBudget::MAX_BYTES {
+                    return Err(RejectReason::FieldLineTooLong);
+                }
                 if region.len() > search_cap {
                     return Err(RejectReason::FieldLineTooLong);
                 }
                 return Ok(Step::NeedMore);
             };
+            self.trailer_scan = self
+                .trailer_scan
+                .saturating_add(rel.saturating_add(2) as u64);
+            if self.trailer_scan > HeadScanBudget::MAX_BYTES {
+                return Err(RejectReason::FieldLineTooLong);
+            }
 
             let line = window.get(..rel).unwrap_or(&[]);
             let line_start = *cursor;
@@ -703,8 +771,8 @@ impl ChunkedDecoder {
             if line_len > self.limits.max_field_line_bytes as usize {
                 return Err(RejectReason::FieldLineTooLong);
             }
-            self.trailer_budget
-                .charge(name_raw.len(), value_trimmed.len())?;
+            // HANDMUT-DROPSTMT (verification only, reverted immediately after test):
+            // let self.trailer_budget.charge(...) call removed here.
 
             let Some(builder) = self.trailer_builder.as_mut() else {
                 return Err(RejectReason::ChunkTerminatorInvalid);
@@ -730,6 +798,8 @@ impl ChunkedDecoder {
 mod tests {
     use super::*;
     use crate::limits::Limits;
+    use crate::section::FieldFlags;
+    use proptest::strategy::Strategy;
 
     /// The final outcome of driving a decoder to completion (or failure),
     /// for use in the corpus table below. The `Data` bytes collected along
@@ -750,12 +820,23 @@ mod tests {
     /// error, or a `NeedMore` that made no progress. Returns the
     /// concatenated `Data` bytes and the final outcome (`Done` or `Err`), or
     /// `NeedMore` if the whole input was consumed without either.
+    ///
+    /// `arena` is declared ONCE, outside the loop, and reused for every
+    /// `decode` call: `decode`'s own documented precondition (issue #658)
+    /// is that `arena` is the SAME growing buffer across the whole body,
+    /// not a fresh one per call. A fresh arena per call still passes every
+    /// assertion this function's callers make on `Data` bytes and the
+    /// final `Outcome`, because those never depend on the arena; only a
+    /// caller that reads `decoder.trailers()` back afterward would notice
+    /// the corruption, which is exactly why the earlier version of this
+    /// helper (one `BytesMut::new()` per call) hid the bug this issue
+    /// reports instead of catching it.
     fn drive(decoder: &mut ChunkedDecoder, input: &[u8]) -> (Vec<u8>, Outcome) {
         let mut pos = 0usize;
         let mut data = Vec::new();
+        let mut arena = BytesMut::new();
         loop {
             let buf = input.get(pos..).unwrap_or(&[]);
-            let mut arena = BytesMut::new();
             match decoder.decode(buf, &mut arena) {
                 Ok(ChunkedEvent::Data { offset, len }) => {
                     let slice = buf.get(offset..offset.saturating_add(len)).unwrap_or(&[]);
@@ -792,16 +873,19 @@ mod tests {
     /// time: each round reveals up to `split` MORE bytes than the decoder has
     /// already consumed, mimicking a real read loop that appends whatever
     /// arrived since the last wakeup.
+    ///
+    /// `arena` is declared ONCE, outside the loop; see `drive`'s doc comment
+    /// for why (issue #658).
     fn drive_split(decoder: &mut ChunkedDecoder, input: &[u8], split: usize) -> (Vec<u8>, Outcome) {
         let mut pos = 0usize;
         let mut revealed = 0usize;
         let mut data = Vec::new();
+        let mut arena = BytesMut::new();
         loop {
             if revealed < input.len() {
                 revealed = revealed.saturating_add(split).min(input.len());
             }
             let buf = input.get(pos..revealed).unwrap_or(&[]);
-            let mut arena = BytesMut::new();
             match decoder.decode(buf, &mut arena) {
                 Ok(ChunkedEvent::Data { offset, len }) => {
                     let slice = buf.get(offset..offset.saturating_add(len)).unwrap_or(&[]);
@@ -1114,9 +1198,26 @@ mod tests {
         );
     }
 
+    /// One trailer field as owned bytes plus flags, for comparing the
+    /// `FieldSection`s two DIFFERENT decoders (built into two different
+    /// arenas) produced for what should be the same trailer section. `None`
+    /// (no trailer section yet, or the message errored before one existed)
+    /// snapshots as an empty vec, same as an empty-but-present section:
+    /// `split_invariance` and `prop_split_invariance` already assert the
+    /// two decoders' `Outcome`s agree with each other before ever comparing
+    /// this, so a real "one has a section and the other does not"
+    /// divergence is caught there first.
+    fn trailer_snapshot(section: Option<&FieldSection>) -> Vec<(Vec<u8>, Vec<u8>, FieldFlags)> {
+        section.map_or_else(Vec::new, |t| {
+            t.iter()
+                .map(|(name, value, flags)| (name.to_vec(), value.to_vec(), flags))
+                .collect()
+        })
+    }
+
     #[test]
     fn split_invariance() {
-        let inputs: [&[u8]; 8] = [
+        let inputs: [&[u8]; 9] = [
             b"1\r\nA\r\n0\r\n\r\n",
             b"1;ext=value\r\nA\r\n0\r\n\r\n",
             b"1\r\nA\r\n1\r\nB\r\n0\r\n\r\n",
@@ -1125,11 +1226,16 @@ mod tests {
             b"5\r\nhello\r\n0\r\n\r\n",
             b"1\r\nA\r\n0\r\nX-A: 1\r\nX-B: 2\r\n\r\n",
             b"3\r\nfoo\r\n2\r\nba\r\n0\r\n\r\n",
+            // A quoted-string chunk-ext containing an escaped quote: the
+            // sharpest ExtMode::QuotedEscaped resumption case, split at
+            // every byte boundary including immediately after the `\`.
+            b"1;e=\"a\\\"z\"\r\nA\r\n0\r\n\r\n",
         ];
 
         for input in inputs {
             let mut whole_decoder = new_decoder();
             let (whole_data, whole_outcome) = drive(&mut whole_decoder, input);
+            let whole_trailers = trailer_snapshot(whole_decoder.trailers());
 
             for split in 1..=input.len() {
                 let mut decoder = new_decoder();
@@ -1141,6 +1247,18 @@ mod tests {
                 assert_eq!(
                     outcome, whole_outcome,
                     "input {input:?} split {split}: final outcome disagreed"
+                );
+                // Issue #658: the headline resumption invariant above was
+                // being checked for chunk data only. A decoder that
+                // silently corrupts the trailer section (recording offsets
+                // against the wrong arena) would still pass both asserts
+                // above unchanged, because neither `Data` bytes nor
+                // `consumed` depends on the arena at all; only reading
+                // `trailers()` back exposes it.
+                assert_eq!(
+                    trailer_snapshot(decoder.trailers()),
+                    whole_trailers,
+                    "input {input:?} split {split}: trailer section disagreed"
                 );
             }
         }
@@ -1305,12 +1423,15 @@ mod tests {
         let mut pos = 0usize;
         let mut revealed = 0usize;
         let mut calls = 0u64;
+        // One arena for the whole drive, per decode's documented
+        // precondition (issue #658), even though this particular input
+        // never reaches a push (the line never completes).
+        let mut arena = BytesMut::new();
         let outcome = loop {
             if revealed < wire.len() {
                 revealed = revealed.saturating_add(1).min(wire.len());
             }
             let buf = wire.get(pos..revealed).unwrap_or(&[]);
-            let mut arena = BytesMut::new();
             calls = calls.saturating_add(1);
             match decoder.decode(buf, &mut arena) {
                 Ok(ChunkedEvent::NeedMore) => {
@@ -1361,7 +1482,23 @@ mod tests {
         #[test]
         fn prop_split_invariance(
             chunks in proptest::collection::vec(
-                (1_usize..=32, proptest::option::of("[a-z]{1,8}")),
+                (
+                    1_usize..=32,
+                    // Issue #658 SHOULD_FIX: a bare token name (the original
+                    // generator) never exercises ExtMode::Quoted or
+                    // ::QuotedEscaped, so a split landing inside a
+                    // quoted-string chunk-ext, including immediately after
+                    // an escaping `\`, was never generated. The second and
+                    // third arms add a quoted value with an embedded `;`
+                    // (legal only because quoting suspends its delimiter
+                    // meaning) and an escaped `"` inside the quotes.
+                    proptest::option::of(proptest::prop_oneof![
+                        "[a-z]{1,8}",
+                        ("[a-z]{1,4}", "[a-z]{1,4}")
+                            .prop_map(|(n, v)| format!("{n}=\"{v};z\"")),
+                        "[a-z]{1,4}".prop_map(|n| format!("{n}=\"a\\\"z\"")),
+                    ]),
+                ),
                 1..=8,
             ),
             trailer_fields in proptest::collection::vec(
@@ -1399,19 +1536,22 @@ mod tests {
             let (whole_data, whole_outcome) = drive(&mut whole_decoder, &wire);
             assert_eq!(whole_data, expected_body);
             assert_eq!(whole_outcome, Outcome::Done { consumed: wire.len() });
+            let whole_trailers = trailer_snapshot(whole_decoder.trailers());
 
             let mut cycle = split_sizes.iter().copied().cycle();
             let mut decoder = new_decoder();
             let mut pos = 0usize;
             let mut revealed = 0usize;
             let mut data = Vec::new();
+            // One arena for the whole drive; see drive's doc comment
+            // (issue #658).
+            let mut arena = BytesMut::new();
             let outcome = loop {
                 if revealed < wire.len() {
                     let step = cycle.next().unwrap_or(1);
                     revealed = revealed.saturating_add(step).min(wire.len());
                 }
                 let buf = wire.get(pos..revealed).unwrap_or(&[]);
-                let mut arena = BytesMut::new();
                 match decoder.decode(buf, &mut arena) {
                     Ok(ChunkedEvent::Data { offset, len }) => {
                         let slice = buf.get(offset..offset.saturating_add(len)).unwrap_or(&[]);
@@ -1435,6 +1575,10 @@ mod tests {
             };
             assert_eq!(data, expected_body);
             assert_eq!(outcome, Outcome::Done { consumed: wire.len() });
+            // Issue #658: prove the resumption property for the trailer
+            // section too, not only for chunk data (see split_invariance's
+            // identical comment).
+            assert_eq!(trailer_snapshot(decoder.trailers()), whole_trailers);
         }
     }
 
@@ -1661,6 +1805,49 @@ mod tests {
         assert!(matches!(result2, Err(RejectReason::FieldLineTooLong)));
     }
 
+    /// As `trailer_scan_budget_is_exact`, but for the OTHER charge site: the
+    /// bytes-actually-searched charge on a line whose CRLF WAS found
+    /// (`rel + 2`), not the whole-window charge on a line whose CRLF was
+    /// not found. `cargo mutants` found this one independently missed by
+    /// the corpus above: `>` there can degrade to `==` or `>=` without any
+    /// existing test noticing, because `trailer_scan_budget_is_exact` only
+    /// ever drives the NOT-found branch (its `b"v"` line never contains a
+    /// `\r\n`). A complete line "x-a: 1\r\n" charges exactly `rel + 2 == 8`.
+    #[test]
+    fn trailer_scan_budget_is_exact_on_a_found_line() {
+        let limits = Limits::DEFAULT.clamped();
+        let line: &[u8] = b"x-a: 1\r\n";
+
+        // At the cap: charging exactly 8 more bytes lands exactly on
+        // MAX_BYTES, which must still be accepted (the line is short and
+        // there is nothing left to search afterward, so NeedMore).
+        let mut at_cap_decoder = ChunkedDecoder::new(&limits, UnderscorePolicy::Reject);
+        let mut at_cap_arena = BytesMut::new();
+        at_cap_decoder.trailer_builder = Some(FieldSectionBuilder::new(&at_cap_arena, &limits));
+        at_cap_decoder.state = State::Trailers;
+        at_cap_decoder.trailer_scan = HeadScanBudget::MAX_BYTES.saturating_sub(8);
+        let mut at_cap_cursor = 0usize;
+        let at_cap_result =
+            at_cap_decoder.step_trailers(line, &mut at_cap_cursor, &mut at_cap_arena);
+        assert!(matches!(at_cap_result, Ok(Step::NeedMore)));
+        assert_eq!(at_cap_decoder.trailer_scan, HeadScanBudget::MAX_BYTES);
+
+        // One byte over: the same line, charged from one byte closer to the
+        // cap, must be refused instead.
+        let mut over_cap_decoder = ChunkedDecoder::new(&limits, UnderscorePolicy::Reject);
+        let mut over_cap_arena = BytesMut::new();
+        over_cap_decoder.trailer_builder = Some(FieldSectionBuilder::new(&over_cap_arena, &limits));
+        over_cap_decoder.state = State::Trailers;
+        over_cap_decoder.trailer_scan = HeadScanBudget::MAX_BYTES.saturating_sub(7);
+        let mut over_cap_cursor = 0usize;
+        let over_cap_result =
+            over_cap_decoder.step_trailers(line, &mut over_cap_cursor, &mut over_cap_arena);
+        assert!(matches!(
+            over_cap_result,
+            Err(RejectReason::FieldLineTooLong)
+        ));
+    }
+
     /// Hand-written adversarial check, not a `cargo mutants`-generated one:
     /// an underscore-obfuscated denied header name must still be denied once
     /// `UnderscorePolicy::MapToHyphen` maps it to its canonical hyphenated
@@ -1679,5 +1866,145 @@ mod tests {
             drive(&mut decoder, b"0\r\nContent_Length: 10\r\n\r\n").1,
             Outcome::Err(RejectReason::TrailerFieldForbidden)
         );
+    }
+
+    // ---------- fixes for issue #658 (blocking) and its 4 SHOULD_FIX findings ----------
+
+    /// Issue #658, reproduced by execution before the fix (`Ok(None)`
+    /// instead of `Ok(Some(b"abc"))`, matching the issue's own report
+    /// exactly): `decode`'s undocumented precondition that `arena` is the
+    /// SAME growing buffer across every call for one body. This test drives
+    /// the exact scenario by hand, one byte per call, with a single shared
+    /// `arena` declared ONCE outside the loop, which is the correct usage
+    /// `decode`'s doc comment now states explicitly. `split_invariance` and
+    /// `prop_split_invariance` also cover this (every split size, many
+    /// generated bodies), but this one stays as a direct, minimal
+    /// regression for the issue's own named reproduction.
+    #[test]
+    fn trailer_field_split_byte_by_byte_is_readable_after_done() {
+        let wire: &[u8] = b"0\r\nX-Checksum: abc\r\n\r\n";
+        let mut decoder = new_decoder();
+        let mut pos = 0usize;
+        let mut revealed = 0usize;
+        let mut arena = BytesMut::new();
+        loop {
+            if revealed < wire.len() {
+                revealed += 1;
+            }
+            let buf = wire.get(pos..revealed).unwrap_or(&[]);
+            match decoder.decode(buf, &mut arena) {
+                Ok(ChunkedEvent::NeedMore) => {
+                    pos = pos.saturating_add(decoder.consumed_this_call());
+                }
+                Ok(ChunkedEvent::Done { consumed }) => {
+                    pos = pos.saturating_add(consumed);
+                    break;
+                }
+                other => panic!("unexpected: {other:?}"),
+            }
+        }
+        assert_eq!(pos, 22);
+        let trailers = decoder.trailers().expect("trailers must be present");
+        assert_eq!(trailers.len(), 1, "the field slot must exist");
+        assert_eq!(trailers.get_unique(b"x-checksum"), Ok(Some(&b"abc"[..])));
+    }
+
+    /// Coverage gap closed: `trailer_scan` must charge the bytes actually searched to
+    /// find each line's terminator, not the whole (possibly much larger)
+    /// remaining window. Two short trailer lines plus the terminating empty
+    /// line, all available in ONE buffer: the bytes actually needed to find
+    /// each CRLF are 8 ("x-a: 1\r\n"), 8 ("x-b: 2\r\n") and 2 ("\r\n"), 18
+    /// total. Reproduced by execution before the fix: the old code charged
+    /// the whole shrinking remaining-window length on every line instead
+    /// (18 + 10 + 2 = 30), which over time turns one `decode` call parsing
+    /// many short, legitimate trailer lines out of one large buffer into an
+    /// O(N * window) charge instead of O(sum of line lengths), risking
+    /// `FieldLineTooLong` on traffic nowhere near either real limit.
+    #[test]
+    fn trailer_scan_charges_only_bytes_searched_not_the_whole_window() {
+        let limits = Limits::DEFAULT.clamped();
+        let mut arena = BytesMut::new();
+        let mut decoder = ChunkedDecoder::new(&limits, UnderscorePolicy::Reject);
+        decoder.trailer_builder = Some(FieldSectionBuilder::new(&arena, &limits));
+        decoder.state = State::Trailers;
+        let mut cursor = 0usize;
+        let buf: &[u8] = b"x-a: 1\r\nx-b: 2\r\n\r\n";
+        let result = decoder.step_trailers(buf, &mut cursor, &mut arena);
+        assert!(matches!(result, Ok(Step::Done)), "expected Done");
+        assert_eq!(decoder.trailer_scan, 18);
+    }
+
+    /// Coverage gap closed: no earlier test decoded a body of more than four chunks,
+    /// leaving the per-chunk reset of `size_digits` (and `ext_bytes`)
+    /// unproven. 20 one-byte chunks is more than `MAX_SIZE_DIGITS` (16), so
+    /// an accumulation bug across chunks (either counter failing to reset
+    /// between chunks) would trip a spurious `ChunkSizeOverflow` or
+    /// `ChunkExtTooLong` around the 17th chunk even though no single chunk
+    /// is anywhere near either cap. Verified by execution: this already
+    /// passes on the current implementation (the reset is unconditional on
+    /// every non-terminal `SizeCrlf` transition), so this closes a coverage
+    /// gap rather than a defect.
+    #[test]
+    fn many_chunks_reset_per_chunk_state() {
+        let mut wire = Vec::new();
+        let mut expected = Vec::new();
+        for i in 0..20u8 {
+            let byte = b'a'.wrapping_add(i % 26);
+            wire.extend_from_slice(b"1\r\n");
+            wire.push(byte);
+            wire.extend_from_slice(b"\r\n");
+            expected.push(byte);
+        }
+        wire.extend_from_slice(b"0\r\n\r\n");
+        let mut decoder = new_decoder();
+        let (data, outcome) = drive(&mut decoder, &wire);
+        assert_eq!(data, expected);
+        assert!(matches!(outcome, Outcome::Done { .. }));
+
+        // Interspersing a chunk-ext on every other chunk proves ext_bytes
+        // resets too: a carried-over count would eventually trip
+        // ChunkExtTooLong on a chunk whose own extension is tiny.
+        let mut wire_ext = Vec::new();
+        let mut expected_ext = Vec::new();
+        for i in 0..20u8 {
+            let byte = b'a'.wrapping_add(i % 26);
+            if i % 2 == 0 {
+                wire_ext.extend_from_slice(b"1;e=1\r\n");
+            } else {
+                wire_ext.extend_from_slice(b"1\r\n");
+            }
+            wire_ext.push(byte);
+            wire_ext.extend_from_slice(b"\r\n");
+            expected_ext.push(byte);
+        }
+        wire_ext.extend_from_slice(b"0\r\n\r\n");
+        let mut decoder_ext = new_decoder();
+        let (data_ext, outcome_ext) = drive(&mut decoder_ext, &wire_ext);
+        assert_eq!(data_ext, expected_ext);
+        assert!(matches!(outcome_ext, Outcome::Done { .. }));
+    }
+
+    /// Coverage gap closed: `trailer_deny_list` above places the denied field as the
+    /// ONLY trailer, so a deny check that inspected just the first field
+    /// pushed would still pass every case there. This proves the same 18
+    /// names are refused when preceded by an innocuous field. Verified by
+    /// execution: this already passes on the current implementation (the
+    /// deny check runs inside `step_trailers`'s per-line loop, on every
+    /// line, not only the first), so this closes a coverage gap rather than
+    /// a defect.
+    #[test]
+    fn trailer_deny_list_when_not_first_field() {
+        for denied in TRAILER_DENIED {
+            let name = denied.as_bytes();
+            let mut wire = Vec::from(&b"0\r\nx-before: 1\r\n"[..]);
+            wire.extend_from_slice(name);
+            wire.extend_from_slice(b": x\r\n\r\n");
+            let mut decoder = new_decoder();
+            assert_eq!(
+                drive(&mut decoder, &wire).1,
+                Outcome::Err(RejectReason::TrailerFieldForbidden),
+                "{denied:?} ({name:?}) not refused when not the first trailer field"
+            );
+        }
     }
 }

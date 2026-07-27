@@ -187,12 +187,18 @@ fn chunked_decode_allocates_nothing_for_a_body_with_no_trailers() {
     let mut decoder = ChunkedDecoder::new(&Limits::DEFAULT.clamped(), UnderscorePolicy::Reject);
     let mut pos = 0usize;
     let mut delivered = 0usize;
+    // One arena for the whole drive, declared outside the loop: decode's
+    // documented precondition (issue #658) is that arena is the SAME
+    // growing buffer across every call for one body, never a fresh one per
+    // call. This body never reaches a trailer section (see the module doc
+    // comment), so the precondition is trivially free to keep here, but a
+    // fresh arena per call would still be wrong to model.
+    let mut arena = BytesMut::new();
     loop {
         let buf = wire.get(pos..).unwrap_or(&[]);
         if buf.is_empty() && delivered == len {
             break;
         }
-        let mut arena = BytesMut::new();
         match decoder
             .decode(buf, &mut arena)
             .expect("a well-formed 1 MiB single chunk must decode without error")
