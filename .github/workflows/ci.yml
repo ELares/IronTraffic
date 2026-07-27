@@ -582,7 +582,13 @@ jobs:
           # A lane can therefore report success while a security surface is
           # entirely unfuzzed, which is the vacuous-success shape this whole job
           # exists to refuse.
-          on_disk="$(find "$fuzz_dir/fuzz_targets" -maxdepth 1 -name '*.rs' -type f 2>/dev/null | sed 's|.*/||; s|\.rs$||' | sort)"
+          # NOT `-maxdepth 1 -type f`. Both predicates opened holes in BOTH
+          # directions: an unregistered target in a subdirectory, or one that is a
+          # symlink, was invisible and passed; while a legitimately nested or
+          # symlinked target that IS registered failed with "no matching
+          # fuzz_targets/*.rs", which is untrue and would redden the lane for a
+          # maintainer who did nothing wrong.
+          on_disk="$(find -L "$fuzz_dir/fuzz_targets" -name '*.rs' \( -type f -o -type l \) 2>/dev/null | sed 's|.*/||; s|\.rs$||' | sort)"
           registered="$(printf '%s\n' "$targets" | sort)"
           unregistered="$(comm -23 <(printf '%s\n' "$on_disk") <(printf '%s\n' "$registered"))"
           missing_file="$(comm -13 <(printf '%s\n' "$on_disk") <(printf '%s\n' "$registered"))"
@@ -598,7 +604,45 @@ jobs:
             printf '  %s\n' $missing_file
             exit 1
           fi
-          echo "ok: every target file in $fuzz_dir is registered and every registration has a file"
+          # AND EVERY REGISTRATION MUST POINT AT ITS OWN FILE.
+          #
+          # The set comparison above compares `cargo fuzz list` NAMES against file
+          # BASENAMES and never reads the `path` key, which is what cargo actually
+          # compiles. So a `[[bin]]` carrying the right NAME whose `path` points at
+          # a DIFFERENT existing target satisfies set equality exactly, and the
+          # file it is supposed to build never compiles or runs. The shard then
+          # prints `== fuzzing ... :: fuzz_path ==` and `Done N runs` for a target
+          # that was never built, and the log is indistinguishable from a real run.
+          #
+          # That is the same silently-unrun target this check exists to prevent,
+          # reachable by the same copy-paste slip that produced #699: the stanzas
+          # in these manifests are identical blocks, so copying one, updating
+          # `name` and forgetting `path` is the mirror image of the original bug.
+          # Cargo does NOT backstop it: a cross-pointed manifest builds cleanly.
+          # Cargo only catches the weaker case where `path` is omitted entirely.
+          #
+          # Verified by binary content rather than by reasoning: with the path
+          # cross-pointed, the compiled `fuzz_path` binary contained zero
+          # occurrences of the assertion string unique to fuzz_path.rs.
+          bad_paths="$(python3 - "$manifest" <<'PYEOF'
+          import sys, tomllib
+          m = tomllib.load(open(sys.argv[1], "rb"))
+          for b in m.get("bin", []):
+              name, path = b.get("name", ""), b.get("path", "")
+              if not name:
+                  print("a [[bin]] stanza has no name")
+              elif path != "fuzz_targets/%s.rs" % name:
+                  print('[[bin]] "%s" has path "%s", expected fuzz_targets/%s.rs' % (name, path, name))
+          PYEOF
+          )"
+          if [ -n "$bad_paths" ]; then
+            echo "FAIL: $manifest has [[bin]] entries that do not point at their own target file:"
+            printf '  %s\n' "$bad_paths"
+            echo "  A stanza whose path names a DIFFERENT file compiles and runs that other"
+            echo "  file under this name, so the target it claims to cover never runs at all."
+            exit 1
+          fi
+          echo "ok: every target file in $fuzz_dir is registered, and every registration points at its own file"
           while IFS= read -r t; do
             [ -n "$t" ] || continue
             echo "== fuzzing $fuzz_dir :: $t =="
