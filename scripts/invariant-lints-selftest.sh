@@ -109,9 +109,15 @@ pub fn allocates(n: usize, raw: &str, parts: &[&str], cow: Cow<'_, str>) -> usiz
     let tok_string_from = String::from(raw);
     let tok_vec_from = Vec::from(raw.as_bytes());
     let tok_box_from: Box<str> = Box::from(raw);
+    // Turbofish evasion (issue #610): a type parameter written explicitly
+    // between the type name and `::` used to remove the `Type::` prefix
+    // these rules require, so `Vec::<u8>::new()` and `Box::<str>::from(raw)`
+    // matched nothing even though `Vec::new()` and `Box::from(raw)` did.
+    let tok_turbofish_from: Box<str> = Box::<str>::from(raw);
     let tok_box_new = Box::new(n);
     let tok_arc_new = Arc::new(n);
     let tok_rc_new = Rc::new(n);
+    let tok_turbofish_new: Vec<u8> = Vec::<u8>::new();
     let tok_box_pin = Box::pin(n);
     let tok_collect_turbofish = raw.bytes().collect::<Vec<u8>>();
     let tok_collect_bare: Vec<u8> = raw.bytes().collect();
@@ -771,9 +777,11 @@ tok_turbofish_with_capacity = Vec::<u8>::with_capacity(
 tok_string_from = String::from(
 tok_vec_from = Vec::from(
 tok_box_from: Box<str> = Box::from(
+tok_turbofish_from: Box<str> = Box::<str>::from(
 tok_box_new = Box::new(
 tok_arc_new = Arc::new(
 tok_rc_new = Rc::new(
+tok_turbofish_new: Vec<u8> = Vec::<u8>::new(
 tok_box_pin = Box::pin(
 tok_collect_turbofish = raw.bytes().collect::<Vec<u8>>()
 tok_collect_bare: Vec<u8> = raw.bytes().collect()
@@ -795,6 +803,149 @@ if [ -n "$MISSED_SPELLINGS" ]; then
   FAILED=1
 else
   note "hot-path-allocation reported every covered call spelling"
+fi
+
+# ---------------------------------------------------------------------------
+# Corpus A, the OTHER direction: the pattern must not outrun NEEDLES.
+#
+# WHY THIS EXISTS (issue #610). The check just above only walks NEEDLES ->
+# hits: it proves every line this file claims is covered really fires, and it
+# says nothing at all about a token that was added to the live pattern in
+# scripts/invariant-lints.sh with no needle here to match it. That is not a
+# hypothetical gap, it is a proven one: appending a brand new top-level
+# alternative to the end of the hot-path-allocation pattern, with nothing
+# added to NEEDLES, left this whole script exiting 0 and printing "hot-path-
+# allocation reported every covered call spelling" for every one of these:
+#   - `|\.to_lowercasee\(\)`      (a typo)
+#   - `|\.to_pathbuf\(\)`         (a real call, just never added as a needle)
+#   - `|\.into_bytes\(\)`         (same)
+# The needles-to-hits check above cannot see any of these, because it never
+# reads the pattern; it only reads what the rule reported. The one case it
+# happens to catch, an unbalanced group, is caught for the wrong reason: an
+# invalid ERE makes grep reject the whole pattern, so every PRE-EXISTING hit
+# vanishes at once, which trips the needles-to-hits check on tokens that were
+# already there, not because the new token itself was noticed.
+#
+# THE CHECK. Extract the live hot-path-allocation pattern from scripts/
+# invariant-lints.sh and count its top-level `|` alternatives: an alternation
+# nested inside a group, such as the type list on the `::new\(` line
+# (`(Vec|String|...)`), is ONE top-level alternative, not many, because
+# touching only the type list is a separate, narrower change this check does
+# not claim to police (see the limits below). Compare that count to the
+# number pinned immediately below, right beside NEEDLES. Add, remove, or
+# otherwise change a top-level alternative in the pattern without updating
+# both this number and the matching NEEDLES line(s), in either direction, and
+# this fails here.
+#
+# WHAT THIS STILL DOES NOT PROVE, STATED HONESTLY. Two independent edits can
+# cancel out and still leave the counts agreeing (add one alternative, remove
+# a different one, forget both needles). It also cannot see a change made
+# INSIDE an existing alternative's own inner list: folding a tenth collection
+# type into the `(Vec|String|HashMap|...)::new\(` group changes nothing at
+# the top level and this check would not notice. It closes the specific,
+# demonstrated hole (a bare token appended to the pattern with nothing else
+# touched), not every hole shaped like it.
+echo "== corpus A: hot-path-allocation pattern alternatives must match NEEDLES =="
+# Keep this number in the same commit as any change to the top-level shape of
+# hot_scan's hot-path-allocation pattern in scripts/invariant-lints.sh, and add
+# or remove the matching NEEDLES line(s) at the same time.
+EXPECTED_ALLOC_ALTERNATIVES=19
+ACTUAL_ALLOC_ALTERNATIVES="$(python3 - <<'PY'
+import re
+
+try:
+    text = open("scripts/invariant-lints.sh", encoding="utf-8").read()
+except OSError:
+    print("ERROR: could not read scripts/invariant-lints.sh")
+    raise SystemExit(0)
+
+m = re.search(r"hot_scan hot-path-allocation '([^']*)'", text)
+if not m:
+    print("ERROR: could not find the hot-path-allocation pattern")
+    raise SystemExit(0)
+pattern = m.group(1)
+
+
+def strip_outer_group(pat):
+    """If pat is wrapped in one group spanning the whole string, return its
+    contents; otherwise return pat unchanged. Depth-aware and character-class
+    aware, exactly like count_top_level below, so it does not mistake a `(`
+    inside `[...]` for a real group, or an escaped `\\(` for one either."""
+    if not (pat.startswith("(") and pat.endswith(")")):
+        return pat
+    depth = 0
+    escaped = False
+    in_class = False
+    for idx, c in enumerate(pat):
+        if escaped:
+            escaped = False
+            continue
+        if c == "\\":
+            escaped = True
+            continue
+        if in_class:
+            if c == "]":
+                in_class = False
+            continue
+        if c == "[":
+            in_class = True
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0 and idx != len(pat) - 1:
+                # Closes before the end: this is not a single wrapping group,
+                # e.g. "(a)|(b)". Leave pat exactly as given.
+                return pat
+    return pat[1:-1]
+
+
+def count_top_level_alternatives(pat):
+    """Count `|` at depth 0, outside any [...] character class, and outside
+    any escaped \\| or \\( or \\). An unescaped `(` opens a real group
+    (depth += 1) and an unescaped `)` closes one (depth -= 1); a `|` only
+    separates top-level alternatives when depth is 0. `(Vec|String)::new\\(`
+    is therefore ONE alternative: its inner `|` sits at depth 1."""
+    depth = 0
+    escaped = False
+    in_class = False
+    count = 1
+    for c in pat:
+        if escaped:
+            escaped = False
+            continue
+        if c == "\\":
+            escaped = True
+            continue
+        if in_class:
+            if c == "]":
+                in_class = False
+            continue
+        if c == "[":
+            in_class = True
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        elif c == "|" and depth == 0:
+            count += 1
+    return count
+
+
+print(count_top_level_alternatives(strip_outer_group(pattern)))
+PY
+)"
+if [ "$ACTUAL_ALLOC_ALTERNATIVES" != "$EXPECTED_ALLOC_ALTERNATIVES" ]; then
+  echo "FAIL: scripts/invariant-lints.sh's hot-path-allocation pattern now has"
+  echo "      $ACTUAL_ALLOC_ALTERNATIVES top-level alternatives, but this file still expects"
+  echo "      $EXPECTED_ALLOC_ALTERNATIVES (EXPECTED_ALLOC_ALTERNATIVES above). A top-level"
+  echo "      alternative was added to or removed from the pattern without updating"
+  echo "      EXPECTED_ALLOC_ALTERNATIVES and the matching NEEDLES line(s) here."
+  FAILED=1
+else
+  note "hot-path-allocation pattern has exactly $EXPECTED_ALLOC_ALTERNATIVES top-level alternatives, matching NEEDLES"
 fi
 
 # ---------------------------------------------------------------------------
