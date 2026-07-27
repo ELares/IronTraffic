@@ -11,6 +11,7 @@ pub mod limits;
 pub mod normalize;
 pub mod precedence;
 pub mod request;
+pub mod scratch;
 pub mod spec;
 pub mod table;
 #[cfg(test)]
@@ -28,6 +29,7 @@ pub use normalize::{
 };
 pub use precedence::{MatchOrdinalKey, OrdinalError, PathKind, Precedence, assign_ordinals};
 pub use request::RequestView;
+pub use scratch::{HeaderSlot, MatchScratch, MatchStatus, QuerySlot};
 pub use spec::{
     AdmissionError, AdmissionErrorKind, HeaderMatch, HostPattern, HttpRouteSpec, PathMatch,
     QueryParamMatch, RouteMatchSpec, RouteOrderKey, RouteRuleSpec,

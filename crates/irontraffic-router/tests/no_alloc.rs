@@ -73,3 +73,27 @@ fn normalize_and_host_key_allocate_nothing() {
          catching it"
     );
 }
+
+#[test]
+fn scratch_steady_state_allocates_nothing() {
+    // `match-scratch-per-worker` (#58) originally intended to prove this with a
+    // process-wide counting `#[global_allocator]`. That does not compile in this
+    // tree (`#![forbid(unsafe_code)]`) and would be unsound anyway because it
+    // would count allocations made by other tests running in parallel. The
+    // module is instead guarded by the same `//! HOT PATH` marker that protects
+    // `normalize_authority`: `scripts/invariant-lints.sh` scans the whole file
+    // for allocating or locking calls, and any genuine exception must carry an
+    // `it-allow: hot-path-allocation` escape with a written reason. This test's
+    // only job is to guard against the marker itself being deleted, which would
+    // silently drop the module out of that CI-enforced net.
+    let source = include_str!("../src/scratch.rs");
+    assert!(
+        source.lines().any(|line| line == HOT_PATH_MARKER),
+        "crates/irontraffic-router/src/scratch.rs must carry a line that is \
+         exactly `{HOT_PATH_MARKER}` so scripts/invariant-lints.sh's \
+         hot-path-allocation and hot-path-lock rules scan this module; without \
+         it, MatchScratch::begin_request, observe_header, index_query and every \
+         helper they call could allocate or lock with nothing in this repository \
+         catching it"
+    );
+}
