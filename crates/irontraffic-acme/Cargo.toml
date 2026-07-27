@@ -1,0 +1,39 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+
+[package]
+name = "irontraffic-acme"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ACME account and directory lifecycle for IronTraffic."
+
+[lints]
+workspace = true
+
+[features]
+default = []
+# Enables the pebble-backed integration tests. Never enabled in a release build.
+acme-integration = []
+schema = ["dep:schemars"]
+
+[dependencies]
+instant-acme = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+schemars = { workspace = true, optional = true }
+zeroize = { workspace = true }
+blake3 = { workspace = true }
+# base64url decoding of the EAB HMAC key; instant-acme's ExternalAccountKey takes raw bytes.
+base64 = "0.22"
+tokio = { version = "1", default-features = false, features = ["time", "fs"] }
+irontraffic-tls = { path = "../irontraffic-tls", version = "0.1.0" }
+tracing = { workspace = true }
+http = { workspace = true }
+hyper = { workspace = true, features = ["client", "http1", "http2"] }
+hyper-util = { workspace = true, features = ["client", "client-legacy", "http1", "http2", "tokio"] }
+hyper-rustls = { version = "0.27.7", default-features = false, features = ["http1", "http2", "native-tokio", "tls12", "rustls-platform-verifier"] }
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
