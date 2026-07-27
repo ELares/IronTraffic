@@ -550,8 +550,18 @@ jobs:
               # If a future fuzz target is added to this crate that DOES
               # construct or exercise a tokio runtime, this exception stops
               # being free and needs re-justifying, not silently inherited.
+              #
+              # crates/irontraffic-config/fuzz (issue #582): same ICE at
+              # rustc_codegen_ssa/mir/operand.rs:291, triggered by compiling
+              # tokio under ASan + sancov when the config fuzz crate pulls
+              # in irontraffic-runtime (which depends on tokio). Same
+              # reasoning applies: every fuzz_target! in this crate calls
+              # only synchronous, I/O-free functions that never construct
+              # or enter a tokio runtime. Scoped to this one crate, not a
+              # blanket change, consistent with every other crate above.
               sanitizer_args=()
-              if [ "$fuzz_dir" = "crates/irontraffic-conn/fuzz" ]; then
+              if [ "$fuzz_dir" = "crates/irontraffic-conn/fuzz" ] || \
+                 [ "$fuzz_dir" = "crates/irontraffic-config/fuzz" ]; then
                 sanitizer_args=(--sanitizer none)
               fi
               # `${sanitizer_args[@]+"${sanitizer_args[@]}"}`, not the plain
@@ -643,7 +653,7 @@ jobs:
         # how many merges land on the base branch in between.
         run: |
           set -euo pipefail
-          git fetch --depth=1 origin "${{ github.event.pull_request.base.sha }}"
+          git fetch origin "${{ github.event.pull_request.base.sha }}"
           if git cat-file -e "FETCH_HEAD:scripts/pr-scope-check.sh" 2>/dev/null; then
             git checkout FETCH_HEAD -- scripts/pr-scope-check.sh
             echo "restored from base: scripts/pr-scope-check.sh"
