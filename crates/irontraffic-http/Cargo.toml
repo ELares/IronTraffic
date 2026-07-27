@@ -83,6 +83,10 @@ name = "http_h1"
 harness = false
 
 [[bench]]
+name = "http_h1_canonicalize"
+harness = false
+
+[[bench]]
 name = "http_known"
 harness = false
 
