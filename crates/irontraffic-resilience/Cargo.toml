@@ -41,3 +41,7 @@ harness = false
 [[bench]]
 name = "health_bitmap"
 harness = false
+
+[[bench]]
+name = "retry_backoff"
+harness = false

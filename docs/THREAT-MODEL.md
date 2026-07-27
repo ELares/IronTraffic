@@ -857,6 +857,19 @@ trusted network position is exactly what a compromised sidecar has. Second, a bu
 driver's read buffer for this phase must not grow past 65551 bytes while `parse` says `Partial`,
 because at that point the bytes cannot be a valid header either.
 
+## Server pushback (`retry-backoff-full-jitter` and `retry-server-pushback-parsers`, #103)
+
+**What this surface parses.** `Retry-After` and `grpc-retry-pushback-ms` are chosen by the upstream origin. Both values are arbitrary bytes that may be well-formed pushback, malformed garbage, or deliberately chosen to suppress or accelerate our retries.
+
+**Structural controls.**
+
+- **A 64-byte parse-length cap** is checked before any template match or digit scan. The longest form this function accepts is the 29-byte IMF-fixdate, so 64 bytes is generous; the check means a multi-megabyte header value is refused after one length comparison, never scanned once per HTTP-date template.
+- **The deadline caps the high side.** A pushback that does not fit the remaining request deadline minus the estimated attempt duration is refused with `PushbackExceedsDeadline`, turning a pinned request into an immediate `DoNotRetry`. This is the only cap above: a parseable pushback is used verbatim, never averaged, maxed, or minned with our computed backoff.
+- **A jittered floor caps the low side.** A pushback of exactly 0 ms is replaced by a uniform draw in `[0, base_interval_ms]`, so a literal `Retry-After: 0`, an HTTP-date already in the past, or a wall clock ahead of the server's all produce a small, decorrelated delay instead of a synchronized retry-now stampede.
+- **The retry budget contains acceleration.** The jittered floor spreads a "retry immediately" signal, but the `retry-budget-tps` (#102) is what prevents an accelerating pushback from becoming an amplifier. `max_attempts` is the final bound.
+- **The wall-clock dependency of the HTTP-date form is isolated.** `parse_retry_after` takes `now_wall_ms` as a parameter and never reads the clock itself, so the parser remains pure and testable; the caller supplies the same wall clock the deadline layer already uses.
+
+**Accepted risk.** A compromised upstream can suppress our retries by returning a large pushback (capped above by the deadline) or accelerate them by returning a zero pushback (capped below by the jittered floor and the budget). Those two bounds are the entire containment; the parser's job is only to be total, allocation-free, and length-bounded so the header itself cannot be the attack.
 ## The assembled proxy: what M1 defends and what it does not
 
 This is the summary an operator reads before deploying `run` or `proxy`. It is a list of plain
