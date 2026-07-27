@@ -9,12 +9,19 @@
 //! `irontraffic-io`'s own signal tests).
 
 use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use irontraffic_conn::{ConnRegistry, DrainConfig, jitter_before_close, supervise_with_trigger};
-use irontraffic_io::{Phase, ShutdownController, ShutdownSignal, Spawner, sleep, with_timeout};
-use irontraffic_time::{TestTimeSource, TimeSource};
+use irontraffic_conn::{
+    AcceptConfig, BoxFut, ConnGuard, ConnHandler, ConnRegistry, DrainConfig, accept_loop,
+    jitter_before_close, supervise_with_trigger,
+};
+use irontraffic_io::{
+    Phase, ShutdownController, ShutdownSignal, ShutdownToken, Spawner, TcpAcceptor, TcpTransport,
+    sleep, with_timeout,
+};
+use irontraffic_time::{SystemTimeSource, TestTimeSource, TimeSource};
 use proptest::prelude::*;
 
 /// The trigger every test below uses: resolves immediately, so the drain body starts
@@ -154,6 +161,106 @@ async fn drain_deadline_advances_to_closing() {
     assert_eq!(token.phase(), Phase::Closing);
 
     drop(guard);
+}
+
+/// A connection handler whose future never completes: it holds both the real socket
+/// and the registry guard for as long as the task lives, and never even looks at
+/// `shutdown`. Used by `drain_terminates_with_a_real_peer_that_never_closes` below to
+/// prove the drain deadline is real against a connection that never observes the
+/// drain at all, not merely one a test held open with a bookkeeping guard and no
+/// actual I/O behind it.
+struct NeverClosingHandler;
+
+impl ConnHandler<TcpTransport> for NeverClosingHandler {
+    fn handle(
+        &self,
+        io: TcpTransport,
+        _peer: SocketAddr,
+        guard: ConnGuard,
+        _shutdown: ShutdownToken,
+    ) -> BoxFut {
+        Box::pin(async move {
+            let _io = io;
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        })
+    }
+}
+
+// Not one of the 13 tests the issue names by number, but directly proving the
+// property the "DRAIN MUST TERMINATE" directive asks for: a connection that never
+// closes must not prevent shutdown past the deadline, demonstrated with a genuine TCP
+// peer accepted through the real `accept_loop` (#17) rather than a `ConnGuard` a test
+// holds by hand with no socket behind it. Uses a real `SystemTimeSource` (not a
+// `TestTimeSource`) so the 50ms graceful window is genuine wall-clock elapsed time,
+// not a clock this test drives itself.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn drain_terminates_with_a_real_peer_that_never_closes() {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let addr = listener.local_addr().expect("local addr");
+    let acceptor = TcpAcceptor::from_std(listener).expect("register with reactor");
+
+    let registry = ConnRegistry::new(8);
+    let (controller, token) = ShutdownController::new();
+    let spawner = Spawner::current().expect("a runtime drives this test");
+    let time: Arc<dyn TimeSource> = Arc::new(SystemTimeSource::new());
+    let handler = Arc::new(NeverClosingHandler);
+
+    let _accept_handle = spawner.spawn(accept_loop(
+        acceptor,
+        Arc::clone(&registry),
+        token.clone(),
+        spawner.clone(),
+        handler,
+        Arc::clone(&time),
+        AcceptConfig::default(),
+    ));
+
+    // A genuine peer: a real TCP client that connects and then does nothing else,
+    // holding its half of the connection open for the rest of the test. Nothing on
+    // either end ever closes this socket or drops its guard.
+    let client = tokio::net::TcpStream::connect(addr)
+        .await
+        .expect("client connects");
+
+    with_timeout(Duration::from_secs(2), async {
+        while registry.stats().current == 0 {
+            sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .expect("the real connection must be admitted through the real accept path");
+
+    let cfg = DrainConfig {
+        graceful_timeout: Duration::from_millis(50),
+        jitter: Duration::from_secs(5),
+        poll_interval: Duration::from_millis(1),
+    };
+
+    let report = with_timeout(
+        Duration::from_secs(5),
+        supervise_with_trigger(
+            controller,
+            Arc::clone(&registry),
+            time,
+            cfg,
+            immediate_term(),
+        ),
+    )
+    .await
+    .expect(
+        "supervise must return well within 5 real seconds even though the real peer \
+         never closes and its handler never observes shutdown",
+    );
+
+    assert_eq!(
+        report.killed, 1,
+        "the one real, never-closing connection must be counted killed, not silently \
+         waited on forever"
+    );
+    assert_eq!(token.phase(), Phase::Closing);
+
+    drop(client);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
