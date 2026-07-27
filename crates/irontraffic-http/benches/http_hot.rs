@@ -27,9 +27,10 @@ use irontraffic_http::forwarded::ForwardedChain;
 use irontraffic_http::framing::{OtherCodings, resolve_request_framing};
 use irontraffic_http::h1::H1Parser;
 use irontraffic_http::known::{self, KnownHeader};
+use irontraffic_http::response::resolve_response_framing;
 use irontraffic_http::section::{FieldSection, FieldSectionBuilder};
 use irontraffic_http::strip;
-use irontraffic_http::{Limits, Method, Scheme, WireVersion};
+use irontraffic_http::{Limits, Method, Scheme, StatusCode, WireVersion};
 use std::hint::black_box;
 
 /// Sixteen (name, value) pairs, 40 bytes each (an 8-byte name, a 32-byte
@@ -637,6 +638,91 @@ fn bench_h1_head_parse(c: &mut Criterion) {
     group.finish();
 }
 
+/// Builds the "typical response" input for
+/// [`bench_resolve_response_framing`]: 16 fields under `Limits::DEFAULT`,
+/// the last of which is `content-length: 1234`, answering a `GET` on
+/// HTTP/1.1.
+#[allow(
+    clippy::unwrap_used,
+    reason = "bench harness setup, not request-path code: every name/value pushed here is a \
+              short fixed literal well inside every limit, so push cannot fail"
+)]
+fn typical_response_section() -> FieldSection {
+    let limits = Limits::DEFAULT.clamped();
+    let mut arena = BytesMut::new();
+    let mut builder = FieldSectionBuilder::new(&arena, &limits);
+    for i in 0..15_u32 {
+        let name = format!("x-bench-{i:02}");
+        builder.push(&mut arena, name.as_bytes(), b"v").unwrap();
+    }
+    builder
+        .push(&mut arena, b"content-length", b"1234")
+        .unwrap();
+    builder.finish(&mut arena)
+}
+
+/// Builds the "304 with content-length" input for
+/// [`bench_resolve_response_framing`]: the early-return, bodyless-by-status
+/// path (step 3 of `resolve_response_framing`), which resolves before the
+/// field is ever inspected.
+#[allow(
+    clippy::unwrap_used,
+    reason = "bench harness setup, not request-path code: every name/value pushed here is a \
+              short fixed literal well inside every limit, so push cannot fail"
+)]
+fn not_modified_response_section() -> FieldSection {
+    let limits = Limits::DEFAULT.clamped();
+    let mut arena = BytesMut::new();
+    let mut builder = FieldSectionBuilder::new(&arena, &limits);
+    builder
+        .push(&mut arena, b"content-length", b"1234")
+        .unwrap();
+    builder.finish(&mut arena)
+}
+
+/// Benchmarks `resolve_response_framing` on the two inputs the design
+/// budgets (reference runner, same as `bench_resolve_framing` above): under
+/// 120 ns each. `check_expect` and `InterimBudget::charge` get no separate
+/// benchmark: `check_expect` is one duplicate check plus one trimmed
+/// byte-slice comparison, and `InterimBudget::charge` is two saturating
+/// integer adds and two comparisons, neither of which has a multi-branch,
+/// data-dependent path the way framing resolution does, so there is no
+/// distinct case here for criterion to distinguish.
+fn bench_resolve_response_framing(c: &mut Criterion) {
+    let typical = typical_response_section();
+    let not_modified = not_modified_response_section();
+
+    let mut group = c.benchmark_group("bench_resolve_response_framing");
+
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("typical_200_content_length", |b| {
+        b.iter(|| {
+            resolve_response_framing(
+                black_box(StatusCode::OK),
+                black_box(&Method::Get),
+                black_box(WireVersion::Http11),
+                black_box(&typical),
+                black_box(OtherCodings::Reject),
+            )
+        });
+    });
+
+    group.throughput(Throughput::Elements(1));
+    group.bench_function("not_modified_304_content_length", |b| {
+        b.iter(|| {
+            resolve_response_framing(
+                black_box(StatusCode::NOT_MODIFIED),
+                black_box(&Method::Get),
+                black_box(WireVersion::Http11),
+                black_box(&not_modified),
+                black_box(OtherCodings::Reject),
+            )
+        });
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_authority_parse,
@@ -646,6 +732,7 @@ criterion_group!(
     bench_resolve_framing,
     bench_strip_ingress,
     bench_forwarded_parse,
-    bench_h1_head_parse
+    bench_h1_head_parse,
+    bench_resolve_response_framing
 );
 criterion_main!(benches);
