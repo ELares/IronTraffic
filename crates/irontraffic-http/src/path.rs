@@ -367,7 +367,7 @@ fn merge_slashes(buf: &mut [u8], len: usize) -> usize {
     let mut r = 0usize;
     let mut w = 0usize;
     while r < len {
-        let b = buf[r]; // r < len by the loop guard
+        let b = *buf.get(r).unwrap_or(&0); // r < len by the loop guard
         if let Some(slot) = buf.get_mut(w) {
             *slot = b;
         }
