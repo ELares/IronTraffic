@@ -11,6 +11,19 @@ description = "IronTraffic: a traffic and API manager. L4 and L7 load balancing,
 [lints]
 workspace = true
 
+[features]
+default = ["control-plane"]
+# The control plane: the control-plane runtime today, and the admin API, the
+# configuration providers, the Kubernetes controller, the consensus crate, and the
+# dashboard assets in later milestones. Every one of those arrives as a dependency
+# under this feature and never under `default` directly.
+control-plane = []
+# The data-plane-only build. Empty on purpose: it is the name the documented
+# invocation `--no-default-features --features dataplane` requires, and later
+# milestones hang data-plane-only wiring off it. It does not turn anything off;
+# turning things off is what `--no-default-features` does.
+dataplane = []
+
 [dependencies]
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
