@@ -26,7 +26,7 @@ use crate::limits::ClampedLimits;
 use crate::path::{NormalizedPath, PathPolicy, TargetForm};
 use crate::peer::{TrustPolicy, resolve_identity};
 use crate::response::resolve_response_framing;
-use crate::scalar::{Method, Scheme};
+use crate::scalar::{Method, Scheme, WireVersion};
 use crate::section::FieldSectionBuilder;
 use crate::strip;
 
@@ -180,7 +180,7 @@ pub fn canonicalize_request(
                 &ctx.limits,
                 arena,
             )?;
-            let Some(host_value) = host_field(&fields, ctx.default_authority)? else {
+            let Some(host_value) = host_field(&fields, head.version, ctx.default_authority)? else {
                 return Err(RejectReason::HostMissing);
             };
             let a = reconcile_authority(
@@ -194,7 +194,7 @@ pub fn canonicalize_request(
             (p, q, a)
         }
         TargetForm::Asterisk => {
-            let Some(host_value) = host_field(&fields, ctx.default_authority)? else {
+            let Some(host_value) = host_field(&fields, head.version, ctx.default_authority)? else {
                 return Err(RejectReason::HostMissing);
             };
             let a = reconcile_authority(
@@ -213,7 +213,7 @@ pub fn canonicalize_request(
                 // CONNECT with an origin-form target is not authority-form.
                 return Err(RejectReason::TargetFormInvalid);
             }
-            let host = host_field(&fields, None)?;
+            let host = host_field(&fields, head.version, None)?;
             let a = resolve_target_authority(target, host, ctx.scheme, &ctx.limits, arena)?;
             (NormalizedPath::root(), None, a)
         }
@@ -224,7 +224,7 @@ pub fn canonicalize_request(
             let (authority_bytes, path_and_query) = split_absolute_target(head.target_bytes())?;
             let (p, q) =
                 NormalizedPath::parse_into(path_and_query, &ctx.path_policy, &ctx.limits, arena)?;
-            let host = host_field(&fields, None)?;
+            let host = host_field(&fields, head.version, None)?;
             let a =
                 resolve_target_authority(authority_bytes, host, ctx.scheme, &ctx.limits, arena)?;
             (p, q, a)
@@ -263,10 +263,22 @@ pub fn canonicalize_request(
 }
 
 /// Returns the `Host` field value when present, or the listener's default authority
-/// host bytes when it is not. Returns `Ok(None)` only when the caller has supplied
-/// no default and the section has no `Host`; callers turn that into `HostMissing`.
+/// host bytes when it is not AND `version` is `Http10`. Returns `Ok(None)` when the
+/// section has no `Host` and either no default is configured or `version` is
+/// `Http11`; callers turn that into `HostMissing`.
+///
+/// The version check is load bearing, not a redundant guard: RFC 9110 Section 7.2
+/// makes a missing `Host` on HTTP/1.1 a 400 unconditionally, while HTTP/1.0 permits
+/// falling back to `ctx.default_authority`. Without it, an HTTP/1.1 request with no
+/// `Host` field on a listener configured with a `default_authority` would silently
+/// receive a synthesized authority, which is exactly the vhost-confusion bypass RFC
+/// 9110 forbids: any WAF rule or ACL keyed on the `Host` field line has nothing to
+/// key on. `reconcile_authority` (`authority.rs`) deliberately does not backstop
+/// this: it documents that the caller substitutes the default, making the version
+/// distinction this function's responsibility.
 fn host_field<'a>(
     fields: &'a crate::section::FieldSection,
+    version: WireVersion,
     default_authority: Option<&'a Authority>,
 ) -> Result<Option<&'a [u8]>, RejectReason> {
     let from_field = fields
@@ -274,8 +286,8 @@ fn host_field<'a>(
         .map_err(|_| RejectReason::HostDuplicate)?;
     Ok(match (from_field, default_authority) {
         (Some(v), _) => Some(v),
-        (None, Some(d)) => Some(d.host()),
-        (None, None) => None,
+        (None, Some(d)) if version == WireVersion::Http10 => Some(d.host()),
+        (None, _) => None,
     })
 }
 
@@ -533,6 +545,16 @@ mod tests {
                 ctx_with(Scheme::Http, true, false, None, &DEFAULT_TRUST, UnderscorePolicy::Reject),
                 Expected::Err(RejectReason::AuthorityMismatch),
             ),
+            // 7b: target and Host name the same host but differ only in port
+            // (#711 SHOULD_FIX). Every other AuthorityMismatch case in this table
+            // differs in hostname, which a `host()`-only comparison would still
+            // catch; this one discriminates comparing the full `Authority`,
+            // port included, from a weakened host-only comparison.
+            (
+                b"GET http://good.com:8080/p HTTP/1.1\r\nHost: good.com:9090\r\n\r\n",
+                ctx_with(Scheme::Http, true, false, None, &DEFAULT_TRUST, UnderscorePolicy::Reject),
+                Expected::Err(RejectReason::AuthorityMismatch),
+            ),
             // 8: Absolute target on reverse proxy.
             (
                 b"GET http://good.com/p HTTP/1.1\r\nHost: good.com\r\n\r\n",
@@ -683,6 +705,21 @@ mod tests {
                 b"GET / HTTP/1.1\r\nHost: example.com\r\ntransfer-encoding: chunked\r\ncontent-length: 5\r\n\r\n",
                 ctx(),
                 Expected::Err(RejectReason::TransferEncodingWithContentLength),
+            ),
+            // 1b: HTTP/1.1 with no Host and a default_authority configured. Distinct
+            // from case 1, which uses `ctx()` (default_authority: None): the version
+            // rule must still refuse this even though a default is available, because
+            // the default only ever applies on HTTP/1.0 (#711 BLOCKING).
+            (
+                b"GET / HTTP/1.1\r\n\r\n",
+                ctx_with(Scheme::Http, false, false, Some(default_auth_ref), &DEFAULT_TRUST, UnderscorePolicy::Reject),
+                Expected::Err(RejectReason::HostMissing),
+            ),
+            // 9b: the Asterisk-form mirror of 1b (#711 BLOCKING).
+            (
+                b"OPTIONS * HTTP/1.1\r\n\r\n",
+                ctx_with(Scheme::Http, false, false, Some(default_auth_ref), &DEFAULT_TRUST, UnderscorePolicy::Reject),
+                Expected::Err(RejectReason::HostMissing),
             ),
         ];
 
@@ -928,6 +965,31 @@ mod tests {
         ));
         // expect is forwarded, so it survives the strip.
         assert!(matches!(req.headers.get_unique(b"expect"), Ok(Some(v)) if v == b"100-continue"));
+    }
+
+    /// #711 `SHOULD_FIX`: `step_order_is_observable` proves framing and identity read
+    /// their fields before the strip, but its `Expect` leg does not discriminate,
+    /// because `expect` there is never named by an inbound `Connection` header, so
+    /// it survives the strip regardless of which side of it `check_expect` runs on.
+    ///
+    /// `strip.rs`'s `strip_ingress` deletes every field NAMED BY the inbound
+    /// `Connection` header (the `Connection: expect` here names the field `expect`
+    /// itself). So whether `check_expect` (step 9) sees the `expect: bogus` field at
+    /// all depends entirely on whether it runs before the strip (step 10), as the
+    /// design requires, or after. Moving `check_expect` after `strip_ingress` would
+    /// delete `expect` first, `check_expect` would then see no `Expect` field and
+    /// return `ExpectAction::None`, and this obfuscated-`Expect` value would be
+    /// forwarded instead of refused with 417.
+    #[test]
+    fn expect_ordering_is_load_bearing() {
+        let head = parse_request_head(
+            b"GET / HTTP/1.1\r\nHost: example.com\r\nConnection: expect\r\nexpect: bogus\r\n\r\n",
+            UnderscorePolicy::Reject,
+        );
+        assert!(matches!(
+            canonicalize_request(&head, &ctx(), &mut BytesMut::new()),
+            Err(RejectReason::ExpectUnsupported)
+        ));
     }
 
     #[test]

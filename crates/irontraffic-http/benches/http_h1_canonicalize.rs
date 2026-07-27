@@ -66,12 +66,28 @@ fn typical_400b_head() -> Vec<u8> {
     build(1_usize.saturating_add(extra))
 }
 
-/// An 8 KiB head: 100 field lines (the field-count limit).
+/// An 8 KiB head: 100 field lines (the field-count limit), the first of
+/// which is `Host`.
+///
+/// #711 `SHOULD_FIX`: with no `Host` field line and `default_authority: None`,
+/// this returned `HostMissing` right after path normalization, so the
+/// measured cost was one early return, not the full assembly. Steps 7
+/// through 11 never ran, including the `O(h * w)` strip the issue's
+/// complexity table singles out as this bench's reason to exist. Giving the
+/// first field a `Host` name (in place of an `X-000`, so the field count
+/// and total size are unchanged) lets `canonicalize_request` proceed
+/// through framing, the forwarding chain, `Expect`, the strip and the
+/// build.
 fn adversarial_8kib_head() -> Vec<u8> {
     let mut head = Vec::from(&b"GET / HTTP/1.1\r\n"[..]);
     for i in 0..100_u32 {
         let value = "v".repeat(69);
-        head.extend_from_slice(format!("X-{i:03}: {value}\r\n").as_bytes());
+        let name = if i == 0 {
+            "Host".to_owned()
+        } else {
+            format!("X-{i:03}")
+        };
+        head.extend_from_slice(format!("{name}: {value}\r\n").as_bytes());
     }
     head.extend_from_slice(b"\r\n");
     head
