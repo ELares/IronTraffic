@@ -108,6 +108,10 @@ blake3 = "1"
 # X.509 field extraction (validity, SPKI OID, SANs, tlsfeature, serial, issuer DN);
 # pinned on the 0.2 line because x509-ocsp 0.2.1, added by #122, depends on that same line
 x509-cert = "0.2"
+# Streaming DER walk for CRL parsing: `x509-cert` re-exports `der` transitively, but the CRL
+# walker needs its `SliceReader` and `Reader` traits directly to skip unknown bytes without
+# materializing per-entry structs.
+der = "0.7"
 # dev-only: builds certificate fixtures in tests so no key material is committed
 rcgen = "0.14.8"
 
