@@ -146,62 +146,78 @@ pub fn post_quantum_available() -> bool {
 
 /// The installed process crypto provider.
 ///
+/// `pub`, not `pub(crate)`: `tests/provider_lifecycle.rs` is a separate crate (every file
+/// under `tests/` compiles to its own binary and gets its own process) and calls this from
+/// outside `irontraffic-tls`, which is exactly why that test can assert pristine pre-install
+/// state without any sibling test in the crate's `--lib` unit test binary being able to
+/// disturb it; see issue #556. Also called from within the crate by
+/// cert-credentials-and-der-interning (#114), which passes it to `CertifiedKey::from_der`,
+/// and by sni-server-config-selection (#119), which passes it to
+/// `ServerConfig::builder_with_provider`.
+///
 /// # Panics
 /// Never panics. Returns `None` if `install_process_provider` has not returned `Ok`; every
 /// caller is on a path that runs after startup installation, so `None` is a programming error
 /// the caller reports as a configuration error rather than unwrapping.
-#[allow(
-    dead_code,
-    reason = "called by cert-credentials-and-der-interning (#114), which passes it to \
-              CertifiedKey::from_der, and by sni-server-config-selection (#119), which passes it \
-              to ServerConfig::builder_with_provider; neither sibling issue is in the tree yet, \
-              so this accessor has no caller until they land"
-)]
-pub(crate) fn provider() -> Option<&'static std::sync::Arc<rustls::crypto::CryptoProvider>> {
+#[must_use]
+pub fn provider() -> Option<&'static std::sync::Arc<rustls::crypto::CryptoProvider>> {
     provider_kind()?;
     rustls::crypto::CryptoProvider::get_default()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{ProviderError, ProviderKind, fips_active, install_process_provider};
-    use super::{post_quantum_available, provider, provider_kind};
+    use super::{
+        ProviderError, ProviderKind, THIS_KIND, fips_active, install_process_provider,
+        post_quantum_available, provider, provider_kind,
+    };
 
-    // Provider installation is process-global and `cargo test` runs the tests of one binary
-    // in parallel threads of one process. Exactly one test function may call
-    // `install_process_provider`, and every assertion whose answer depends on installation
-    // lives inside that function, in order. Do not split them and do not rely on test
-    // execution order.
+    // provider_lifecycle used to live here. It asserts PRE-INSTALL process state
+    // (provider_kind() == None, !fips_active(), CryptoProvider::get_default().is_none())
+    // before calling install_process_provider(), which is process-global and installable at
+    // most once per process. `cargo test` runs every `--lib` unit test of a crate, across
+    // every module, in ONE process, so any sibling test anywhere in this crate that also
+    // needed crate::provider::provider() to return Some raced it for that one slot and broke
+    // its precondition assertions almost every run (issue #556). It now lives in its own file,
+    // tests/provider_lifecycle.rs: every file under tests/ compiles to its own binary with its
+    // own process, so its pristine pre-install state is guaranteed by the OS instead of by a
+    // comment nobody else's test can see.
+    //
+    // THE RULE FOR FUTURE TESTS: if a test, in this module or a sibling module of this crate,
+    // needs crate::provider::provider() (or rustls::crypto::CryptoProvider::get_default()) to
+    // return Some, do not add it here or anywhere under src/. Give it its own file under
+    // tests/ and call install_process_provider() (or a helper that does) from there. Only a
+    // POST-install assertion (one whose expected answer does not depend on being first) is
+    // safe to add to a --lib unit test in this crate, like
+    // sibling_provider_install_does_not_race_provider_lifecycle below: it makes no assumption
+    // about being the only caller in this binary and asserts nothing that depends on
+    // provider_lifecycle's PRE-install state.
+
+    // Regression guard for issue #556, proving the fix rather than merely describing it. This
+    // mimics the shape cert-credentials-and-der-interning (#114) and policy-and-protocol-
+    // versions (#116) both need: a --lib unit test in this crate that installs the process
+    // provider so crate::provider::provider() returns Some. Before the fix this made
+    // provider_lifecycle (then also a --lib unit test in this same binary) fail on its own
+    // PRE-install assertions on almost every run, because there is exactly one process-wide
+    // provider slot and cargo test runs every --lib unit test of a crate in one process.
+    // provider_lifecycle now lives in its own process (tests/provider_lifecycle.rs) and cannot
+    // observe anything this test does, no matter how many times the two run together.
+    //
+    // Every assertion below is POST-install and order-independent (true regardless of whether
+    // this test or some other one happened to install first), which is what makes it safe to
+    // keep in this shared binary at all: it is exactly the POST-install half of what
+    // provider_lifecycle used to assert in one function, minus the three PRE-install
+    // assertions, which cannot be replicated here without reintroducing the same race this
+    // test exists to prove is gone (asserting provider_kind() == None here would depend on
+    // this test happening to run before any other provider-touching test, which is precisely
+    // the assumption issue #556 broke).
     #[test]
-    fn provider_lifecycle() {
-        assert_eq!(provider_kind(), None);
-        // Invariant 3 / edge case 7: fips_active() must be false before installation,
-        // not merely equal to cfg!(feature = "crypto-fips"). A fips_active()
-        // implemented as bare cfg!(feature = "crypto-fips") (explicitly forbidden)
-        // would return true here on a crypto-fips build, before anything is
-        // installed, and this assertion is the only place that shape is checked.
-        assert!(!fips_active());
-        // The crate's one job is putting a provider in place process-wide. Assert
-        // the pre-state directly against rustls, not just against this crate's own
-        // provider_kind() bookkeeping, so a install_process_provider() that never
-        // calls install_default cannot pass by only touching its own OnceLock.
-        assert!(rustls::crypto::CryptoProvider::get_default().is_none());
-        let expected = if cfg!(feature = "crypto-ring") {
-            ProviderKind::Ring
-        } else if cfg!(feature = "crypto-fips") {
-            ProviderKind::AwsLcRsFips
-        } else {
-            ProviderKind::AwsLcRs
-        };
-        assert_eq!(install_process_provider(), Ok(expected));
-        assert_eq!(provider_kind(), Some(expected));
+    fn sibling_provider_install_does_not_race_provider_lifecycle() {
+        assert_eq!(install_process_provider(), Ok(THIS_KIND));
+        assert!(provider().is_some());
+        assert_eq!(provider_kind(), Some(THIS_KIND));
         assert_eq!(fips_active(), cfg!(feature = "crypto-fips"));
         assert!(rustls::crypto::CryptoProvider::get_default().is_some());
-        // provider() must actually expose what was installed above, and must still
-        // require provider_kind() to be Some to get there (checked in isolation:
-        // this cannot observe the fail-open case where SOME OTHER provider was
-        // installed before ours, which needs a separate test binary; see #112).
-        assert!(provider().is_some());
         let installed = rustls::crypto::CryptoProvider::get_default().expect("installed above");
         let first_is_hybrid = installed.kx_groups[0].name() == rustls::NamedGroup::X25519MLKEM768;
         assert_eq!(first_is_hybrid, post_quantum_available());
@@ -209,11 +225,11 @@ mod tests {
             install_process_provider(),
             Err(ProviderError::AlreadyInstalled)
         );
-        assert_eq!(provider_kind(), Some(expected));
+        assert_eq!(provider_kind(), Some(THIS_KIND));
     }
 
-    // Safe to run in parallel with `provider_lifecycle`: `post_quantum_available` reads no
-    // shared state.
+    // Safe to run in parallel with any other test in this binary: `post_quantum_available`
+    // reads no shared state.
     #[test]
     fn pq_available_matches_provider() {
         assert_eq!(post_quantum_available(), !cfg!(feature = "crypto-ring"));
