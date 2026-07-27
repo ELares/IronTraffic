@@ -14,5 +14,6 @@
 pub mod canonicalize;
 pub mod chunked;
 pub mod parser;
+pub mod serialize;
 
 pub use parser::{H1Parser, HeadScanBudget, RawField, RawHead, RawResponseHead, Span};
