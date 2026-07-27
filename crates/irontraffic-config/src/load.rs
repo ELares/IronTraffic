@@ -22,11 +22,29 @@
 //! grammar: a guard that has to understand YAML in order to protect the YAML parser is
 //! a second parser with the same class of bug. The residual limitation is that this is
 //! a token count rather than a measured expansion factor: 64 aliases each expanding a
-//! large anchor are still accepted, bounded only by the 1 MiB input cap. The full
-//! document budget (a 32 MiB cap, an explicit recursion depth cap, and a measured
-//! expansion factor) belongs to the dynamic configuration path in a later milestone.
-//! JSON needs no such guard: `serde_json` enforces its own recursion limit (128 by
-//! default) and reports a parse error beyond it.
+//! large anchor are still accepted, bounded only by the 1 MiB input cap.
+//!
+//! **A second, unrelated cost, with zero aliases involved.** `serde_norway`'s
+//! underlying tokenizer pays cost quadratic in nesting depth for a YAML flow
+//! collection (`[...]` or `{...}`) nested as the value of a block mapping key, and it
+//! pays that cost while producing its flat event stream, before `serde` examines a
+//! single field, so neither the alias budget nor `deny_unknown_fields` on the target
+//! struct helps: a document is rejected only after the tokenizer has already paid the
+//! full cost of scanning it. Measured directly against this crate's own `load`: a 1
+//! MiB document built entirely from nested `[` and `]` characters (zero `*` bytes,
+//! under `MAX_DOC_BYTES`, under [`MAX_YAML_ALIASES`]) cost 475 seconds of CPU, and a
+//! 320 KB document of the same shape (nesting depth 160,000) cost 34.8 seconds. A
+//! block sequence or mapping cannot reach this cost the same way: each additional
+//! level of block nesting costs bytes of indentation proportional to the level
+//! reached, so [`MAX_DOC_BYTES`] already limits block-style depth to a few hundred,
+//! far below where the quadratic cost is measurable. A flow collection has no such
+//! self-limiting shape: one byte buys one level of depth. So a third, equally cheap,
+//! lexical bound runs before the YAML parser ever sees the text: at most
+//! [`MAX_YAML_NESTING_DEPTH`] levels of `[`/`{` nesting, counted the same way the
+//! alias budget is, for the same reason. JSON needs no such guard: `serde_json`
+//! enforces its own recursion limit (128 by default) and reports a parse error beyond
+//! it, and that limit is enforced while building the value, not after the fact, so it
+//! genuinely bounds the cost rather than merely bounding the outcome.
 
 use std::ffi::OsStr;
 use std::io::Read;
@@ -46,6 +64,25 @@ pub const MAX_DOC_BYTES: u64 = 1_048_576;
 /// bootstrap schema contains names, addresses, integers, and booleans, none of which
 /// can legitimately contain `*`, so 64 leaves room for comments and none for a bomb.
 pub const MAX_YAML_ALIASES: usize = 64;
+
+/// The deepest YAML flow-collection (`[` or `{`) nesting accepted in one document.
+///
+/// This is a different guard for a different cost than [`MAX_YAML_ALIASES`]: a YAML
+/// flow collection nested as the value of a block mapping key costs the tokenizer CPU
+/// quadratic in nesting depth, with zero aliases involved, and it pays that cost
+/// while producing its event stream, before serde examines a single field. See the
+/// module documentation for the measurements that established this. Counted as raw
+/// byte occurrences before the parser runs, for the same reason the alias budget is:
+/// a guard that has to parse YAML to protect the YAML parser has the same class of
+/// bug it is guarding against. The bootstrap document itself nests at most a handful
+/// of levels (the document, the listener list, one listener's fields), so 32 is
+/// generous for anything legitimate and small enough that the quadratic tokenizer
+/// cost stays in the microseconds regardless of how large the rest of the document
+/// is. A block-style document does not need this margin: reaching depth d that way
+/// costs bytes of indentation proportional to d at every level after the first, so
+/// [`MAX_DOC_BYTES`] already bounds block-style depth to a few hundred, far below
+/// where the quadratic tokenizer cost becomes measurable.
+pub const MAX_YAML_NESTING_DEPTH: usize = 32;
 
 const ENV_WORKERS: &str = "IRONTRAFFIC_WORKERS";
 const ENV_RUNTIME_MODE: &str = "IRONTRAFFIC_RUNTIME_MODE";
@@ -197,6 +234,21 @@ pub enum LoadError {
         /// The limit that was exceeded, always [`MAX_YAML_ALIASES`].
         limit: usize,
     },
+    /// The YAML document nests flow collections deeper than
+    /// [`MAX_YAML_NESTING_DEPTH`].
+    #[error(
+        "{path} nests YAML flow collections {depth} levels deep, above the limit of \
+         {limit}; deep flow nesting costs the YAML tokenizer CPU quadratic in depth, \
+         before any value is produced"
+    )]
+    NestingTooDeep {
+        /// The file that exceeded the nesting budget.
+        path: PathBuf,
+        /// The deepest `[`/`{` nesting observed.
+        depth: usize,
+        /// The limit that was exceeded, always [`MAX_YAML_NESTING_DEPTH`].
+        limit: usize,
+    },
     /// The parser rejected the document.
     #[error("{path}:{line}:{column}: {message}")]
     Parse {
@@ -234,6 +286,34 @@ fn read_bounded(reader: impl Read) -> std::io::Result<Vec<u8>> {
     Ok(raw)
 }
 
+/// The deepest `[`/`{` flow-collection nesting reached while scanning `text`.
+///
+/// A byte-level scan, not a YAML parse, exactly like the alias budget's raw count
+/// above it: `[` and `{` push the running depth up by one, `]` and `}` pop it back
+/// down, and the result is the highest point reached. It does not track quoting or
+/// comments, so a scalar value containing bracket characters can nudge the count;
+/// that is a deliberate false positive in the same spirit as the alias budget's raw
+/// byte count (see [`MAX_YAML_NESTING_DEPTH`]), and cheaper and safer than a scanner
+/// that has to understand YAML quoting to protect the YAML parser. `depth` never
+/// underflows below zero: an unmatched closing bracket saturates rather than
+/// wrapping, because a malformed document is the parser's problem to reject, not
+/// this guard's.
+fn max_flow_nesting_depth(text: &str) -> usize {
+    let mut depth: usize = 0;
+    let mut max_depth: usize = 0;
+    for byte in text.bytes() {
+        match byte {
+            b'[' | b'{' => {
+                depth += 1;
+                max_depth = max_depth.max(depth);
+            }
+            b']' | b'}' => depth = depth.saturating_sub(1),
+            _ => {}
+        }
+    }
+    max_depth
+}
+
 /// Reads, parses, and applies overrides in the order
 /// `CLI > environment > file > defaults`.
 ///
@@ -244,13 +324,21 @@ fn read_bounded(reader: impl Read) -> std::io::Result<Vec<u8>> {
 /// [`MAX_YAML_ALIASES`] alias tokens, counted on the raw bytes before the parser runs,
 /// because a byte cap bounds the input size and not YAML alias expansion. The residual
 /// limitation is that this is a token count rather than a measured expansion factor;
-/// the full document budget (a 32 MiB cap, an explicit recursion depth cap, and a
-/// measured expansion factor) belongs to the dynamic configuration path in a later
-/// milestone. JSON needs no such guard: `serde_json` enforces its own recursion limit.
+/// a measured expansion factor belongs to the dynamic configuration path in a later
+/// milestone.
+///
+/// A YAML document is separately rejected if it nests `[`/`{` flow collections deeper
+/// than [`MAX_YAML_NESTING_DEPTH`], also counted on the raw bytes before the parser
+/// runs. This guards a distinct cost from the alias budget above: the YAML tokenizer
+/// pays CPU quadratic in flow-collection nesting depth while producing its event
+/// stream, before serde examines a single field, so a document with zero aliases can
+/// still cost minutes of CPU without this guard. JSON needs neither guard:
+/// `serde_json` enforces its own recursion limit while building the value, which
+/// genuinely bounds the parse rather than only bounding the outcome.
 ///
 /// # Errors
 /// [`LoadError`], always naming the path, naming line and column for a parse failure,
-/// and naming the count and the limit for an alias-budget failure.
+/// and naming the count and the limit for an alias-budget or nesting-depth failure.
 pub fn load(path: &Path, env: &dyn EnvSource, cli: &Overrides) -> Result<Loaded, LoadError> {
     let metadata_result = std::fs::metadata(path); // it-allow: no-blocking-in-async reason: called once at startup before any runtime exists, per this function's own doc comment
     let metadata = metadata_result.map_err(|source| LoadError::Read {
@@ -311,6 +399,20 @@ pub fn load(path: &Path, env: &dyn EnvSource, cli: &Overrides) -> Result<Loaded,
                 path: path.to_path_buf(),
                 found: aliases,
                 limit: MAX_YAML_ALIASES,
+            });
+        }
+
+        // Also counted BEFORE the parser runs, on raw bytes, guarding a different
+        // cost than the alias budget above: the YAML tokenizer's cost of scanning
+        // nested flow collections is quadratic in nesting depth even with zero
+        // aliases involved. See the module documentation and
+        // MAX_YAML_NESTING_DEPTH.
+        let depth = max_flow_nesting_depth(&text);
+        if depth > MAX_YAML_NESTING_DEPTH {
+            return Err(LoadError::NestingTooDeep {
+                path: path.to_path_buf(),
+                depth,
+                limit: MAX_YAML_NESTING_DEPTH,
             });
         }
     }
@@ -421,8 +523,8 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
 
     use super::{
-        EnvSource, LoadError, MAX_DOC_BYTES, MAX_YAML_ALIASES, MapEnv, Overrides, ProcessEnv, load,
-        read_bounded,
+        EnvSource, LoadError, MAX_DOC_BYTES, MAX_YAML_ALIASES, MAX_YAML_NESTING_DEPTH, MapEnv,
+        Overrides, ProcessEnv, load, max_flow_nesting_depth, read_bounded,
     };
 
     static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -651,6 +753,122 @@ mod tests {
         let loaded =
             load(&path, &env, &cli).expect("the yaml-only alias budget does not apply to json");
         assert_eq!(loaded.doc.api_version, stars);
+    }
+
+    // Regression test for the quadratic YAML tokenizer cost documented on
+    // `MAX_YAML_NESTING_DEPTH`: a deeply nested flow collection with zero alias
+    // tokens is not caught by `MAX_YAML_ALIASES` at all, and before this guard
+    // existed, `load` measured 34.8 real seconds of CPU on exactly this document
+    // shape at this nesting depth (320 KB) on this machine, and 475 seconds on the
+    // full 1 MiB shape from issue #581's reproduction. The depth is chosen to
+    // reproduce that same catastrophic cost if the guard were missing or ran after
+    // the parser rather than before it: a generous timeout around a call that might
+    // hang is not a bound, so the sub-100-millisecond assertion below is what
+    // actually proves the guard runs first, the same way
+    // `yaml_alias_bomb_is_rejected_before_parsing` proves it for the alias budget.
+    #[test]
+    fn yaml_nesting_bomb_is_rejected_before_parsing() {
+        let depth = 160_000;
+        let mut yaml = String::from("apiVersion: irontraffic.io/v1\nlisteners: ");
+        for _ in 0..depth {
+            yaml.push('[');
+        }
+        for _ in 0..depth {
+            yaml.push(']');
+        }
+        yaml.push_str("\nupstream:\n  address: \"10.0.0.1:9000\"\n");
+
+        let (path, _guard) = write_fixture("nesting-bomb", "bomb.yaml", yaml.as_bytes());
+        let env = MapEnv::default();
+        let cli = Overrides::default();
+
+        let start = std::time::Instant::now();
+        let err =
+            load(&path, &env, &cli).expect_err("deep flow nesting is rejected before parsing");
+        let elapsed = start.elapsed();
+
+        match err {
+            LoadError::NestingTooDeep {
+                depth: found,
+                limit,
+                ..
+            } => {
+                assert_eq!(found, depth);
+                assert_eq!(limit, MAX_YAML_NESTING_DEPTH);
+            }
+            other => panic!("expected NestingTooDeep, got {other:?}"),
+        }
+        assert!(elapsed < std::time::Duration::from_millis(100));
+    }
+
+    #[test]
+    fn yaml_under_the_nesting_depth_still_loads() {
+        let yaml = "apiVersion: irontraffic.io/v1\n\
+                    listeners: [{name: web, bind: \"127.0.0.1:0\"}]\n\
+                    upstream:\n\
+                    \x20\x20address: \"127.0.0.1:9000\"\n";
+        let (path, _guard) = write_fixture("nesting-ok", "doc.yaml", yaml.as_bytes());
+        let env = MapEnv::default();
+        let cli = Overrides::default();
+        let loaded =
+            load(&path, &env, &cli).expect("ordinary shallow flow nesting is well under budget");
+        assert_eq!(loaded.doc.listeners.len(), 1);
+    }
+
+    // Not one of the 13 named loader tests. Mutation testing found that the nesting
+    // budget's own boundary (exactly MAX_YAML_NESTING_DEPTH) was never exercised: the
+    // bomb test above is far above it and the "still loads" test is far below it, so
+    // a "> mutated to >=" would survive both, mirroring
+    // `yaml_alias_budget_boundary_is_inclusive`.
+    #[test]
+    fn yaml_nesting_depth_boundary_is_inclusive() {
+        let mut yaml = String::from("# ");
+        for _ in 0..MAX_YAML_NESTING_DEPTH {
+            yaml.push('[');
+        }
+        for _ in 0..MAX_YAML_NESTING_DEPTH {
+            yaml.push(']');
+        }
+        yaml.push_str(
+            "\napiVersion: irontraffic.io/v1\nlisteners:\n  - name: web\n    bind: \"127.0.0.1:0\"\nupstream:\n  address: \"127.0.0.1:9000\"\n",
+        );
+        let (path, _guard) = write_fixture("nesting-boundary", "doc.yaml", yaml.as_bytes());
+        let env = MapEnv::default();
+        let cli = Overrides::default();
+        let loaded = load(&path, &env, &cli).expect(
+            "exactly MAX_YAML_NESTING_DEPTH levels of nesting is at, not above, the budget",
+        );
+        assert_eq!(loaded.doc.listeners.len(), 1);
+    }
+
+    #[test]
+    fn json_nesting_depth_budget_does_not_apply() {
+        let brackets = "[".repeat(MAX_YAML_NESTING_DEPTH * 4);
+        let json = format!(
+            r#"{{"apiVersion":"{brackets}","listeners":[{{"name":"web","bind":"127.0.0.1:0"}}],"upstream":{{"address":"127.0.0.1:9000"}}}}"#
+        );
+        let (path, _guard) = write_fixture("json-brackets", "doc.json", json.as_bytes());
+        let env = MapEnv::default();
+        let cli = Overrides::default();
+        let loaded = load(&path, &env, &cli)
+            .expect("the yaml-only nesting-depth budget does not apply to json");
+        assert_eq!(loaded.doc.api_version, brackets);
+    }
+
+    // Not one of the 13 named loader tests. Direct unit coverage of the byte-level
+    // scanner itself: proves it tracks a running maximum rather than a final depth,
+    // handles mixed bracket and brace nesting, and saturates rather than
+    // underflowing on an unmatched closing bracket, none of which `load`'s own
+    // tests exercise precisely because they only assert the pass/fail boundary.
+    #[test]
+    fn max_flow_nesting_depth_tracks_running_max_and_saturates() {
+        assert_eq!(max_flow_nesting_depth(""), 0);
+        assert_eq!(max_flow_nesting_depth("no brackets here"), 0);
+        assert_eq!(max_flow_nesting_depth("[[[]]]"), 3);
+        assert_eq!(max_flow_nesting_depth("[][[]]"), 2);
+        assert_eq!(max_flow_nesting_depth("{[{}]}"), 3);
+        assert_eq!(max_flow_nesting_depth("]]]"), 0);
+        assert_eq!(max_flow_nesting_depth("[[[]]]]]]"), 3);
     }
 
     // Not one of the 13 named loader tests, added on top of them: proves the

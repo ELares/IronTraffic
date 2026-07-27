@@ -21,8 +21,8 @@ pub mod diagnostic;
 pub mod load;
 pub mod model;
 pub mod newtypes;
-pub mod validate;
 pub mod v1;
+pub mod validate;
 
 pub use diagnostic::{Diagnostic, Diagnostics, Severity};
 pub use load::{
@@ -36,12 +36,12 @@ pub use model::{
     TimeoutSection, UpstreamSection,
 };
 pub use newtypes::{Backlog, BindAddr, FieldError, ListenerName, Millis, ModeSpec, UpstreamAddr};
-pub use validate::{MAX_LISTENERS, validate};
 pub use v1::{
     DYNAMIC_API_VERSION, Extensions, Hostname, MAX_ERROR_ECHO_BYTES, MAX_EXTENSION_DEPTH,
     MAX_EXTENSION_KEY_BYTES, MAX_EXTENSION_KEYS, MAX_EXTENSIONS_BYTES, MAX_REF_BYTES, NameError,
     Named, Namespace, ProviderName, ResourceName, ResourceRef, Weight,
 };
+pub use validate::{MAX_LISTENERS, validate};
 
 /// The only supported `apiVersion` value.
 pub const API_VERSION: &str = "irontraffic.io/v1";

@@ -3,18 +3,22 @@
 # Not a workspace member: the empty [workspace] table below is required so that
 # Cargo treats this manifest as its own independent workspace root instead of
 # trying to join the ancestor workspace at the repository root (the root
-# Cargo.toml's [workspace] `exclude` entry for `crates/irontraffic-router/fuzz`
-# only stops implicit glob discovery from picking a nested directory up; it does
-# not, by itself, stop Cargo from treating a nested-but-unlisted manifest as
-# wanting to join that ancestor workspace). This is the standard cargo-fuzz
-# layout: a cargo-fuzz project pins its own toolchain-sensitive edition and is
-# built with `cargo fuzz`, never `cargo build --workspace`. `forward-bidirectional`
-# (#20) adds a second target to this same manifest and neither issue blocks the
-# other: whichever lands first creates this file with both `libfuzzer-sys` and
-# `arbitrary` already declared, and the other issue only adds one `[[bin]]`
-# section plus one path dependency on the crate it fuzzes, changing nothing else.
+# Cargo.toml's [workspace] `exclude` entry for this path only stops implicit glob
+# discovery from picking a nested directory up; it does not, by itself, stop
+# Cargo from treating a nested-but-unlisted manifest as wanting to join that
+# ancestor workspace). This is the standard cargo-fuzz layout: a cargo-fuzz
+# project pins its own toolchain-sensitive edition and is built with
+# `cargo fuzz`, never `cargo build --workspace`.
+#
+# This crate originally lived at the repository root as `fuzz/Cargo.toml`, which
+# `.github/workflows/ci.yml`'s fuzz lane never discovers: that lane only walks
+# `crates/<name>/fuzz/Cargo.toml`, matching the layout every other fuzz crate in
+# this tree already uses (`crates/irontraffic-router/fuzz`,
+# `crates/irontraffic-tls/fuzz`, and so on). A root-level fuzz crate silently
+# never ran, so `fuzz_parse_bootstrap` was never compiled and never fuzzed by CI.
+# Moved here, beside the crate it fuzzes, per issue #582.
 [package]
-name = "irontraffic-fuzz"
+name = "irontraffic-config-fuzz"
 version = "0.0.0"
 publish = false
 edition = "2021"
@@ -27,7 +31,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1", features = ["derive"] }
-irontraffic-config = { path = "../crates/irontraffic-config" }
+irontraffic-config = { path = ".." }
 # The target calls `serde_json::from_str::<BootstrapDoc>` and
 # `serde_norway::from_str::<BootstrapDoc>` directly, per the issue's own fuzz
 # target contract. Rust's 2018-and-later edition dependency resolution does not

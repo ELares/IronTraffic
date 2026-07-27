@@ -1,8 +1,5 @@
 /target
 **/*.rs.bk
-/fuzz/target
-/fuzz/corpus
-/fuzz/artifacts
 node_modules/
 packages/*/dist/
 packages/dashboard/.vite/

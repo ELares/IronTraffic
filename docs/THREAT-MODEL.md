@@ -247,10 +247,26 @@ over a file from a pull request. Treat the bytes as untrusted even though the pa
 
 ### What bounds the parse
 
-A 1 MiB byte cap enforced twice (a metadata check and a bounded read, so a growing file cannot slip
-past), a 64-token YAML alias budget that defeats the billion-laughs expansion the byte cap cannot,
-`serde_json`'s own 128-level recursion limit for JSON, and a `deny_unknown_fields` schema that
-rejects anything it does not recognise.
+`irontraffic-config`'s `load` enforces three bounds before either parser sees the document, plus a
+fourth `serde_json` enforces on its own. A 1 MiB byte cap is enforced twice (a metadata check and a
+bounded read, so a growing file cannot slip past). A 64-token YAML alias budget defeats the
+billion-laughs expansion the byte cap cannot, by rejecting more than 64 `*` bytes before
+`serde_norway` ever sees the text. A separate 32-level YAML nesting-depth budget defeats a distinct,
+quadratic cost inside `serde_norway`'s own tokenizer: a flow collection (`[...]` or `{...}`) nested as
+the value of a block mapping key costs CPU quadratic in nesting depth while the tokenizer builds its
+event stream, before any value exists for `serde` to examine, and it does this with zero alias tokens
+involved. Measured directly against this crate: a 1 MiB document built entirely from nested `[` and
+`]` characters, with no aliases, cost 475 seconds of CPU before this guard existed. `serde_json` needs
+no guard of ours for the equivalent JSON shape: it enforces its own 128-level recursion limit while
+building the value, which genuinely bounds the cost of parsing rather than only bounding the outcome.
+
+`deny_unknown_fields` on `BootstrapDoc` is a validation-time control, not a parse-time bound, and an
+earlier version of this section listed it as one of the things that bounds the parse. That was false:
+`deny_unknown_fields` can only reject a document once the tokenizer has already produced a value for
+`serde` to examine, so it does nothing to limit the cost of getting there, and the quadratic nesting
+cost above is exactly the cost it does not limit. The paragraph is corrected here rather than left
+standing, because a threat model asserting a protection that is not there is worse than one that says
+nothing.
 
 ### What bounds validation
 
