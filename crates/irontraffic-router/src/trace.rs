@@ -24,11 +24,28 @@
 //! [`NoTrace`] is a zero sized type, every method body is empty, and every
 //! method is `#[inline(always)]`, so monomorphization erases the sink
 //! entirely: `match_request::<NoTrace>` compiles to the same machine code as a
-//! version of the function with no trace parameter at all. That identity is a
-//! CI check added by `match-request-core` (#60), because it needs
-//! `match_request` to exist; this module's obligation is only to make that
-//! check achievable, which is why every method below takes only `Copy` scalar
-//! arguments and nothing borrowed. A method that took a `&[u8]` or built a
+//! version of the function with no trace parameter at all.
+//!
+//! THAT IDENTITY IS NOT CHECKED ANYWHERE TODAY, and this comment used to say it
+//! was. `match-request-core` (#60) is open, `match_request` does not exist yet,
+//! and #60 explicitly DEFERS the instruction-count proof ("deferred to the
+//! milestone-7 benchmark harness issue"); its `## Files` table contains no path
+//! under `.github/` or `scripts/`, so it could not add the check even when it
+//! lands, and the milestone-7 issue it defers to does not exist (M7 is
+//! "Configuration plane and zero-downtime").
+//!
+//! NO ISSUE CURRENTLY DECLARES THIS CHECK. #423 (open, M17) is where the
+//! instruction-count machinery it would need is built, but #423 gates four
+//! named benchmarks against absolute budgets and never compares a traced
+//! build against a trace-free copy, so it does not own this identity either.
+//! No instruction-count dependency, bench target or CI job for it exists in
+//! this tree. (Stated as a proposition rather than as a grep, because the
+//! previous wording named a command that this very sentence then made
+//! return a hit.)
+//!
+//! This module's obligation is only to make the check ACHIEVABLE, which is
+//! why every method below takes only `Copy` scalar arguments and nothing
+//! borrowed. A method that took a `&[u8]` or built a
 //! struct would leave a trace of itself in the optimized code even with an
 //! empty body, because computing the argument is work the caller would still
 //! pay for.
@@ -362,15 +379,16 @@ impl RouteTrace for RecordTrace {
 #[cfg(test)]
 mod tests {
     use std::collections::HashSet;
-    use std::time::{Duration, Instant};
 
     use super::{ExplainStep, MAX_EXPLAIN_STEPS, NoTrace, RecordTrace, RejectReason, RouteTrace};
     use crate::ids::{GroupId, NodeId, RouteId};
     use crate::precedence::{PathKind, Precedence};
 
-    /// Touches every `RouteTrace` method once, generic over the sink. Used
-    /// both to prove `NoTrace` satisfies the trait and, in
-    /// `notrace_calls_are_free` below, as the body of a tight loop.
+    /// Touches every `RouteTrace` method once, generic over the sink, which is
+    /// what proves `NoTrace` satisfies the trait through the generic bound.
+    /// `notrace_is_zero_sized` calls it once; there is no tight loop here, and
+    /// this comment claimed one because it was written for a wall-clock test
+    /// that has since been deleted (#650).
     fn touch_all<T: RouteTrace>(trace: &mut T) {
         trace.on_host(GroupId(1), 0xdead_beef);
         trace.on_group(GroupId(2));
@@ -571,39 +589,6 @@ mod tests {
             unique.len(),
             labels.len(),
             "labels must be pairwise distinct"
-        );
-    }
-
-    /// Edge case 7 from the issue: an indirect but real check that a
-    /// `NoTrace`-driven call sequence is actually free rather than merely
-    /// declared so. A million iterations of every `RouteTrace` method
-    /// (seven million calls) through a generic function is asserted to
-    /// finish well inside a generous bound.
-    ///
-    /// The issue's own prose names "under a millisecond" as the bound. This
-    /// test uses a much larger one (50 milliseconds, roughly two orders of
-    /// magnitude of headroom over what was observed while writing this test)
-    /// because `cargo test` builds at `opt-level = 0`, not the release
-    /// profile the codegen-equality CI check in `match-request-core` (#60)
-    /// will actually use, and a bound tight enough to be meaningful only
-    /// under full optimization would make this specific test flaky on a
-    /// loaded or virtualized CI runner without adding any real sensitivity:
-    /// if `NoTrace` were doing real work (an allocation, a syscall, a
-    /// non-trivial computation) per call, seven million repetitions would
-    /// overshoot 50 milliseconds by orders of magnitude, not by a factor of
-    /// two. The exact codegen equality this issue exists to make possible is
-    /// proved by that separate, dedicated CI check, not by wall-clock timing.
-    #[test]
-    fn notrace_calls_are_free() {
-        let mut nt = NoTrace;
-        let start = Instant::now();
-        for _ in 0..1_000_000u32 {
-            touch_all(&mut nt);
-        }
-        let elapsed = start.elapsed();
-        assert!(
-            elapsed < Duration::from_millis(50),
-            "one million NoTrace call rounds took {elapsed:?}, expected it to be free"
         );
     }
 }
