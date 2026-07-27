@@ -534,167 +534,33 @@ proptest! {
     }
 }
 
-/// Captures `tracing` events emitted while `fut` runs and returns its output alongside
-/// every captured event's formatted message. Not one of the 13 tests the issue names.
-///
-/// Mutation testing (`cargo mutants -j 1`) found that the `if live > 0 { warn!(..) }
-/// else { info!(..) }` branch right after the drain loop can have its comparison
-/// flipped to `==`, `<`, or `>=` without any of the 13 named tests failing: none of
-/// them observes which line was actually logged, only the returned `DrainReport`,
-/// which is identical either way. The two tests below reuse the exact `Subscriber`
-/// capture technique already reviewed and merged in `irontraffic-runtime`'s
-/// `startup_log_tests` (`crates/irontraffic-runtime/src/plane.rs`) and in this crate's
-/// own `fallback_warning` module (`tests/sharded_bind.rs`) to pin which line depends
-/// on which value of `live`.
-///
-/// Sets the subscriber with `tracing::subscriber::set_default` and holds the guard
-/// across the `.await`, which is only sound because every test using this runs on a
-/// single-threaded (default-flavor) `#[tokio::test]`: the default subscriber is
-/// thread-local, and a current-thread runtime never migrates a task to another OS
-/// thread between polls, so nothing here relies on the multi-thread flavor's
-/// work-stealing behaviour.
-async fn capture_async<T>(fut: impl std::future::Future<Output = T>) -> (T, Vec<String>) {
-    use std::sync::Mutex;
-
-    use tracing::field::{Field, Visit};
-    use tracing::span::{Attributes, Id, Record};
-    use tracing::{Event, Metadata, Subscriber};
-
-    struct MessageVisitor<'a>(&'a mut String);
-
-    impl Visit for MessageVisitor<'_> {
-        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
-            if field.name() == "message" {
-                *self.0 = format!("{value:?}");
-            }
-        }
-        fn record_str(&mut self, field: &Field, value: &str) {
-            if field.name() == "message" {
-                value.clone_into(self.0);
-            }
-        }
-    }
-
-    struct Collector(Arc<Mutex<Vec<String>>>);
-
-    impl Subscriber for Collector {
-        fn enabled(&self, _: &Metadata<'_>) -> bool {
-            true
-        }
-        fn new_span(&self, _: &Attributes<'_>) -> Id {
-            Id::from_u64(1)
-        }
-        fn record(&self, _: &Id, _: &Record<'_>) {}
-        fn record_follows_from(&self, _: &Id, _: &Id) {}
-        fn event(&self, event: &Event<'_>) {
-            let mut message = String::new();
-            event.record(&mut MessageVisitor(&mut message));
-            if let Ok(mut events) = self.0.lock() {
-                events.push(message);
-            }
-        }
-        fn enter(&self, _: &Id) {}
-        fn exit(&self, _: &Id) {}
-    }
-
-    let events = Arc::new(Mutex::new(Vec::new()));
-    let collector = Collector(Arc::clone(&events));
-    let guard = tracing::subscriber::set_default(collector);
-    // `tracing` caches, per callsite, whether any subscriber has ever been interested
-    // in it, the first time that callsite fires. Another test in this same binary may
-    // already have logged "drain starting" or "drain complete" with no subscriber
-    // installed at all, caching "never interested" for that line for the rest of the
-    // process; without this call the events below could be silently skipped
-    // regardless of `Collector::enabled` always returning `true`. Rebuilding here,
-    // with `collector` as the active default, forces every callsite this scope
-    // reaches to be re-evaluated against it.
-    tracing::callsite::rebuild_interest_cache();
-    let result = fut.await;
-    drop(guard);
-
-    let messages = match events.lock() {
-        Ok(g) => g.clone(),
-        Err(poisoned) => poisoned.into_inner().clone(),
-    };
-    (result, messages)
-}
-
-#[tokio::test]
-async fn drain_deadline_with_live_connections_logs_a_warning() {
-    let registry = ConnRegistry::new(8);
-    let guard = ConnRegistry::try_admit(&registry).expect("admits one guard");
-    let (controller, _token) = ShutdownController::new();
-    let time: Arc<dyn TimeSource> = Arc::new(TestTimeSource::new());
-    // Both durations zero: the graceful deadline is reached on the very first check
-    // (a deadline equal to `started` is already `reached`), and a zero poll interval
-    // collapses step 10's post-Closing grace window to zero too, so this resolves
-    // without spawning a task or advancing any clock, with the guard held throughout.
-    let cfg = DrainConfig {
-        graceful_timeout: Duration::ZERO,
-        poll_interval: Duration::ZERO,
-        ..DrainConfig::default()
-    };
-
-    let (report, messages) = with_timeout(
-        Duration::from_secs(2),
-        capture_async(supervise_with_trigger(
-            controller,
-            Arc::clone(&registry),
-            time,
-            cfg,
-            immediate_term(),
-        )),
-    )
-    .await
-    .expect("a zero graceful timeout and a zero poll interval must return promptly");
-
-    assert_eq!(report.killed, 1, "the guard was never dropped");
-    assert!(
-        messages
-            .iter()
-            .any(|m| m.contains("drain deadline reached")),
-        "expected the deadline-reached warning when a connection was still live, got: {messages:?}"
-    );
-    assert!(
-        !messages
-            .iter()
-            .any(|m| m.contains("drain complete; no connections remained")),
-        "the clean-drain message must not fire when a connection was still live, got: {messages:?}"
-    );
-
-    drop(guard);
-}
-
-#[tokio::test]
-async fn drain_with_no_live_connections_logs_no_warning() {
-    let registry = ConnRegistry::new(8);
-    let (controller, _token) = ShutdownController::new();
-    let time: Arc<dyn TimeSource> = Arc::new(TestTimeSource::new());
-
-    let (report, messages) = with_timeout(
-        Duration::from_secs(2),
-        capture_async(supervise_with_trigger(
-            controller,
-            Arc::clone(&registry),
-            time,
-            test_cfg(),
-            immediate_term(),
-        )),
-    )
-    .await
-    .expect("a drain with no live connections must return promptly");
-
-    assert_eq!(report.killed, 0);
-    assert!(
-        messages
-            .iter()
-            .any(|m| m.contains("drain complete; no connections remained")),
-        "expected the clean-drain message when nothing was live, got: {messages:?}"
-    );
-    assert!(
-        !messages
-            .iter()
-            .any(|m| m.contains("drain deadline reached")),
-        "the deadline-reached warning must not fire when nothing was live, got: {messages:?}"
-    );
-}
+// drain_deadline_with_live_connections_logs_a_warning and
+// drain_with_no_live_connections_logs_no_warning used to live here, along with a
+// capture_async helper that captured tracing output via tracing::subscriber::set_default.
+// Both proved the `if live > 0 { warn!(..) } else { info!(..) }` branch right after the
+// drain loop actually depends on `live`, since none of the 13 named tests observes which
+// line was logged, only the returned DrainReport, which is identical either way.
+//
+// They now live in their own file, tests/drain_logging.rs: every file under tests/
+// compiles to its own binary with its own process, and tracing's per-callsite interest
+// cache is a single process-global value, not one scoped to a thread or a test. Every
+// other test in THIS file calls supervise_with_trigger too, which unconditionally hits
+// the shared "drain starting" callsite (and, depending on the scenario, "drain complete"
+// or "drain deadline reached"), with no subscriber installed at all. Whichever test's
+// poll reached one of those callsites FIRST in the process decided, for the rest of the
+// process, whether tracing considered it worth calling a subscriber about at all: if that
+// first hit landed on a worker thread with no subscriber active (the common case for
+// every test here except the two capturing ones), the callsite cached "never interested"
+// for good, and rebuild_interest_cache() cannot rescue a callsite that has not registered
+// yet when it runs. This raced the two capturing tests against every other test in this
+// file for 13 to 14 failures in 200 runs (issue #621), each one the captured events
+// coming back empty or missing "drain starting". Moved to its own process, the only code
+// that ever touches those callsites there is the two capturing tests, and both always
+// install a real subscriber before doing so, so the callsite can never be cached "never
+// interested" from a bare context in the first place.
+//
+// THE RULE FOR FUTURE TESTS: a test that asserts on tracing output emitted by
+// supervise_with_trigger or jitter_before_close does not belong in this file, because
+// every other test here calls those functions with no subscriber installed and can win
+// the registration race for a shared callsite. Give it its own file under tests/, the way
+// tests/drain_logging.rs does.
