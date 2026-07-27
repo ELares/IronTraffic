@@ -781,6 +781,18 @@ mod tests {
         "[a-z][a-z0-9-]{0,20}"
     }
 
+    /// Like `any_name_pattern`, but roughly half its draws are 63 to 91 bytes
+    /// long: one byte short of `MAX_FAST_NAME_LEN`, exactly at it, and past it
+    /// into the `long` list. `any_name_pattern` alone never exceeds 21 bytes,
+    /// so a generator built only from it can never populate `ordered` with a
+    /// name that takes `CompiledNameSet::lookup_long`'s path at all, which is
+    /// exactly how issue #579 found `exhaustive_membership` silent on that
+    /// path: it cannot pick, as its base name, something the mutated code
+    /// under test never even routes to the code being mutated.
+    fn membership_name_pattern() -> &'static str {
+        "[a-z][a-z0-9-]{0,20}|[a-z][a-z0-9-]{62,90}"
+    }
+
     #[test]
     fn empty_set_misses_everything() {
         let set = CompiledNameSet::empty();
@@ -1195,9 +1207,10 @@ mod tests {
 
         #[test]
         fn exhaustive_membership(
-            names in prop::collection::hash_set(any_name_pattern(), 1..40),
+            names in prop::collection::hash_set(membership_name_pattern(), 1..40),
             pick in 0usize..1000,
-            mutation in 0u8..4,
+            mutation in 0u8..6,
+            mutation_idx in 0usize..1000,
             mutation_byte in proptest::prelude::any::<u8>(),
         ) {
             let ordered: Vec<String> = {
@@ -1215,22 +1228,73 @@ mod tests {
 
             let idx = pick % ordered.len();
             let base = ordered[idx].clone();
+            let base_bytes = base.into_bytes();
+            let len = base_bytes.len();
+            // Each arm below targets a different set of byte positions
+            // `CompiledNameSet::lookup` reads, worked out from the code: the
+            // three-load prefilter (length, first byte, last byte) only ever
+            // screens byte 0, the last byte, and a length change, so a near
+            // miss built only from those three primitives can never reach a
+            // final full comparison with an interior difference. Deleting
+            // that final comparison on any of `lookup`'s three paths (the
+            // NO_DISC single-entry return, the disc-scan bucket loop, or
+            // `lookup_long`) is exactly the false positive issue #579 names:
+            // a header predicate matching the wrong header.
             let candidate: Vec<u8> = match mutation {
-                0 => base.into_bytes(),
+                0 => base_bytes,
                 1 => {
-                    let mut bytes = base.into_bytes();
-                    if let Some(slot) = bytes.get_mut(0) {
+                    // Rewrite one byte at a position chosen uniformly across
+                    // the whole name, including position 0 and the last
+                    // byte, the two positions the prefilter loads directly.
+                    let mut bytes = base_bytes;
+                    let at = mutation_idx % len;
+                    if let Some(slot) = bytes.get_mut(at) {
                         *slot = mutation_byte;
                     }
                     bytes
                 }
                 2 => {
-                    let mut bytes = base.into_bytes();
+                    // Rewrite a byte strictly between the first and last, so
+                    // the candidate agrees with `base` on every byte the
+                    // prefilter reads (length, first byte, last byte). Only
+                    // the final full comparison can reject a candidate built
+                    // this way. Needs len >= 3; a shorter name has no
+                    // interior byte at all, so it falls back to appending,
+                    // still a genuine near miss.
+                    let mut bytes = base_bytes;
+                    if len >= 3 {
+                        let at = 1 + (mutation_idx % (len - 2));
+                        if let Some(slot) = bytes.get_mut(at) {
+                            *slot = mutation_byte;
+                        }
+                    } else {
+                        bytes.push(mutation_byte);
+                    }
+                    bytes
+                }
+                3 => {
+                    // Rewrite only the final byte. The last-byte filter is a
+                    // 256-bit bitmap shared by every entry of this length, so
+                    // a candidate whose last byte collides with a DIFFERENT
+                    // entry's last byte (not `base`'s) still passes the
+                    // filter even though it does not match `base`; this is
+                    // the exact shape of the cross-header collision issue
+                    // #579's reproduction demonstrates.
+                    let mut bytes = base_bytes;
+                    if let Some(last) = len.checked_sub(1)
+                        && let Some(slot) = bytes.get_mut(last)
+                    {
+                        *slot = mutation_byte;
+                    }
+                    bytes
+                }
+                4 => {
+                    let mut bytes = base_bytes;
                     bytes.push(mutation_byte);
                     bytes
                 }
                 _ => {
-                    let mut bytes = base.into_bytes();
+                    let mut bytes = base_bytes;
                     bytes.pop();
                     bytes
                 }
