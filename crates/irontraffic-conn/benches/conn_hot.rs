@@ -25,6 +25,7 @@
 //! returning nothing.
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
+use irontraffic_conn::bodybuf::{BufferPool, ByteSize};
 use irontraffic_conn::{ConnBudget, FrameEvent};
 use std::hint::black_box;
 
@@ -93,5 +94,73 @@ fn bench_frame_debit(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_frame_debit);
+// Benchmarks `BufferPool::try_acquire` paired with the resulting
+// `BufferLease`'s drop: the zero-byte streaming path (what `Buffering::None`'s
+// `lease_size()` always requests) and the nonzero buffering path.
+//
+// Budget (reference runner: see the module doc comment above): under 2
+// nanoseconds for the zero-byte case, because it must be a branch rather than
+// an atomic operation, and under 25 nanoseconds for the nonzero case, which
+// pays one load, one compare-and-swap on the uncontended path, and one atomic
+// subtract on drop. Criterion does not enforce either budget itself; compare
+// the reported time against them by hand.
+fn bench_buffer_lease(c: &mut Criterion) {
+    let mut group = c.benchmark_group("bench_buffer_lease");
+
+    // Both closures below discard the `Result` with `let _ =`, exactly the
+    // convention `bench_frame_debit` above uses for `on_frame`'s `Result`:
+    // production code must never `unwrap` or `expect`, and that rule applies
+    // to this bench binary too (it is a real compiled target, not test code,
+    // so clippy.toml's test-only allowance for `expect` does not cover it).
+    // The discarded `Ok` lease still drops at the end of the `let _ =`
+    // statement, so one measured iteration covers exactly one acquire paired
+    // with its release.
+    let zero_pool = BufferPool::new(ByteSize::mib(64));
+    group.bench_function("zero_byte_acquire_release", |b| {
+        b.iter(|| {
+            let _ = black_box(BufferPool::try_acquire(
+                black_box(&zero_pool),
+                black_box(ByteSize(0)),
+            ));
+        });
+    });
+
+    let nonzero_pool = BufferPool::new(ByteSize::mib(64));
+    group.bench_function("nonzero_acquire_release", |b| {
+        b.iter(|| {
+            let _ = black_box(BufferPool::try_acquire(
+                black_box(&nonzero_pool),
+                black_box(ByteSize::kib(4)),
+            ));
+        });
+    });
+
+    group.finish();
+
+    // A two-thread contended variant, recorded but deliberately not gated: a
+    // contended figure on a shared CI runner is not a stable number to assert
+    // a budget against, because it depends on how many other processes land
+    // on the same physical cores at the moment the benchmark happens to run.
+    // Criterion's own `Bencher::iter` does the timing here, exactly as it
+    // does for every other benchmark in this file, so this closure never
+    // reads a clock itself; only the two spawned threads' combined completion
+    // time per iteration is measured.
+    let mut contended_group = c.benchmark_group("bench_buffer_lease_contended");
+    let contended_pool = BufferPool::new(ByteSize::mib(64));
+    contended_group.bench_function("two_thread_contended_acquire_release", |b| {
+        b.iter(|| {
+            std::thread::scope(|scope| {
+                for _ in 0..2 {
+                    let pool = &contended_pool;
+                    scope.spawn(move || {
+                        let _ = black_box(BufferPool::try_acquire(pool, ByteSize::kib(4)));
+                    });
+                }
+            });
+        });
+    });
+    contended_group.finish();
+}
+
+criterion_group!(benches, bench_frame_debit, bench_buffer_lease);
 criterion_main!(benches);
