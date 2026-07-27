@@ -47,6 +47,7 @@ pub mod error;
 pub mod field;
 pub mod forwarded;
 pub mod framing;
+pub mod h1;
 pub mod hlist;
 pub mod known;
 pub mod limits;

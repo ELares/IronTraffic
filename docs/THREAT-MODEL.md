@@ -267,6 +267,57 @@ the recorded chain is `trust-policy-and-peer-identity` (#32)'s job.
   `Forwarded` or `X-Forwarded-For` value to be split across several field lines that are
   semantically one comma-joined list; reading only the first or only the last line is a bypass, so
   `ForwardedChain::parse_into` takes every line, in arrival order, for all three families.
+
+### HTTP/1 head (`h1-head-parser`, #34)
+
+**Parses:** the request line, the status line, and the field section of an HTTP/1.0 or HTTP/1.1
+head, from the accumulated read buffer of an unauthenticated attacker. This is the single parse
+boundary for HTTP/1 request smuggling: it decides where a message begins and ends, and every
+downstream component (routing, forwarding, the next message on the same connection) trusts that
+decision without re-deriving it.
+
+**Stateless across calls, and what that costs.** `H1Parser::parse_request_head` and
+`parse_response_head` hold no cursor: when the head is not yet complete they return
+`ParseStatus::Partial`, and the caller appends more bytes to the SAME buffer and calls again from
+offset zero. Statelessness is what makes this parser exhaustively fuzzable and makes the resumption
+class of bugs unrepresentable, but it is not free: a head delivered one byte per read is rescanned
+once per byte, `O(L^2)` in total bytes scanned. Two limits bound this parser and NEITHER bounds that
+quadratic rescan cost:
+
+- `max_head_bytes` (`max_request_line_bytes + max_header_list_bytes + 2`; 73,730 at the defaults)
+  bounds the MEMORY one incomplete head may occupy. It says nothing about how many times those bytes
+  are re-scanned.
+- `header_read_timeout` (the corpus-wide deadline name; not yet armed by any accept-to-first-byte
+  read loop in this milestone's plan) bounds the WALL CLOCK a head may occupy a connection. At its
+  10 second default it does not help either: the CPU cost of the quadratic rescan (about 0.9 seconds
+  for a maximum-size head delivered one byte at a time) is paid and gone long before the deadline
+  fires, so 10,000 such connections inside one deadline window buy an attacker roughly 9,000
+  CPU-seconds.
+
+**The structural control: `HeadScanBudget`, a third, explicit bound on WORK.** The connection
+driver charges `HeadScanBudget::charge(buf.len())` immediately before every `parse_request_head` or
+`parse_response_head` call, and the cumulative charge for one head may never exceed
+`HeadScanBudget::MAX_BYTES` (4 MiB, about 56x `max_head_bytes` at the defaults) before the connection
+is refused with `HeaderListTooLarge`. A maximum-size head drip-fed one byte per read is cut off after
+roughly 1.5 ms of CPU instead of 900 ms: the head was never going to be accepted, and refusing it
+costs a bounded, constant amount of work regardless of how a peer drips it in. The budget is reset
+only after a `Complete`, never after a `Partial`, so a pipelined connection gets a fresh budget per
+message rather than a shared one; a driver that forgets to call `reset` eventually refuses a
+legitimate connection. `HeadScanBudget` is not configurable: it is a floor on how much CPU a peer can
+buy, not an operator-facing feature, and neither `max_head_bytes` nor `header_read_timeout` is a
+substitute for it.
+
+**Every name and value byte is validated during the scan**, never assumed safe because it "came from
+what we parsed" (the pattern Pingora's `HeaderValue::from_maybe_shared_unchecked` follows, and this
+parser deliberately does not). A bare CR, a bare LF, obs-fold, whitespace before a field's colon, and
+an empty field name (HAProxy CVE-2023-25725) are all refused rather than tolerated or normalized.
+
+**Refusal is not an oracle here either**, per section 3 above: every one of the refusal reasons this
+parser returns (`RequestLineMalformed`, `BareCr`, `BareLf`, `ObsFold`, `WhitespaceBeforeColon`,
+`FieldNameEmpty`, and the rest of the reject table) maps to a status and a metric label, never to
+response bytes, so a client cannot use the specific refusal reason to distinguish this parser's
+behaviour from another's on the same malformed input.
+
 ## Listening sockets and socket options
 
 **What the listening socket exposes.** A TCP port reachable by anyone who can route to the bound
