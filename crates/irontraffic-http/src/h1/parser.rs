@@ -170,6 +170,15 @@ impl<'a> RawHead<'a> {
     pub fn field_count(&self) -> usize {
         self.fields.len()
     }
+
+    /// The request-target bytes. Crate-private: invariant P1 says there is
+    /// exactly one path value in the system, produced by
+    /// `NormalizedPath::parse_into`, so no code outside this crate may read
+    /// the raw target.
+    #[must_use]
+    pub(crate) fn target_bytes(&self) -> &[u8] {
+        self.target.of(self.buf).unwrap_or(&[])
+    }
 }
 
 /// A parsed response head.
@@ -192,6 +201,26 @@ pub struct RawResponseHead<'a> {
                   RawHead's struct shape exactly as specified"
     )]
     buf: &'a [u8],
+}
+
+impl<'a> RawResponseHead<'a> {
+    /// The field name bytes as received (NOT lowercased).
+    #[must_use]
+    pub(crate) fn field_name(&self, i: usize) -> Option<&'a [u8]> {
+        self.fields.get(i).and_then(|f| f.name.of(self.buf))
+    }
+
+    /// The OWS-trimmed field value bytes.
+    #[must_use]
+    pub(crate) fn field_value(&self, i: usize) -> Option<&'a [u8]> {
+        self.fields.get(i).and_then(|f| f.value.of(self.buf))
+    }
+
+    /// Number of field lines.
+    #[must_use]
+    pub(crate) fn field_count(&self) -> usize {
+        self.fields.len()
+    }
 }
 
 /// Bounds the total bytes the head parser may scan for ONE head, across every
