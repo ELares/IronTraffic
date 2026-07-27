@@ -771,6 +771,24 @@ impl ChunkedDecoder {
             if line_len > self.limits.max_field_line_bytes as usize {
                 return Err(RejectReason::FieldLineTooLong);
             }
+            // This charge is, as far as any test in this crate can currently
+            // observe, redundant with `FieldSectionBuilder::push_normalized`'s
+            // own internal `admit()` call just below: `admit()` enforces the
+            // identical `max_field_count` and `max_header_list_bytes` formula
+            // against the SAME `self.limits`, using the builder's own
+            // `list_bytes`/count state, which is already fresh because
+            // `self.trailer_builder` is a brand-new `FieldSectionBuilder`
+            // created in `step_size_crlf` for this trailer section alone.
+            // Verified by removing this call and its field entirely: every
+            // existing test, including corpus_table's case 38
+            // (`FieldCountExceeded`) and case 39 (`HeaderListTooLarge`),
+            // still passed on a clean rebuild, because `push_normalized`'s
+            // own check fires first regardless. Kept anyway because the
+            // issue's own design explicitly calls for "a FRESH one created
+            // in step 3, never the head's" and removing a field the issue
+            // names is a design decision outside a review-finding fix's
+            // scope, not because any input distinguishes its presence from
+            // its absence today.
             self.trailer_budget
                 .charge(name_raw.len(), value_trimmed.len())?;
 
