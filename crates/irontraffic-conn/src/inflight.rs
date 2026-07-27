@@ -557,6 +557,121 @@ mod tests {
         );
     }
 
+    // Edge case 18, strengthened per issue #659: the churn phase must run against a
+    // gauge sized to the concurrency it actually generates, not against the `gauge:
+    // 256` above, which two threads doing admit-then-immediate-drop never come close
+    // to filling. `max_seen <= 256` there had 254 units of headroom and could not tell
+    // the CAS loop this module requires apart from the fetch_add-then-check-then-
+    // fetch_sub implementation the "## Do NOT" list forbids by name, which briefly
+    // over-admits. Confirmed by execution: swapping in that forbidden implementation
+    // left this whole test suite, including the old assertion, green.
+    // `CHURN_THREADS` exceeds `CHURN_MAX` here, so a real over-admission is observable
+    // (a bug of this shape peaks at `CHURN_THREADS`, not at `CHURN_MAX`).
+    //
+    // Each churner also drives `StreamSlot::on_downstream_reset` at a different point
+    // in its own lifecycle, so a hostile downstream RST_STREAM landing at any point
+    // relative to the admit/settle/drop sequence cannot corrupt the shared balance:
+    //   thread 0: reset immediately after admit, before any other transition
+    //             ("before any work");
+    //   thread 1: reset after yielding a few times, still before its drop ("after work
+    //             is credited but before it is debited");
+    //   thread 2: reset twice in a row (on_downstream_reset is idempotent: the second
+    //             call must return false and must not change the state or the gauge);
+    //   threads 3.. : no reset at all, so those iterations complete and drop while
+    //             threads 0-2 are resetting, which is "reset concurrent with
+    //             completion": with `CHURN_THREADS` racing under one barrier, one
+    //             thread's on_downstream_reset can land at the same instant as another
+    //             thread's Drop.
+    // Under this tight, contended max, some admits also fail outright with Refuse,
+    // which is "a reset on a slot that was never opened": there is no StreamSlot to
+    // call on_downstream_reset on, and the balance must be untouched by that attempt,
+    // exactly like every other Refuse in this file.
+    fn churn_with_interleaved_resets() {
+        const CHURN_MAX: u32 = 3;
+        const CHURN_THREADS: u32 = 8;
+        let churn = InflightGauge::new(CHURN_MAX);
+        let churn_start = Arc::new(Barrier::new(CHURN_THREADS as usize + 1));
+        let stop = Arc::new(AtomicBool::new(false));
+        let max_seen = Arc::new(AtomicU32::new(0));
+
+        let reader = {
+            let gauge = Arc::clone(&churn);
+            let start = Arc::clone(&churn_start);
+            let stop = Arc::clone(&stop);
+            let max_seen = Arc::clone(&max_seen);
+            thread::spawn(move || {
+                start.wait();
+                while !stop.load(Ordering::Relaxed) {
+                    max_seen.fetch_max(gauge.inflight(), Ordering::Relaxed);
+                }
+            })
+        };
+
+        let churners: Vec<_> = (0..CHURN_THREADS)
+            .map(|id| {
+                let gauge = Arc::clone(&churn);
+                let start = Arc::clone(&churn_start);
+                thread::spawn(move || {
+                    start.wait();
+                    for _ in 0..2000 {
+                        let Ok(mut slot) = gauge.admit() else {
+                            // A slot never opened: nothing to reset, balance untouched.
+                            continue;
+                        };
+                        match id {
+                            0 => {
+                                assert!(
+                                    slot.on_downstream_reset(),
+                                    "the first reset on a running slot must request cancellation"
+                                );
+                            }
+                            1 => {
+                                for _ in 0..4 {
+                                    thread::yield_now();
+                                }
+                                assert!(
+                                    slot.on_downstream_reset(),
+                                    "the first reset on a running slot must request cancellation"
+                                );
+                            }
+                            2 => {
+                                assert!(slot.on_downstream_reset());
+                                assert!(
+                                    !slot.on_downstream_reset(),
+                                    "a repeat downstream reset must be idempotent"
+                                );
+                            }
+                            _ => {}
+                        }
+                        slot.on_upstream_settled();
+                        drop(slot);
+                    }
+                })
+            })
+            .collect();
+
+        for handle in churners {
+            handle.join().expect("a churning thread must not panic");
+        }
+        stop.store(true, Ordering::Relaxed);
+        reader.join().expect("the reader thread must not panic");
+
+        let seen = max_seen.load(Ordering::Relaxed);
+        assert!(
+            seen <= CHURN_MAX,
+            "inflight() must never be observed above max ({CHURN_MAX}), even while \
+             downstream resets race completion; a value here (especially one near \
+             u32::MAX, which is what an unsigned underflow from an extra fetch_sub \
+             would produce) means the balance was corrupted, but saw {seen}"
+        );
+        assert_eq!(
+            churn.inflight(),
+            0,
+            "the balance must return to its starting value of 0 once every churned \
+             slot is dropped, regardless of how many of them were reset first"
+        );
+    }
+
     #[test]
     fn concurrent_admission_respects_the_limit() {
         // Edge case 12: two threads race 300 admits each against max: 256, synchronised to
@@ -599,55 +714,12 @@ mod tests {
         drop(all_slots);
         assert_eq!(gauge.inflight(), 0);
 
-        // Edge case 18: while two threads race admit-then-immediate-drop cycles, a third
+        // Edge case 18: while several threads race admit-then-drop cycles, a reader
         // thread repeatedly reads inflight() and must never observe a value above max.
-        let churn_start = Arc::new(Barrier::new(3));
-        let stop = Arc::new(AtomicBool::new(false));
-        let max_seen = Arc::new(AtomicU32::new(0));
-
-        let reader = {
-            let gauge = Arc::clone(&gauge);
-            let start = Arc::clone(&churn_start);
-            let stop = Arc::clone(&stop);
-            let max_seen = Arc::clone(&max_seen);
-            thread::spawn(move || {
-                start.wait();
-                while !stop.load(Ordering::Relaxed) {
-                    max_seen.fetch_max(gauge.inflight(), Ordering::Relaxed);
-                }
-            })
-        };
-
-        let churners: Vec<_> = (0..2)
-            .map(|_| {
-                let gauge = Arc::clone(&gauge);
-                let start = Arc::clone(&churn_start);
-                thread::spawn(move || {
-                    start.wait();
-                    for _ in 0..2000 {
-                        if let Ok(slot) = gauge.admit() {
-                            drop(slot);
-                        }
-                    }
-                })
-            })
-            .collect();
-
-        for handle in churners {
-            handle.join().expect("a churning thread must not panic");
-        }
-        stop.store(true, Ordering::Relaxed);
-        reader.join().expect("the reader thread must not panic");
-
-        assert!(
-            max_seen.load(Ordering::Relaxed) <= 256,
-            "inflight() must never be observed above max"
-        );
-        assert_eq!(
-            gauge.inflight(),
-            0,
-            "every churned slot must be dropped by the time the churners join"
-        );
+        // See churn_with_interleaved_resets for why this runs against its own tightly
+        // sized gauge rather than reusing `gauge` above (issue #659), and for how it
+        // interleaves downstream resets at each transition point.
+        churn_with_interleaved_resets();
 
         // The second half of edge case 18: a read taken strictly after a slot's drop has
         // completed (the drop call itself, not a racy poll) must see the decrement.
