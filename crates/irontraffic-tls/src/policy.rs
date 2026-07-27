@@ -755,6 +755,23 @@ mod tests {
         let modern_policy = TlsPolicy::compile(&modern_cfg).expect("modern is a valid profile");
         assert_eq!(modern_policy.profile(), TlsProfile::Modern);
 
+        // Acceptance criterion 4 of issue #116: the version lists themselves, not just the
+        // behaviour they produce. Without these, `INTERMEDIATE_VERSIONS` enabling TLS 1.2 at
+        // all, and TLS 1.3 being first in it, are both unasserted anywhere in the suite: the
+        // handshake check below only ever exercises Modern against a TLS 1.2-only client, so it
+        // proves Modern excludes 1.2 but says nothing about what Intermediate, the profile every
+        // listener gets by default, actually offers.
+        assert_eq!(versions(TlsProfile::Modern).len(), 1);
+        assert_eq!(versions(TlsProfile::Intermediate).len(), 2);
+        assert_eq!(
+            versions(TlsProfile::Intermediate)[0].version,
+            rustls::ProtocolVersion::TLSv1_3
+        );
+        assert_eq!(
+            versions(TlsProfile::Intermediate)[1].version,
+            rustls::ProtocolVersion::TLSv1_2
+        );
+
         // Fixture: rcgen self-signed leaf for "t.example".
         let (leaf_der, key_der) = gen_leaf(&rcgen::PKCS_ECDSA_P256_SHA256, &["t.example"]);
         let chain = vec![rustls::pki_types::CertificateDer::from(leaf_der.clone())];
