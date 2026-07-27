@@ -51,13 +51,42 @@ name = "http_chunked"
 harness = false
 
 [[bench]]
-name = "http_hot"
-harness = false
-
-[[bench]]
 name = "http_priority"
 harness = false
 
 [[bench]]
 name = "http_trust"
 harness = false
+
+[[bench]]
+name = "http_authority"
+harness = false
+
+[[bench]]
+name = "http_field"
+harness = false
+
+[[bench]]
+name = "http_forwarded"
+harness = false
+
+[[bench]]
+name = "http_framing"
+harness = false
+
+[[bench]]
+name = "http_h1"
+harness = false
+
+[[bench]]
+name = "http_known"
+harness = false
+
+[[bench]]
+name = "http_section"
+harness = false
+
+[[bench]]
+name = "http_strip"
+harness = false
+

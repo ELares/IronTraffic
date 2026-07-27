@@ -2086,6 +2086,190 @@ exact shape of a request-smuggling bug:
   // it-allow: framing-fields-confined reason: <why this file must read it>" "$hits"
 
 # ---------------------------------------------------------------------------
+# 25. bench-registration: a criterion benchmark that is defined but never
+#     registered in a `criterion_group!` compiles perfectly and measures
+#     nothing. A whole `criterion_group!` that is defined but never named by
+#     a `criterion_main!` compiles just as perfectly and measures nothing
+#     either, and it is the more dangerous shape of the two.
+#
+#     WHY THIS EXISTS (issue #630). `crates/irontraffic-http/benches/http_hot.rs`
+#     was a single bench target that six separate issues appended to, and every
+#     rebase conflicted in it. The conflicts were the dangerous kind: both sides
+#     end their diff by editing the SAME `criterion_group!` argument list, each
+#     adding a different name, so git presents one hunk whose two sides are
+#     "register mine" and "register theirs". Taking either side wholesale, which
+#     is what a union merge or a hurried hand resolution does, leaves a file that
+#     compiles, passes clippy, passes every test, and has silently stopped
+#     measuring the other side's benchmark. It was observed three times in one
+#     session and git flagged none of them, because from git's point of view the
+#     conflict WAS resolved.
+#
+#     Splitting the shared file into one bench target per surface (which #630
+#     also did) shrinks the surface but does not close this: two issues touching
+#     the same surface still meet in one `criterion_group!`, and a single-file
+#     bench can lose its own registration to a bad hand edit just as easily.
+#     This rule is the detector, and it is the one thing in the pipeline that
+#     can tell the difference, because the difference is not expressible as a
+#     compile error.
+#
+#     THE FUNCTION-LEVEL CHECK. In every `benches/*.rs`, the set of `fn bench_*`
+#     DEFINED at the top level must equal the set REGISTERED across that file's
+#     `criterion_group!` invocations. Both directions are checked: an
+#     unregistered definition is the dropped-registration failure above, and a
+#     registration naming a `bench_*` this file does not define is the mirror
+#     image, a stale entry left behind when a function moved to another bench
+#     file.
+#
+#     THE GROUP-LEVEL CHECK (independent review of PR 636, issue #673). The
+#     function-level check above only guards the `criterion_group!` argument
+#     list, and the compiler already catches a registered-but-undefined name
+#     there: it fails to build. The realistic and unguarded merge shape in the
+#     same family is clobbering the `criterion_main!` group list instead. A
+#     file can define a second `criterion_group!` (its own name plus a fully
+#     correct, fully registered set of targets) and simply never pass that
+#     group's name to `criterion_main!`. That still compiles, still passes
+#     clippy, still passes every test, and the entire group's benchmarks never
+#     run, because criterion never calls a group's runner unless
+#     `criterion_main!` names it. Nothing else in the pipeline can see this
+#     either, for the same reason as above: the result is valid Rust. So every
+#     `criterion_group!` name DEFINED in a file must appear in that file's
+#     `criterion_main!` invocation(s). The reverse (a `criterion_main!` naming
+#     a group the file does not define) is left to the compiler, which already
+#     refuses an undefined identifier there.
+#
+#     Both `criterion_group!` spellings are understood: the positional
+#     `criterion_group!(name, target, ...)` form, whose first argument is the
+#     group's own name rather than a target, and the
+#     `criterion_group!(name = ...; config = ...; targets = ...)` form, where
+#     the `name` field is the group's own name and only the `targets` list
+#     counts as registered functions.
+#
+#     rslex is used rather than a plain regex for the same reason every other
+#     rule here does: a doc comment that mentions `criterion_group!` or
+#     `criterion_main!` in prose, or a benchmark id string containing a brace,
+#     must not be mistaken for the real macro invocation or desynchronize the
+#     bracket match.
+# ---------------------------------------------------------------------------
+bench_files() {
+  rust_files | grep -E '(^|/)benches/[^/]+\.rs$' || true
+}
+
+cat > "$WORK/bench_registration.py" <<'PY'
+import os, re, sys
+
+sys.path.insert(0, os.environ["WORK"])
+import rslex
+
+# A top-level `fn bench_*(`: column zero, so a nested helper inside another
+# function body (indented) is not mistaken for a criterion target.
+DEF = re.compile(r'^(?:pub(?:\([^)]*\))?\s+)?fn\s+(bench_\w+)\s*[(<]', re.M)
+GROUP_MACRO = re.compile(r'\bcriterion_group\s*!')
+MAIN_MACRO = re.compile(r'\bcriterion_main\s*!')
+
+for path in sys.argv[1:]:
+    try:
+        text = open(path, encoding="utf-8").read()
+    except (OSError, UnicodeDecodeError):
+        continue
+
+    defined = {}
+    for m in rslex.finditer_real(DEF, text):
+        defined.setdefault(m.group(1), rslex.line_of(text, m.start()))
+
+    registered = {}
+    groups = {}
+    for m in rslex.finditer_real(GROUP_MACRO, text):
+        open_idx = rslex.find_first_real(text, m.end(), "([{")
+        if open_idx < 0:
+            continue
+        close_idx = rslex.find_matching(text, open_idx)
+        if close_idx < 0:
+            continue
+        body = text[open_idx + 1:close_idx]
+        line = rslex.line_of(text, m.start())
+        if re.search(r'\btargets\s*=', body):
+            # `name = benches; config = ...; targets = a, b`
+            name_m = re.search(r'\bname\s*=\s*(\w+)', body)
+            group_name = name_m.group(1) if name_m else None
+            tail = body.split("targets", 1)[1]
+            tail = tail.split("=", 1)[1] if "=" in tail else ""
+            args = [a.strip() for a in tail.split(",")]
+        else:
+            # `criterion_group!(name, a, b)`: the FIRST argument is the
+            # group's own name, never a target.
+            all_args = rslex.top_level_split(text, open_idx, close_idx)
+            group_name = all_args[0].strip() if all_args else None
+            args = all_args[1:]
+        if group_name:
+            groups.setdefault(group_name, line)
+        for arg in args:
+            arg = arg.strip().rstrip(";").strip()
+            nm = rslex.NAME.fullmatch(arg)
+            if nm:
+                registered.setdefault(arg, line)
+
+    # criterion_main!(a, b, ...): every argument is a criterion_group! group
+    # name, never a bench_* target, so nothing here is skipped the way the
+    # first positional argument is above.
+    main_named = set()
+    for m in rslex.finditer_real(MAIN_MACRO, text):
+        open_idx = rslex.find_first_real(text, m.end(), "([{")
+        if open_idx < 0:
+            continue
+        close_idx = rslex.find_matching(text, open_idx)
+        if close_idx < 0:
+            continue
+        for arg in rslex.top_level_split(text, open_idx, close_idx):
+            arg = arg.strip().rstrip(";").strip()
+            nm = rslex.NAME.fullmatch(arg)
+            if nm:
+                main_named.add(arg)
+
+    lines = text.splitlines()
+
+    def src(n):
+        return lines[n - 1] if 0 < n <= len(lines) else ""
+
+    for name, line in sorted(defined.items(), key=lambda kv: kv[1]):
+        if name not in registered:
+            print(f"{path}:{line}:{src(line)}"
+                  f"   <-- `{name}` is defined here but no criterion_group! in "
+                  f"this file registers it, so it is compiled and never measured")
+
+    for name, line in sorted(registered.items(), key=lambda kv: kv[1]):
+        if name.startswith("bench_") and name not in defined:
+            print(f"{path}:{line}:{src(line)}"
+                  f"   <-- criterion_group! registers `{name}`, which this file "
+                  f"does not define; a stale entry left behind by a move or a merge")
+
+    for name, line in sorted(groups.items(), key=lambda kv: kv[1]):
+        if name not in main_named:
+            print(f"{path}:{line}:{src(line)}"
+                  f"   <-- criterion_group! defines group `{name}`, but no "
+                  f"criterion_main! in this file names it, so the entire group "
+                  f"is compiled and never run")
+PY
+
+hits="$(bench_files | tr '\n' '\0' | xargs -0 -r python3 "$WORK/bench_registration.py" \
+  | drop_escaped bench-registration)"
+[ -n "$hits" ] && fail bench-registration \
+"Every 'fn bench_*' in a benches/*.rs must appear in a criterion_group! in that
+same file, and every bench_* a criterion_group! names must be defined there.
+Every criterion_group! defined in a file must in turn be named by that file's
+criterion_main!. A benchmark that is defined but not registered, or a whole
+group that is registered but never handed to criterion_main!, still compiles,
+still passes clippy, and measures NOTHING: this is exactly what a merge of two
+issues that each appended to one shared bench file produces when either side
+of the criterion_group! or criterion_main! argument list is taken wholesale,
+and nothing else in this pipeline can see it, because the result is valid
+Rust.
+
+Add the missing name to the criterion_group! or criterion_main! argument list
+(or remove the stale one), or, if a bench_-prefixed function or a group
+genuinely is not a criterion target:
+  // it-allow: bench-registration reason: <why this fn or group is not a target>" "$hits"
+
+# ---------------------------------------------------------------------------
 if [ "$FAILED" -ne 0 ]; then
   printf '\ninvariant-lints: FAILED. Each block above names the rule, explains why it\n'
   printf 'exists, and lists the offending lines. Fix the code; do not silence a lint\n'

@@ -625,10 +625,43 @@ pub fn triggers_panic(n: u8) -> u8 {
 }
 RS
 
+# ---------------------------------------------------------------------------
+# bench-registration (issue #630): deliberately defines a criterion benchmark
+# that no criterion_group! in this file registers, registers one this file
+# does not define, and defines a second criterion_group! that this file's
+# criterion_main! never names, exercising all three failure shapes a merge of
+# two issues appending to one shared bench file (or a hand-edited
+# criterion_main! group list) produces. Every one of these is valid Rust: it
+# compiles, passes clippy, and passes every test, which is exactly why nothing
+# else in the pipeline can see it.
+# ---------------------------------------------------------------------------
+mkdir -p "$A/crates/irontraffic-http/benches"
+cat > "$A/crates/irontraffic-http/benches/rogue_bench.rs" <<'RS'
+//! Deliberately violates bench-registration in all three directions.
+use criterion::{Criterion, criterion_group, criterion_main};
+
+fn bench_registered(c: &mut Criterion) {
+    c.bench_function("registered", |b| b.iter(|| 1 + 1));
+}
+
+fn bench_never_registered(c: &mut Criterion) {
+    c.bench_function("dropped", |b| b.iter(|| 2 + 2));
+}
+
+fn bench_orphan_group(c: &mut Criterion) {
+    c.bench_function("orphan", |b| b.iter(|| 3 + 3));
+}
+
+criterion_group!(benches, bench_registered, bench_moved_to_another_file);
+criterion_group!(orphan_group, bench_orphan_group);
+criterion_main!(benches);
+RS
+
 printf '[workspace.dependencies]\nserde = "1"\n' > "$A/Cargo.toml"
 
 EXPECTED='allow-needs-reason
 balance-drop-only
+bench-registration
 constant-time-secrets
 core-ctx-not-stored
 crate-inherits-workspace
@@ -724,6 +757,43 @@ if [ -n "$MISSING_LINES" ]; then
   FAILED=1
 else
   note "all four #628 regression files are individually visible to no-panic"
+fi
+
+# ---------------------------------------------------------------------------
+# issue #673 (independent review of PR 636): the SET-OF-RULE-NAMES check above
+# is just as blind here as it is for no-panic above, and in a way that matters
+# more, because rogue_bench.rs carries three INDEPENDENT bench-registration
+# violations (a dropped fn-level registration, a stale fn-level registration,
+# and a criterion_group! never named by criterion_main!). A regression that
+# silently disables only the THIRD check (the one #673 found missing entirely)
+# would still leave `bench-registration` in ACTUAL, because the first two
+# violations still fire on their own, so the coarse rule-name check would
+# report success on a gate that no longer guards the criterion_main! link at
+# all. Grep the RAW per-line output for each violation's specific file:line,
+# verified by running the corpus directly (not transcribed by hand), so each
+# of the three failure shapes is individually proven to still be visible.
+# ---------------------------------------------------------------------------
+echo "== corpus A: all three bench-registration violations must be individually visible =="
+NEEDED_BENCH_LINES=(
+  "crates/irontraffic-http/benches/rogue_bench.rs:8:"
+  "crates/irontraffic-http/benches/rogue_bench.rs:16:"
+  "crates/irontraffic-http/benches/rogue_bench.rs:17:"
+)
+MISSING_BENCH_LINES=""
+for needle in "${NEEDED_BENCH_LINES[@]}"; do
+  printf '%s\n' "$RAW_A" | grep -qF "$needle" || MISSING_BENCH_LINES="$MISSING_BENCH_LINES$needle
+"
+done
+if [ -n "$MISSING_BENCH_LINES" ]; then
+  echo "FAIL: corpus A's raw output is missing these expected bench-registration hits."
+  echo "      The set-of-rule-names check above cannot tell a regression in one"
+  echo "      of the three checks (dropped fn registration, stale fn"
+  echo "      registration, criterion_group! not named by criterion_main!) apart"
+  echo "      from the other two still firing in this same file. Missing:"
+  printf '%s' "$MISSING_BENCH_LINES" | sed 's/^/    /'
+  FAILED=1
+else
+  note "all three bench-registration violations (dropped fn, stale fn, ungoverned group) are individually visible"
 fi
 
 # ---------------------------------------------------------------------------
@@ -1707,6 +1777,69 @@ cat > "$B/Cargo.toml" <<'TOML'
 # serde: configuration deserialization. MIT OR Apache-2.0, pure Rust, musl clean.
 serde = "1"
 TOML
+
+# ---------------------------------------------------------------------------
+# bench-registration (issue #630): a correctly wired criterion bench target,
+# in both spellings criterion accepts, plus a file with two groups both named
+# by a single criterion_main!, must never fire bench-registration. The
+# criterion_group! mentioned in each doc comment above must not be mistaken
+# for a real invocation either.
+# ---------------------------------------------------------------------------
+mkdir -p "$B/crates/irontraffic-router/benches"
+cat > "$B/crates/irontraffic-router/benches/clean_bench.rs" <<'RS'
+//! A correctly wired criterion bench target. Every fn bench_* below appears in
+//! the criterion_group! at the bottom, and that group is named by
+//! criterion_main!, so bench-registration must stay silent.
+use criterion::{Criterion, criterion_group, criterion_main};
+
+fn bench_one(c: &mut Criterion) {
+    c.bench_function("one", |b| b.iter(|| 1 + 1));
+}
+
+fn bench_two(c: &mut Criterion) {
+    c.bench_function("two", |b| b.iter(|| 2 + 2));
+}
+
+criterion_group!(benches, bench_one, bench_two);
+criterion_main!(benches);
+RS
+
+cat > "$B/crates/irontraffic-router/benches/clean_bench_configured.rs" <<'RS'
+//! The same, in criterion's `name = ...; config = ...; targets = ...` form,
+//! where the group name is a named field rather than the first positional
+//! argument, and that name is what criterion_main! must be seen to name.
+use criterion::{Criterion, criterion_group, criterion_main};
+
+fn bench_configured(c: &mut Criterion) {
+    c.bench_function("configured", |b| b.iter(|| 3 + 3));
+}
+
+criterion_group! {
+    name = benches;
+    config = Criterion::default();
+    targets = bench_configured
+}
+criterion_main!(benches);
+RS
+
+cat > "$B/crates/irontraffic-router/benches/clean_bench_multi_group.rs" <<'RS'
+//! Two criterion_group! groups in one file, both named by a single
+//! criterion_main!, proving the group-coverage direction of
+//! bench-registration accepts a file that names every group it defines.
+use criterion::{Criterion, criterion_group, criterion_main};
+
+fn bench_alpha(c: &mut Criterion) {
+    c.bench_function("alpha", |b| b.iter(|| 1 + 1));
+}
+
+fn bench_beta(c: &mut Criterion) {
+    c.bench_function("beta", |b| b.iter(|| 2 + 2));
+}
+
+criterion_group!(alpha_group, bench_alpha);
+criterion_group!(beta_group, bench_beta);
+criterion_main!(alpha_group, beta_group);
+RS
 
 echo "== corpus B: no rule may fire =="
 # Captured once and reused for the same reason corpus A is: running the lints
