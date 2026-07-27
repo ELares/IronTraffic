@@ -21,6 +21,7 @@ default = ["crypto-aws-lc-rs"]
 crypto-aws-lc-rs = ["rustls/aws_lc_rs", "rustls/prefer-post-quantum"]
 crypto-ring = ["rustls/ring"]
 crypto-fips = ["rustls/fips", "rustls/aws_lc_rs", "rustls/prefer-post-quantum"]
+schema = ["dep:schemars"]
 
 [dependencies]
 rustls = { workspace = true }
@@ -28,6 +29,8 @@ siphasher = { workspace = true }
 blake3 = { workspace = true }
 x509-cert = { workspace = true }
 irontraffic-rand = { path = "../irontraffic-rand", version = "0.1.0" }
+serde = { workspace = true }
+schemars = { workspace = true, optional = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
