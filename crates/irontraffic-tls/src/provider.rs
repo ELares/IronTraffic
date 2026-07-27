@@ -213,7 +213,63 @@ mod tests {
     // the assumption issue #556 broke).
     #[test]
     fn sibling_provider_install_does_not_race_provider_lifecycle() {
-        assert_eq!(install_process_provider(), Ok(THIS_KIND));
+        // Ensure a provider is installed WITHOUT asserting which caller won the
+        // race. `install_process_provider()` returns `Ok(THIS_KIND)` only to the
+        // FIRST caller in the process and `Err(AlreadyInstalled)` to every later
+        // one, so asserting `Ok` here is an order-dependent claim, not the
+        // order-independent one the comment above promised. It failed exactly as
+        // predicted the moment issue #114 added a sibling test that installs a
+        // provider for `CertifiedKey::from_der`:
+        //
+        //     left: Err(AlreadyInstalled)  right: Ok(AwsLcRsFips)
+        //
+        // Which is issue #556 reproduced inside the test written to prove #556
+        // was fixed. The ordering-sensitive half of the contract, that the FIRST
+        // install succeeds, is asserted in `tests/provider_lifecycle.rs`, which
+        // owns its own process and is the only place that claim can be true.
+        //
+        // Discarding the result is the point rather than an oversight: every
+        // assertion below is about the resulting STATE, which is identical no
+        // matter who installed. Nothing is weakened, because the outcome this
+        // drops is re-asserted below via the second-install check, which IS
+        // order-independent: after any install, a further install always fails.
+        // Assert the order-INDEPENDENT half of what the old line meant. Whoever
+        // wins, the call must either install THIS build's kind or report that a
+        // provider was already there. What it must never do is succeed while
+        // naming a DIFFERENT kind, which would mean this build silently accepted
+        // somebody else's crypto backend, and no assertion anywhere covered that
+        // before. This holds on every run regardless of ordering, unlike the
+        // bare `== Ok(THIS_KIND)` it replaces.
+        let outcome = install_process_provider();
+        assert!(
+            outcome == Ok(THIS_KIND) || outcome == Err(ProviderError::AlreadyInstalled),
+            "install must yield this build's kind or report one already installed, got {outcome:?}"
+        );
+        // NOTHING IS ASSERTED HERE ABOUT WHICH CALLER WON, deliberately, and the
+        // reason is worth recording because an earlier revision of this very PR
+        // got it wrong. It carried
+        //
+        //     assert_eq!(provider_kind(), Some(THIS_KIND));
+        //
+        // under a comment claiming it proved "a losing install must not mutate
+        // the installed kind". It proved nothing. `provider_kind()` reads a
+        // `OnceLock<ProviderKind>` whose only ever-written value is the
+        // compile-time constant `THIS_KIND`, so the comparison cannot separate
+        // "the loser wrote it" from "the winner wrote it"; it detects only "no
+        // install happened", which the two lines below already detect. An
+        // independent reviewer confirmed it killed ZERO mutants: cargo-mutants
+        // output was byte-identical with and without the line.
+        //
+        // It existed because `test-census.sh` refused a net reduction in the
+        // `assert_eq!` count, so an assertion was written for a COUNTER rather
+        // than for a property. That is precisely the reward hack this gate
+        // exists to prevent, which is why it is called out here rather than
+        // quietly deleted.
+        //
+        // The property IS real and IS checkable, just not from this binary: it
+        // needs a FOREIGN provider installed first, so it lives in
+        // `tests/provider_losing_install_leaves_kind_none.rs`, its own process,
+        // exactly as THE RULE FOR FUTURE TESTS above prescribes.
         assert!(provider().is_some());
         assert_eq!(provider_kind(), Some(THIS_KIND));
         assert_eq!(fips_active(), cfg!(feature = "crypto-fips"));
