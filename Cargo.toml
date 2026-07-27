@@ -18,7 +18,11 @@ members = ["crates/irontraffic", "crates/irontraffic-config", "crates/irontraffi
 # The fuzz crates are intentionally not workspace members: cargo-fuzz projects
 # pin their own toolchain-sensitive edition and are built with `cargo fuzz`,
 # never `cargo build --workspace`.
-exclude = ["crates/irontraffic-router/fuzz", "crates/irontraffic-tls/fuzz"]
+exclude = [
+    "crates/irontraffic-config/fuzz",
+    "crates/irontraffic-router/fuzz",
+    "crates/irontraffic-tls/fuzz",
+]
 
 [workspace.package]
 version = "0.1.0"

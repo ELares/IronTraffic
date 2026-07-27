@@ -238,6 +238,51 @@ arrives on.
 **What is out of scope here.** Connection admission, rate limiting, and per-source limits are not
 this module's job; it creates the socket and reports what it applied.
 
+## Configuration loading and validation
+
+### Who can supply a document
+
+The operator, through a local path, and in practice a CI pipeline running `irontraffic validate`
+over a file from a pull request. Treat the bytes as untrusted even though the path is trusted.
+
+### What bounds the parse
+
+`irontraffic-config`'s `load` enforces three bounds before either parser sees the document, plus a
+fourth `serde_json` enforces on its own. A 1 MiB byte cap is enforced twice (a metadata check and a
+bounded read, so a growing file cannot slip past). A 64-token YAML alias budget defeats the
+billion-laughs expansion the byte cap cannot, by rejecting more than 64 `*` bytes before
+`serde_norway` ever sees the text. A separate 32-level YAML nesting-depth budget defeats a distinct,
+quadratic cost inside `serde_norway`'s own tokenizer: a flow collection (`[...]` or `{...}`) nested as
+the value of a block mapping key costs CPU quadratic in nesting depth while the tokenizer builds its
+event stream, before any value exists for `serde` to examine, and it does this with zero alias tokens
+involved. Measured directly against this crate: a 1 MiB document built entirely from nested `[` and
+`]` characters, with no aliases, cost 475 seconds of CPU before this guard existed. `serde_json` needs
+no guard of ours for the equivalent JSON shape: it enforces its own 128-level recursion limit while
+building the value, which genuinely bounds the cost of parsing rather than only bounding the outcome.
+
+`deny_unknown_fields` on `BootstrapDoc` is a validation-time control, not a parse-time bound, and an
+earlier version of this section listed it as one of the things that bounds the parse. That was false:
+`deny_unknown_fields` can only reject a document once the tokenizer has already produced a value for
+`serde` to examine, so it does nothing to limit the cost of getting there, and the quadratic nesting
+cost above is exactly the cost it does not limit. The paragraph is corrected here rather than left
+standing, because a threat model asserting a protection that is not there is worse than one that says
+nothing.
+
+### What bounds validation
+
+`validate` is pure: no filesystem, no network, no subprocess, no clock. Its only super-linear work is
+two duplicate scans that run after the listener count has been proved at most 64, so the whole
+function is bounded at a few thousand comparisons however large the document is. This is the property
+that makes it safe to expose from the admin API in a later milestone, and it is the correction to
+ingress-nginx rendering attacker-controlled input to a temp file and executing the proxy binary on it.
+
+### What is echoed back
+
+`validate --print` writes the resolved document to stdout verbatim. The M1 bootstrap document
+contains no secret, and any future field that does must be redacted by `Loaded::render_json` before
+it is added, not afterwards. An unrecognised argument is echoed to stderr through
+`sanitize_for_terminal`, so an argument carrying an ASCII escape or a newline cannot move an
+operator's cursor or forge a log line.
 ## Request deadlines
 
 **What is attacker-controlled.** Every inbound timeout signal `deadline::establish` reads is set
