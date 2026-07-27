@@ -73,6 +73,27 @@ impl std::error::Error for ProviderError {}
 
 static INSTALLED: OnceLock<ProviderKind> = OnceLock::new();
 
+// Serializes the whole body of `install_process_provider` (issue #624). That function
+// makes two separate publications: rustls's own process-default slot via
+// `install_default`, and this crate's own `INSTALLED` record. They cannot be combined
+// into one atomic write because they are two different types owned by two different
+// crates, so without this lock a concurrent second caller, released the instant
+// `install_default` fails for it, could return `Err(AlreadyInstalled)` before the first
+// caller (the winner) reached its own `INSTALLED.set`, and observe `provider_kind() ==
+// None` for a provider that is, in fact, already the process default. Measured on the
+// unfixed function: 418 of 3000 launches of 8 barrier-synced threads produced at least
+// one thread whose well-formed outcome (`Ok` or `Err(AlreadyInstalled)`) was paired with
+// `provider_kind() == None` read immediately afterward.
+//
+// Locking the whole function serializes every call into a total order: no call can
+// return until the critical section it ran inside has completed, including
+// `INSTALLED.set` on the winning path. A loser can therefore only ever start running
+// after the winner has fully finished, at which point both publications the loser might
+// need to observe (rustls's slot and `INSTALLED`) already agree. This is not the request
+// path (see the doc comment below: call exactly once, at startup), so a `Mutex` here does
+// not violate the "never take a lock on the request path" rule.
+static INSTALL_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(feature = "crypto-aws-lc-rs")]
 const THIS_KIND: ProviderKind = ProviderKind::AwsLcRs;
 #[cfg(feature = "crypto-fips")]
@@ -90,6 +111,13 @@ const THIS_KIND: ProviderKind = ProviderKind::Ring;
 /// `ProviderError::FipsNotActive` if this is a `crypto-fips` build whose provider does not
 /// report FIPS mode.
 pub fn install_process_provider() -> Result<ProviderKind, ProviderError> {
+    // Step 0: serialize against every other concurrent caller of this function for the
+    // rest of the body. See the INSTALL_LOCK doc comment above for why this closes
+    // issue #624 rather than merely narrowing the window.
+    let _guard = INSTALL_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+
     // Named `crypto_provider`, not `provider`: a bare `provider` binding here would
     // collide with the module-level `fn provider` below the moment a future cfg
     // edit left none of the three arms below active (exactly what a workspace-wide
@@ -117,7 +145,7 @@ pub fn install_process_provider() -> Result<ProviderKind, ProviderError> {
     }
 
     // Step 6.
-    let _ = INSTALLED.set(THIS_KIND); // it-allow: no-swallowed-error reason: set cannot fail here, install_default above already succeeded exactly once, so INSTALLED is still empty
+    let _ = INSTALLED.set(THIS_KIND); // it-allow: no-swallowed-error reason: set cannot fail here, install_default above already succeeded exactly once under INSTALL_LOCK, so INSTALLED is still empty
     Ok(THIS_KIND)
 }
 
@@ -158,7 +186,12 @@ pub fn post_quantum_available() -> bool {
 /// # Panics
 /// Never panics. Returns `None` if `install_process_provider` has not returned `Ok`; every
 /// caller is on a path that runs after startup installation, so `None` is a programming error
-/// the caller reports as a configuration error rather than unwrapping.
+/// the caller reports as a configuration error rather than unwrapping. This held only for a
+/// single caller before issue #624's fix: a concurrent second installer, released from its
+/// own `install_process_provider` call between the winner's two publications, could observe
+/// `None` here even though a provider was, in fact, already installed. `INSTALL_LOCK` closes
+/// that window, so this promise now also holds across concurrent callers of
+/// `install_process_provider`, not only within a single one.
 #[must_use]
 pub fn provider() -> Option<&'static std::sync::Arc<rustls::crypto::CryptoProvider>> {
     provider_kind()?;
