@@ -26,8 +26,11 @@
 
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use irontraffic_conn::bodybuf::{BufferPool, ByteSize};
+use irontraffic_conn::inflight::InflightGauge;
 use irontraffic_conn::{ConnBudget, FrameEvent};
 use std::hint::black_box;
+use std::thread;
+use std::time::Instant;
 
 /// A fixed rotation of frame events representative of ordinary multiplexed
 /// traffic: mostly `Ordinary` frames with an occasional `HeadersOpen`,
@@ -166,5 +169,66 @@ fn bench_buffer_lease(c: &mut Criterion) {
     contended_group.finish();
 }
 
-criterion_group!(benches, bench_frame_debit, bench_buffer_lease);
+/// `InflightGauge::admit` immediately followed by dropping the returned `StreamSlot`,
+/// single threaded.
+///
+/// Budget (reference runner, see the module doc above): under 25 nanoseconds per
+/// admit-release pair, two lock-prefixed operations (the CAS in `admit`, the `fetch_sub`
+/// in `Drop for StreamSlot`) on a cache line that stays Modified locally because nothing
+/// else touches this gauge between the two calls.
+fn bench_admit_release(c: &mut Criterion) {
+    let mut group = c.benchmark_group("bench_admit_release");
+    group.throughput(Throughput::Elements(1));
+
+    group.bench_function("single_threaded", |b| {
+        let gauge = InflightGauge::new(256);
+        b.iter(|| {
+            if let Ok(slot) = black_box(gauge.admit()) {
+                drop(black_box(slot));
+            }
+        });
+    });
+
+    // Contended two-thread variant, reported WITHOUT a gate: a contended figure on a
+    // shared CI runner is not a stable gate, only a data point. Expectation: 100 to 200
+    // cycles same-socket, because the gauge's cache line now bounces between the two
+    // threads' cores on every admit and every release instead of staying Modified
+    // locally the way the single-threaded variant above does.
+    group.bench_function("two_thread_contended", |b| {
+        let gauge = InflightGauge::new(256);
+        b.iter_custom(|iters| {
+            #[allow(
+                clippy::integer_division,
+                reason = "splitting the reported iteration count evenly between the two \
+                          contended threads below; at most one iteration is lost to \
+                          truncation, which is immaterial to a contended figure this \
+                          benchmark reports without a gate"
+            )]
+            let per_thread = iters / 2;
+            let start = Instant::now();
+            thread::scope(|scope| {
+                for _ in 0..2 {
+                    let gauge = &gauge;
+                    scope.spawn(move || {
+                        for _ in 0..per_thread {
+                            if let Ok(slot) = black_box(gauge.admit()) {
+                                drop(black_box(slot));
+                            }
+                        }
+                    });
+                }
+            });
+            start.elapsed()
+        });
+    });
+
+    group.finish();
+}
+
+criterion_group!(
+    benches,
+    bench_frame_debit,
+    bench_buffer_lease,
+    bench_admit_release
+);
 criterion_main!(benches);

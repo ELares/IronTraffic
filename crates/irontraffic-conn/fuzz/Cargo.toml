@@ -26,3 +26,10 @@ path = "fuzz_targets/fuzz_budget_events.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_inflight_sequences"
+path = "fuzz_targets/fuzz_inflight_sequences.rs"
+test = false
+doc = false
+bench = false

@@ -51,6 +51,7 @@ pub mod accept;
 pub mod bodybuf;
 pub mod budget;
 pub mod drain;
+pub mod inflight;
 pub mod listener;
 pub mod registry;
 
