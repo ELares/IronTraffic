@@ -3,6 +3,7 @@
 
 mod cli;
 mod logging;
+mod serve;
 
 /// Process entrypoint. Returns the process exit code: 0 for `--version`, `--help`,
 /// and a valid configuration; 1 for validation errors; 2 for a usage error; 3 when

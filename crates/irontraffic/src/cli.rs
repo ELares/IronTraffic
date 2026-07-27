@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
-//! The hand-written argument parser and the `irontraffic validate` mode.
+//! The hand-written argument parser and the `validate`, `run`, `proxy`, and `control`
+//! modes.
 //!
 //! Grammar, exactly:
 //!
@@ -8,6 +9,9 @@
 //! argv := "--version" | "-V"
 //!       | "--help" | "-h"
 //!       | "validate" flag*
+//!       | "run" flag*
+//!       | "proxy" flag*
+//!       | "control" flag*
 //! flag  := "--config" PATH
 //!       |  "--workers" UINT
 //!       |  "--bind" ADDR
@@ -16,16 +20,20 @@
 //!       |  "--print"
 //! ```
 //!
-//! `--config` is required for `validate`. A flag may appear at most once; a repeat is
+//! `run`, `proxy`, and `control` accept exactly the flags `validate` accepts, and
+//! `--config` is required for all four. A flag may appear at most once; a repeat is
 //! a usage error naming the flag. `--flag=value` is not supported and produces a usage
 //! error naming the space-separated form, because supporting both doubles the
 //! parser's cases for no benefit. An unknown flag is a usage error naming it. A
-//! missing value for a flag that takes one is a usage error naming the flag.
+//! missing value for a flag that takes one is a usage error naming the flag. `--print`
+//! is accepted by `run`, `proxy`, and `control` and silently ignored there: rejecting a
+//! harmless flag combination is a worse operator experience than ignoring it.
 //!
-//! Exit codes are a contract a CI pipeline branches on and never change meaning:
-//! 0 valid (warnings allowed), 1 validation errors, 2 usage error, 3 the
-//! configuration file could not be loaded. `run`, `proxy`, and `control` are added by
-//! a later issue; adding them here would mean shipping a mode that binds nothing.
+//! Exit codes are a contract a CI pipeline branches on and never change meaning: 0
+//! clean, 1 validation errors, 2 usage error, 3 the configuration file could not be
+//! loaded, 4 runtime or entropy initialisation failure, 5 bind failure, 6 shutdown left
+//! live connections. Codes 4 through 6 are produced only by `run`, `proxy`, and
+//! `control`, through [`crate::serve::run`]; `validate` never reaches them.
 
 use std::io::Write as _;
 use std::path::PathBuf;
@@ -41,22 +49,59 @@ enum Command {
     Help,
     /// Load and validate a configuration document.
     Validate(ValidateArgs),
+    /// Run everything: data plane plus control-plane runtime.
+    Run(ValidateArgs),
+    /// Run the data plane only.
+    Proxy(ValidateArgs),
+    /// Run the control plane only.
+    Control(ValidateArgs),
 }
 
-/// The parsed `validate` flags.
-struct ValidateArgs {
-    config: PathBuf,
-    workers: Option<usize>,
-    bind: Option<BindAddr>,
-    upstream: Option<UpstreamAddr>,
-    mode: Option<ModeSpec>,
-    print: bool,
+/// Which mode was requested. Threaded from [`Command`] into [`crate::serve::run`].
+///
+/// Re-exported from the library crate rather than redefined here: `irontraffic::Mode`
+/// has named these same four variants since the workspace skeleton, and is also used
+/// directly to decide which [`Command`] variant [`parse`] builds, so this is the
+/// single definition both this crate's binary target and its library target share. A
+/// second, parallel enum of the same four modes in this crate would drift from it,
+/// which is exactly the failure mode a later milestone (`dataplane-feature-build-gate`,
+/// #430) is about to gate builds on.
+///
+/// `pub(crate)` rather than re-exporting at `pub`, for the same reason as [`run`]:
+/// `cli` is a module of the binary crate root, which has no external consumer, so a
+/// wider visibility is unreachable and `clippy::unreachable_pub` refuses to compile
+/// it. The library's own `Mode` is `pub`, which is what satisfies the "Public API"
+/// section of `serve-and-smoke-test` (#21) literally.
+pub(crate) use irontraffic::Mode;
+
+/// The parsed `validate`, `run`, `proxy`, or `control` flags. Reused for all four
+/// commands rather than duplicated, per `serve-and-smoke-test` (#21): `run` ignores
+/// `print`.
+///
+/// `pub(crate)` and its fields likewise: [`crate::serve::run`] is a sibling module in
+/// this same binary crate and reads `config`, `workers`, `bind`, `upstream`, and
+/// `mode` to build the same [`irontraffic_config::Overrides`] [`run_validate`] builds.
+pub(crate) struct ValidateArgs {
+    /// The configuration file to load. Required for all four commands.
+    pub(crate) config: PathBuf,
+    /// Overrides `runtime.workers`.
+    pub(crate) workers: Option<usize>,
+    /// Overrides the first listener's `bind`.
+    pub(crate) bind: Option<BindAddr>,
+    /// Overrides `upstream.address`.
+    pub(crate) upstream: Option<UpstreamAddr>,
+    /// Overrides `runtime.mode`.
+    pub(crate) mode: Option<ModeSpec>,
+    /// `--print`. Meaningful to `validate` only; `run`, `proxy`, and `control` ignore it.
+    pub(crate) print: bool,
 }
 
 /// Parses `argv` and runs the requested command.
 ///
-/// Exit codes: 0 valid or informational, 1 validation errors, 2 usage error,
-/// 3 the configuration file could not be loaded.
+/// Exit codes: 0 valid or informational, 1 validation errors, 2 usage error, 3 the
+/// configuration file could not be loaded, 4 runtime or entropy initialisation
+/// failure, 5 bind failure, 6 shutdown left live connections. Codes 4 through 6 come
+/// from [`crate::serve::run`], which `run`, `proxy`, and `control` call into.
 ///
 /// `pub(crate)` rather than `pub`: `cli` is a module of the binary crate root
 /// (declared `mod cli;` in `main.rs`, per the issue that added it), which has no
@@ -84,6 +129,9 @@ pub(crate) fn run(argv: &[String]) -> ExitCode {
             ExitCode::SUCCESS
         }
         Ok(Command::Validate(validate_args)) => run_validate(&validate_args),
+        Ok(Command::Run(mode_args)) => crate::serve::run(Mode::Run, &mode_args),
+        Ok(Command::Proxy(mode_args)) => crate::serve::run(Mode::Proxy, &mode_args),
+        Ok(Command::Control(mode_args)) => crate::serve::run(Mode::Control, &mode_args),
     }
 }
 
@@ -157,15 +205,23 @@ fn parse(argv: &[String]) -> Result<Command, String> {
     }
 
     let Some((head, rest)) = argv.split_first() else {
-        return Err("missing command; expected \"validate\"".to_owned());
+        return Err(
+            "missing command; expected \"validate\", \"run\", \"proxy\", or \"control\"".to_owned(),
+        );
     };
 
-    if head != "validate" {
-        return Err(format!(
-            "unrecognised command \"{}\"; expected \"validate\", \"--version\", or \"--help\"",
+    // `Mode::parse` is the same lookup `CommandKind` used to perform locally: it
+    // validates the command word once, up front, so the match at the bottom of this
+    // function (which builds the `Command` this word selects) matches on a type
+    // `parse` already proved exhaustive, with nothing legitimate left for a wildcard
+    // arm to catch.
+    let kind = Mode::parse(head.as_str()).ok_or_else(|| {
+        format!(
+            "unrecognised command \"{}\"; expected \"validate\", \"run\", \"proxy\", \
+             \"control\", \"--version\", or \"--help\"",
             sanitize_for_terminal(head)
-        ));
-    }
+        )
+    })?;
 
     let mut config: Option<PathBuf> = None;
     let mut workers: Option<usize> = None;
@@ -267,16 +323,28 @@ fn parse(argv: &[String]) -> Result<Command, String> {
         index += 1;
     }
 
-    let config = config.ok_or_else(|| "\"--config\" is required for \"validate\"".to_owned())?;
+    let config = config.ok_or_else(|| {
+        format!(
+            "\"--config\" is required for \"{}\"",
+            sanitize_for_terminal(head)
+        )
+    })?;
 
-    Ok(Command::Validate(ValidateArgs {
+    let parsed_args = ValidateArgs {
         config,
         workers,
         bind,
         upstream,
         mode,
         print,
-    }))
+    };
+
+    Ok(match kind {
+        Mode::Validate => Command::Validate(parsed_args),
+        Mode::Run => Command::Run(parsed_args),
+        Mode::Proxy => Command::Proxy(parsed_args),
+        Mode::Control => Command::Control(parsed_args),
+    })
 }
 
 /// Writes the usage block.
@@ -292,7 +360,39 @@ pub(crate) fn print_usage(out: &mut dyn std::io::Write) -> std::io::Result<()> {
         out,
         "  irontraffic validate --config <path> [--workers N] [--bind ADDR] [--upstream ADDR] [--mode MODE] [--print]"
     )?;
-    writeln!(out, "flags for validate:")?;
+    writeln!(
+        out,
+        "  irontraffic run      --config <path> [--workers N] [--bind ADDR] [--upstream ADDR] [--mode MODE] [--print]"
+    )?;
+    writeln!(
+        out,
+        "  irontraffic proxy    --config <path> [--workers N] [--bind ADDR] [--upstream ADDR] [--mode MODE] [--print]"
+    )?;
+    writeln!(
+        out,
+        "  irontraffic control  --config <path> [--workers N] [--bind ADDR] [--upstream ADDR] [--mode MODE] [--print]"
+    )?;
+    writeln!(out, "modes:")?;
+    writeln!(
+        out,
+        "  validate   load, validate, report, and exit without binding anything"
+    )?;
+    writeln!(
+        out,
+        "  run        everything: data plane plus control-plane runtime (the default deployment)"
+    )?;
+    writeln!(
+        out,
+        "  proxy      data plane only; does not build the control-plane runtime"
+    )?;
+    writeln!(
+        out,
+        "  control    control plane only; has no work in this version and exits 0"
+    )?;
+    writeln!(
+        out,
+        "flags (accepted by validate, run, proxy, and control):"
+    )?;
     writeln!(
         out,
         "  --config <path>      configuration file to load (required)"
@@ -309,8 +409,17 @@ pub(crate) fn print_usage(out: &mut dyn std::io::Write) -> std::io::Result<()> {
     )?;
     writeln!(
         out,
-        "  --print              print the resolved document as JSON to stdout"
+        "  --print              print the resolved document as JSON to stdout; validate only, \
+         ignored by run, proxy, and control"
     )?;
+    writeln!(out, "exit codes:")?;
+    writeln!(out, "  0  clean")?;
+    writeln!(out, "  1  validation errors")?;
+    writeln!(out, "  2  usage error")?;
+    writeln!(out, "  3  the configuration file could not be loaded")?;
+    writeln!(out, "  4  runtime or entropy initialisation failure")?;
+    writeln!(out, "  5  bind failure")?;
+    writeln!(out, "  6  shutdown left live connections")?;
     Ok(())
 }
 

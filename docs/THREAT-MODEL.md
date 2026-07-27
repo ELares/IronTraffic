@@ -856,3 +856,46 @@ alone never expires anything. Being inside `trusted_cidrs` is not a reason to sk
 trusted network position is exactly what a compromised sidecar has. Second, a buffer bound: the
 driver's read buffer for this phase must not grow past 65551 bytes while `parse` says `Partial`,
 because at that point the bytes cannot be a valid header either.
+
+## The assembled proxy: what M1 defends and what it does not
+
+This is the summary an operator reads before deploying `run` or `proxy`. It is a list of plain
+statements about the assembled binary, not an argument; the sections above give the mechanism-level
+detail for each of the surfaces named here.
+
+**Defended, with the mechanism named:**
+
+- Connection floods: a hard `limits.max_connections` cap that closes the extra connection rather than
+  queuing it, plus a 1 ms pause per rejection so a flood at the cap cannot spin the accept loop.
+- Memory exhaustion by a slow reader: structural one-buffer-of-credit backpressure in the forwarding
+  loop, so an idle connection holds zero buffers.
+- Descriptor exhaustion: a startup clamp of `max_connections` to `(RLIMIT_NOFILE soft limit - 64) / 2`,
+  plus classified accept errors with a bounded, doubling backoff instead of a 100%-CPU spin.
+- Silent connections: `timeouts.idle_ms`, an idle deadline with no bytes in either direction.
+- Half-open connections: `timeouts.half_close_ms`, a deadline after one direction has closed.
+- Configuration denial of service: a 1 MiB document cap, a 64-token YAML alias budget, a 32-level YAML
+  flow-nesting budget, and a validator whose only super-linear work runs behind a 64-listener check.
+- Self-amplification: the validator's `upstream_is_own_listener` check refuses an upstream address that
+  is also one of this process's own listeners.
+- Unclean shutdown: a two-phase drain (`Draining` then `Closing`) with a configurable graceful deadline
+  and a killed-connection count reported at shutdown and in the exit code (6 when it is non-zero).
+
+**Not defended, each with the lever that exists today and the milestone that closes it:**
+
+- Per-source-IP connection limits do not exist, so one source can occupy the whole connection cap.
+  Today's levers are `limits.max_connections`, `timeouts.idle_ms`, and `timeouts.max_lifetime_ms`
+  (unset by default); closed by the rate-limiting milestone.
+- There is no accept-to-first-byte or header-read deadline, because there is no request framing to
+  define one against yet; closed by the HTTP milestone.
+- Nothing is inspected: no HTTP parsing, no routing, no forwarding headers, no request-framing
+  enforcement, so a request-smuggling payload is forwarded verbatim. Do not place this version where an
+  HTTP-aware security control is assumed to exist.
+- There is no TLS, so everything is plaintext on both sides.
+- A local process running as the same user can join our `SO_REUSEPORT` group and take a share of the
+  traffic, or use `SO_REUSEADDR` to bind a more specific address on the same port than ours and have the
+  kernel deliver matching connections to it instead (see "Listening sockets and socket options" above);
+  run as a dedicated, unshared user account.
+
+**Trust boundaries.** The configuration file and the environment are trusted (they are process
+identity, set by whoever operates the process). Every byte on every socket, in both directions, downstream
+and upstream, is not.

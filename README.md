@@ -55,6 +55,64 @@ The full analysis, with citations, is what the issue tracker is built from.
 
 See [ARCHITECTURE.md](ARCHITECTURE.md) for the reasoning and the crate graph.
 
+## Running the first milestone
+
+The first milestone (M1) forwards TCP bytes between a listener and a single configured
+upstream. `examples/minimal.yaml` is the smallest valid document:
+
+```yaml
+apiVersion: irontraffic.io/v1
+listeners:
+  - name: web
+    bind: "127.0.0.1:8080"
+upstream:
+  address: "127.0.0.1:9000"
+```
+
+Validate it first, which parses, checks, and exits without binding anything:
+
+```
+cargo run -p irontraffic -- validate --config examples/minimal.yaml
+```
+
+Then run it, against any listener already on port 9000:
+
+```
+cargo run -p irontraffic -- run --config examples/minimal.yaml
+```
+
+and confirm it forwards, from another terminal:
+
+```
+curl -v http://127.0.0.1:8080/
+```
+
+`proxy` runs the data plane alone, without the control-plane runtime; `control` has no
+work in this version and exits 0. See `irontraffic --help` for the full flag and exit
+code list.
+
+### What this version does not do
+
+M1 forwards bytes; it does not parse HTTP or any other wire protocol carried over the
+connection. Concretely, this version:
+
+- Does not parse HTTP/1.1, WebSocket upgrades, or any other protocol on the
+  connection: it is a transparent byte forwarder for whatever the two ends agree to
+  speak.
+- Does not route: one upstream, configured once, for every listener.
+- Does not add, remove, or rewrite any header, including `Forwarded` or
+  `X-Forwarded-*`.
+- Does not enforce request framing of any kind. A request-smuggling payload is
+  therefore forwarded verbatim, because there is no HTTP layer here to have an
+  opinion about it: do not place this version where an HTTP-aware security control
+  is assumed to exist.
+- Has no TLS: every byte, on both sides, is plaintext.
+- Has no per-source-IP connection limit, so one source can occupy the whole
+  connection cap (`limits.max_connections`).
+
+See [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md) for the full account of what this
+version defends against and what it does not, mechanism by mechanism.
+
 ## Promises
 
 [COVENANTS.md](COVENANTS.md) is a set of falsifiable commitments: no paywalled security, no feature
