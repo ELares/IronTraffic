@@ -41,6 +41,37 @@ run_census() {
   ( cd "$1" && BASE_REF=HEAD bash "$CENSUS" 2>&1 || true )
 }
 
+# run_census_with_pr <dir> <pr_body> -- runs the real script as if invoked
+# from a pull request whose body is exactly <pr_body>, WITHOUT any real
+# network or GitHub API access: a fake `gh` shadowing the real one on PATH
+# answers the one call scripts/test-census.sh makes (`gh api
+# repos/<repo>/pulls/<n>`) by echoing <pr_body> back, and `gh repo view` with
+# a fixed fake slug. This keeps the selftest fully offline and deterministic,
+# the same property every other corpus in this file already has; it does not
+# depend on this repository, this PR, or any real GitHub state.
+run_census_with_pr() {
+  local dir="$1" body="$2"
+  local fakebin="$WORK/fakebin"
+  mkdir -p "$fakebin"
+  printf '%s' "$body" > "$WORK/pr-body.txt"
+  cat > "$fakebin/gh" <<FAKEGH
+#!/usr/bin/env bash
+if [ "\$1" = "repo" ] && [ "\$2" = "view" ]; then
+  echo "test-org/test-repo"
+  exit 0
+fi
+if [ "\$1" = "api" ]; then
+  cat "$WORK/pr-body.txt"
+  exit 0
+fi
+echo "fake gh: unhandled args: \$*" >&2
+exit 1
+FAKEGH
+  chmod +x "$fakebin/gh"
+  ( cd "$dir" && PATH="$fakebin:$PATH" PR_NUMBER=1 GITHUB_REPOSITORY=test-org/test-repo \
+      BASE_REF=HEAD bash "$CENSUS" 2>&1 || true )
+}
+
 BASE_LIB='//! Base revision: one attributed test with a real assertion.
 pub fn add(a: u8, b: u8) -> u8 { a + b }
 
@@ -295,6 +326,146 @@ if printf '%s\n' "$OUT7C" | grep -qF 'ignored.rs'; then
   FAILED=1
 else
   note "the gitignored file is never named, even in a failing run"
+fi
+
+# ---------------------------------------------------------------------------
+# 8. test-census-allow (issue #589): the FAIL messages for both rules have
+#    always told a reviewer to write this line in the pull request body; nothing
+#    ever read it back until this. Proven in four directions: a matching path
+#    allowance clears rule 2, a matching name allowance clears rule 1
+#    independently of rule 2, a non-matching allowance still fails, and no
+#    PR_NUMBER at all (a push event) behaves exactly as if the feature did not
+#    exist, because "could not check the body" must never read as "everything
+#    is allowed".
+# ---------------------------------------------------------------------------
+D8="$WORK/census-allow"
+base_commit "$D8" '//! Base revision: one file with a real assertion.
+pub fn add(a: u8, b: u8) -> u8 { a + b }
+
+#[cfg(test)]
+mod tests {
+    use super::add;
+
+    #[test]
+    fn adds_two_numbers() {
+        assert_eq!(add(2, 3), 5);
+        assert_eq!(add(0, 0), 0);
+    }
+}
+'
+# head: drop one assertion from the same file, with no PR context at all.
+cat > "$D8/src/lib.rs" <<'RS'
+//! Head revision: one assertion removed from the surviving test.
+pub fn add(a: u8, b: u8) -> u8 { a + b }
+
+#[cfg(test)]
+mod tests {
+    use super::add;
+
+    #[test]
+    fn adds_two_numbers() {
+        assert_eq!(add(2, 3), 5);
+    }
+}
+RS
+
+echo "== test-census-allow, stage 1: no PR_NUMBER at all must still fail =="
+OUT8A="$(run_census "$D8")"
+if printf '%s\n' "$OUT8A" | grep -q '^FAIL \[assertions-weakened\]$'; then
+  note "with no PR context, a real weakening still fails"
+else
+  echo "FAIL: a genuine weakening passed with no PR_NUMBER set. Got:"
+  echo "$OUT8A" | sed 's/^/    /'
+  FAILED=1
+fi
+
+echo "== test-census-allow, stage 2: a non-matching allow line must still fail =="
+OUT8B="$(run_census_with_pr "$D8" 'test-census-allow: src/unrelated.rs reason: does not name the file that actually changed')"
+if printf '%s\n' "$OUT8B" | grep -q '^FAIL \[assertions-weakened\]$'; then
+  note "a non-matching allow line does not excuse a real weakening"
+else
+  echo "FAIL: a non-matching allow line excused a weakening it does not name. Got:"
+  echo "$OUT8B" | sed 's/^/    /'
+  FAILED=1
+fi
+
+echo "== test-census-allow, stage 3: a matching PATH allow line clears rule 2 =="
+OUT8C="$(run_census_with_pr "$D8" 'test-census-allow: src/lib.rs reason: intentionally trimmed a redundant assertion in this selftest fixture')"
+if printf '%s\n' "$OUT8C" | grep -q '^FAIL \[assertions-weakened\]$'; then
+  echo "FAIL: a matching test-census-allow path line did not clear the weakening. Got:"
+  echo "$OUT8C" | sed 's/^/    /'
+  FAILED=1
+elif ! printf '%s\n' "$OUT8C" | grep -qF 'test-census-allow honored'; then
+  echo "FAIL: the census passed but never said the allowance was honored. Got:"
+  echo "$OUT8C" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a matching path allow line clears assertions-weakened and says so"
+fi
+
+# A genuine test REMOVAL (not a same-file edit), to prove rule 1's own
+# allow-by-name is independent of rule 2's allow-by-path: naming only the
+# test must not also silence a real per-file assertion drop.
+D8B="$WORK/census-allow-removed"
+base_commit "$D8B" '//! Base revision: two tests.
+pub fn add(a: u8, b: u8) -> u8 { a + b }
+
+#[cfg(test)]
+mod tests {
+    use super::add;
+
+    #[test]
+    fn removed_test() {
+        assert_eq!(add(1, 1), 2);
+        assert_eq!(add(2, 2), 4);
+    }
+
+    #[test]
+    fn surviving_test() {
+        assert_eq!(add(0, 0), 0);
+    }
+}
+'
+cat > "$D8B/src/lib.rs" <<'RS'
+//! Head revision: removed_test is gone entirely, taking its assertions with it.
+pub fn add(a: u8, b: u8) -> u8 { a + b }
+
+#[cfg(test)]
+mod tests {
+    use super::add;
+
+    #[test]
+    fn surviving_test() {
+        assert_eq!(add(0, 0), 0);
+    }
+}
+RS
+
+echo "== test-census-allow, stage 4: naming only the TEST does not also excuse the file's own drop =="
+OUT8D="$(run_census_with_pr "$D8B" 'test-census-allow: removed_test reason: superseded, but this line does not mention the path')"
+if printf '%s\n' "$OUT8D" | grep -q '^FAIL \[test-removed\]$'; then
+  echo "FAIL: naming the removed test by name did not clear rule 1. Got:"
+  echo "$OUT8D" | sed 's/^/    /'
+  FAILED=1
+fi
+if ! printf '%s\n' "$OUT8D" | grep -q '^FAIL \[assertions-weakened\]$'; then
+  echo "FAIL: rule 1's name-only allowance incorrectly also silenced rule 2's" \
+       "independent per-file check. Got:"
+  echo "$OUT8D" | sed 's/^/    /'
+  FAILED=1
+else
+  note "an allow line naming only the test clears rule 1 but rule 2 still fires independently"
+fi
+
+echo "== test-census-allow, stage 5: naming BOTH the test and the path clears both rules =="
+OUT8E="$(run_census_with_pr "$D8B" 'test-census-allow: removed_test reason: superseded by a stronger test elsewhere
+test-census-allow: src/lib.rs reason: the removed test'"'"'s assertions went with it, reviewed and accepted')"
+if printf '%s\n' "$OUT8E" | grep -qE '^FAIL \['; then
+  echo "FAIL: naming both the test and the path still left a rule failing. Got:"
+  echo "$OUT8E" | sed 's/^/    /'
+  FAILED=1
+else
+  note "naming both the test and the path clears both rules"
 fi
 
 echo
