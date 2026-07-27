@@ -65,3 +65,16 @@ path = "fuzz_targets/fuzz_chunked.rs"
 test = false
 doc = false
 bench = false
+
+# fuzz_path.rs existed in fuzz_targets/ since #29/#512 with NO entry here, which
+# meant it had never been fuzzed once. `cargo fuzz list` enumerates `[[bin]]`
+# stanzas, not files on disk, so the target was invisible to the runner while
+# looking present to any reader of the directory. The surface it covers is
+# `NormalizedPath::parse_into`, which is the CVE-2025-66490 encoded-dot path, so
+# this was the highest risk parser in the crate going unfuzzed. See #699, and the
+# fifth fail-closed check added to the fuzz lane in the same PR that makes an
+# unregistered target file a red build rather than a silent omission.
+[[bin]]
+name = "fuzz_path"
+path = "fuzz_targets/fuzz_path.rs"
+test = false
