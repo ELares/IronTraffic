@@ -53,6 +53,7 @@ pub mod budget;
 pub mod drain;
 pub mod inflight;
 pub mod listener;
+pub mod proxyproto;
 pub mod registry;
 pub mod settings;
 

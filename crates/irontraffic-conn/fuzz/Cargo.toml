@@ -33,3 +33,10 @@ path = "fuzz_targets/fuzz_inflight_sequences.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_proxyproto"
+path = "fuzz_targets/fuzz_proxyproto.rs"
+test = false
+doc = false
+bench = false

@@ -522,3 +522,53 @@ milestones respectively. Do not describe M1 as slowloris-resistant.
 `EAGAIN` retry immediately; anything else stops that one shard loudly. Without the classification,
 descriptor exhaustion is a 100% CPU spin that serves nothing, which is a denial of service an
 attacker reaches by opening connections.
+
+## PROXY protocol
+
+**A PROXY protocol header declares a client identity, so it is a trust plane, not merely a
+parser.** `ProxyHeader::parse` (`proxy-protocol-parser`, #43) turns the first bytes of a connection
+into a claimed source and destination address pair. Trusting that claim from the wrong sender lets
+an attacker impersonate any client, including one that would otherwise be refused by an IP
+allowlist.
+
+**Read ONLY on a listener explicitly configured for it, and ONLY after the socket-level check.**
+`ProxyHeader::parse` is called only when the listener's `trusted_cidrs` is non-empty, and only
+after the connection driver has checked the socket's peer address against that list. The parser
+itself takes no address and no `trusted_cidrs` parameter: it cannot make the trust decision, and
+its signature is written so that omission cannot be mistaken for something it does. If the socket
+peer is not in `trusted_cidrs`, the connection is closed before a single header byte is parsed.
+
+**No sniffing, no fallback to raw HTTP.** The PROXY protocol specification requires a receiver to
+be configured for exactly one of "PROXY protocol present" or "PROXY protocol absent" and forbids
+guessing. If the first bytes are not a valid v1 or v2 header, the connection is closed with no
+response, never re-interpreted as an HTTP request. A receiver that sniffs lets an attacker who can
+merely reach the listener choose whether to be treated as a trusted proxy.
+
+**The bounds are 107 bytes for v1 and 65551 bytes for v2, with zero allocation.** A v1 line is
+refused, never parsed, past 107 bytes including its terminating CRLF. A v2 header's fixed part
+plus its declared length is at most 16 + 65535 = 65551 bytes. Neither bound is enforced by
+allocating a buffer of that size: `parse` returns `Partial` until the bytes the caller already
+holds are enough, and reads nothing past what has arrived, so a v2 header declaring the maximum
+65535-byte length while only a handful of bytes have actually arrived costs nothing beyond a
+length comparison.
+
+**TLVs are walked and discarded, never interpreted.** A v2 header's trailing TLV list is scanned
+only far enough to confirm every entry's declared length fits inside the header's own declared
+length; no TLV type is read for meaning anywhere in this parser. Interpreting a TLV (the AWS VPC
+endpoint TLV, the SSL TLV, the authority TLV) is out of scope until a future issue does so
+deliberately.
+
+**A header from a trusted sender may claim any address, including loopback and an address inside
+`trusted_cidrs` itself.** This parser has no opinion about what a trusted sender is allowed to
+claim: the socket-level `trusted_cidrs` check already established the sender as trusted, and a
+trusted sender is trusted to say who its client was. Refusing a loopback or in-network claim here
+would break every sidecar deployment, where the immediate TCP peer legitimately is loopback.
+
+**Two caller obligations this parser cannot enforce itself.** First, a deadline: the connection
+driver MUST apply `accept_to_first_byte` to the first byte and `header_read_timeout` (10 s) to the
+completion of the header, closing the connection on expiry, because a peer that declares 65535
+bytes and sends one byte per minute would otherwise hold a connection indefinitely, and `Partial`
+alone never expires anything. Being inside `trusted_cidrs` is not a reason to skip this deadline: a
+trusted network position is exactly what a compromised sidecar has. Second, a buffer bound: the
+driver's read buffer for this phase must not grow past 65551 bytes while `parse` says `Partial`,
+because at that point the bytes cannot be a valid header either.

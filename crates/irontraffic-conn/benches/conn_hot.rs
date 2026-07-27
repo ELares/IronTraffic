@@ -27,6 +27,7 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use irontraffic_conn::bodybuf::{BufferPool, ByteSize};
 use irontraffic_conn::inflight::InflightGauge;
+use irontraffic_conn::proxyproto::ProxyHeader;
 use irontraffic_conn::{ConnBudget, FrameEvent};
 use std::hint::black_box;
 use std::thread;
@@ -225,10 +226,27 @@ fn bench_admit_release(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(
-    benches,
-    bench_frame_debit,
-    bench_buffer_lease,
-    bench_admit_release
-);
+
+fn bench_proxyproto_parse(c: &mut Criterion) {
+    let v1_line = b"PROXY TCP4 1.2.3.4 5.6.7.8 1 2\r\n".to_vec();
+    let v2_no_tlv = v2_ipv4_header(0);
+    let v2_1kib_tlv = v2_ipv4_header(ONE_KIB_OF_TLVS);
+
+    let mut group = c.benchmark_group("bench_proxyproto_parse");
+    group.throughput(Throughput::Elements(1));
+
+    group.bench_function("v1_tcp4", |b| {
+        b.iter(|| black_box(ProxyHeader::parse(black_box(&v1_line))));
+    });
+    group.bench_function("v2_no_tlv", |b| {
+        b.iter(|| black_box(ProxyHeader::parse(black_box(&v2_no_tlv))));
+    });
+    group.bench_function("v2_1kib_tlv", |b| {
+        b.iter(|| black_box(ProxyHeader::parse(black_box(&v2_1kib_tlv))));
+    });
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_frame_debit, bench_buffer_lease, bench_admit_release, bench_proxyproto_parse);
 criterion_main!(benches);
