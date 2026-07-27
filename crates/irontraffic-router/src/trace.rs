@@ -24,10 +24,16 @@
 //! [`NoTrace`] is a zero sized type, every method body is empty, and every
 //! method is `#[inline(always)]`, so monomorphization erases the sink
 //! entirely: `match_request::<NoTrace>` compiles to the same machine code as a
-//! version of the function with no trace parameter at all. That identity is a
-//! CI check added by `match-request-core` (#60), because it needs
-//! `match_request` to exist; this module's obligation is only to make that
-//! check achievable, which is why every method below takes only `Copy` scalar
+//! version of the function with no trace parameter at all.
+//!
+//! THAT IDENTITY IS NOT CHECKED ANYWHERE TODAY, and this comment used to say it
+//! was. `match-request-core` (#60) is open, `match_request` does not exist yet,
+//! and #60 explicitly DEFERS the instruction-count proof ("deferred to the
+//! milestone-7 benchmark harness issue"); its `## Files` table contains no path
+//! under `.github/` or `scripts/`, so it could not add the check even when it
+//! lands. The owner is #423, open, milestone M17. `git grep -ri gungraun`
+//! returns nothing. This module's obligation is only to make the check
+//! ACHIEVABLE, which is why every method below takes only `Copy` scalar
 //! arguments and nothing borrowed. A method that took a `&[u8]` or built a
 //! struct would leave a trace of itself in the optimized code even with an
 //! empty body, because computing the argument is work the caller would still
@@ -367,9 +373,11 @@ mod tests {
     use crate::ids::{GroupId, NodeId, RouteId};
     use crate::precedence::{PathKind, Precedence};
 
-    /// Touches every `RouteTrace` method once, generic over the sink. Used
-    /// both to prove `NoTrace` satisfies the trait and, in
-    /// `notrace_is_zero_sized` above, as the body of a tight loop.
+    /// Touches every `RouteTrace` method once, generic over the sink, which is
+    /// what proves `NoTrace` satisfies the trait through the generic bound.
+    /// `notrace_is_zero_sized` calls it once; there is no tight loop here, and
+    /// this comment claimed one because it was written for a wall-clock test
+    /// that has since been deleted (#650).
     fn touch_all<T: RouteTrace>(trace: &mut T) {
         trace.on_host(GroupId(1), 0xdead_beef);
         trace.on_group(GroupId(2));
