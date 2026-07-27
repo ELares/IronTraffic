@@ -9,7 +9,12 @@
 //! `pub mod` lines here; this issue creates only the wheel.
 
 pub mod bitmap;
+pub mod schedule;
 pub mod wheel;
 
 pub use bitmap::{ClusterHealth, EndpointHealth, HealthBitmap};
+pub use schedule::{
+    CheckOutcome, EndpointSchedule, FailKind, HealthCheckConfig, IntervalState, Transition,
+    phase_ms,
+};
 pub use wheel::TimerWheel;
