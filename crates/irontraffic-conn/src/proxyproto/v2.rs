@@ -313,6 +313,28 @@ mod tests {
                     consumed: 16,
                 },
             ),
+            // Not one of the issue's 40 numbered edge cases; added during PR review of issue
+            // #43 because edge 24 above is the only LOCAL row in this table and it uses an
+            // EMPTY address block (family AF_UNSPEC, length 0), so there is nothing there
+            // for `is_local`'s early return to actually ignore. That leaves the trust plane
+            // rule genuinely untested: LOCAL means the connection is not proxied, so a bug
+            // that let a populated address block leak through when the command is LOCAL
+            // would attribute a real address to what the sender declared a health check with
+            // no client at all, and edge 24 alone cannot catch it. This row is a LOCAL
+            // command (0x20) carrying a full, well formed IPv4 PROXY-shaped address block
+            // (the same bytes edge 25 below uses for a REAL claim) and asserts it is still
+            // reported `Unspec`: the address block must be ignored, not merely absent.
+            // Verified by hand: temporarily narrowing the early return to
+            // `if is_local && required == 0` (so LOCAL only short circuits when there is no
+            // address family at all) turns this exact row from `Unspec` into
+            // `Tcp { src: 1.2.3.4:1, dst: 5.6.7.8:2 }`, and reverting restores it.
+            (
+                header(0x20, 0x11, 12, &ipv4_addr_block),
+                Expected::Complete {
+                    addrs: ExpectedAddrs::Unspec,
+                    consumed: 28,
+                },
+            ),
             // Edge 25: PROXY, family 0x11 (TCP/IPv4), length 12.
             (
                 header(0x21, 0x11, 12, &ipv4_addr_block),
@@ -551,6 +573,49 @@ mod tests {
         rest34.extend_from_slice(&[0x01, 0x00]);
         let buf34 = header(0x21, 0x11, 14, &rest34);
         assert_eq!(super::parse(&buf34), Err(ProxyError::V2BadTlv));
+
+        // Not one of the issue's 40 numbered edge cases; added during PR review of issue #43
+        // because edges 32 through 34 above each use a SINGLE TLV, so none of them can tell
+        // `walk_tlvs`'s per-iteration `region.get(offset..)` (the true remaining bytes after
+        // everything already walked) apart from a hypothetical mutant that instead compares
+        // every TLV's declared length against the WHOLE region regardless of `offset`: at
+        // `offset == 0`, on the very first TLV, the two are the same slice, so a single-TLV
+        // case can never distinguish them. This case walks a WELL-FORMED first TLV (4 bytes:
+        // type, a 2-byte length of 1, and 1 value byte) followed by a second TLV whose header
+        // declares a 4-byte value (needing 7 more bytes total) while only 6 bytes actually
+        // remain in the region after the first TLV, though the region's OVERALL size (10
+        // bytes) is still large enough that a whole-region-relative check would wrongly wave
+        // it through. The correct parser must refuse this as `V2BadTlv`. Verified by hand:
+        // temporarily changing `walk_tlvs`'s `remaining` binding from
+        // `region.get(offset..).ok_or(ProxyError::V2BadTlv)?` to `Ok::<_, ProxyError>(region)?`
+        // (always the full region, ignoring how much has already been walked) turns this
+        // exact case from `Err(V2BadTlv)` into `Ok(3)` (it re-reads the first TLV's own
+        // length bytes on every later iteration and happily advances past the second TLV's
+        // truncated value), and reverting restores it.
+        let mut rest_multi_tlv = ipv4_addr_block.to_vec();
+        // TLV 1: type 0x01, length 1, one value byte. 4 bytes total.
+        rest_multi_tlv.extend_from_slice(&[0x01, 0x00, 0x01, 0x99]);
+        // TLV 2: type 0x02, DECLARED length 4 (needs 3 + 4 = 7 more bytes), but only 3 value
+        // bytes actually follow (6 bytes total for this TLV's header plus partial value),
+        // one short of the 7 the declaration demands.
+        rest_multi_tlv.extend_from_slice(&[0x02, 0x00, 0x04, 0xAA, 0xBB, 0xCC]);
+        assert_eq!(rest_multi_tlv.len(), 12 + 4 + 6);
+        let declared_len_multi_tlv = u16::try_from(rest_multi_tlv.len()).expect("fits in u16");
+        let buf_multi_tlv = header(0x21, 0x11, declared_len_multi_tlv, &rest_multi_tlv);
+        assert_eq!(
+            super::parse(&buf_multi_tlv),
+            Err(ProxyError::V2BadTlv),
+            "a second TLV's declared length exceeding the TRUE remaining bytes (not merely \
+             the whole region's size) must be refused"
+        );
+        // Same case, calling `walk_tlvs` directly over just the TLV region, the same
+        // precision `tlv_walk_bounds`'s edge 35 assertion below uses.
+        let tlv_start_multi = FIXED_HEADER_LEN + 12;
+        let tlv_end_multi = FIXED_HEADER_LEN + rest_multi_tlv.len();
+        assert_eq!(
+            walk_tlvs(&buf_multi_tlv, tlv_start_multi, tlv_end_multi),
+            Err(ProxyError::V2BadTlv)
+        );
 
         // Edge 35: length 65535, all 65551 bytes present, filled with well-formed
         // zero-value TLVs (3 bytes each: type, then a 2-byte length of 0). The walk is

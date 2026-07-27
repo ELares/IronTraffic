@@ -483,4 +483,37 @@ mod tests {
         assert!(!line_108.contains(&b'\n'));
         assert_eq!(super::parse(&line_108), Err(ProxyError::V1LineTooLong));
     }
+
+    /// Not one of the issue's 40 numbered edge cases; added during PR review of issue #43
+    /// because the 107-byte scan window itself, the only thing refusing an over-long v1
+    /// line, had no test that put a real CRLF just past it. `line_length_boundary`'s
+    /// 108-byte case above contains no `\r` or `\n` anywhere, so it cannot distinguish
+    /// `find_crlf` being correctly bounded to `buf[..107]` from a hypothetical mutant that
+    /// searched the whole, unbounded `buf`: both would find nothing and agree on
+    /// `V1LineTooLong`. This test puts a well-formed CRLF at bytes 106 and 107 (0 indexed),
+    /// one byte past the last position `find_crlf` may ever inspect for a complete `\r\n`
+    /// pair inside a 107-byte scan (the last such pair starts at index 105), in an otherwise
+    /// valid-looking `UNKNOWN` line. The correct parser must still refuse it as
+    /// `V1LineTooLong`: accepting it would mean a 108-byte "header" slipped past the
+    /// specification's 107-byte maximum, which is the one bound the threat model advertises
+    /// for v1. Verified by hand: temporarily widening the scan to the whole buffer (`let
+    /// scan = buf;` instead of the `buf.get(..scan_len)` bound) turns this exact case from
+    /// `Err(V1LineTooLong)` into `Ok(Complete)` with `consumed == 108`, and reverting
+    /// restores it.
+    #[test]
+    fn scan_window_ignores_crlf_past_bound() {
+        let mut buf = b"PROXY UNKNOWN ".to_vec();
+        while buf.len() < 106 {
+            buf.push(b'x');
+        }
+        buf.truncate(106);
+        buf.extend_from_slice(b"\r\n");
+        assert_eq!(buf.len(), 108);
+        // The trap CRLF sits at the very end, one byte past the 107-byte scan window; there
+        // is no other CR or LF anywhere earlier in the buffer.
+        assert_eq!(&buf[106..108], b"\r\n");
+        assert!(!buf[..106].contains(&b'\r'));
+        assert!(!buf[..106].contains(&b'\n'));
+        assert_eq!(super::parse(&buf), Err(ProxyError::V1LineTooLong));
+    }
 }
