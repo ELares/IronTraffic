@@ -30,8 +30,20 @@
 //! directions on one connection: if the two directions disagreed about how
 //! `content-length` or `transfer-encoding` are parsed, the disagreement
 //! itself would be the smuggling primitive, even with both directions
-//! individually "correct". Sharing the parsers is what makes that
-//! disagreement structurally impossible rather than merely untested.
+//! individually "correct". Sharing the parsers rules out the two directions
+//! independently reimplementing, and subtly diverging in, the parsing rules
+//! themselves.
+//!
+//! Sharing the parser functions does NOT by itself make a call site pass
+//! them the same complete input on both sides: a call site that read only
+//! the first `transfer-encoding` field line and handed it, alone, to
+//! [`crate::framing::tokenize_transfer_encoding`] would still be calling
+//! the identical, unmodified, shared function, and would still be wrong.
+//! That is a per call site property, not a property of the parser being
+//! shared, and it is pinned by tests rather than made structurally
+//! impossible: see `multi_line_transfer_encoding_reaches_tokenizer` and the
+//! extended `prop_response_framing_total` below, and the request side
+//! equivalent in `framing.rs`.
 //!
 //! **Enforcement.** This function, [`crate::framing::resolve_request_framing`]
 //! and the egress serializer are the only places in the codebase permitted
@@ -496,6 +508,115 @@ mod tests {
         );
     }
 
+    #[test]
+    fn multi_line_transfer_encoding_reaches_tokenizer() {
+        // #619: the response-side twin of #580 (confirmed on the request
+        // side, against merged code). Nothing previously drove more than
+        // one `transfer-encoding` field line through
+        // `resolve_response_framing`, so the multi-line list join at the
+        // call site (`fields.get_all_known(KnownHeader::TransferEncoding)`
+        // threaded whole into `tokenize_transfer_encoding`) was unverified.
+        // Inserting `.take(1)` there turns both cases below from an `Err`
+        // into `Ok(ResponseFraming::Streamed)`, because only the first
+        // field line (`chunked`) would ever be inspected.
+        assert_eq!(
+            resolve(
+                &[
+                    (b"transfer-encoding", b"chunked"),
+                    (b"transfer-encoding", b"chunked"),
+                ],
+                200,
+                Method::Get,
+                WireVersion::Http11
+            ),
+            Err(RejectReason::TransferEncodingChunkedRepeated)
+        );
+        assert_eq!(
+            resolve(
+                &[
+                    (b"transfer-encoding", b"chunked"),
+                    (b"transfer-encoding", b"identity"),
+                ],
+                200,
+                Method::Get,
+                WireVersion::Http11
+            ),
+            Err(RejectReason::TransferEncodingFinalNotChunked)
+        );
+    }
+
+    #[test]
+    fn malformed_content_length_is_rejected_http11() {
+        // #620: `resolve_response_framing`'s own doc promises
+        // `ContentLengthInvalid` and `ContentLengthOverflow`, but nothing
+        // asserted either on the response side. Changing `declared_len`'s
+        // `Some(v) => Ok(Some(parse_content_length(trim_ows(v))?))` arm to
+        // fall back to `Ok(Some(0))` on a parse error turns every case
+        // below into `Ok(ResponseFraming::Empty)`, which is a
+        // response-splitting primitive: an `Empty` response with no
+        // `forbids_reuse` leaves the connection poolable underneath the
+        // origin's real, undeclared body bytes. This exercises the step 7
+        // path (HTTP/1.1); `malformed_content_length_is_rejected_h2` below
+        // exercises the step 5b path.
+        for bad in ["abc", "+5", ""] {
+            assert_eq!(
+                resolve(
+                    &[(b"content-length", bad.as_bytes())],
+                    200,
+                    Method::Get,
+                    WireVersion::Http11
+                ),
+                Err(RejectReason::ContentLengthInvalid),
+                "{bad:?}"
+            );
+        }
+        let mut too_many_digits = [b'0'; 21];
+        if let Some(last) = too_many_digits.last_mut() {
+            *last = b'5';
+        }
+        assert_eq!(
+            resolve(
+                &[(b"content-length", &too_many_digits)],
+                200,
+                Method::Get,
+                WireVersion::Http11
+            ),
+            Err(RejectReason::ContentLengthOverflow)
+        );
+    }
+
+    #[test]
+    fn malformed_content_length_is_rejected_h2() {
+        // #620, the step 5b (multiplexed) path through `declared_len`. See
+        // `malformed_content_length_is_rejected_http11` for the step 7
+        // path and the reproduction this pins.
+        for bad in ["abc", "+5", ""] {
+            assert_eq!(
+                resolve(
+                    &[(b"content-length", bad.as_bytes())],
+                    200,
+                    Method::Get,
+                    WireVersion::H2
+                ),
+                Err(RejectReason::ContentLengthInvalid),
+                "{bad:?}"
+            );
+        }
+        let mut too_many_digits = [b'0'; 21];
+        if let Some(last) = too_many_digits.last_mut() {
+            *last = b'5';
+        }
+        assert_eq!(
+            resolve(
+                &[(b"content-length", &too_many_digits)],
+                200,
+                Method::Get,
+                WireVersion::H2
+            ),
+            Err(RejectReason::ContentLengthOverflow)
+        );
+    }
+
     proptest::proptest! {
         #[test]
         fn prop_response_framing_total(
@@ -535,6 +656,45 @@ mod tests {
                 assert!(cl_values.is_empty(), "UntilClose with a content-length present");
                 assert!(te_values.is_empty(), "UntilClose with a transfer-encoding present");
                 assert!(!version.is_multiplexed(), "UntilClose on a multiplexed protocol");
+            }
+
+            // #619: a non-empty transfer-encoding list whose combined final
+            // token (the last comma-split, OWS-trimmed token across every
+            // field line, in arrival order) is not `chunked` must never
+            // resolve `Ok`. The property test already drew 0..=2
+            // transfer-encoding values, but its only assertion fired on
+            // `Ok(UntilClose)`, so a truncated-iterator bug (only the first
+            // field line reaching the tokenizer) was invisible: it turns
+            // this exact case into `Ok(Streamed)`. The bodyless-by-status
+            // and bodyless-by-method shortcuts (steps 3 and 4) are the only
+            // paths that can legitimately return `Ok` while ignoring a bad
+            // transfer-encoding list, because they skip field inspection
+            // entirely; every other reachable path either rejects outright
+            // (duplicate content-length, transfer-encoding with
+            // content-length, a multiplexed protocol, HTTP/1.0) or actually
+            // tokenizes the full combined list, so it is excluded below.
+            if !te_values.is_empty() {
+                let mut final_token: Option<&[u8]> = None;
+                for v in &te_values {
+                    for raw in v.as_bytes().split(|&b| b == b',') {
+                        final_token = Some(trim_ows(raw));
+                    }
+                }
+                let final_is_chunked =
+                    final_token.is_some_and(|t| t.eq_ignore_ascii_case(b"chunked"));
+                let is_bodyless = status.is_interim()
+                    || status.as_u16() == 204
+                    || status.as_u16() == 304
+                    || method.is_head()
+                    || (method.is_connect() && (200..300).contains(&status.as_u16()));
+                if !final_is_chunked && !is_bodyless {
+                    assert!(
+                        result.is_err(),
+                        "non-chunked final transfer-encoding token resolved Ok: \
+                         te={te_values:?} status={status_num} method={method:?} \
+                         version={version:?} result={result:?}"
+                    );
+                }
             }
         }
     }

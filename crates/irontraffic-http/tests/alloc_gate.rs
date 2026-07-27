@@ -755,3 +755,74 @@ fn parse_field_storage_spills_only_past_the_inline_32() {
         other => panic!("expected Complete for 33 fields, got {other:?}"),
     }
 }
+
+/// `response-framing-and-expect-policy` (#28)'s zero-allocation gate for
+/// `resolve_response_framing`, the response-side twin of
+/// `resolve_request_framing` above.
+///
+/// The same substitution as `framing_allocates_nothing` above, extended by
+/// one function: `resolve_response_framing`'s entire call graph inside this
+/// crate is itself, its own private `declared_len` helper,
+/// `tokenize_transfer_encoding`, `parse_content_length`, and
+/// `field::trim_ows` (the last three shared, unchanged, with the request
+/// side), so a text scan of exactly those five function bodies for the same
+/// allocating-call vocabulary is exhaustive over every possible input, not
+/// just the two benchmark inputs the issue's design named.
+#[test]
+fn response_framing_allocates_nothing() {
+    let response_source = include_str!("../src/response.rs");
+    let framing_source = include_str!("../src/framing.rs");
+    let field_source = include_str!("../src/field.rs");
+
+    let resolve_body = extract_fn_body(response_source, "pub fn resolve_response_framing(").expect(
+        "`fn resolve_response_framing` not found in src/response.rs; has it moved or been \
+             renamed?",
+    );
+    let declared_len_body = extract_fn_body(
+        response_source,
+        "fn declared_len(fields: &FieldSection) -> Result<Option<u64>, RejectReason> {",
+    )
+    .expect("`fn declared_len` not found in src/response.rs; has it moved or been renamed?");
+    let tokenize_body = extract_fn_body(framing_source, "pub fn tokenize_transfer_encoding<")
+        .expect(
+            "`fn tokenize_transfer_encoding` not found in src/framing.rs; has it moved or been \
+             renamed?",
+        );
+    let parse_cl_body = extract_fn_body(framing_source, "pub fn parse_content_length(").expect(
+        "`fn parse_content_length` not found in src/framing.rs; has it moved or been renamed?",
+    );
+    let trim_ows_body = extract_fn_body(field_source, "pub fn trim_ows(value: &[u8]) -> &[u8] {")
+        .expect("`fn trim_ows` not found in src/field.rs; has it moved or been renamed?");
+
+    for call in ALLOCATING_CALLS {
+        assert!(
+            !resolve_body.contains(call),
+            "resolve_response_framing's body contains `{call}`, which can allocate; \
+             resolve_response_framing is documented to never allocate"
+        );
+        assert!(
+            !declared_len_body.contains(call),
+            "declared_len's body contains `{call}`, which can allocate; it is one of \
+             resolve_response_framing's callees and resolve_response_framing is documented to \
+             never allocate"
+        );
+        assert!(
+            !tokenize_body.contains(call),
+            "tokenize_transfer_encoding's body contains `{call}`, which can allocate; it is \
+             one of resolve_response_framing's callees and resolve_response_framing is \
+             documented to never allocate"
+        );
+        assert!(
+            !parse_cl_body.contains(call),
+            "parse_content_length's body contains `{call}`, which can allocate; it is one of \
+             resolve_response_framing's callees and resolve_response_framing is documented to \
+             never allocate"
+        );
+        assert!(
+            !trim_ows_body.contains(call),
+            "trim_ows's body contains `{call}`, which can allocate; it is one of \
+             resolve_response_framing's callees and resolve_response_framing is documented to \
+             never allocate"
+        );
+    }
+}
