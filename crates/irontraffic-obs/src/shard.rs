@@ -41,8 +41,17 @@ pub const MAX_SHARDS: usize = 4096;
 /// struct's own size up to a multiple of 128, so a neighbouring block boundary can
 /// never land inside this one's payload. Its size is therefore
 /// `round_up(128 + size_of::<T>(), 128)`, which is 256 bytes for a 16 byte payload.
-/// Each block is allocated by its own `Box::new` (see [`Shards::new`]), so blocks are
-/// not contiguous either.
+///
+/// [`Shards::new`] allocates every block in ONE contiguous buffer
+/// (`collect::<Vec<_>>().into_boxed_slice()`), not by a separate `Box::new` per
+/// block: blocks ARE contiguous, block `i + 1`'s guard immediately follows block
+/// `i`'s payload (`shard::tests::blocks_are_one_contiguous_allocation` measures this).
+/// Contiguity does not reintroduce false sharing, because the alignment argument
+/// above needs no separate allocation to hold: `align(128)` still rounds each
+/// block's own size up to a multiple of 128 and the leading guard still occupies the
+/// whole first line of each block, so block `i`'s payload and block `i + 1`'s
+/// payload can never land in the same 128 byte line regardless of how `T` is sized,
+/// whether the blocks sit in one buffer or in `n` separate ones.
 #[derive(Debug)]
 #[repr(C, align(128))]
 pub struct ShardBlock<T> {
@@ -228,6 +237,190 @@ mod tests {
                     assert_ne!(a / super::SHARD_ALIGN, b / super::SHARD_ALIGN);
                 }
             }
+        }
+    }
+
+    #[test]
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "test-only address arithmetic over a Vec<usize> built one line above, \
+                  bounded by the fixed loop range 0..7 against a length-8 collection; \
+                  not a value that could ever be out of range"
+    )]
+    fn blocks_are_one_contiguous_allocation() {
+        // Issue #610: an earlier revision of `ShardBlock`'s doc comment claimed
+        // "each block is allocated by its own Box::new ... so blocks are not
+        // contiguous either". That was false: `Shards::new` builds every block in
+        // ONE `collect::<Vec<_>>().into_boxed_slice()` call, never a per-block
+        // `Box::new`. This measures the fact the corrected doc comment now states:
+        // consecutive block addresses differ by exactly
+        // `size_of::<ShardBlock<Cell64>>()`, which is what one contiguous buffer of
+        // fixed-size elements looks like; separate per-block allocations would
+        // scatter these addresses with no fixed relationship between them.
+        let s = Shards::<Cell64>::new(8, |_| Cell64::new(0));
+        let addrs: Vec<usize> = (0..8)
+            .map(|i| {
+                let block = s.get(i).expect("index within len");
+                core::ptr::from_ref(block).addr()
+            })
+            .collect();
+        let stride = core::mem::size_of::<super::ShardBlock<Cell64>>();
+        assert_eq!(
+            stride, 256,
+            "a Cell64 payload rounds a 128 byte guard up to 256"
+        );
+        for i in 0..7 {
+            assert_eq!(
+                addrs[i + 1] - addrs[i],
+                stride,
+                "block {} and block {} must be exactly one ShardBlock<Cell64> apart, \
+                 proving they share one contiguous allocation",
+                i,
+                i + 1
+            );
+        }
+    }
+
+    #[test]
+    fn with_current_indexes_by_the_calling_cores_actual_index() {
+        // Issue #609: nothing in this crate proved `Shards` actually shards per
+        // core rather than always using shard 0 (or any other fixed shard). A
+        // hand mutation of `with_current`'s `let i = c.index();` to `let i = 0;`
+        // passed every OTHER test in this file, because none of them compares a
+        // probing thread's own actual `CoreCtx::index()` against the shard its
+        // increment landed in.
+        //
+        // Threads are spawned and joined ONE AT A TIME (mirroring
+        // `with_current_falls_back_to_shard_zero`'s technique), so each shard has
+        // exactly one writer at a time and the per-shard totals below are exact,
+        // not subject to the documented lost-update race a genuinely SHARED shard
+        // accepts.
+        ensure_multi_core_for_tests();
+        let s: Shards<Cell64> = Shards::from_core_count(|_| Cell64::new(0));
+        let mut expected = vec![0u64; s.len()];
+        let mut seen_indices = std::collections::HashSet::new();
+
+        for _ in 0..64 {
+            let idx = std::thread::scope(|scope| {
+                let handle = scope.spawn(|| {
+                    let idx =
+                        irontraffic_runtime::core::with(irontraffic_runtime::core::CoreCtx::index);
+                    s.with_current(|c| c.add_local(1));
+                    idx
+                });
+                handle.join().expect("a probing thread must not panic")
+            });
+            seen_indices.insert(idx);
+            if let Some(slot) = expected.get_mut(idx) {
+                *slot += 1;
+            }
+        }
+
+        assert!(
+            seen_indices.len() >= 2,
+            "expected at least two distinct core indices across 64 probing \
+             threads, saw {seen_indices:?}"
+        );
+        for (idx, &want) in expected.iter().enumerate() {
+            assert_eq!(
+                s.get(idx).expect("index within len").read_foreign(),
+                want,
+                "shard {idx} must hold exactly the increments made by threads \
+                 whose own CoreCtx::index() was {idx}, never some other shard's \
+                 total"
+            );
+        }
+    }
+
+    #[test]
+    fn from_core_count_uses_the_installed_core_count() {
+        // Issue #609's second hand mutation: rewriting `from_core_count` to call
+        // `Shards::new(1, ..)` instead of passing
+        // `irontraffic_runtime::core::core_count()` survives every test in this
+        // crate, because `EpochWitness::new()`, the one production caller, is
+        // exercised in tests only through a fixed-length `#[cfg(test)]`
+        // constructor that bypasses `from_core_count` entirely. This asserts
+        // `from_core_count` itself actually sizes by the real installed core
+        // count rather than a constant.
+        ensure_multi_core_for_tests();
+        let installed = irontraffic_runtime::core::core_count();
+        assert!(
+            installed > 1,
+            "ensure_multi_core_for_tests must have installed more than one core"
+        );
+        let s: Shards<u8> = Shards::from_core_count(|_| 0);
+        assert_eq!(
+            s.len(),
+            installed,
+            "from_core_count must allocate exactly one shard per installed \
+             core, not a fixed count"
+        );
+    }
+
+    #[test]
+    fn with_current_falls_back_specifically_to_shard_zero_not_the_last_shard() {
+        // Issue #609's third hand mutation: `with_current`'s fallback changed
+        // from `&self.blocks[0]` to the LAST block still passes
+        // `with_current_falls_back_to_shard_zero`, because that test builds a
+        // ONE-shard array, where "shard 0" and "the last shard" are the same
+        // slot and cannot be told apart. This uses a shard array longer than
+        // one so the two are distinguishable, and checks shard 0 specifically.
+        //
+        // Only the one probe that actually overflows ever calls
+        // `with_current`; every other candidate thread learns its own index
+        // (which touches no shard cell at all) and is discarded in range, so
+        // the untouched shards below are provably untouched by anything other
+        // than the single overflowing call.
+        ensure_multi_core_for_tests();
+        let installed = irontraffic_runtime::core::core_count();
+        let len = 3usize;
+        assert!(
+            installed > len,
+            "ensure_multi_core_for_tests must install more cores than this \
+             shard array's length, so a probing thread's real index can \
+             exceed it"
+        );
+        let s = Shards::<Cell64>::new(len, |_| Cell64::new(0));
+        let mut seen_overflow = false;
+        for _ in 0..256 {
+            let overflowed = std::thread::scope(|scope| {
+                let handle = scope.spawn(|| {
+                    let idx =
+                        irontraffic_runtime::core::with(irontraffic_runtime::core::CoreCtx::index);
+                    if idx >= len {
+                        s.with_current(|c| c.add_local(1));
+                        true
+                    } else {
+                        false
+                    }
+                });
+                handle.join().expect("a probing thread must not panic")
+            });
+            if overflowed {
+                seen_overflow = true;
+                break;
+            }
+        }
+        assert!(
+            seen_overflow,
+            "expected at least one probing thread whose real core index \
+             reached or exceeded this shard array's length {len} within 256 \
+             tries, with no in-range thread before it ever touching a shard"
+        );
+        assert_eq!(
+            s.get(0).expect("index within len").read_foreign(),
+            1,
+            "an overflowing core's increment must land in shard 0"
+        );
+        for i in 1..len {
+            assert_eq!(
+                s.get(i).expect("index within len").read_foreign(),
+                0,
+                "shard {i} must be untouched: the one overflowing probe above \
+                 must not have landed here, which specifically rules out a \
+                 `&self.blocks[len - 1]` fallback (that would land in shard {})",
+                len - 1
+            );
         }
     }
 

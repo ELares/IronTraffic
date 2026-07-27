@@ -18,35 +18,53 @@
 //!   docs say a reader may see the new epoch paired with the old timestamp, or vice
 //!   versa, and that is accepted). There is therefore no cross-word consistency
 //!   property here for acquire/release to establish, on any architecture.
-//! - The one correctness property this crate DOES claim under concurrent, unsynchronised
-//!   access to a SHARED cell (the documented `Shards::with_current` fallback, when two
-//!   cores land on the same shard) is that [`EpochWitness::observe`]'s monotone guard
-//!   never moves a shard's epoch backwards, even though an increment can be lost and the
-//!   value can overshoot. That property does not need acquire or release either: the
-//!   C++/Rust memory model guarantees a single total **modification order** per atomic
-//!   object, for every memory ordering including `Relaxed` (this is the "coherence"
-//!   requirement on atomics, not a `Relaxed`-specific weakening). Two consequences of
-//!   that guarantee are load bearing here: first, a single object's plain `Relaxed`
-//!   loads and stores are never torn in bits, whatever architecture this runs on, only
-//!   stale in time; second, a thread's own two `Relaxed` loads of the SAME object are
-//!   never observed out of that object's modification order (a thread cannot read a
-//!   value, then later read an OLDER one from the same location). `add_local`'s internal
-//!   load in [`EpochWitness::observe`] is therefore never older, in modification order,
-//!   than the value `observe` itself just read, so the value it stores is always at
-//!   least the epoch being observed. That argument holds identically on `x86_64` and
-//!   `aarch64`: it is a property of the atomics model, not of a hardware ordering
-//!   guarantee either architecture happens to give for free.
+//! - **This crate does NOT claim that a shared cell's value is monotone, or that it is
+//!   ever at least the last epoch observed.** An earlier revision of this comment
+//!   claimed exactly that: that [`EpochWitness::observe`]'s guard "never moves a
+//!   shard's epoch backwards" and that coherence makes the stored value "always at
+//!   least the epoch being observed". Both claims are false, and this crate's own test
+//!   suite proves it (`shared_cell_add_local_can_regress_below_a_value_already_polled`,
+//!   below; also `epoch::tests::prop_epoch_witness_never_decreases`, whose own doc
+//!   comment records a 20-in-200,000 measured regression). The premise those claims
+//!   started from is correct: the C++/Rust memory model gives every atomic object a
+//!   single total **modification order**, for every ordering including `Relaxed` (the
+//!   "coherence" requirement), and two consequences of it are real and load-bearing
+//!   here: a single object's `Relaxed` loads and stores are never torn in bits, only
+//!   stale in time, and a thread's own two `Relaxed` loads of the SAME object are never
+//!   observed out of that object's modification order (a thread cannot read a value,
+//!   then later read one from an EARLIER position in that order). The invalid step was
+//!   the next one: modification order is an order of WRITES, not of the numeric values
+//!   those writes carry, and coherence says nothing about whether later positions hold
+//!   numerically larger values. `add_local` gives it no reason to: it is a plain load,
+//!   add, store, never a `fetch_max` or a compare-and-swap retry, so a write's value
+//!   depends only on whatever the writer's own load happened to see, which can be
+//!   arbitrarily stale relative to a concurrent writer sharing the same cell. Two
+//!   writers can each load the same old value and each add their own delta, so the
+//!   later of their two stores (later in modification order, decided by which writer's
+//!   store instruction physically executes second) can carry the SMALLER of the two
+//!   results, overwriting a larger value a poller already observed. The test below
+//!   forces exactly that schedule with a real two-thread turnstile, deterministically
+//!   rather than by chance.
+//! - What DOES hold for a shared cell, and all that holds: no torn reads (every load
+//!   returns bit-for-bit some value some store actually wrote, never a mix of two), and
+//!   an upper bound (a cell driven only by `add_local(delta)` calls can never exceed the
+//!   sum of every `delta` fed into it so far, from any thread, whatever the schedule,
+//!   because each store adds a nonnegative amount to some value that was itself once
+//!   legitimately in the cell). Nothing here is monotone and no direction of a stale
+//!   reading is safe to treat as proof of anything; see [`crate::epoch::EpochWitness`]'s
+//!   own docs, corrected for the same reason (issues 567 and 608 in this project's
+//!   tracker).
 //! - Concurrency here is exercised with real threads
-//!   (`shard::tests::with_current_falls_back_to_shard_zero`,
-//!   `epoch::tests::prop_epoch_witness_never_decreases`), not `loom`: this crate's
-//!   `[dev-dependencies]` are fixed by its own acceptance criteria to exactly `proptest`
-//!   and `criterion`, and `loom` is not a dependency of this workspace (it is not in
-//!   `[workspace.dependencies]` on the branch this issue was implemented against, and is
-//!   not authorised by this issue's manifest section), so it is not available to model
-//!   with here. The reasoning above is the substitute: a proof from the atomics model's
-//!   own coherence guarantee, which needs no architecture-specific assumption, backed by
-//!   tests that actually run two threads against one shared cell rather than only
-//!   asserting single-threaded behaviour.
+//!   (`cell::tests::shared_cell_add_local_can_regress_below_a_value_already_polled`,
+//!   `shard::tests::with_current_falls_back_to_shard_zero`,
+//!   `epoch::tests::prop_epoch_witness_never_decreases`), not `loom`. `loom` became a
+//!   workspace dependency after this crate was first written (issue #99), but adding it
+//!   HERE would mean touching this crate's `Cargo.toml`, outside this fix's declared
+//!   file (`crates/irontraffic-obs/src/cell.rs` alone; see issue #607). The turnstile
+//!   test below is the substitute: real threads, a channel handoff forcing the one
+//!   interleaving that matters, and an assertion on the exact values involved, so the
+//!   regression it demonstrates is reproduced on every run rather than found by chance
+//!   in one run out of 10,000.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -140,5 +158,83 @@ mod tests {
     fn layout() {
         assert_eq!(core::mem::size_of::<Cell64>(), 8);
         assert_eq!(core::mem::align_of::<Cell64>(), 8);
+    }
+
+    #[test]
+    fn shared_cell_add_local_can_regress_below_a_value_already_polled() {
+        // Proves the corrected claim in this module's doc comment above and
+        // disproves the false one it replaced: coherence orders a thread's own
+        // loads against an atomic's modification order, not the NUMERIC value
+        // written at each position, so nothing stops a shared cell's value from
+        // regressing below a value a poller already saw. `add_local` is a plain
+        // load, add, store, never a fetch-max or a compare-and-swap retry, so two
+        // writers racing the same cell can produce exactly this.
+        //
+        // The forced schedule: thread A loads the cell while it is still 0 (its
+        // own `cur`), then pauses, a real and unremarkable OS preemption between
+        // `add_local`'s load and its store, until thread B has run `add_local(5)`
+        // to completion against the still-zero cell, landing 5. Thread A then
+        // resumes and stores using the `cur = 0` it captured before B ever ran,
+        // landing `0 + 2 = 2` and overwriting B's 5. A poller sampling right
+        // after B's store would see 5; the cell settles at 2, strictly less.
+        //
+        // Thread A mirrors `add_local`'s own two steps directly on the private
+        // field rather than calling `add_local` itself, because the whole point
+        // is to force a pause BETWEEN those two steps, which the public API
+        // gives no way to do from outside. `cell::tests` is a child module of
+        // `cell`, so it has exactly the access to the private `AtomicU64` field
+        // that `add_local` itself has; this is not `unsafe` and adds no
+        // dependency, and `.store(` is unrestricted here because
+        // `single-snapshot-publish` blanks out `#[cfg(test)]` regions before it
+        // scans (`scripts/invariant-lints.sh`'s `build_prod_tree`).
+        use core::sync::atomic::Ordering;
+        use std::sync::mpsc::sync_channel;
+
+        let c = Cell64::new(0);
+        let poller_saw_after_b = core::sync::atomic::AtomicU64::new(0);
+        let (a_loaded_tx, a_loaded_rx) = sync_channel::<()>(0);
+        let (b_done_tx, b_done_rx) = sync_channel::<()>(0);
+        // `&Cell64` and `&AtomicU64` are `Send` (both types are `Sync`), so a plain
+        // shared reference crosses the `scope.spawn` boundary; the `mpsc` endpoints
+        // below are moved in directly instead, one end per closure, because
+        // `Receiver<T>` is not `Sync` and so cannot cross by shared reference.
+        let c_ref = &c;
+        let poller_ref = &poller_saw_after_b;
+
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let cur = c_ref.0.load(Ordering::Relaxed);
+                a_loaded_tx.send(()).expect("thread b must be listening");
+                b_done_rx
+                    .recv()
+                    .expect("thread b must finish before a stores");
+                c_ref.0.store(cur.wrapping_add(2), Ordering::Relaxed);
+            });
+            scope.spawn(move || {
+                a_loaded_rx.recv().expect("thread a must load first");
+                c_ref.add_local(5);
+                poller_ref.store(c_ref.read_foreign(), Ordering::Relaxed);
+                b_done_tx.send(()).expect("thread a must be waiting");
+            });
+        });
+
+        let poller_saw = poller_saw_after_b.load(Ordering::Relaxed);
+        let settled = c.read_foreign();
+        assert_eq!(
+            poller_saw, 5,
+            "b's own add_local(5) against a freshly zero cell must land exactly 5"
+        );
+        assert_eq!(
+            settled, 2,
+            "a's stale store, computed from the value it loaded before b ran, must \
+             overwrite b's 5 with 2"
+        );
+        assert!(
+            settled < poller_saw,
+            "the settled value ({settled}) must be strictly less than a value a \
+             poller already observed ({poller_saw}): this is what the corrected \
+             doc comment above means by 'no safe reading direction' for a shared \
+             cell"
+        );
     }
 }

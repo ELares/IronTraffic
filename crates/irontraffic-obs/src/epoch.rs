@@ -76,19 +76,30 @@ impl EpochWitness {
 
     /// The sighting with the smallest epoch.
     ///
-    /// **Advisory. Never gate a fail-open decision on this alone.** The monotone
-    /// guard in [`EpochWitness::observe`] holds exactly when the single writer
-    /// contract holds. When two cores share a shard (`Shards::with_current`'s
-    /// documented fallback), both can read the same current epoch, both compute a
-    /// delta to the same target epoch, and both deltas are applied, leaving that shard
-    /// reporting an epoch strictly greater than any epoch that core actually
-    /// installed. The value therefore has one safe reading direction:
-    /// `oldest().epoch < target` proves the config has NOT reached every core, while
-    /// `oldest().epoch >= target` is only a hint that it probably has. Any consumer
-    /// whose wrong answer costs correctness (a readiness probe that admits traffic, a
-    /// drain that declares itself finished, a config commit that reports success) must
-    /// treat a too-high reading as possible and combine this witness with an
-    /// authoritative signal it owns.
+    /// **Advisory. Never gate a fail-open decision on this alone, in EITHER
+    /// direction.** The guard in [`EpochWitness::observe`] is monotone only when the
+    /// single writer contract holds. When two cores share a shard
+    /// (`Shards::with_current`'s documented fallback), both can read the same current
+    /// epoch, both compute a delta to the same target epoch, and both deltas get
+    /// applied: the shard can settle strictly ABOVE any epoch either core actually
+    /// installed (issue #567), and, on a different schedule, it can also settle
+    /// BELOW an epoch every core sharing it has already, individually, finished
+    /// observing (issue #608; `tests::shared_shard_can_undershoot_a_target_every_core_reached`
+    /// reproduces this deterministically). An earlier revision of this doc claimed
+    /// `oldest().epoch < target` PROVES the config has not reached every core, as
+    /// though the low direction, at least, were safe. That claim is false: the same
+    /// lost-update race that can push a shared shard's value above target can, on a
+    /// different interleaving, leave it below target after every core sharing that
+    /// shard has already returned from `observe(target)`, and nothing about that
+    /// state repairs itself without a further `observe` call reaching it. There is
+    /// therefore no reading of `oldest()` that is safe to treat as proof of anything
+    /// once a shard is shared; it is a best-effort hint in BOTH directions, and it is
+    /// exact only under the single-writer contract (one core per shard, the ordinary
+    /// case once `core::install` has run before any `Shards` in this witness was
+    /// built). Any consumer whose wrong answer costs correctness (a readiness probe
+    /// that admits traffic, a drain that declares itself finished, a config commit
+    /// that reports success) must treat both a too-high and a too-low reading as
+    /// possible and combine this witness with an authoritative signal it owns.
     #[must_use]
     pub fn oldest(&self) -> EpochSighting {
         let mut best: Option<EpochSighting> = None;
@@ -217,6 +228,116 @@ mod tests {
                 epoch: 0,
                 at_unix_millis: 0
             }
+        );
+    }
+
+    #[test]
+    fn shared_shard_can_undershoot_a_target_every_core_reached() {
+        // Proves the corrected claim in `oldest()`'s doc comment above and disproves
+        // the one it replaced. Two threads share one shard: thread 0's history is
+        // observe(1) then observe(3), thread 1's is observe(2) then observe(3) (the
+        // same two histories issue #608 itself uses). BOTH threads individually
+        // return from their own `observe(3)` call by the end of this test, yet the
+        // shard settles on 2, strictly below the target of 3, and nothing about
+        // that state self-repairs without a further `observe` call reaching it. So
+        // `oldest().epoch < target` does NOT prove the config has not reached every
+        // core: it can be false exactly when every core sharing the shard has
+        // already reached it.
+        //
+        // This mirrors `EpochWitness::observe`'s own two-step algorithm (an outer
+        // read, then, if it is smaller than the target, `add_local`'s own inner
+        // read and store) on a bare `AtomicU64` rather than through `EpochWitness`
+        // or `Cell64`, because the whole point is to pause a thread BETWEEN its own
+        // outer and inner reads, which neither public API exposes a way to do from
+        // outside. That needs no dependency and no access to any private field,
+        // matching the dependency-free reproduction this file's own
+        // `prop_epoch_witness_never_decreases` test already describes for the
+        // overshoot direction. The exact schedule was found by an exhaustive search
+        // over every interleaving of the two histories above against a shard
+        // starting at 0, and is forced here with rendezvous channels rather than
+        // left to chance.
+        use core::sync::atomic::{AtomicU64, Ordering};
+        use std::sync::mpsc::sync_channel;
+
+        fn read(cell: &AtomicU64) -> u64 {
+            cell.load(Ordering::Relaxed)
+        }
+        fn commit(cell: &AtomicU64, inner: u64, outer: u64, epoch: u64) {
+            // Mirrors `Cell64::add_local`'s own wrapping add exactly (see
+            // cell.rs). The subtraction is unwrapped because every call site
+            // below only reaches this after its own outer read already
+            // established `outer < epoch`, exactly as `EpochWitness::observe`'s
+            // own `if cur_e < epoch` guard does.
+            cell.store(inner.wrapping_add(epoch - outer), Ordering::Relaxed);
+        }
+
+        let cell = AtomicU64::new(0);
+        let cell_ref = &cell;
+        let (h1_tx, h1_rx) = sync_channel::<()>(0);
+        let (h2_tx, h2_rx) = sync_channel::<()>(0);
+        let (h3_tx, h3_rx) = sync_channel::<()>(0);
+        let (h4_tx, h4_rx) = sync_channel::<()>(0);
+        let (h5_tx, h5_rx) = sync_channel::<()>(0);
+
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                // Thread 0's history: observe(1), then observe(3).
+                let outer0 = read(cell_ref);
+                let inner0 = read(cell_ref);
+                debug_assert_eq!((outer0, inner0), (0, 0));
+                h1_tx.send(()).expect("thread 1 must be listening");
+                h2_rx.recv().expect(
+                    "thread 1 must run observe(2) fully and capture observe(3)'s outer read",
+                );
+                commit(cell_ref, inner0, outer0, 1); // observe(1) returns, using stale reads
+                let outer1 = read(cell_ref);
+                let inner1 = read(cell_ref);
+                debug_assert_eq!((outer1, inner1), (1, 1));
+                h3_tx.send(()).expect("thread 1 must be listening");
+                h4_rx
+                    .recv()
+                    .expect("thread 1 must capture its own observe(3) inner read");
+                commit(cell_ref, inner1, outer1, 3); // observe(3) returns
+                h5_tx.send(()).expect("thread 1 must be listening");
+            });
+            scope.spawn(move || {
+                // Thread 1's history: observe(2), then observe(3).
+                h1_rx
+                    .recv()
+                    .expect("thread 0 must capture its own reads first");
+                let outer0 = read(cell_ref);
+                let inner0 = read(cell_ref);
+                debug_assert_eq!((outer0, inner0), (0, 0));
+                commit(cell_ref, inner0, outer0, 2); // observe(2) returns
+                let outer1 = read(cell_ref);
+                debug_assert_eq!(outer1, 2);
+                h2_tx.send(()).expect("thread 0 must be listening");
+                h3_rx
+                    .recv()
+                    .expect("thread 0 must finish observe(1) and capture its own observe(3) reads");
+                let inner1 = read(cell_ref); // this IS add_local's own inner read
+                debug_assert_eq!(inner1, 1);
+                h4_tx.send(()).expect("thread 0 must be listening");
+                h5_rx
+                    .recv()
+                    .expect("thread 0 must finish its own observe(3) store first");
+                // observe(3) returns, using the stale outer1 and inner1 captured above.
+                commit(cell_ref, inner1, outer1, 3);
+            });
+        });
+
+        let settled = cell.load(Ordering::Relaxed);
+        assert_eq!(
+            settled, 2,
+            "both threads returned from their own observe(3) call, yet the shard \
+             settles at 2, strictly below the target of 3"
+        );
+        assert!(
+            settled < 3,
+            "this is exactly the state the corrected oldest() doc warns about: \
+             oldest().epoch < target here does NOT mean the config has not reached \
+             every core, because every core sharing this shard explicitly observed \
+             target 3 and returned"
         );
     }
 
