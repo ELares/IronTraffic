@@ -590,3 +590,184 @@ proptest! {
         assert!(id1 <= id2);
     }
 }
+
+/// Regression for issue #665: `Calendar { Day, "Pacific/Chatham" }` with
+/// `subject_spread: true` and an anchor hour of 3, at the exact inputs
+/// reported. `Pacific/Chatham` is UTC+12:45 standard and UTC+13:45 in
+/// daylight saving, one of the few zones with a 45 minute offset and a DST
+/// transition, and its autumn fold repeats the local wall clock range
+/// [02:45, 03:45). The anchor hour of 3 falls inside that range, and this
+/// subject's constant one-hour-bounded spread pushes the unspread window
+/// boundary past the fold's transition instant, so `now` and the window's
+/// end land in different occurrences of the same repeated wall-clock hour.
+///
+/// Before the fix, `calendar_civil_start` compared the bare civil (offset
+/// naive) datetime of the candidate boundary against the bare civil datetime
+/// of `now`. During the second occurrence of a fold, a wall clock reading
+/// can look "earlier" than a first-occurrence candidate while actually being
+/// later in absolute time, so the comparison picked the wrong day and
+/// `period_of` queried exactly at a window's exclusive end returned a window
+/// starting a full nominal day earlier, putting that instant in two periods.
+#[test]
+fn calendar_day_tiles_across_the_chatham_autumn_fold_with_subject_spread() {
+    let period = Period::Calendar {
+        unit: CalendarUnit::Day,
+        tz: Box::from("Pacific/Chatham"),
+        anchor: CalendarAnchor {
+            month_of_year: 1,
+            day_of_month: 1,
+            weekday: 1,
+            hour: 3,
+        },
+        subject_spread: true,
+    };
+    let resolver = PeriodResolver::new(period).unwrap();
+    let subject = SubjectHash {
+        hi: 1_746_374_178_425_565_603,
+        lo: 13_586_956_261_155_929_603,
+    };
+    let now_ms = 541_517_132_388u64;
+
+    let w = resolver.period_of(subject, wall(now_ms)).unwrap();
+    assert!(w.contains(now_ms), "window {w:?} does not contain {now_ms}");
+
+    let after = resolver.period_of(subject, wall(w.end_unix_ms)).unwrap();
+    assert_eq!(
+        after.start_unix_ms, w.end_unix_ms,
+        "the period starting at w's exclusive end must start exactly there; \
+         got {after:?} for w = {w:?}"
+    );
+}
+
+/// Walks `hops` consecutive periods forward from `start_ms` for one subject,
+/// asserting at every step both that the resolved window contains the
+/// instant it was resolved for, and that the next period's start is exactly
+/// the previous period's exclusive end. This is Invariant 1 (containment)
+/// and Invariant 3 (tiling) from issue #227, checked together the same way
+/// `prop_every_instant_is_in_exactly_one_period` checks them, but walked
+/// deterministically rather than drawn at random.
+/// Returns the number of hops it actually verified, which the caller asserts
+/// against the number it asked for. That return value is not decoration: a
+/// helper that returns early, or that is handed `hops: 0`, otherwise reports
+/// success having checked nothing, and the caller cannot tell the difference.
+/// It also gives the caller a real assertion of its own, which
+/// `invariant-lints.sh`'s `no-test-without-assertion` rule requires and cannot
+/// otherwise see, because that rule looks for an assertion lexically inside the
+/// test body and cannot follow a call into a helper (see #562, #563). The
+/// honest fix for that blind spot is an assertion the test genuinely needs, not
+/// a decorative one added to quiet the lint.
+fn assert_calendar_periods_tile(
+    resolver: &PeriodResolver,
+    subject: SubjectHash,
+    start_ms: u64,
+    hops: usize,
+) -> Result<usize, PeriodError> {
+    let mut verified = 0_usize;
+    let mut now_ms = start_ms;
+    for hop in 0..hops {
+        let w = resolver.period_of(subject, wall(now_ms))?;
+        assert!(
+            w.contains(now_ms),
+            "hop {hop}: window {w:?} does not contain {now_ms}"
+        );
+        let after = resolver.period_of(subject, wall(w.end_unix_ms))?;
+        assert_eq!(
+            after.start_unix_ms, w.end_unix_ms,
+            "hop {hop}: periods do not tile: window {w:?} followed by {after:?}"
+        );
+        now_ms = w.end_unix_ms;
+        verified += 1;
+    }
+    Ok(verified)
+}
+
+/// Companion guard for issue #665's fix: the fix in `calendar_civil_start`
+/// touches the shared code path for every `CalendarUnit`, not only `Day`, so
+/// this checks Week, Month and Year still tile exactly, including with
+/// `subject_spread: true`, across five zones.
+///
+/// WHAT THIS DOES NOT DO, stated because an earlier version of this comment
+/// claimed it did. This is a "still works" guard, NOT a discriminating test: it
+/// passes identically on the pre-fix and post-fix source, so it cannot detect
+/// the bug and does not rule out the fix having been narrowly tied to the case
+/// it was found through. Measured, twice, by reverting the one-line fix in
+/// `calendar_civil_start` and re-running: still green.
+///
+/// The reason is structural. It starts at 2026-01-01 and walks six periods, so
+/// for Week and Month it never reaches a DST transition at all, and the changed
+/// branch is only reachable when `now` falls in the second occurrence of an
+/// ambiguous local hour with the anchor hour strictly inside the repeated
+/// range. Adding zones alone does not fix that; the start instant has to sit on
+/// a transition too.
+///
+/// A recipe that WOULD discriminate is recorded in the follow-up issue, with
+/// the configuration measured to fail pre-fix (`Antarctica/Troll`, a two-hour
+/// shift, anchor hour 2, weekday 7, around the 2023-10-29 transition). Making
+/// that work is more than a zone-list edit and is deliberately not attempted
+/// here rather than shipped as a guess.
+///
+/// The discriminating coverage that DOES exist is
+/// `calendar_day_tiles_across_the_chatham_autumn_fold_with_subject_spread` and
+/// `prop_every_instant_is_in_exactly_one_period` with the committed seed; both
+/// fail on the pre-fix source.
+#[test]
+fn calendar_week_month_year_tile_with_subject_spread_across_zones() {
+    let cases = [
+        (
+            CalendarUnit::Week,
+            CalendarAnchor {
+                month_of_year: 1,
+                day_of_month: 1,
+                weekday: 3,
+                hour: 3,
+            },
+        ),
+        (
+            CalendarUnit::Month,
+            CalendarAnchor {
+                month_of_year: 1,
+                day_of_month: 15,
+                weekday: 1,
+                hour: 3,
+            },
+        ),
+        (
+            CalendarUnit::Year,
+            CalendarAnchor {
+                month_of_year: 3,
+                day_of_month: 10,
+                weekday: 1,
+                hour: 3,
+            },
+        ),
+    ];
+    let start_ms = utc_ms(2026, 1, 1, 0, 0, 0) as u64;
+    let subjects: Vec<SubjectHash> = (0..25).map(subject_for).collect();
+
+    for (unit, anchor) in cases {
+        for tz in [
+            "Antarctica/Troll",
+            "Pacific/Chatham",
+            "America/New_York",
+            "UTC",
+            "Australia/Eucla",
+        ] {
+            let period = Period::Calendar {
+                unit,
+                tz: Box::from(tz),
+                anchor,
+                subject_spread: true,
+            };
+            let resolver = PeriodResolver::new(period).unwrap();
+            for &subject in &subjects {
+                let verified =
+                    assert_calendar_periods_tile(&resolver, subject, start_ms, 6).unwrap();
+                assert_eq!(
+                    verified, 6,
+                    "{unit:?} in {tz}: only {verified} of 6 hops were checked, \
+                     so this case proved less than it claims"
+                );
+            }
+        }
+    }
+}

@@ -160,8 +160,13 @@ pub const SPREAD_MODULUS_MS: u64 = 86_400_000;
 ///
 /// One hour, not one day. The recomputation in `calendar_window` step 7 walks
 /// back exactly one period, so the spread must be strictly smaller than the
-/// shortest possible preceding period, and the shortest `Day` period is 23
-/// hours on a spring-forward day. A one-day modulus would put an instant two
+/// shortest possible preceding period. The shortest `Day` period is 22 hours,
+/// not 23: zones with a TWO hour transition exist, and measuring every civil
+/// day 1971-2030 finds `Antarctica/Troll` 2005-03-27 and `America/St_Johns`
+/// 1988-04-03 both at 22.00 h. One hour is still comfortably below that, so
+/// the conclusion is unchanged, but the margin is one hour smaller than this
+/// comment used to claim and anyone tightening the constant should reason from
+/// 22. A one-day modulus would put an instant two
 /// periods back for some subjects on two days a year, and the returned window
 /// would not contain it.
 pub const SPREAD_MODULUS_DAY_MS: u64 = 3_600_000;
@@ -481,12 +486,11 @@ fn calendar_window(
     let now_zoned = Timestamp::from_millisecond(now_i64)
         .map_err(|_| PeriodError::OutOfRange { unix_ms: now_ms })?
         .to_zoned(tz.clone());
-    let now_civil = now_zoned.datetime();
     let hour = i8::try_from(anchor.hour).map_err(|_| PeriodError::InvalidAnchor {
         why: "hour must be 0 to 23",
     })?;
 
-    let civil_start = calendar_civil_start(unit, hour, anchor, now_civil, tz)?;
+    let civil_start = calendar_civil_start(unit, hour, anchor, &now_zoned, tz)?;
     let (mut start_ms, mut end_ms) = window_ms_for_civil(unit, anchor, civil_start, tz)?;
 
     if subject_spread {
@@ -517,12 +521,19 @@ fn calendar_civil_start(
     unit: CalendarUnit,
     hour: i8,
     anchor: CalendarAnchor,
-    now: DateTime,
+    now: &jiff::Zoned,
     tz: &TimeZone,
 ) -> Result<DateTime, PeriodError> {
-    let candidate = candidate_for_unit(unit, hour, anchor, now)?;
+    let candidate = candidate_for_unit(unit, hour, anchor, now.datetime())?;
     let candidate_zoned = resolve_civil(tz, candidate)?;
-    if candidate_zoned.datetime() > now {
+    // Compare the RESOLVED ABSOLUTE INSTANTS, not the bare civil (offset-naive)
+    // datetimes. A civil-only comparison is wrong whenever `now` itself falls
+    // in the second occurrence of an ambiguous (autumn fold) local hour: its
+    // wall clock reads earlier than the candidate's first-occurrence wall
+    // clock even though, in absolute time, it is later. Comparing timestamps
+    // instead reflects real elapsed time and is correct in every case,
+    // including the ordinary one where no fold is involved.
+    if candidate_zoned.timestamp() > now.timestamp() {
         civil_add_unit(unit, anchor, candidate, -1)
     } else {
         Ok(candidate)
