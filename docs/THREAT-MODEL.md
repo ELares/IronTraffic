@@ -609,6 +609,99 @@ and one upstream descriptor. `serve-and-smoke-test` (#21) is where that total is
 occupy the whole connection cap. That is recorded in the accept-and-admission section rather than
 duplicated here.
 
+## WebSocket frame relay
+
+**What `irontraffic-ws` parses.** Every WebSocket frame header crossing the relay in either
+direction, attacker chosen on the client-to-server side and origin chosen (partially trusted, per
+the trust zones table above) on the server-to-client side. A proxy that forwards a malformed frame
+and then goes into byte-shovelling mode has created a bidirectional channel in which the two
+endpoints disagree about frame boundaries; an attacker who can control that disagreement can inject
+a frame the other side attributes to us. That is the smuggling precondition restated for a
+framed, bidirectional protocol instead of a request/response one.
+
+**`irontraffic-ws` never reassembles.** The codec has no message buffer: it validates one frame
+header, reports the header, and the caller forwards that frame's payload through a pooled buffer
+without the codec ever holding it. A relay that reassembled fragmented messages would let an
+attacker's 100-fragment message become our buffer; not reassembling means the only cost a
+fragmented message imposes on us is rate, which the tunnel budget below bounds.
+
+**Every validation rule, and the RFC 6455 clause it comes from:**
+
+- **Masking direction (Section 5.1).** A client-to-server frame MUST be masked and a
+  server-to-client frame MUST NOT be; "The server MUST close the connection upon receiving a frame
+  that is not masked." An unmasked client frame is the classic cache-poisoning primitive against an
+  intermediary that inspects the stream. `FrameDecoder` takes `Direction` as a constructor argument
+  rather than inferring it, because the rule is not inferable from the frame itself.
+- **Control frames are at most 125 bytes and are never fragmented (Section 5.5).** A fragmented
+  control frame is a frame whose meaning is split across two arrivals, the same ambiguity class
+  every other rule here refuses.
+- **Minimal length encoding (Section 5.2).** A payload of 200 bytes encoded in the 64-bit length
+  form is a second encoding of one value; two encodings of one thing is a canonicalisation
+  divergence between our length parser and the origin's. A 64-bit length with its high bit set is
+  refused for the same section's requirement that the bit be zero.
+- **Reserved bits (RSV1 to RSV3) must be zero unless a negotiated extension claims them.** This
+  milestone negotiates no extensions, so `reserved_allowed` is zero and any reserved bit set is a
+  protocol error. The decoder takes the allowed mask as a parameter rather than hardcoding zero, so
+  a future extension (`permessage-deflate` claims RSV1) does not require editing this check.
+- **Continuation ordering.** A continuation frame with no preceding non-final data frame is an
+  error, and a new data frame while a fragmented message is already open is an error. A control
+  frame interleaved into an open fragmented message is legal and does not close it: RFC 6455
+  permits control frames between the fragments of a data message.
+- **Reserved opcodes (0x3 to 0x7, 0xB to 0xF).** A relay that forwards one forwards a value neither
+  endpoint agreed the wire format defines.
+
+**The close payload is the one payload this codec looks at, and why that is still safe.** A `Close`
+frame is a control frame, so RFC 6455 Section 5.5 already bounds it to at most 125 bytes with no
+fragmentation: its whole payload arrives in one frame, so validating it costs no buffer and no
+reassembly. RFC 6455 Section 5.5.1 and Section 7.4 govern what `validate_close_payload` checks:
+
+- A close payload is either empty or at least 2 bytes; a 1-byte payload is a status code split in
+  half and is a protocol error.
+- The first two bytes are the status code, and 1005, 1006 and 1015 MUST NOT appear on the wire:
+  they are values an implementation reports internally when no code was received or the connection
+  failed, and forwarding one lets a peer make the other endpoint report "no status received" for a
+  close that carried a status.
+- A code below 1000 is unassigned and is a protocol error. Codes in 3000 to 4999 are the library and
+  application ranges and are accepted: the code is opaque to a relay, and rejecting them would break
+  every application that uses one for no safety benefit.
+
+The status code is read THROUGH the mask (`payload[i] ^ key[i]` for the first two bytes) rather than
+by unmasking the buffer: nothing is written back, so the bytes the relay forwards are byte-identical
+to the bytes that arrived. This is the ONE place in the codec that inspects payload content, and it
+is safe precisely because the 125-byte control-frame bound makes "the whole payload is already in
+hand" true without any reassembly.
+
+**Masking is never removed or replaced.** A relay forwards a client frame to an upstream that is
+also a server, so the frame stays masked with its original key. Unmasking and remasking with a
+different key would produce a different byte stream for the same message, which is what makes the
+relay byte-transparent rather than byte-opaque. `mask_in_place` exists only for the RFC 8441
+extended-CONNECT bridge (`ws-extended-connect-bridge`, #204), for the one case where a frame arrives
+unmasked over an HTTP/2 or HTTP/3 carriage and must be masked before it reaches an HTTP/1 upstream
+that requires masking; it has no caller anywhere in `irontraffic-ws` itself.
+
+**The tunnel budget.** A WebSocket tunnel is otherwise an unmetered channel through the gateway:
+every other rate limit, quota and body inspection in this product operates on a request, and a
+tunnel is one request that lasts for hours. `TunnelBudget` is the same lazily refilled token bucket
+shape `ConnBudget` uses for HTTP/2 frames: 1000 frames of capacity refilling at 200 per second, and
+16 MiB of capacity refilling at 4 MiB per second, per direction, by default. `Ping` and `Pong` cost 5
+frame tokens against an ordinary data frame's 1, because they are the cheapest frames for an
+attacker to generate and the ones that force a response. Exceeding either bucket closes the tunnel
+with close code 1008 (policy violation) rather than dropping the frame: a silently dropped frame
+produces a hung application and no signal, which is a worse outcome than a closed connection because
+nothing tells the operator or the client what happened. A refill is clamped to the bucket's
+capacity, so a coarse clock that jumps or steps backwards grants at most one full bucket, never more
+than the configured capacity, regardless of how large the apparent elapsed time is.
+
+**Two deliberate non-bounds, stated so a later reviewer does not add either reflexively:**
+
+- **No UTF-8 validation of `Text` frames.** Validating text means holding a fragmented message
+  until it is complete, which is reassembly, which is the thing this codec exists not to do. RFC
+  6455 puts the UTF-8 validation obligation on endpoints, and a relay is not an endpoint.
+- **No fragment-count limit.** A peer may send a message as a million one-byte continuation frames.
+  That costs the relay no memory, because it never reassembles, so the only resource a
+  fragment-count limit could protect is one this codec does not consume; adding one would break a
+  legitimate streaming application for no gain. `TunnelBudget` already bounds the RATE (200 frames
+  per second sustained by default), which is the resource a flood actually spends.
 ## Connection admission and accept-error handling
 
 ### What a connection flood costs us
