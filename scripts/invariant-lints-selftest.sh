@@ -62,6 +62,84 @@ pub fn handle(n: usize) -> usize {
 }
 RS
 
+# One deliberate hot-path allocation per line, one line per call spelling the
+# hot-path-allocation rule claims to cover.
+#
+# WHY THIS FILE EXISTS (issue #539). Corpus A above only proves that the RULE
+# fired somewhere in the corpus, which is satisfied by a single `format!` and
+# says nothing about the other thirty-odd spellings in the token list. That is
+# exactly how the list shipped for months without `to_lowercase`,
+# `String::with_capacity` or `push_str` in it: a reviewer proved by injection
+# that `raw.to_lowercase()` in a `//! HOT PATH` module left the gate CLEAN,
+# while `raw.to_owned()` correctly failed it. The stage below asserts that the
+# rule reports EVERY line in this file, by line, so a token can never again be
+# added to the rule and quietly match nothing.
+#
+# Each binding is named `tok_<spelling>` so the assertion can key on a string
+# that appears nowhere else, in particular nowhere in the rule's own explain
+# text, which names several of these calls in prose and would otherwise make
+# the assertion pass vacuously.
+cat > "$A/crates/irontraffic-router/src/hot_alloc.rs" <<'RS'
+//! HOT PATH
+//! Deliberately allocates once per line, one call spelling per line.
+use std::borrow::Cow;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap, HashSet, LinkedList, VecDeque};
+use std::rc::Rc;
+use std::sync::Arc;
+
+/// Every statement in here is a deliberate violation.
+pub fn allocates(n: usize, raw: &str, parts: &[&str], cow: Cow<'_, str>) -> usize {
+    let tok_format = format!("{n}");
+    let tok_to_string = n.to_string();
+    let tok_to_owned = raw.to_owned();
+    let tok_into_owned = cow.into_owned();
+    let tok_to_vec = raw.as_bytes().to_vec();
+    let tok_vec_macro = vec![0u8; 4];
+    let tok_vec_new: Vec<u8> = Vec::new();
+    let tok_string_new = String::new();
+    let tok_hash_map_new: HashMap<u8, u8> = HashMap::new();
+    let tok_hash_set_new: HashSet<u8> = HashSet::new();
+    let tok_btree_map_new: BTreeMap<u8, u8> = BTreeMap::new();
+    let tok_btree_set_new: BTreeSet<u8> = BTreeSet::new();
+    let tok_vec_deque_new: VecDeque<u8> = VecDeque::new();
+    let tok_binary_heap_new: BinaryHeap<u8> = BinaryHeap::new();
+    let tok_linked_list_new: LinkedList<u8> = LinkedList::new();
+    let tok_string_with_capacity = String::with_capacity(n);
+    let tok_turbofish_with_capacity = Vec::<u8>::with_capacity(n);
+    let tok_string_from = String::from(raw);
+    let tok_vec_from = Vec::from(raw.as_bytes());
+    let tok_box_from: Box<str> = Box::from(raw);
+    // Turbofish evasion (issue #610): a type parameter written explicitly
+    // between the type name and `::` used to remove the `Type::` prefix
+    // these rules require, so `Vec::<u8>::new()` and `Box::<str>::from(raw)`
+    // matched nothing even though `Vec::new()` and `Box::from(raw)` did.
+    let tok_turbofish_from: Box<str> = Box::<str>::from(raw);
+    let tok_box_new = Box::new(n);
+    let tok_arc_new = Arc::new(n);
+    let tok_rc_new = Rc::new(n);
+    let tok_turbofish_new: Vec<u8> = Vec::<u8>::new();
+    let tok_box_pin = Box::pin(n);
+    let tok_collect_turbofish = raw.bytes().collect::<Vec<u8>>();
+    let tok_collect_bare: Vec<u8> = raw.bytes().collect();
+    let tok_clone = tok_string_new.clone();
+    let tok_to_lowercase = raw.to_lowercase();
+    let tok_to_uppercase = raw.to_uppercase();
+    let mut tok_push_str = tok_string_from;
+    tok_push_str.push_str(raw);
+    let tok_repeat = raw.repeat(2);
+    let tok_join = parts.join(".");
+    // Wrapped by rustfmt so the separator is not on the same line as the
+    // call: the rule must still see it, which is why the separator test
+    // accepts end of line as well as a non-`)` character.
+    let tok_join_wrapped = parts.join(
+        ".",
+    );
+    let tok_into_boxed_slice = tok_vec_from.into_boxed_slice();
+    let tok_into_boxed_str = tok_push_str.into_boxed_str();
+    n + tok_into_boxed_slice.len() + tok_into_boxed_str.len()
+}
+RS
+
 cat > "$A/crates/irontraffic-router/src/bad.rs" <<'RS'
 //! Deliberately violates the production-code rules.
 use std::time::Instant;
@@ -578,8 +656,10 @@ echo "== corpus A: every rule must fire =="
 # Captured ONCE: run_lints_in commits whatever is new in $A and then runs the
 # real script, so a second call on the same tree with nothing left to commit
 # would fail its own `git commit` step and silently return empty output. The
-# rule-name set below (ACTUAL) and the specific file:line check further down
-# (issue #641) both read this same capture rather than re-running the corpus.
+# rule-name set below (ACTUAL), the specific file:line check further down
+# (issue #641), and the hot-path-allocation per-spelling check further down
+# still (issue #539) all read this same capture rather than re-running the
+# corpus.
 RAW_A="$(run_lints_in "$A")"
 ACTUAL="$(printf '%s\n' "$RAW_A" | sed -n 's/^FAIL \[\(.*\)\]$/\1/p' | LC_ALL=C sort -u)"
 # comm requires both inputs sorted under the SAME collation, so sort both here
@@ -644,6 +724,228 @@ if [ -n "$MISSING_LINES" ]; then
   FAILED=1
 else
   note "all four #628 regression files are individually visible to no-panic"
+fi
+
+# ---------------------------------------------------------------------------
+# Corpus A, per call spelling: hot-path-allocation must name EVERY covered
+# call, by line.
+#
+# WHY THIS IS NOT REDUNDANT WITH THE CHECK ABOVE (issue #539). The check above
+# asks only whether the rule fired anywhere in corpus A, which one `format!`
+# satisfies. hot-path-allocation is a deny list of more than thirty call
+# spellings, and a deny list is only worth the entries that actually match: a
+# token added to the pattern with a typo, an unescaped metacharacter, or an
+# alternation the shell mangled matches nothing and costs nothing to nobody,
+# forever, while this file keeps reporting that the rule fired. That is
+# precisely how `to_lowercase`, `String::with_capacity` and `push_str` came to
+# be absent from a rule whose own documentation said it caught every call that
+# can allocate.
+#
+# So every spelling gets its own line in hot_alloc.rs and its own needle here.
+# Add a token to the rule, add its needle here, and watch it fail before you
+# trust it. The hits are filtered to lines naming hot_alloc.rs first, because
+# the rule's explain text discusses several of these calls in prose and a
+# needle matching that prose would pass while matching no source line at all.
+# ---------------------------------------------------------------------------
+echo "== corpus A: hot-path-allocation must report every covered call by line =="
+ALLOC_HITS="$(printf '%s\n' "$RAW_A" \
+  | awk '/^FAIL \[hot-path-allocation\]$/ { on = 1; next } /^FAIL \[/ { on = 0 } on' \
+  | grep -F 'crates/irontraffic-router/src/hot_alloc.rs:' || true)"
+MISSED_SPELLINGS=""
+while IFS= read -r needle; do
+  [ -n "$needle" ] || continue
+  printf '%s\n' "$ALLOC_HITS" | grep -qF -- "$needle" \
+    || MISSED_SPELLINGS="$MISSED_SPELLINGS  $needle"$'\n'
+done <<'NEEDLES'
+tok_format = format!(
+tok_to_string = n.to_string()
+tok_to_owned = raw.to_owned()
+tok_into_owned = cow.into_owned()
+tok_to_vec = raw.as_bytes().to_vec()
+tok_vec_macro = vec![
+tok_vec_new: Vec<u8> = Vec::new()
+tok_string_new = String::new()
+tok_hash_map_new: HashMap<u8, u8> = HashMap::new()
+tok_hash_set_new: HashSet<u8> = HashSet::new()
+tok_btree_map_new: BTreeMap<u8, u8> = BTreeMap::new()
+tok_btree_set_new: BTreeSet<u8> = BTreeSet::new()
+tok_vec_deque_new: VecDeque<u8> = VecDeque::new()
+tok_binary_heap_new: BinaryHeap<u8> = BinaryHeap::new()
+tok_linked_list_new: LinkedList<u8> = LinkedList::new()
+tok_string_with_capacity = String::with_capacity(
+tok_turbofish_with_capacity = Vec::<u8>::with_capacity(
+tok_string_from = String::from(
+tok_vec_from = Vec::from(
+tok_box_from: Box<str> = Box::from(
+tok_turbofish_from: Box<str> = Box::<str>::from(
+tok_box_new = Box::new(
+tok_arc_new = Arc::new(
+tok_rc_new = Rc::new(
+tok_turbofish_new: Vec<u8> = Vec::<u8>::new(
+tok_box_pin = Box::pin(
+tok_collect_turbofish = raw.bytes().collect::<Vec<u8>>()
+tok_collect_bare: Vec<u8> = raw.bytes().collect()
+tok_clone = tok_string_new.clone()
+tok_to_lowercase = raw.to_lowercase()
+tok_to_uppercase = raw.to_uppercase()
+tok_push_str.push_str(
+tok_repeat = raw.repeat(
+tok_join = parts.join(
+tok_join_wrapped = parts.join(
+tok_into_boxed_slice = tok_vec_from.into_boxed_slice()
+tok_into_boxed_str = tok_push_str.into_boxed_str()
+NEEDLES
+if [ -n "$MISSED_SPELLINGS" ]; then
+  echo "FAIL: hot-path-allocation did not report these deliberate allocations:"
+  printf '%s' "$MISSED_SPELLINGS"
+  echo "      Each one is a call the rule's token list claims to cover. A token"
+  echo "      that matches nothing is a rule that enforces nothing."
+  FAILED=1
+else
+  note "hot-path-allocation reported every covered call spelling"
+fi
+
+# ---------------------------------------------------------------------------
+# Corpus A, the OTHER direction: the pattern must not outrun NEEDLES.
+#
+# WHY THIS EXISTS (issue #610). The check just above only walks NEEDLES ->
+# hits: it proves every line this file claims is covered really fires, and it
+# says nothing at all about a token that was added to the live pattern in
+# scripts/invariant-lints.sh with no needle here to match it. That is not a
+# hypothetical gap, it is a proven one: appending a brand new top-level
+# alternative to the end of the hot-path-allocation pattern, with nothing
+# added to NEEDLES, left this whole script exiting 0 and printing "hot-path-
+# allocation reported every covered call spelling" for every one of these:
+#   - `|\.to_lowercasee\(\)`      (a typo)
+#   - `|\.to_pathbuf\(\)`         (a real call, just never added as a needle)
+#   - `|\.into_bytes\(\)`         (same)
+# The needles-to-hits check above cannot see any of these, because it never
+# reads the pattern; it only reads what the rule reported. The one case it
+# happens to catch, an unbalanced group, is caught for the wrong reason: an
+# invalid ERE makes grep reject the whole pattern, so every PRE-EXISTING hit
+# vanishes at once, which trips the needles-to-hits check on tokens that were
+# already there, not because the new token itself was noticed.
+#
+# THE CHECK. Extract the live hot-path-allocation pattern from scripts/
+# invariant-lints.sh and count its top-level `|` alternatives: an alternation
+# nested inside a group, such as the type list on the `::new\(` line
+# (`(Vec|String|...)`), is ONE top-level alternative, not many, because
+# touching only the type list is a separate, narrower change this check does
+# not claim to police (see the limits below). Compare that count to the
+# number pinned immediately below, right beside NEEDLES. Add, remove, or
+# otherwise change a top-level alternative in the pattern without updating
+# both this number and the matching NEEDLES line(s), in either direction, and
+# this fails here.
+#
+# WHAT THIS STILL DOES NOT PROVE, STATED HONESTLY. Two independent edits can
+# cancel out and still leave the counts agreeing (add one alternative, remove
+# a different one, forget both needles). It also cannot see a change made
+# INSIDE an existing alternative's own inner list: folding a tenth collection
+# type into the `(Vec|String|HashMap|...)::new\(` group changes nothing at
+# the top level and this check would not notice. It closes the specific,
+# demonstrated hole (a bare token appended to the pattern with nothing else
+# touched), not every hole shaped like it.
+echo "== corpus A: hot-path-allocation pattern alternatives must match NEEDLES =="
+# Keep this number in the same commit as any change to the top-level shape of
+# hot_scan's hot-path-allocation pattern in scripts/invariant-lints.sh, and add
+# or remove the matching NEEDLES line(s) at the same time.
+EXPECTED_ALLOC_ALTERNATIVES=19
+ACTUAL_ALLOC_ALTERNATIVES="$(python3 - <<'PY'
+import re
+
+try:
+    text = open("scripts/invariant-lints.sh", encoding="utf-8").read()
+except OSError:
+    print("ERROR: could not read scripts/invariant-lints.sh")
+    raise SystemExit(0)
+
+m = re.search(r"hot_scan hot-path-allocation '([^']*)'", text)
+if not m:
+    print("ERROR: could not find the hot-path-allocation pattern")
+    raise SystemExit(0)
+pattern = m.group(1)
+
+
+def strip_outer_group(pat):
+    """If pat is wrapped in one group spanning the whole string, return its
+    contents; otherwise return pat unchanged. Depth-aware and character-class
+    aware, exactly like count_top_level below, so it does not mistake a `(`
+    inside `[...]` for a real group, or an escaped `\\(` for one either."""
+    if not (pat.startswith("(") and pat.endswith(")")):
+        return pat
+    depth = 0
+    escaped = False
+    in_class = False
+    for idx, c in enumerate(pat):
+        if escaped:
+            escaped = False
+            continue
+        if c == "\\":
+            escaped = True
+            continue
+        if in_class:
+            if c == "]":
+                in_class = False
+            continue
+        if c == "[":
+            in_class = True
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if depth == 0 and idx != len(pat) - 1:
+                # Closes before the end: this is not a single wrapping group,
+                # e.g. "(a)|(b)". Leave pat exactly as given.
+                return pat
+    return pat[1:-1]
+
+
+def count_top_level_alternatives(pat):
+    """Count `|` at depth 0, outside any [...] character class, and outside
+    any escaped \\| or \\( or \\). An unescaped `(` opens a real group
+    (depth += 1) and an unescaped `)` closes one (depth -= 1); a `|` only
+    separates top-level alternatives when depth is 0. `(Vec|String)::new\\(`
+    is therefore ONE alternative: its inner `|` sits at depth 1."""
+    depth = 0
+    escaped = False
+    in_class = False
+    count = 1
+    for c in pat:
+        if escaped:
+            escaped = False
+            continue
+        if c == "\\":
+            escaped = True
+            continue
+        if in_class:
+            if c == "]":
+                in_class = False
+            continue
+        if c == "[":
+            in_class = True
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+        elif c == "|" and depth == 0:
+            count += 1
+    return count
+
+
+print(count_top_level_alternatives(strip_outer_group(pattern)))
+PY
+)"
+if [ "$ACTUAL_ALLOC_ALTERNATIVES" != "$EXPECTED_ALLOC_ALTERNATIVES" ]; then
+  echo "FAIL: scripts/invariant-lints.sh's hot-path-allocation pattern now has"
+  echo "      $ACTUAL_ALLOC_ALTERNATIVES top-level alternatives, but this file still expects"
+  echo "      $EXPECTED_ALLOC_ALTERNATIVES (EXPECTED_ALLOC_ALTERNATIVES above). A top-level"
+  echo "      alternative was added to or removed from the pattern without updating"
+  echo "      EXPECTED_ALLOC_ALTERNATIVES and the matching NEEDLES line(s) here."
+  FAILED=1
+else
+  note "hot-path-allocation pattern has exactly $EXPECTED_ALLOC_ALTERNATIVES top-level alternatives, matching NEEDLES"
 fi
 
 # ---------------------------------------------------------------------------
@@ -1253,6 +1555,146 @@ pub fn is_transfer_encoding(k: KnownHeader) -> bool {
 }
 RS
 
+# Legitimate, NON-allocating hot-path code that a naive widening of the
+# hot-path-allocation token list would have rejected.
+#
+# WHY THIS FILE EXISTS (issue #539). Widening a deny list is the easy half; not
+# over-widening it is the half that costs people time. This repository already
+# carries two rules that reach too far: single-snapshot-publish is broad enough
+# that two implementers wrote `AtomicU32::store(&cell, ...)` in fully qualified
+# form purely to route around it, and constant-time-secrets fires on any
+# identifier matching token[a-z_]*\s*==. A rule people have learned to evade
+# stops being a rule. Every function below is correct, allocation-free code
+# that the obvious version of each newly added token would have flagged, so the
+# clean-corpus check is what keeps the widened rule honest in the other
+# direction.
+cat > "$B/crates/irontraffic-router/src/hot_ok.rs" <<'RS'
+//! HOT PATH
+//! Correct, allocation-free hot-path code. Every call here is one a naive
+//! version of the hot-path-allocation token list would have rejected.
+use std::sync::Arc;
+
+/// Lowercases ASCII into a buffer the caller already owns, allocating
+/// nothing. This is the exact idiom `crates/irontraffic-router/src/
+/// normalize.rs` uses on the real request path: on a byte receiver the ASCII
+/// case conversions return a byte and touch no heap, while on a str receiver
+/// the identical spelling returns an owned string. A receiver-blind text scan
+/// cannot separate the two, which is why neither is in the token list.
+pub fn lowercase_into(src: &[u8], buf: &mut [u8; 64]) -> usize {
+    let mut written = 0usize;
+    for (i, &b) in src.iter().enumerate() {
+        let out = match b {
+            b'A'..=b'Z' => b.to_ascii_lowercase(),
+            _ => b,
+        };
+        if let Some(slot) = buf.get_mut(i) {
+            *slot = out;
+            written += 1;
+        }
+    }
+    written
+}
+
+/// The char form of the same conversion, which also allocates nothing.
+#[must_use]
+pub fn upper_char(c: char) -> char {
+    c.to_ascii_uppercase()
+}
+
+/// Comparing two names case-insensitively without building an owned copy of
+/// either: the call a hot path should reach for, and one a rule keyed on the
+/// word "lowercase" rather than on the call spelling would have flagged.
+#[must_use]
+pub fn same_name(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+
+/// Classifying a byte. Same reasoning as above.
+#[must_use]
+pub fn is_lower(b: u8) -> bool {
+    b.is_ascii_lowercase()
+}
+
+/// Appending into a buffer the CALLER owns and has already sized: the idiom
+/// the rule's own failure message recommends, which is why extend and
+/// extend_from_slice are deliberately not tokens.
+pub fn append(buf: &mut Vec<u8>, src: &[u8]) {
+    buf.extend_from_slice(src);
+}
+
+/// Reading how much room a buffer already has is not reserving any. The token
+/// for the capacity constructor is spelled as a double-colon path, so an
+/// ordinary method call on a receiver cannot match it.
+///
+/// Note the shape of this comment: it describes the token rather than
+/// quoting it. hot-path-allocation is a plain text scan with no idea what a
+/// comment is, so quoting a covered call in prose inside a HOT PATH module
+/// fires the rule on the documentation. This corpus hit that twice while it
+/// was being written.
+#[must_use]
+pub fn headroom(buf: &Vec<u8>) -> usize {
+    buf.capacity()
+}
+
+/// Waiting for a worker takes no separator, so it is not the allocating slice
+/// join: the token requires join to receive an argument.
+pub fn wait(handle: std::thread::JoinHandle<()>) -> bool {
+    handle.join().is_ok()
+}
+
+/// Repeating through the free function allocates nothing and is not the
+/// allocating slice method: the token requires a receiver and a dot.
+pub fn filler(n: usize) -> impl Iterator<Item = u8> {
+    std::iter::repeat_n(b'a', n)
+}
+
+/// Bumping a reference count is not an allocation. Constructing a fresh
+/// counted pointer is a covered call; the fully qualified clone of an
+/// existing one is not, and must stay legal on the request path.
+#[must_use]
+pub fn share(v: &Arc<u8>) -> Arc<u8> {
+    Arc::clone(v)
+}
+
+/// Pinning to the stack allocates nothing, unlike the boxed form.
+pub fn pin_local(v: &mut u8) -> std::pin::Pin<&mut u8> {
+    std::pin::Pin::new(v)
+}
+
+/// Setting an Option in place never allocates, which is one reason insert is
+/// not a token.
+pub fn fill(slot: &mut Option<u8>, v: u8) -> u8 {
+    *slot.insert(v)
+}
+
+/// A crate type's own constructor. The token list names the standard
+/// collection types explicitly rather than matching any `::new()`, so an
+/// ordinary constructor call on the request path stays legal.
+pub struct Cursor {
+    at: usize,
+}
+
+impl Cursor {
+    /// Builds a cursor over nothing. Allocates nothing.
+    #[must_use]
+    pub fn new() -> Self {
+        Self { at: 0 }
+    }
+
+    /// A field named for collecting is not a call to collect.
+    #[must_use]
+    pub fn collect_count(&self) -> usize {
+        self.at
+    }
+}
+
+/// Constructing a crate type is not constructing a collection.
+#[must_use]
+pub fn make() -> Cursor {
+    Cursor::new()
+}
+RS
+
 mkdir -p "$B/scripts"
 cat > "$B/scripts/allowlist-arcswap-store.txt" <<'TXT'
 # Corpus-only allowlist: the one designated ArcSwap publisher in this
@@ -1267,11 +1709,16 @@ serde = "1"
 TOML
 
 echo "== corpus B: no rule may fire =="
-CLEAN_FIRED="$(fired_rules "$B")"
+# Captured once and reused for the same reason corpus A is: running the lints
+# a second time to print the detail would find nothing to commit, short
+# circuit before the lint script, and print an empty diagnostic for the
+# failure it was called to explain.
+OUT_B="$(run_lints_in "$B")"
+CLEAN_FIRED="$(printf '%s\n' "$OUT_B" | sed -n 's/^FAIL \[\(.*\)\]$/\1/p' | LC_ALL=C sort -u)"
 if [ -n "$CLEAN_FIRED" ]; then
   echo "FAIL: these rules produced FALSE POSITIVES on clean code:"
   echo "$CLEAN_FIRED" | sed 's/^/    /'
-  run_lints_in "$B" | sed 's/^/    /'
+  printf '%s\n' "$OUT_B" | sed 's/^/    /'
   FAILED=1
 else
   note "clean corpus is clean"
