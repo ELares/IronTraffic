@@ -1,0 +1,24 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "irontraffic-upgrade"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The zero-downtime binary upgrade wire format: a pure, bounded, fuzzed descriptor-handoff frame."
+
+[lints]
+workspace = true
+
+[dependencies]
+# Framing checksum. Not a security control: it turns a partial write or a
+# version confusion into a clean rejection instead of a nonsense address.
+blake3 = "1.5"
+# Typed error enums without hand-written Display impls.
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# The one canonical spelling both sides of a handoff compare; used only in tests.
+irontraffic-config = { path = "../irontraffic-config", version = "0.1.0" }
+proptest = { workspace = true }

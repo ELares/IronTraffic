@@ -121,6 +121,27 @@ Later issues append one subsection per surface here: `path-normalization` (#29),
 `desync-corpus-and-reject-table` (#47) adds a section 6 that ties every named attack to its corpus
 entry.
 
+## Binary upgrade handoff
+
+**What the exchange parses.** A predecessor process serialises its listening sockets into a
+versioned, length-prefixed frame and sends the frame over a Unix stream socket together with the
+file descriptors as `SCM_RIGHTS`. The successor parses the frame, matches each entry's canonical bind
+address against its own listeners, registers the inherited descriptors, and replies with a one-byte
+acknowledgement before the predecessor stops accepting.
+
+**What an attacker can do.** A peer on the upgrade socket does not merely send a message; it sends
+listening sockets, and the receiver then accepts connections on them. A peer that can complete the
+exchange therefore chooses which sockets this process serves traffic on. It could hand over a socket
+it also holds, and read every request and response that arrives.
+
+**Structural controls.** The frame carries no authentication of any kind. The only controls are who
+may connect to the upgrade socket: the socket lives in a directory with mode 0700 owned by the
+process's own user, the socket itself is mode 0700, and both sides verify peer credentials and refuse
+unless the peer's effective uid equals their own. The receiver also verifies that the number of
+descriptors actually received in the control message equals the frame's count before indexing the
+array. A checksum inside the frame is a framing check only: it turns a partial write or a version
+confusion into a clean rejection, not a security boundary.
+
 ## Authority normalization
 
 **Parses:** the `Host` header (HTTP/1) or the `:authority` pseudo-header (HTTP/2, HTTP/3), via
