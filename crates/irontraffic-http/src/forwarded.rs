@@ -1184,6 +1184,49 @@ mod tests {
                     el(addr("2.2.2.2", None), None, true),
                 ]),
             ),
+            // 36 (added by #598; not one of the issue's original numbered
+            // edge cases): the Forwarded list split across two field lines
+            // is ONE concatenated list, the same #list-split rule edge case
+            // 3/4 already pin for X-Forwarded-For. Until this row existed,
+            // nothing in corpus_table supplied more than one `Forwarded`
+            // line.
+            (
+                &[b"for=1.1.1.1, for=2.2.2.2", b"for=3.3.3.3"],
+                &[],
+                &[],
+                ok(vec![
+                    el(addr("1.1.1.1", None), None, false),
+                    el(addr("2.2.2.2", None), None, false),
+                    el(addr("3.3.3.3", None), None, false),
+                ]),
+            ),
+            // 37 (added by #600; not one of the issue's original numbered
+            // edge cases): X-Forwarded-Proto is written onto the LAST
+            // element of a multi-element chain, never an earlier one.
+            // Every case above uses a chain of exactly one element, so
+            // `elements.last_mut()` swapped for `elements.first_mut()`
+            // survives undetected without this row.
+            (
+                &[b"for=1.1.1.1, for=2.2.2.2"],
+                &[],
+                &[b"https"],
+                ok(vec![
+                    el(addr("1.1.1.1", None), None, false),
+                    el(addr("2.2.2.2", None), Some(Scheme::Https), false),
+                ]),
+            ),
+            // 38 (added by #600; not one of the issue's original numbered
+            // edge cases): the LAST X-Forwarded-Proto field LINE wins, not
+            // the first. Every case above uses exactly one XFP line, so
+            // `last_xfp = Some(value)` swapped for `last_xfp =
+            // last_xfp.or(Some(value))` (a fail-open first-line-wins bug)
+            // survives undetected without this row.
+            (
+                &[b"for=1.1.1.1"],
+                &[],
+                &[b"http", b"https"],
+                ok(vec![el(addr("1.1.1.1", None), Some(Scheme::Https), false)]),
+            ),
         ];
 
         for (forwarded, xff, xfp, expected) in cases {
@@ -1279,6 +1322,40 @@ mod tests {
                 Some(want_addr.parse().expect("valid ip"))
             );
         }
+
+        // #598: the SAME property, for the `Forwarded` family rather than
+        // `X-Forwarded-For`. Every case above supplies at most one
+        // `Forwarded` line, so `for value in forwarded_values` truncated to
+        // `.take(1)` (reads only the first line) or to
+        // `.last().into_iter()` (reads only the last line) both survived
+        // the entire gate: this is the RFC 7239 Section 7.1 `#list`-split
+        // bypass the issue's own Context section calls "the single most
+        // common source of both smuggling and XFF bypasses", left
+        // unexercised for the field this crate names first.
+        let forwarded_full = parse3(&[b"for=1.1.1.1, for=2.2.2.2", b"for=3.3.3.3"], &[], &[])
+            .expect("well formed Forwarded chain");
+        assert_eq!(forwarded_full.len(), 3);
+        let want_forwarded: [&str; 3] = ["1.1.1.1", "2.2.2.2", "3.3.3.3"];
+        for (element, want_addr) in forwarded_full.elements().iter().zip(want_forwarded.iter()) {
+            assert!(!element.from_xff);
+            assert_eq!(
+                element.node.addr(),
+                Some(want_addr.parse().expect("valid ip"))
+            );
+        }
+
+        // Reading only the FIRST Forwarded line would have produced two
+        // elements, not three: `.take(1)` on `forwarded_values` stops here.
+        let forwarded_first_only =
+            parse3(&[b"for=1.1.1.1, for=2.2.2.2"], &[], &[]).expect("well formed Forwarded chain");
+        assert_eq!(forwarded_first_only.len(), 2);
+
+        // Reading only the LAST Forwarded line would have produced one
+        // element, not three: `.last().into_iter()` on `forwarded_values`
+        // stops here.
+        let forwarded_last_only =
+            parse3(&[b"for=3.3.3.3"], &[], &[]).expect("well formed Forwarded chain");
+        assert_eq!(forwarded_last_only.len(), 1);
     }
 
     #[test]
@@ -1475,6 +1552,27 @@ mod tests {
         // element for it.
         let still_empty = parse3(&[], &[], &[b"https"]).expect("well formed, still empty");
         assert!(still_empty.is_empty());
+
+        // #600: X-Forwarded-Proto is written onto the LAST element of a
+        // multi-element chain, never onto an earlier one. Every case above
+        // uses a chain of exactly one element, so `elements.last_mut()`
+        // swapped for `elements.first_mut()` (attaching an outer hop's
+        // claim to the wrong, inner element, exactly the failure mode the
+        // design comment above `elements.last_mut()` in this module warns
+        // against) survived the entire gate.
+        let two_element_chain =
+            parse3(&[b"for=1.1.1.1, for=2.2.2.2"], &[], &[b"https"]).expect("well formed");
+        assert_eq!(two_element_chain.elements()[0].proto, None);
+        assert_eq!(two_element_chain.elements()[1].proto, Some(Scheme::Https));
+
+        // #600: the LAST X-Forwarded-Proto field LINE wins, not the first.
+        // Every case above supplies exactly one XFP line, so `last_xfp =
+        // Some(value)` swapped for `last_xfp = last_xfp.or(Some(value))`
+        // (fail open: a client-prepended line would beat a trusted proxy's
+        // own appended one) survived the entire gate.
+        let two_xfp_lines =
+            parse3(&[b"for=1.1.1.1"], &[], &[b"http", b"https"]).expect("well formed");
+        assert_eq!(two_xfp_lines.elements()[0].proto, Some(Scheme::Https));
     }
 
     #[test]
