@@ -16,3 +16,24 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 # load, validate, and the types the `validate` mode's flags parse into.
 irontraffic-config = { path = "../irontraffic-config", version = "0.1.0" }
+# the accept loop, the connection registry and guard, the sharded listener,
+# and the graceful drain.
+irontraffic-conn = { path = "../irontraffic-conn", version = "0.1.0" }
+# the one-buffer-of-credit bidirectional forwarding loop.
+irontraffic-dataplane = { path = "../irontraffic-dataplane", version = "0.1.0" }
+# the transport seam: capability probe, spawner, shutdown signalling, the timer.
+irontraffic-io = { path = "../irontraffic-io", version = "0.1.0" }
+# the entropy seam: the per-core RNG seed.
+irontraffic-rand = { path = "../irontraffic-rand", version = "0.1.0" }
+# the two tokio runtimes and the per-core counter state.
+irontraffic-runtime = { path = "../irontraffic-runtime", version = "0.1.0" }
+# the process clock, constructed once at startup.
+irontraffic-time = { path = "../irontraffic-time", version = "0.1.0" }
+# the single upstream connector.
+irontraffic-upstream = { path = "../irontraffic-upstream", version = "0.1.0" }
+
+[dev-dependencies]
+# the in-test origin server and the child-process smoke test driver need an
+# async runtime; the binary itself never names tokio (see
+# `crates/irontraffic/src/serve.rs`).
+tokio = { workspace = true }

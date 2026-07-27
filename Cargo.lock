@@ -926,6 +926,14 @@ name = "irontraffic"
 version = "0.1.0"
 dependencies = [
  "irontraffic-config",
+ "irontraffic-conn",
+ "irontraffic-dataplane",
+ "irontraffic-io",
+ "irontraffic-rand",
+ "irontraffic-runtime",
+ "irontraffic-time",
+ "irontraffic-upstream",
+ "tokio",
  "tracing",
  "tracing-subscriber",
 ]

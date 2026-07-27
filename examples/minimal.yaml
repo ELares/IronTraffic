@@ -1,0 +1,6 @@
+apiVersion: irontraffic.io/v1
+listeners:
+  - name: web
+    bind: "127.0.0.1:8080"
+upstream:
+  address: "127.0.0.1:9000"
