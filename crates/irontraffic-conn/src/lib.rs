@@ -53,6 +53,7 @@ pub mod budget;
 pub mod drain;
 pub mod listener;
 pub mod registry;
+pub mod settings;
 
 pub use accept::{AcceptConfig, AcceptOutcome, BoxFut, ConnHandler, MAX_BACKOFF_MS, accept_loop};
 pub use budget::{ConnBudget, EnhanceYourCalm, FrameCosts, FrameEvent, TooManyStreams};

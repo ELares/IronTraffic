@@ -52,6 +52,7 @@ pub mod h1;
 pub mod hlist;
 pub mod known;
 pub mod limits;
+pub mod priority;
 pub mod response;
 pub mod scalar;
 pub mod section;
