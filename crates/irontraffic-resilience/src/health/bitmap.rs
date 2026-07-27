@@ -6,8 +6,30 @@
 //! endpoint's health is one relaxed load, one shift, and one mask. The
 //! `ClusterHealth` record adds a per-endpoint slow-start weight multiplier and a
 //! membership generation.
+//!
+//! # `words` under `loom`
+//!
+//! `loom_tests`, at the bottom of this file, models the one property this
+//! module cannot prove single threaded: that two writers setting different
+//! endpoints in the same word never clobber each other. That model needs
+//! loom's instrumented atomic in place of `core`'s for exactly the field the
+//! model exercises, `HealthBitmap::words`, so `AtomicU32` is aliased below.
+//! `weights` and `CLUSTER_ENDPOINTS_TRUNCATED` deliberately keep
+//! `core::sync::atomic`'s own types unaliased: neither is part of the
+//! concurrency property the model checks, so aliasing them would only make
+//! loom explore interleavings that cannot affect anything this module
+//! guarantees.
 
-use core::sync::atomic::{AtomicU16, AtomicU32, AtomicU64, Ordering};
+#![allow(
+    unexpected_cfgs,
+    reason = "cfg(loom) is a deliberate custom cfg for the loom concurrency-model tests, the same #[cfg(loom)] convention loom's own downstream users (tokio, crossbeam) rely on; registering it via a package-level [lints.rust] check-cfg table would conflict with this crate's required [lints] workspace = true, and this crate may not touch the workspace lints table to add it there instead"
+)]
+
+#[cfg(not(loom))]
+use core::sync::atomic::AtomicU32;
+use core::sync::atomic::{AtomicU16, AtomicU64, Ordering};
+#[cfg(loom)]
+use loom::sync::atomic::AtomicU32;
 
 use crate::ids::EndpointIdx;
 
@@ -166,13 +188,18 @@ impl HealthBitmap {
 
     /// Decode the two-bit state for a raw endpoint index.
     ///
-    /// Callers must ensure `idx < self.len`.
+    /// Callers must ensure `idx < self.len`. A missing word (unreachable today,
+    /// since every caller guarantees `idx < self.len`) falls back to the bit
+    /// pattern for `Unhealthy`, not `Healthy`: every other out of range path in
+    /// this module fails safe, and a fail open fallback here would be a latent
+    /// trap for a future caller that loses that guarantee.
     #[inline]
     fn state_at(&self, idx: usize) -> EndpointHealth {
+        let unhealthy_fallback = (EndpointHealth::Unhealthy as u32) * 0x5555_5555; // it-allow: unchecked-cast reason: EndpointHealth is #[repr(u8)] with discriminants 0..=3; u8 to u32 is a widening cast and cannot truncate
         let w = self
             .words
             .get(idx >> 4)
-            .map_or(0, |w| w.load(Ordering::Relaxed));
+            .map_or(unhealthy_fallback, |w| w.load(Ordering::Relaxed));
         let shift = (idx & 0xF) * 2;
         EndpointHealth::from_bits(((w >> shift) & 0b11) as u8) // it-allow: unchecked-cast reason: the mask `& 0b11` produces a value in 0..=3, which always fits in u8
     }
@@ -222,6 +249,10 @@ impl ClusterHealth {
             .map(|_| AtomicU16::new(10_000))
             .collect::<Vec<_>>()
             .into_boxed_slice();
+        debug_assert!(
+            weights.len() == bitmap.len(),
+            "invariant 3: weights and bitmap must cover the same endpoint count"
+        );
         Self {
             bitmap,
             weights,
@@ -368,11 +399,12 @@ mod tests {
     fn set_does_not_disturb_neighbours() {
         let b = HealthBitmap::new(32, EndpointHealth::Healthy);
         for state in [
+            EndpointHealth::Healthy,
             EndpointHealth::Degraded,
             EndpointHealth::Unhealthy,
             EndpointHealth::Draining,
         ] {
-            for idx in [0, 15, 16, 31] {
+            for idx in [0, 5, 15, 16, 31] {
                 assert!(b.set(mkidx(idx), state));
                 for other in 0..32 {
                     let expected = if other == idx {
@@ -437,6 +469,19 @@ mod tests {
     fn out_of_range_set_returns_false() {
         let b = HealthBitmap::new(10, EndpointHealth::Healthy);
         assert!(!b.set(EndpointIdx(10), EndpointHealth::Healthy));
+    }
+
+    /// `state_at`'s documented contract is `idx < self.len`; every caller in this
+    /// crate upholds it, which makes the missing-word branch of its fallback
+    /// unreachable through the public API. This test calls the private helper
+    /// directly, deliberately violating that contract, to prove the fallback
+    /// itself fails safe (decodes to `Unhealthy`) rather than fails open
+    /// (decodes to `Healthy`), matching the rule `get` enforces for every other
+    /// out of range path in this module.
+    #[test]
+    fn state_at_missing_word_fails_unhealthy() {
+        let b = HealthBitmap::new(1, EndpointHealth::Healthy);
+        assert_eq!(b.state_at(1_000), EndpointHealth::Unhealthy);
     }
 
     #[test]
@@ -531,8 +576,100 @@ mod tests {
         }
     }
 
+    /// #91's Do NOT list forbids implementing `set` as a load, a full-word
+    /// recompute, and a store: it requires `fetch_and` then `fetch_or` so that a
+    /// concurrent write to a DIFFERENT endpoint in the SAME word survives. A
+    /// single threaded test cannot observe the difference, because a single
+    /// threaded load-then-store is bit-identical to two RMWs. This test uses two
+    /// real OS threads, each hammering its own endpoint in word 0 (index 3 and
+    /// index 4, sixteen endpoints per word) for many iterations with no
+    /// synchronization between them, so the two writers actually race.
+    ///
+    /// Each thread cycles through a fixed sequence of states and remembers the
+    /// last one it wrote. Nothing but that thread ever writes its own index, so
+    /// if the final read does not match the last value that thread wrote, the
+    /// only possible explanation is that the OTHER thread's concurrent write to
+    /// the same word clobbered it, which is exactly the bug a load, recompute,
+    /// store implementation has and two RMWs do not. Running many independent
+    /// rounds, each with a fresh bitmap and thousands of iterations per thread,
+    /// keeps this from being a one-shot coin flip: the forbidden implementation
+    /// fails it on close to every run, the required one never does.
+    #[test]
+    fn concurrent_set_on_different_endpoints_in_one_word_survives() {
+        use std::sync::Arc;
+        use std::thread;
+
+        const ROUNDS: usize = 50;
+        const ITERS_PER_ROUND: usize = 4_000;
+
+        let states = [
+            EndpointHealth::Degraded,
+            EndpointHealth::Unhealthy,
+            EndpointHealth::Draining,
+            EndpointHealth::Healthy,
+        ];
+
+        for _round in 0..ROUNDS {
+            let b = Arc::new(HealthBitmap::new(16, EndpointHealth::Healthy));
+
+            let b3 = Arc::clone(&b);
+            let t3 = thread::spawn(move || {
+                let mut last = EndpointHealth::Healthy;
+                for i in 0..ITERS_PER_ROUND {
+                    let s = states[i % states.len()];
+                    assert!(b3.set(EndpointIdx(3), s));
+                    last = s;
+                }
+                last
+            });
+
+            let b4 = Arc::clone(&b);
+            let t4 = thread::spawn(move || {
+                let mut last = EndpointHealth::Healthy;
+                for i in 0..ITERS_PER_ROUND {
+                    let s = states[(i + 2) % states.len()];
+                    assert!(b4.set(EndpointIdx(4), s));
+                    last = s;
+                }
+                last
+            });
+
+            let last3 = t3.join().expect("writer thread for index 3 must not panic");
+            let last4 = t4.join().expect("writer thread for index 4 must not panic");
+
+            assert_eq!(
+                b.get(EndpointIdx(3)),
+                last3,
+                "index 3's final state must be exactly what its own writer thread \
+                 last set, never a value clobbered by index 4's concurrent writer \
+                 in the same word"
+            );
+            assert_eq!(
+                b.get(EndpointIdx(4)),
+                last4,
+                "index 4's final state must be exactly what its own writer thread \
+                 last set, never a value clobbered by index 3's concurrent writer \
+                 in the same word"
+            );
+        }
+    }
+
+    /// `CLUSTER_ENDPOINTS_TRUNCATED` is a process-global static, and every test
+    /// below that constructs a bitmap above `MAX_ENDPOINTS` increments it. The
+    /// default test harness runs tests concurrently, so a delta computed from
+    /// two loads of the counter (snapshot, construct, snapshot) can still be
+    /// corrupted by an unrelated test's increment landing inside that window;
+    /// a plain delta is not enough on its own. Every test that touches the
+    /// counter takes this lock first, which serializes exactly the handful of
+    /// tests that share the static and nothing else, so the delta check below
+    /// is deterministic rather than merely unlikely to flake.
+    static TRUNCATION_COUNTER_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn len_clamped_to_max_endpoints() {
+        let _guard = TRUNCATION_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let b = HealthBitmap::new(MAX_ENDPOINTS + 1_000, EndpointHealth::Healthy);
         assert_eq!(b.len(), MAX_ENDPOINTS);
         assert_eq!(b.get(mkidx(MAX_ENDPOINTS)), EndpointHealth::Unhealthy);
@@ -542,8 +679,46 @@ mod tests {
 
     #[test]
     fn len_usize_max_does_not_overflow() {
+        let _guard = TRUNCATION_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let b = HealthBitmap::new(usize::MAX, EndpointHealth::Healthy);
         assert_eq!(b.len(), MAX_ENDPOINTS);
+    }
+
+    /// `cluster_endpoints_truncated` is process global and other tests in this
+    /// binary construct clamped bitmaps concurrently, so this asserts a DELTA
+    /// against a snapshot rather than an absolute value; an absolute assertion
+    /// would be flaky under parallel test execution. The shared lock above
+    /// keeps that delta from being corrupted by those other tests' own
+    /// increments landing inside this test's snapshot window.
+    ///
+    /// The second half, the non clamping construction, is load bearing: it is
+    /// what catches a mutant that fires the counter on every construction
+    /// rather than only on a construction that actually truncates.
+    #[test]
+    fn truncation_counter_fires_exactly_on_clamp() {
+        let _guard = TRUNCATION_COUNTER_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let before = CLUSTER_ENDPOINTS_TRUNCATED.load(Ordering::Relaxed);
+        let b = HealthBitmap::new(MAX_ENDPOINTS + 1, EndpointHealth::Healthy);
+        assert_eq!(b.len(), MAX_ENDPOINTS);
+        let after_clamp = CLUSTER_ENDPOINTS_TRUNCATED.load(Ordering::Relaxed);
+        assert_eq!(
+            after_clamp - before,
+            1,
+            "constructing above MAX_ENDPOINTS must advance the counter by exactly one"
+        );
+
+        let b = HealthBitmap::new(MAX_ENDPOINTS, EndpointHealth::Healthy);
+        assert_eq!(b.len(), MAX_ENDPOINTS);
+        let after_exact = CLUSTER_ENDPOINTS_TRUNCATED.load(Ordering::Relaxed);
+        assert_eq!(
+            after_exact, after_clamp,
+            "constructing at exactly MAX_ENDPOINTS must not advance the counter"
+        );
     }
 
     proptest! {
@@ -595,5 +770,57 @@ mod tests {
                 assert_eq!(ch.weight_bp(mkidx(i)), expected.unwrap_or(10_000));
             }
         }
+    }
+}
+
+/// Exhaustive loom model of the property
+/// `concurrent_set_on_different_endpoints_in_one_word_survives` above checks
+/// by sampling: that two writers setting DIFFERENT endpoints in the SAME word
+/// never clobber each other. `loom::model` explores every legal interleaving
+/// of the two threads' atomic operations rather than a bounded number of real
+/// scheduler outcomes, so a defect here is a proof of absence, not a sample
+/// that happened not to catch it.
+///
+/// Not part of the default test run: nothing in `scripts/gate-fast.sh` builds
+/// with `--cfg loom`, so this module is inert under a normal `cargo test`.
+/// Run it directly with `RUSTFLAGS="--cfg loom" cargo test -p
+/// irontraffic-resilience --lib health::bitmap::loom_tests::`. Do not add
+/// `--release`: `health::wheel`'s own debug-only structural check is
+/// `#[cfg(debug_assertions)]` and a release build drops it, which fails the
+/// crate's unrelated wheel tests before this model ever runs.
+#[cfg(loom)]
+mod loom_tests {
+    use loom::sync::Arc;
+    use loom::thread;
+
+    use super::{EndpointHealth, EndpointIdx, HealthBitmap};
+
+    #[test]
+    fn loom_two_writers_in_one_word_both_land() {
+        loom::model(|| {
+            let b = Arc::new(HealthBitmap::new(16, EndpointHealth::Healthy));
+
+            let b3 = Arc::clone(&b);
+            let t3 = thread::spawn(move || {
+                assert!(b3.set(EndpointIdx(3), EndpointHealth::Unhealthy));
+            });
+
+            let b4 = Arc::clone(&b);
+            let t4 = thread::spawn(move || {
+                assert!(b4.set(EndpointIdx(4), EndpointHealth::Draining));
+            });
+
+            assert!(
+                t3.join().is_ok(),
+                "writer thread for index 3 must not panic"
+            );
+            assert!(
+                t4.join().is_ok(),
+                "writer thread for index 4 must not panic"
+            );
+
+            assert_eq!(b.get(EndpointIdx(3)), EndpointHealth::Unhealthy);
+            assert_eq!(b.get(EndpointIdx(4)), EndpointHealth::Draining);
+        });
     }
 }
