@@ -575,7 +575,13 @@ transport-seam
 unchecked-cast'
 
 echo "== corpus A: every rule must fire =="
-ACTUAL="$(fired_rules "$A")"
+# Captured ONCE: run_lints_in commits whatever is new in $A and then runs the
+# real script, so a second call on the same tree with nothing left to commit
+# would fail its own `git commit` step and silently return empty output. The
+# rule-name set below (ACTUAL) and the specific file:line check further down
+# (issue #641) both read this same capture rather than re-running the corpus.
+RAW_A="$(run_lints_in "$A")"
+ACTUAL="$(printf '%s\n' "$RAW_A" | sed -n 's/^FAIL \[\(.*\)\]$/\1/p' | LC_ALL=C sort -u)"
 # comm requires both inputs sorted under the SAME collation, so sort both here
 # rather than trusting the literal above to stay in order.
 EXPECTED_SORTED="$(echo "$EXPECTED" | LC_ALL=C sort -u)"
@@ -591,6 +597,54 @@ if [ -n "$EXTRA" ]; then
   echo "$EXTRA" | sed 's/^/    /'
 fi
 [ -z "$MISSING" ] && note "all $(echo "$EXPECTED" | wc -l | tr -d ' ') expected rules fired"
+
+# ---------------------------------------------------------------------------
+# issue #641: the SET-OF-RULE-NAMES check above is blind to whether the four
+# #628 regression files below are actually reaching no-panic, because
+# `no-panic` is ALREADY in EXPECTED from the unrelated bad.rs file in this
+# same corpus: reverting build_prod_tree's entire #628 fix (item_extent back
+# to "search forward for the next real `{`") still leaves `no-panic` in
+# ACTUAL, so MISSING stays empty and this whole check reports success on a
+# gate that no longer does what it claims. Grep the RAW per-line output
+# instead, for the specific file:line hits each of the four regression files
+# is known to produce once build_prod_tree correctly confines a
+# `#[cfg(test)]` attribute's blanking to just the attributed item, rather
+# than the set of rule NAMES that fired.
+#
+# The four lines below are the genuine violation lines in each file, verified
+# by running the corpus directly (not transcribed by hand): a doc comment on
+# an EARLIER line in three of the four files also mentions the word
+# `unwrap()`/`panic!()` in prose, but `.unwrap()`/`.expect(` require a
+# literal preceding dot that comment prose does not have, so only the real
+# code line actually fires for those three. `panic!(` has no such anchor, so
+# cfg_test_struct_literal_bad.rs's doc comment on line 17 fires too (it
+# literally contains the word `panic!(`), alongside the real `panic!()` call
+# on line 20; line 17 is used below since it is sufficient on its own to
+# prove this file's content is visible.
+# ---------------------------------------------------------------------------
+echo "== corpus A: the four #628 regression files must be individually visible to no-panic =="
+NEEDED_LINES=(
+  "crates/irontraffic-router/src/cfg_test_field_bad.rs:12:"
+  "crates/irontraffic-router/src/cfg_test_prose_bad.rs:8:"
+  "crates/irontraffic-router/src/cfg_test_modsemi_bad.rs:9:"
+  "crates/irontraffic-router/src/cfg_test_struct_literal_bad.rs:17:"
+)
+MISSING_LINES=""
+for needle in "${NEEDED_LINES[@]}"; do
+  printf '%s\n' "$RAW_A" | grep -qF "$needle" || MISSING_LINES="$MISSING_LINES$needle
+"
+done
+if [ -n "$MISSING_LINES" ]; then
+  echo "FAIL: corpus A's raw output is missing these expected no-panic hits."
+  echo "      The set-of-rule-names check above cannot tell these four #628"
+  echo "      regression files apart from the unrelated no-panic hit already"
+  echo "      firing on bad.rs in this same corpus (issue #641); a full"
+  echo "      revert of the item_extent fix leaves it green anyway. Missing:"
+  printf '%s' "$MISSING_LINES" | sed 's/^/    /'
+  FAILED=1
+else
+  note "all four #628 regression files are individually visible to no-panic"
+fi
 
 # ---------------------------------------------------------------------------
 # Corpus B: clean code. No rule may fire.
@@ -1395,20 +1449,53 @@ cat > "$H/crates/irontraffic-router/src/truncated.rs" <<'RS'
 pub fn noop() {}
 #[cfg(test)]
 RS
-printf '[workspace.dependencies]\nserde = "1"\n' > "$H/Cargo.toml"
+# Deliberately NO Cargo.toml, and in particular no unjustified
+# `[workspace.dependencies]\nserde = "1"` entry (issue #642): that entry
+# trips dependency-justification and supplies a nonzero exit ALL ON ITS OWN,
+# which let this corpus pass even with `kill -TERM "$$"` deleted from
+# build_prod_tree. dependency-justification's own Python reads Cargo.toml
+# with `except OSError: sys.exit(0)`, so a missing manifest is a silent no-op
+# for it, and no other rule here depends on one existing at all: this corpus
+# now has exactly one way to produce a nonzero exit, the refusal itself.
 ( cd "$H" && git init -q . && git config user.email t@t && git config user.name t \
     && git add -A >/dev/null && git commit -qm t >/dev/null )
 
 echo "== corpus H: an unresolvable #[cfg(test)] refuses rather than guesses =="
 H_RC=0
 ( cd "$H" && bash "$LINTS" ) > "$WORK/h_output.txt" 2>&1 || H_RC=$?
-if [ "$H_RC" -eq 0 ]; then
-  echo "FAIL: an unresolvable #[cfg(test)] did not stop the gate; it exited 0:"
+# DIAG_COUNT, not just presence: build_prod_tree runs inside a command-
+# substitution subshell from almost every call site, so a plain `exit 1`
+# there kills only that one subshell and lets the run silently carry on to
+# the NEXT rule's own build_prod_tree call, printing the same diagnostic
+# again from scratch, once per remaining call site (measured at 15 on this
+# corpus, issue #642). Exactly once is what proves `kill -TERM "$$"` reached
+# the top-level script and stopped it at the FIRST refusal, which is the
+# property this corpus exists to prove; more than once means the kill did
+# not fire and the run only happened to still end nonzero for an unrelated
+# reason.
+DIAG_COUNT="$(grep -c 'FAIL \[build-prod-tree\]' "$WORK/h_output.txt" || true)"
+if [ "$H_RC" -le 128 ]; then
+  echo "FAIL: an unresolvable #[cfg(test)] did not die BY SIGNAL (exit $H_RC;"
+  echo "      143 is SIGTERM, so anything at or below 128 is an ordinary"
+  echo "      nonzero exit from some OTHER rule, not proof that kill -TERM"
+  echo "      \"\$\$\" in build_prod_tree actually fired):"
   sed 's/^/    /' "$WORK/h_output.txt"
   FAILED=1
-elif grep -q 'FAIL \[build-prod-tree\]' "$WORK/h_output.txt" \
-    && grep -qF 'truncated.rs' "$WORK/h_output.txt"; then
-  note "unresolvable #[cfg(test)] refuses loudly (exit $H_RC) and names the file"
+elif [ "$DIAG_COUNT" -ne 1 ]; then
+  echo "FAIL: the build-prod-tree diagnostic appeared $DIAG_COUNT time(s), not"
+  echo "      exactly once. Exactly once is what proves the run STOPPED at the"
+  echo "      first refusal rather than continuing through every later"
+  echo "      scan_prod call site:"
+  sed 's/^/    /' "$WORK/h_output.txt"
+  FAILED=1
+elif grep -q '^invariant-lints: clean$' "$WORK/h_output.txt"; then
+  echo "FAIL: the gate printed \"invariant-lints: clean\" even though a"
+  echo "      #[cfg(test)] attribute could not be resolved; the refusal did"
+  echo "      not actually stop the run:"
+  sed 's/^/    /' "$WORK/h_output.txt"
+  FAILED=1
+elif grep -qF 'truncated.rs' "$WORK/h_output.txt"; then
+  note "unresolvable #[cfg(test)] refuses by signal (exit $H_RC), names the file, prints the diagnostic exactly once, and never reaches \"clean\""
 else
   echo "FAIL: the gate stopped (exit $H_RC), but not with the expected"
   echo "      build-prod-tree diagnostic naming the offending file:"

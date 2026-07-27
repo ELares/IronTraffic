@@ -381,17 +381,37 @@ rust_non_test_files() {
 #     Reaching end of file with depth still open and none of the above
 #     resolved REFUSES instead of guessing: see the REFUSE note below.
 #
+#     ITEM HEADERS ARE NOT SUBJECT TO THE GAP BELOW (issue #643). A
+#     `#[cfg(test)]`-attributed `fn`/`impl`/`struct`/`enum`/`trait`/`union`/
+#     `mod` (optionally preceded by `pub`, `pub(...)`, `unsafe`, `async`,
+#     `const`, `extern`, or `default`) is recognized by is_item_header() and
+#     is terminable ONLY by `{` or `;`, never by a depth-0 `,`: its own
+#     header can legitimately contain one, in a generic parameter list
+#     (`fn helper<A, B>`, `struct S<A, B>`), a lifetime list
+#     (`fn f<'a, 'b>`), or a trailing where-clause bound list (`impl<T>
+#     Trait for Wrap<T> where T: Send,`). Before this fix all four shapes
+#     terminated at that comma instead of at the item's real body, which
+#     UNDER-blanks (leaves a test-only body visible to no-panic and friends,
+#     which then fire loudly on it) rather than the over-reaching failure
+#     modes 1 and 2 above, but is still a real gap: the escape a weaker
+#     implementer reaches for on a false positive is an `it-allow` marker on
+#     a line of genuinely test-only code, which permanently blinds that line
+#     for every future run.
+#
 #     ACCEPTED GAP, the same shape already documented on no-swallowed-error
-#     above: a field or statement whose own text contains a top-level
-#     `<`/`>` (a generic parameter list with an internal comma, as in
-#     `HashMap<K, V>`, or a comparison used as a struct-literal field's value
-#     before its own comma) is not tracked as a bracket pair here, because
-#     `<`/`>` are also comparison and shift operators and Rust's grammar
-#     does not make disambiguating them safe to fake with a text scanner.
-#     The concrete corpus case issue #628 was filed against
-#     (`std::cell::Cell<u64>`) has no internal comma and is handled
-#     correctly; a type or value that does would need a real parser, not a
-#     bigger regex, and is left as a known limitation rather than a guess.
+#     above: a FIELD or a standalone STATEMENT (not an item header, so
+#     is_item_header() is false and the comma still ends it, correctly, the
+#     way `#[cfg(test)] scan_steps: Cell<u64>,` must) whose own text contains
+#     a top-level `<`/`>` (a generic parameter list with an internal comma,
+#     as in a field typed `HashMap<K, V>`, or a comparison used as a
+#     struct-literal field's value before its own comma) is not tracked as a
+#     bracket pair here, because `<`/`>` are also comparison and shift
+#     operators and Rust's grammar does not make disambiguating them safe to
+#     fake with a text scanner. The concrete corpus case issue #628 was filed
+#     against (`std::cell::Cell<u64>`) has no internal comma and is handled
+#     correctly; a field type or value that does would need a real parser,
+#     not a bigger regex, and is left as a known limitation rather than a
+#     guess.
 #
 #     REFUSE, DO NOT GUESS: if item_extent() reaches end of file with an
 #     unresolved bracket depth, build_prod_tree.py prints the offending file
@@ -421,6 +441,67 @@ import rslex
 OUT = sys.argv[1]
 CFG = re.compile(r"#\[cfg\(\s*test\s*\)\]")
 
+# issue #643: an item's own HEADER can contain a depth-0 comma that is not
+# the end of the item at all, most commonly a generic parameter list
+# (`fn helper<A, B>`, `struct S<A, B>`), a lifetime list (`fn f<'a, 'b>`), or
+# a trailing where-clause bound list (`impl<T> Trait for Wrap<T> where T:
+# Send,`). None of `<`/`>` are tracked as a bracket pair here (see the
+# ACCEPTED GAP note above build_prod_tree: they are also comparison and
+# shift operators, and Rust's grammar does not make disambiguating them safe
+# to fake with a text scanner), so the naive depth-0-comma-ends-the-item rule
+# stops at the FIRST comma inside `<...>` instead of at the item's real body,
+# silently narrowing what gets blanked. A struct field or a struct-literal
+# field entry (`#[cfg(test)] scan_steps: Cell<u64>,`) has no such header and
+# must still end at its own comma, so this can only apply to an actual item:
+# `fn`/`impl`/`struct`/`enum`/`trait`/`union`/`mod`, optionally preceded by
+# `pub` (optionally with a `(...)` visibility qualifier), `unsafe`, `async`,
+# `const`, `extern`, or `default`, is terminable ONLY by `{` or `;`, never by
+# a depth-0 `,`, because none of those item shapes ends in a bare comma.
+MODIFIER_KEYWORDS = {'pub', 'unsafe', 'async', 'const', 'extern', 'default'}
+ITEM_KEYWORDS = {'fn', 'impl', 'struct', 'enum', 'trait', 'union', 'mod'}
+WORD = re.compile(r'[A-Za-z_]\w*')
+
+
+def is_item_header(text, start):
+    """True if, from `start`, skipping trivia and any further `#[...]`
+    attributes, the next tokens are zero or more modifier keywords (with an
+    optional `(...)` visibility qualifier right after `pub`) followed by an
+    item keyword. See the module-level note above for why this matters."""
+    n = len(text)
+    i = start
+    while True:
+        while i < n:
+            skipped = rslex.skip_trivia(text, i)
+            if skipped != i:
+                i = skipped
+                continue
+            if text[i].isspace():
+                i += 1
+                continue
+            break
+        if i < n and text[i] == '#' and i + 1 < n and text[i + 1] == '[':
+            close = rslex.find_matching(text, i + 1)
+            if close < 0:
+                return False
+            i = close + 1
+            continue
+        break
+    m = WORD.match(text, i)
+    if not m:
+        return False
+    word = m.group(0)
+    if word in ITEM_KEYWORDS:
+        return True
+    if word not in MODIFIER_KEYWORDS:
+        return False
+    i = m.end()
+    if word == 'pub' and i < n and text[i] == '(':
+        close = rslex.find_matching(text, i)
+        if close < 0:
+            return False
+        i = close + 1
+    return is_item_header(text, i)
+
 
 def item_extent(text, start):
     """From just past a REAL `#[cfg(test)]` match, find where the attribute's
@@ -443,6 +524,9 @@ def item_extent(text, start):
     n = len(text)
     depth = 0
     i = start
+    # See MODIFIER_KEYWORDS/ITEM_KEYWORDS/is_item_header above (issue #643):
+    # an item's own header can contain a depth-0 comma that is not its end.
+    is_item = is_item_header(text, start)
     while i < n:
         skipped = rslex.skip_trivia(text, i)
         if skipped != i:
@@ -467,6 +551,9 @@ def item_extent(text, start):
         if depth == 0 and c == ';':
             return 'semi', i + 1
         if depth == 0 and c == ',':
+            if is_item:
+                i += 1
+                continue
             return 'comma', i + 1
         i += 1
     return 'eof', None
