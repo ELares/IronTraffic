@@ -613,8 +613,14 @@ async fn at_most_two_buffers_outstanding() {
     );
 
     let observed_max = max_seen.load(Ordering::Relaxed);
+    // Only the c2u direction carries data here (the upstream side sends
+    // nothing and closes immediately), so the true peak under the
+    // one-buffer-of-credit rule is exactly 1 above baseline, not 2: a bound of
+    // `baseline + 2` would also accept a per-direction read-ahead buffer held
+    // alongside the one in flight, which is precisely the memory shape this
+    // crate exists to forbid.
     assert!(
-        observed_max <= baseline + 2,
+        observed_max <= baseline + 1,
         "outstanding rose to {observed_max}, baseline {baseline}"
     );
 
@@ -711,8 +717,14 @@ async fn slow_reader_does_not_grow_memory() {
     );
 
     let observed_max = max_seen.load(Ordering::Relaxed);
+    // Only the u2c direction carries data here, so the true peak under the
+    // one-buffer-of-credit rule is exactly 1 above baseline. A bound of
+    // `baseline + 2` would also accept a per-direction read-ahead buffer held
+    // alongside the one already in flight while the slow reader backpressures
+    // the write, which is exactly the memory growth this test exists to rule
+    // out.
     assert!(
-        observed_max <= baseline + 2,
+        observed_max <= baseline + 1,
         "outstanding rose to {observed_max}, baseline {baseline}"
     );
 
@@ -1020,7 +1032,14 @@ async fn closing_phase_ends_the_loop() {
 #[tokio::test]
 async fn byte_cap_ends_the_direction() {
     let _guard = BUFFER_STATS_LOCK.lock().await;
-    let payload = pattern_bytes(4096, 0x77);
+    // 100,000 bytes, far larger than one 32,768-byte chunk. A payload that fits
+    // inside a single chunk (the original 4096 bytes here) can never distinguish
+    // a cap that genuinely stops the direction from one that only sets the
+    // `ByteCap` label: both forward the whole payload, because natural end of
+    // file and the cap firing happen on the very same read. Making the payload
+    // many chunks long is what makes "the cap must actually stop the direction"
+    // an observable, failable property instead of a tautology.
+    let payload = pattern_bytes(100_000, 0x77);
 
     let (mut client_near, client_far) = tcp_pair().await.unwrap();
     let (mut upstream_near, upstream_far) = tcp_pair().await.unwrap();
@@ -1053,9 +1072,17 @@ async fn byte_cap_ends_the_direction() {
 
     assert_eq!(reason, EndReason::ByteCap);
     assert!(stats.client_to_upstream >= 1000);
-    assert_eq!(
+    // The cap is checked after a whole buffer has been written, so it may
+    // overshoot by up to one 32,768-byte chunk (documented edge case 15), but
+    // it must not overshoot all the way to the end of a 100,000-byte payload.
+    // A cap that only sets the `ByteCap` label and never stops the read (the
+    // defect this test exists to catch) forwards the whole payload and this
+    // assertion is what actually fails against that.
+    assert!(
+        stats.client_to_upstream < u64::try_from(payload.len()).unwrap(),
+        "the cap must actually STOP the direction: forwarded {} of {}",
         stats.client_to_upstream,
-        u64::try_from(payload.len()).unwrap()
+        payload.len()
     );
 
     let received = with_timeout(Duration::from_secs(2), upstream_task)
@@ -1063,9 +1090,19 @@ async fn byte_cap_ends_the_direction() {
         .expect("upstream side must observe a clean end, not hang")
         .unwrap()
         .unwrap();
+    let forwarded_len = usize::try_from(stats.client_to_upstream).unwrap();
     assert_eq!(
-        received, payload,
-        "upstream must receive the whole payload, not a truncated prefix, proving step 5 ran"
+        received.len(),
+        forwarded_len,
+        "upstream must receive exactly as many bytes as forward_bidirectional reported \
+         forwarding, not more (a hang past the cap) or fewer (a truncated shutdown)"
+    );
+    assert_eq!(
+        received,
+        payload.get(..forwarded_len).unwrap_or_default(),
+        "upstream must receive exactly the prefix of the payload that was actually forwarded \
+         before the cap stopped the direction, delivered cleanly with a proper FIN rather than \
+         a truncated stream, proving step 5 still ran on the capped direction"
     );
 
     client_task.abort();
