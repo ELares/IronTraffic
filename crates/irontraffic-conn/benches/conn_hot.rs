@@ -27,6 +27,7 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use irontraffic_conn::bodybuf::{BufferPool, ByteSize};
 use irontraffic_conn::inflight::InflightGauge;
+use irontraffic_conn::proxyproto::ProxyHeader;
 use irontraffic_conn::{ConnBudget, FrameEvent};
 use std::hint::black_box;
 use std::thread;
@@ -225,10 +226,66 @@ fn bench_admit_release(c: &mut Criterion) {
     group.finish();
 }
 
+/// The 12-byte v2 signature, duplicated here (rather than made `pub` from the crate) since
+/// this benchmark binary is the only place outside `proxyproto::v2` itself that needs the
+/// raw bytes to build an input; `ProxyHeader::parse` takes no way to construct one directly.
+const V2_SIGNATURE: [u8; 12] = [
+    0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A,
+];
+
+/// 1 KiB (1024), rounded down to a whole number of 3-byte TLVs (1 type byte, 2 length
+/// bytes, 0 value bytes each): `341 * 3 = 1023`. The declared v2 length and the bytes
+/// actually written must match exactly, or the header is short of its own declaration and
+/// `ProxyHeader::parse` takes the cheap `Partial` path instead of walking the TLVs this
+/// benchmark exists to measure.
+const ONE_KIB_OF_TLVS: u16 = 1023;
+
+/// A v2 IPv4 PROXY header (`ver_cmd = 0x21`, `family = 0x11`) with `tlv_bytes` bytes of
+/// well-formed, zero-value TLVs appended after the 12-byte address block. `tlv_bytes` MUST
+/// be a multiple of 3; any remainder is simply not written, which callers avoid by only
+/// ever passing 0 or [`ONE_KIB_OF_TLVS`].
+fn v2_ipv4_header(tlv_bytes: u16) -> Vec<u8> {
+    let len = 12u16.saturating_add(tlv_bytes);
+    let mut buf = V2_SIGNATURE.to_vec();
+    buf.push(0x21);
+    buf.push(0x11);
+    buf.extend_from_slice(&len.to_be_bytes());
+    buf.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8, 0, 1, 0, 2]);
+    let mut remaining = tlv_bytes;
+    while remaining >= 3 {
+        buf.push(0x01);
+        buf.extend_from_slice(&0u16.to_be_bytes());
+        remaining = remaining.saturating_sub(3);
+    }
+    buf
+}
+
+fn bench_proxyproto_parse(c: &mut Criterion) {
+    let v1_line = b"PROXY TCP4 1.2.3.4 5.6.7.8 1 2\r\n".to_vec();
+    let v2_no_tlv = v2_ipv4_header(0);
+    let v2_1kib_tlv = v2_ipv4_header(ONE_KIB_OF_TLVS);
+
+    let mut group = c.benchmark_group("bench_proxyproto_parse");
+    group.throughput(Throughput::Elements(1));
+
+    group.bench_function("v1_tcp4", |b| {
+        b.iter(|| black_box(ProxyHeader::parse(black_box(&v1_line))));
+    });
+    group.bench_function("v2_no_tlv", |b| {
+        b.iter(|| black_box(ProxyHeader::parse(black_box(&v2_no_tlv))));
+    });
+    group.bench_function("v2_1kib_tlv", |b| {
+        b.iter(|| black_box(ProxyHeader::parse(black_box(&v2_1kib_tlv))));
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_frame_debit,
     bench_buffer_lease,
-    bench_admit_release
+    bench_admit_release,
+    bench_proxyproto_parse
 );
 criterion_main!(benches);
