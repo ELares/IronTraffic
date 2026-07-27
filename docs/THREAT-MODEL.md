@@ -109,8 +109,17 @@ that names the failing branch hands an attacker a free desync-probing oracle: th
 ## 4. Bounded state
 
 Every buffer, table, counter map and queue reachable from the network has a named limit with a
-default, stated either in `Limits` or in a per-issue constant, and a defined behaviour at the limit.
-The subsections under section 5 name each one.
+default, stated in `Limits`, in a per-issue constant, or in a connection-level balance, and a
+defined behaviour at the limit. `Limits` bounds the CONTENT of one message; it does not bound how
+many messages, streams or upstream exchanges are in flight on one connection at once, which is a
+separate class of bound. `ConnBudget` (`conn-budget-token-bucket` (#40)) prices every frame received
+on a connection against a lazily refilled token bucket and closes the connection once the price
+exceeds the budget, which bounds the RATE of protocol-level work a connection may cause.
+`InflightGauge` (this issue) bounds the COUNT of upstream exchanges in flight on one connection to
+`max_inflight_work` (default 256), which is what stops a `RST_STREAM`-based reset from freeing
+capacity the upstream is still spending (CERT/CC VU#767506, the MadeYouReset defect class). The
+subsections under section 5 name the per-message limits; this paragraph names the per-connection
+ones.
 
 ## 5. Per-surface sections
 
