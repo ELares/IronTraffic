@@ -660,6 +660,94 @@ mod tests {
     }
 
     #[test]
+    fn multi_line_transfer_encoding_field_lines_are_combined() {
+        // `te_obfuscation_corpus` above proves `tokenize_transfer_encoding`
+        // combines every line correctly when it is handed the lines
+        // directly. It does not prove that `resolve_request_framing` itself
+        // feeds the tokenizer every line: a call site that read only the
+        // first, or only the last, `transfer-encoding` field line would
+        // still compile and the tokenizer would happily accept whatever
+        // slice it was given. Issue #27's Do NOT list forbids exactly that
+        // ("Do NOT read only the first or only the last transfer-encoding
+        // field line") and edge case 14 states the required behaviour at
+        // this level, so this test drives real multi-line `FieldSection`s
+        // through `resolve_request_framing`, guarding the wiring rather than
+        // the algorithm it calls.
+        //
+        // The first two cases below are each sufficient on their own to
+        // catch a call site that reads only the first line (equivalent to
+        // `.take(1)`) and one that reads only the last line (equivalent to
+        // `.last().into_iter()`), because the correct, fully combined answer
+        // disagrees with BOTH single-line reads:
+        //   - `[chunked][chunked]`: a first-only or last-only read each see
+        //     a single `chunked` token and resolve `Ok(Streamed)`; the
+        //     correct combined list repeats `chunked` and is
+        //     `Err(TransferEncodingChunkedRepeated)`.
+        //   - `[identity][chunked]`: a first-only read sees just `identity`
+        //     (`Err(TransferEncodingFinalNotChunked)`); a last-only read
+        //     sees just `chunked` (`Ok(Streamed)`); the correct combined
+        //     list has `identity` as a non-final "other" coding, which is
+        //     `Err(TransferEncodingUnsupportedCoding)` under the default
+        //     policy, matching neither.
+        type FieldPair<'a> = (&'a [u8], &'a [u8]);
+        let cases: &[(&[FieldPair<'_>], RejectReason)] = &[
+            (
+                &[
+                    (b"transfer-encoding", b"chunked"),
+                    (b"transfer-encoding", b"chunked"),
+                ],
+                RejectReason::TransferEncodingChunkedRepeated,
+            ),
+            (
+                &[
+                    (b"transfer-encoding", b"identity"),
+                    (b"transfer-encoding", b"chunked"),
+                ],
+                RejectReason::TransferEncodingUnsupportedCoding,
+            ),
+            // The reviewer's suggested minimum: reject reason
+            // `TransferEncodingFinalNotChunked` because the combined list's
+            // final token is `identity`, not `chunked`.
+            (
+                &[
+                    (b"transfer-encoding", b"chunked"),
+                    (b"transfer-encoding", b"identity"),
+                ],
+                RejectReason::TransferEncodingFinalNotChunked,
+            ),
+            // Same shape with `gzip` as the second line instead of
+            // `identity`.
+            (
+                &[
+                    (b"transfer-encoding", b"chunked"),
+                    (b"transfer-encoding", b"gzip"),
+                ],
+                RejectReason::TransferEncodingFinalNotChunked,
+            ),
+            // Three lines: the repeated `chunked` spans the first and third
+            // line with an unrelated "other" coding line in between, so no
+            // read of fewer than all three lines, from either end, can reach
+            // the correct answer.
+            (
+                &[
+                    (b"transfer-encoding", b"chunked"),
+                    (b"transfer-encoding", b"gzip"),
+                    (b"transfer-encoding", b"chunked"),
+                ],
+                RejectReason::TransferEncodingChunkedRepeated,
+            ),
+        ];
+
+        for (fields, expected) in cases {
+            assert_eq!(
+                resolve(fields, Method::Post, WireVersion::Http11),
+                Err(*expected),
+                "{fields:?}"
+            );
+        }
+    }
+
+    #[test]
     fn eight_tokens_is_within_the_cap() {
         // The other side of `te_obfuscation_corpus`'s "nine tokens" boundary:
         // exactly 8 tokens (the cap itself), the last of which is `chunked`,
