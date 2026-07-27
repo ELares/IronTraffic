@@ -49,6 +49,46 @@ Any performance claim added to the repository carries the hardware, the version,
 methodology, and is reproducible by a script committed here. Benchmarks are never run with safety
 features disabled. See [COVENANTS.md](COVENANTS.md).
 
+## One bench file and one allocation-gate file per surface (mandatory)
+
+Never append to another issue's bench file or allocation-gate file. A new surface gets its own
+`crates/<crate>/benches/<crate-prefix>_<surface>.rs` with its own `criterion_group!` and
+`criterion_main!` plus its own `[[bench]]` entry in that crate's `Cargo.toml`, and its own
+`crates/<crate>/tests/alloc_gate_<surface>.rs`. Criterion supports many bench targets per crate, so
+this costs nothing.
+
+This is not a style preference. `crates/irontraffic-http/benches/http_hot.rs` and
+`crates/irontraffic-http/tests/alloc_gate.rs` were shared, append-only files that six separate
+issues added to, and every rebase conflicted in them. The conflicts resolved in ways that COMPILE
+while silently losing work, three distinct shapes of it, none of which git flagged: a dropped
+`criterion_group!` registration (both sides register a different subset, so taking either side
+compiles perfectly and simply stops measuring the other), an elided closing brace that cut two
+functions off mid-body, and a dropped `use` line that surfaced as `cannot find type` rather than as
+anything resembling a merge problem. Issue #630 split both files apart for that reason.
+
+Splitting shrinks the conflict surface; it does not make a dropped registration detectable, so
+`scripts/invariant-lints.sh`'s `bench-registration` rule does that. It guards two separate links,
+because a merge can clobber either one: in every `benches/*.rs` the set of `fn bench_*` defined must
+equal the set registered across that file's `criterion_group!` invocations, in both directions; and
+every `criterion_group!` defined in that file must in turn be named by that file's `criterion_main!`.
+The second link matters because the first, alone, guards only what the compiler already catches (a
+`criterion_group!` naming an undefined function fails to build); the realistic and unguarded shape is
+a merge that clobbers the `criterion_main!` group list instead, which drops a whole group silently
+while the file still compiles, still passes clippy, and still passes every test.
+
+The rule guards exactly those two links and no more. It does NOT catch every way a benchmark can
+be compiled and never measured, and two such files are live in this repository today, so do not
+read the two links as a general guarantee:
+
+- a `benches/*.rs` with no `[[bench]]` entry at all is autodiscovered with `harness = true` and
+  measures nothing (`crates/irontraffic-resilience/benches/deadline.rs`);
+- a target not named `bench_*` is invisible to the rule in both directions, so dropping its
+  registration is silent (`crates/irontraffic-filter/benches/chain.rs` defines `phase_mask_has`).
+
+So when adding a bench file, two properties beyond the three above are load bearing and neither is
+checked for you: the `[[bench]]` entry MUST carry `harness = false`, and the target functions MUST
+be named `bench_*` or the registration rule cannot see them.
+
 ## Security
 
 Never open a public issue for a suspected vulnerability. See [SECURITY.md](SECURITY.md).
