@@ -32,3 +32,9 @@ name = "fuzz_outlier_stats"
 path = "fuzz_targets/fuzz_outlier_stats.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fuzz_retryability"
+path = "fuzz_targets/fuzz_retryability.rs"
+test = false
+doc = false
