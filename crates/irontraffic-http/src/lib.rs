@@ -43,6 +43,7 @@
 //! `clippy::arithmetic_side_effects` to enforce that.
 
 pub mod authority;
+pub mod cidr;
 pub mod error;
 pub mod expect;
 pub mod field;
@@ -52,6 +53,7 @@ pub mod h1;
 pub mod hlist;
 pub mod known;
 pub mod limits;
+pub mod peer;
 pub mod priority;
 pub mod response;
 pub mod scalar;
