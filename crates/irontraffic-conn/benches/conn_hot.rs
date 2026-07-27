@@ -99,11 +99,15 @@ fn bench_frame_debit(c: &mut Criterion) {
 // `lease_size()` always requests) and the nonzero buffering path.
 //
 // Budget (reference runner: see the module doc comment above): under 2
-// nanoseconds for the zero-byte case, because it must be a branch rather than
-// an atomic operation, and under 25 nanoseconds for the nonzero case, which
+// nanoseconds for the zero-byte case, because it must touch the shared,
+// process-wide `outstanding` counter with a branch rather than an atomic
+// read-modify-write, and under 25 nanoseconds for the nonzero case, which
 // pays one load, one compare-and-swap on the uncontended path, and one atomic
-// subtract on drop. Criterion does not enforce either budget itself; compare
-// the reported time against them by hand.
+// subtract on drop. The zero-byte case is not free of atomics altogether:
+// `Arc::clone`/drop on the pool handle still perform an uncontended atomic
+// refcount update either way, which is a fixed, unavoidable cost this budget
+// does not attempt to eliminate. Criterion does not enforce either budget
+// itself; compare the reported time against them by hand.
 fn bench_buffer_lease(c: &mut Criterion) {
     let mut group = c.benchmark_group("bench_buffer_lease");
 

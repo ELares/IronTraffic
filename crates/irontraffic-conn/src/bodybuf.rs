@@ -284,9 +284,25 @@ impl BufferPool {
         for _ in 0..64 {
             // Step 2.
             let outstanding = self.outstanding.load(Ordering::Acquire);
-            // Step 3. `saturating_add` so a request for close to `u64::MAX`
-            // bytes cannot wrap the sum back under `total` and be admitted.
-            let after = outstanding.saturating_add(bytes.0);
+            // Step 3. `checked_add` rather than `saturating_add`: with a
+            // saturating sum, a `total` of `u64::MAX` (the only spelling of
+            // "unlimited" available, since `ByteSize::kib`/`mib` themselves
+            // saturate onto exactly `u64::MAX` for a large enough caller
+            // value) makes `outstanding + bytes.0` clamp to `u64::MAX` for
+            // every request, so `after > self.total` can never be true and
+            // the guard stops firing: the pool over-issues past its cap and
+            // `outstanding` is later driven to a wrapped, unrecoverable
+            // value by the leases' own releases on drop. `checked_add`
+            // returning `None` means the true, unclamped sum overflowed
+            // `u64`, which is itself proof the request cannot fit any finite
+            // budget, so it is rejected the same as an over-budget request.
+            let Some(after) = outstanding.checked_add(bytes.0) else {
+                return Err(BudgetExhausted {
+                    requested: bytes.0,
+                    outstanding,
+                    total: self.total,
+                });
+            };
             if after > self.total {
                 return Err(BudgetExhausted {
                     requested: bytes.0,
@@ -374,9 +390,15 @@ impl Drop for BufferLease {
         // assertion on `outstanding()`, at any point from any thread, can
         // ever distinguish the two versions, so this is not a gap for a test
         // to close. The guard is kept anyway, and is what the benchmark's
-        // "zero-byte case must be a branch, not an atomic" budget measures:
-        // it turns a maybe-contended atomic read-modify-write into a
-        // predictable branch on the streaming path.
+        // zero-byte budget measures: it replaces a maybe-contended atomic
+        // read-modify-write on the shared `outstanding` counter with a
+        // predictable branch on the streaming path. That claim is scoped to
+        // `outstanding` specifically, not to every atomic operation the
+        // streaming path performs: `try_acquire`'s zero-byte return still
+        // does `Arc::clone(self)`, and this drop still runs the matching
+        // `Arc` decrement, each an uncontended atomic refcount update. The
+        // fast path avoids the one atomic this module's own budget is
+        // shared and contended on, not atomics in general.
         if self.bytes > 0 {
             self.pool
                 .outstanding
@@ -430,6 +452,16 @@ mod tests {
             buffering: Buffering::Window(ByteSize::kib(1)),
             on_exceed: OnExceed::Reject413,
         };
+
+        // `lease_size` for a `Window` ceiling reserves the whole window, the
+        // same as it would for a `Whole` ceiling of the same size: the
+        // window is resident all at once. Asserted here directly, on a
+        // `Window` value specifically, because every other `lease_size`
+        // assertion in this file exercises `NONE` or `Whole`; a mutation
+        // that made `Window`'s arm return something other than `n` (for
+        // example always 0, as if it behaved like `Buffering::None`) would
+        // otherwise pass this whole test module undetected.
+        assert_eq!(window_1kib_reject.lease_size(), ByteSize::kib(1));
 
         // Edge case 2: strictly under the ceiling.
         assert_eq!(window_1kib_reject.observe(ByteSize(1023)), None);
@@ -615,12 +647,40 @@ mod tests {
             .expect("the pool must admit again once the only lease is dropped");
         assert_eq!(pool.outstanding(), 1_048_576);
 
-        // Edge case 15: an acquire of u64::MAX must fail via saturating
-        // arithmetic rather than wrapping, and must leave the counter exactly
-        // as it was.
+        // Edge case 15: an acquire of u64::MAX must fail via checked,
+        // overflow-detecting arithmetic rather than wrapping, and must leave
+        // the counter exactly as it was.
         let before = pool.outstanding();
         assert!(BufferPool::try_acquire(&pool, ByteSize(u64::MAX)).is_err());
         assert_eq!(pool.outstanding(), before);
+
+        // Regression for issue 661: with a `total` of `u64::MAX` (the only
+        // available spelling of "unlimited", since `ByteSize::mib`/`kib`
+        // themselves saturate onto exactly `u64::MAX`), a `saturating_add`
+        // based guard can never fire because the clamped sum can never
+        // exceed `u64::MAX`. A first acquire of the whole budget must still
+        // leave no room for a second, non-zero acquire, and every dropped
+        // lease must bring the counter back to exactly 0, not a wrapped
+        // value.
+        let unlimited_pool = BufferPool::new(ByteSize(u64::MAX));
+        let whole_budget = BufferPool::try_acquire(&unlimited_pool, ByteSize(u64::MAX))
+            .expect("a single acquire of the entire unlimited budget must fit exactly once");
+        assert_eq!(unlimited_pool.outstanding(), u64::MAX);
+        assert_eq!(
+            BufferPool::try_acquire(&unlimited_pool, ByteSize(1)).unwrap_err(),
+            BudgetExhausted {
+                requested: 1,
+                outstanding: u64::MAX,
+                total: u64::MAX,
+            },
+            "the budget is fully committed; a saturating-add guard would wrongly admit this"
+        );
+        drop(whole_budget);
+        assert_eq!(
+            unlimited_pool.outstanding(),
+            0,
+            "outstanding must return to exactly 0, not a wrapped value, once the only lease is dropped"
+        );
         drop(reacquired);
 
         // Edge case 22: reserving the whole declared ceiling up front means
