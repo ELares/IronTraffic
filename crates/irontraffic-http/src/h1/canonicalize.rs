@@ -24,9 +24,9 @@ use crate::h1::parser::{RawHead, RawResponseHead};
 use crate::known::KnownHeader;
 use crate::limits::ClampedLimits;
 use crate::path::{NormalizedPath, PathPolicy, TargetForm};
-use crate::peer::{PeerIdentity, TrustPolicy, resolve_identity};
-use crate::response::{ResponseFraming, resolve_response_framing};
-use crate::scalar::{Method, Scheme, WireVersion};
+use crate::peer::{TrustPolicy, resolve_identity};
+use crate::response::resolve_response_framing;
+use crate::scalar::{Method, Scheme};
 use crate::section::FieldSectionBuilder;
 use crate::strip;
 
@@ -67,6 +67,11 @@ pub struct H1Context<'c> {
 /// parsed separately and the two canonical authorities are compared. This helper
 /// keeps the extra parse on the absolute/authority branch so the common origin
 /// path pays for exactly one authority resolution.
+#[allow(
+    clippy::trivially_copy_pass_by_ref,
+    reason = "ClampedLimits is Copy but Authority::parse_into takes &ClampedLimits and this \
+              function passes limits through without owning it"
+)]
 fn resolve_target_authority(
     target_authority_bytes: &[u8],
     host_field: Option<&[u8]>,
@@ -91,7 +96,9 @@ fn split_absolute_target(raw: &[u8]) -> Result<(&[u8], &[u8]), RejectReason> {
         .windows(3)
         .position(|w| w == b"://")
         .ok_or(RejectReason::TargetFormInvalid)?;
-    let scheme = &raw[..scheme_end];
+    let scheme = raw
+        .get(..scheme_end)
+        .ok_or(RejectReason::TargetFormInvalid)?;
     if !scheme.eq_ignore_ascii_case(b"http") && !scheme.eq_ignore_ascii_case(b"https") {
         return Err(RejectReason::TargetFormInvalid);
     }
@@ -161,17 +168,20 @@ pub fn canonicalize_request(
     }
 
     // Step 4: target-form classification.
-    let form = path::classify_target(head.target_bytes(), &method)?;
+    let form = crate::path::classify_target(head.target_bytes(), &method)?;
 
     // Step 5/6: path normalization and authority resolution, together because both
     // depend on the target form.
     let (path, query, authority) = match form {
         TargetForm::Origin => {
-            let (p, q) =
-                NormalizedPath::parse_into(head.target_bytes(), &ctx.path_policy, &ctx.limits, arena)?;
-            let host_value = match host_field(&fields, ctx.default_authority)? {
-                Some(v) => v,
-                None => return Err(RejectReason::HostMissing),
+            let (p, q) = NormalizedPath::parse_into(
+                head.target_bytes(),
+                &ctx.path_policy,
+                &ctx.limits,
+                arena,
+            )?;
+            let Some(host_value) = host_field(&fields, ctx.default_authority)? else {
+                return Err(RejectReason::HostMissing);
             };
             let a = reconcile_authority(
                 Some(host_value),
@@ -184,9 +194,8 @@ pub fn canonicalize_request(
             (p, q, a)
         }
         TargetForm::Asterisk => {
-            let host_value = match host_field(&fields, ctx.default_authority)? {
-                Some(v) => v,
-                None => return Err(RejectReason::HostMissing),
+            let Some(host_value) = host_field(&fields, ctx.default_authority)? else {
+                return Err(RejectReason::HostMissing);
             };
             let a = reconcile_authority(
                 Some(host_value),
@@ -213,14 +222,11 @@ pub fn canonicalize_request(
                 return Err(RejectReason::TargetFormInvalid);
             }
             let (authority_bytes, path_and_query) = split_absolute_target(head.target_bytes())?;
-            let (p, q) = NormalizedPath::parse_into(
-                path_and_query,
-                &ctx.path_policy,
-                &ctx.limits,
-                arena,
-            )?;
+            let (p, q) =
+                NormalizedPath::parse_into(path_and_query, &ctx.path_policy, &ctx.limits, arena)?;
             let host = host_field(&fields, None)?;
-            let a = resolve_target_authority(authority_bytes, host, ctx.scheme, &ctx.limits, arena)?;
+            let a =
+                resolve_target_authority(authority_bytes, host, ctx.scheme, &ctx.limits, arena)?;
             (p, q, a)
         }
     };
@@ -261,7 +267,7 @@ pub fn canonicalize_request(
 /// no default and the section has no `Host`; callers turn that into `HostMissing`.
 fn host_field<'a>(
     fields: &'a crate::section::FieldSection,
-    default_authority: Option<&Authority>,
+    default_authority: Option<&'a Authority>,
 ) -> Result<Option<&'a [u8]>, RejectReason> {
     let from_field = fields
         .get_unique_known(KnownHeader::Host)
@@ -301,7 +307,13 @@ pub fn canonicalize_response(
     let mut fields = builder.finish(arena);
 
     // Step 2: framing.
-    let framing = resolve_response_framing(head.status, request_method, head.version, &fields, ctx.codings)?;
+    let framing = resolve_response_framing(
+        head.status,
+        request_method,
+        head.version,
+        &fields,
+        ctx.codings,
+    )?;
 
     // Step 3: capture the upstream's declared length before the strip deletes it.
     let declared_len = match fields.get_unique(b"content-length") {
@@ -326,9 +338,9 @@ mod tests {
     use crate::field::UnderscorePolicy;
     use crate::framing::RequestFraming;
     use crate::h1::H1Parser;
-    use crate::limits::Limits as LimitsType;
     use crate::peer::IdentitySource;
-    use crate::scalar::{ParseStatus, StatusCode};
+    use crate::response::ResponseFraming;
+    use crate::scalar::ParseStatus;
     use bytes::BytesMut;
     use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
@@ -338,6 +350,17 @@ mod tests {
         let parser = H1Parser::new(&Limits::DEFAULT.clamped(), underscores);
         match parser.parse_request_head(buf).unwrap() {
             ParseStatus::Complete { value, .. } => value,
+            ParseStatus::Partial => panic!("unexpected partial request head"),
+        }
+    }
+
+    fn try_parse_request_head(
+        buf: &[u8],
+        underscores: UnderscorePolicy,
+    ) -> Result<RawHead<'_>, RejectReason> {
+        let parser = H1Parser::new(&Limits::DEFAULT.clamped(), underscores);
+        match parser.parse_request_head(buf)? {
+            ParseStatus::Complete { value, .. } => Ok(value),
             ParseStatus::Partial => panic!("unexpected partial request head"),
         }
     }
@@ -364,7 +387,7 @@ mod tests {
             codings: OtherCodings::Reject,
             underscores,
             scheme,
-            socket_peer: SocketAddr::new(IpAddr::V4(Ipv4Addr::new(127, 0, 0, 1)), 12345),
+            socket_peer: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 12345),
             proxy_proto: None,
             trust,
             default_authority,
@@ -374,7 +397,14 @@ mod tests {
     }
 
     fn ctx() -> H1Context<'static> {
-        ctx_with(Scheme::Http, false, false, None, &DEFAULT_TRUST, UnderscorePolicy::Reject)
+        ctx_with(
+            Scheme::Http,
+            false,
+            false,
+            None,
+            &DEFAULT_TRUST,
+            UnderscorePolicy::Reject,
+        )
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -399,7 +429,16 @@ mod tests {
     #[test]
     fn corpus_table() {
         let assert_case = |head: &[u8], ctx: &H1Context<'_>, expected: &Expected| {
-            let raw = parse_request_head(head, ctx.underscores);
+            let raw = match try_parse_request_head(head, ctx.underscores) {
+                Ok(raw) => raw,
+                Err(reason) => {
+                    assert!(
+                        matches!(expected, Expected::Err(e) if *e == reason),
+                        "for {head:?}: parser returned {reason:?}, expected {expected:?}"
+                    );
+                    return;
+                }
+            };
             let mut arena = BytesMut::new();
             let got = canonicalize_request(&raw, ctx, &mut arena);
             match (expected, got) {
@@ -421,7 +460,7 @@ mod tests {
                     assert_eq!(req.authority.host(), *host, "host mismatch for {head:?}");
                     assert_eq!(req.path.as_bytes(), *path, "path mismatch for {head:?}");
                     assert_eq!(
-                        req.query.as_ref().map(|q| q.as_bytes()),
+                        req.query.as_ref().map(crate::path::RawQuery::as_bytes),
                         *query,
                         "query mismatch for {head:?}"
                     );
@@ -441,14 +480,7 @@ mod tests {
             &mut BytesMut::new(),
         )
         .unwrap();
-        // `default_auth` lives until the end of the test; the `&'static` cast below is
-        // safe because it is not dropped before the cases that reference it.
-        let default_auth_ref: &'static Authority = unsafe {
-            // it-allow: no-unsafe reason: test-only helper leaking a freshly parsed
-            // authority so H1Context's Option<&'static Authority> can reference it;
-            // the value is owned by this stack frame and outlives every use.
-            std::mem::transmute(&default_auth)
-        };
+        let default_auth_ref: &'static Authority = Box::leak(Box::new(default_auth));
 
         let cases: &[(&[u8], H1Context<'static>, Expected)] = &[
             // 1: HTTP/1.1 with no Host.
@@ -671,22 +703,34 @@ mod tests {
     #[test]
     fn host_rules() {
         let no_host = b"GET / HTTP/1.1\r\n\r\n";
-        assert_eq!(
-            canonicalize_request(&parse_request_head(no_host, UnderscorePolicy::Reject), &ctx(), &mut BytesMut::new()),
+        assert!(matches!(
+            canonicalize_request(
+                &parse_request_head(no_host, UnderscorePolicy::Reject),
+                &ctx(),
+                &mut BytesMut::new()
+            ),
             Err(RejectReason::HostMissing)
-        );
+        ));
 
         let dup_same = b"GET / HTTP/1.1\r\nHost: a\r\nHost: a\r\n\r\n";
-        assert_eq!(
-            canonicalize_request(&parse_request_head(dup_same, UnderscorePolicy::Reject), &ctx(), &mut BytesMut::new()),
+        assert!(matches!(
+            canonicalize_request(
+                &parse_request_head(dup_same, UnderscorePolicy::Reject),
+                &ctx(),
+                &mut BytesMut::new()
+            ),
             Err(RejectReason::HostDuplicate)
-        );
+        ));
 
         let dup_diff = b"GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n";
-        assert_eq!(
-            canonicalize_request(&parse_request_head(dup_diff, UnderscorePolicy::Reject), &ctx(), &mut BytesMut::new()),
+        assert!(matches!(
+            canonicalize_request(
+                &parse_request_head(dup_diff, UnderscorePolicy::Reject),
+                &ctx(),
+                &mut BytesMut::new()
+            ),
             Err(RejectReason::HostDuplicate)
-        );
+        ));
 
         let default_auth = Authority::parse_into(
             b"default.example.com",
@@ -695,13 +739,16 @@ mod tests {
             &mut BytesMut::new(),
         )
         .unwrap();
-        let default_auth_ref: &'static Authority = unsafe {
-            // it-allow: no-unsafe reason: test-only reference to a stack-owned value
-            // that outlives the single use below.
-            std::mem::transmute(&default_auth)
-        };
+        let default_auth_ref: &'static Authority = Box::leak(Box::new(default_auth));
         let http10_no_host_default = b"GET / HTTP/1.0\r\n\r\n";
-        let ctx_default = ctx_with(Scheme::Http, false, false, Some(default_auth_ref), &DEFAULT_TRUST, UnderscorePolicy::Reject);
+        let ctx_default = ctx_with(
+            Scheme::Http,
+            false,
+            false,
+            Some(default_auth_ref),
+            &DEFAULT_TRUST,
+            UnderscorePolicy::Reject,
+        );
         let (req, _, _) = canonicalize_request(
             &parse_request_head(http10_no_host_default, UnderscorePolicy::Reject),
             &ctx_default,
@@ -711,84 +758,120 @@ mod tests {
         assert_eq!(req.authority.host(), b"default.example.com");
 
         let http10_no_host_no_default = b"GET / HTTP/1.0\r\n\r\n";
-        assert_eq!(
-            canonicalize_request(&parse_request_head(http10_no_host_no_default, UnderscorePolicy::Reject), &ctx(), &mut BytesMut::new()),
+        assert!(matches!(
+            canonicalize_request(
+                &parse_request_head(http10_no_host_no_default, UnderscorePolicy::Reject),
+                &ctx(),
+                &mut BytesMut::new()
+            ),
             Err(RejectReason::HostMissing)
-        );
+        ));
 
         let http10_dup = b"GET / HTTP/1.0\r\nHost: a\r\nHost: b\r\n\r\n";
-        assert_eq!(
-            canonicalize_request(&parse_request_head(http10_dup, UnderscorePolicy::Reject), &ctx(), &mut BytesMut::new()),
+        assert!(matches!(
+            canonicalize_request(
+                &parse_request_head(http10_dup, UnderscorePolicy::Reject),
+                &ctx(),
+                &mut BytesMut::new()
+            ),
             Err(RejectReason::HostDuplicate)
-        );
+        ));
     }
 
     #[test]
     fn target_forms() {
-        let forward = ctx_with(Scheme::Http, true, false, None, &DEFAULT_TRUST, UnderscorePolicy::Reject);
+        let forward = ctx_with(
+            Scheme::Http,
+            true,
+            false,
+            None,
+            &DEFAULT_TRUST,
+            UnderscorePolicy::Reject,
+        );
 
         // 7: Host disagrees with absolute-form target.
         let head = parse_request_head(
             b"GET http://good.com/p HTTP/1.1\r\nHost: evil.com\r\n\r\n",
             UnderscorePolicy::Reject,
         );
-        assert_eq!(
+        assert!(matches!(
             canonicalize_request(&head, &forward, &mut BytesMut::new()),
             Err(RejectReason::AuthorityMismatch)
-        );
+        ));
 
         // 8: Absolute on reverse proxy.
         let head = parse_request_head(
             b"GET http://good.com/p HTTP/1.1\r\nHost: good.com\r\n\r\n",
             UnderscorePolicy::Reject,
         );
-        assert_eq!(
+        assert!(matches!(
             canonicalize_request(&head, &ctx(), &mut BytesMut::new()),
             Err(RejectReason::TargetFormInvalid)
-        );
+        ));
 
         // 8b: ftp scheme.
-        let head = parse_request_head(b"GET ftp://internal/x HTTP/1.1\r\n\r\n", UnderscorePolicy::Reject);
-        assert_eq!(
+        let head = parse_request_head(
+            b"GET ftp://internal/x HTTP/1.1\r\n\r\n",
+            UnderscorePolicy::Reject,
+        );
+        assert!(matches!(
             canonicalize_request(&head, &forward, &mut BytesMut::new()),
             Err(RejectReason::TargetFormInvalid)
-        );
+        ));
 
         // 8b: file scheme.
-        let head = parse_request_head(b"GET file:///etc/passwd HTTP/1.1\r\n\r\n", UnderscorePolicy::Reject);
-        assert_eq!(
+        let head = parse_request_head(
+            b"GET file:///etc/passwd HTTP/1.1\r\n\r\n",
+            UnderscorePolicy::Reject,
+        );
+        assert!(matches!(
             canonicalize_request(&head, &forward, &mut BytesMut::new()),
             Err(RejectReason::TargetFormInvalid)
-        );
+        ));
 
         // 8b: HTTP scheme is accepted case-insensitively.
-        let head = parse_request_head(b"GET HTTP://GOOD.COM/p HTTP/1.1\r\n\r\n", UnderscorePolicy::Reject);
+        let head = parse_request_head(
+            b"GET HTTP://GOOD.COM/p HTTP/1.1\r\n\r\n",
+            UnderscorePolicy::Reject,
+        );
         let (req, _, form) = canonicalize_request(&head, &forward, &mut BytesMut::new()).unwrap();
         assert_eq!(form, TargetForm::Absolute);
         assert_eq!(req.scheme, Scheme::Http);
         assert_eq!(req.authority.host(), b"good.com");
 
         // 8c: target scheme is ignored; listener scheme wins.
-        let head = parse_request_head(b"GET https://good.com/p HTTP/1.1\r\n\r\n", UnderscorePolicy::Reject);
+        let head = parse_request_head(
+            b"GET https://good.com/p HTTP/1.1\r\n\r\n",
+            UnderscorePolicy::Reject,
+        );
         let (req, _, form) = canonicalize_request(&head, &forward, &mut BytesMut::new()).unwrap();
         assert_eq!(form, TargetForm::Absolute);
         assert_eq!(req.scheme, Scheme::Http);
 
         // 9: OPTIONS *.
-        let head = parse_request_head(b"OPTIONS * HTTP/1.1\r\nHost: example.com\r\n\r\n", UnderscorePolicy::Reject);
+        let head = parse_request_head(
+            b"OPTIONS * HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            UnderscorePolicy::Reject,
+        );
         let (req, _, form) = canonicalize_request(&head, &ctx(), &mut BytesMut::new()).unwrap();
         assert_eq!(form, TargetForm::Asterisk);
         assert_eq!(req.path.as_bytes(), b"/");
 
         // 10: GET *.
-        let head = parse_request_head(b"GET * HTTP/1.1\r\nHost: example.com\r\n\r\n", UnderscorePolicy::Reject);
-        assert_eq!(
+        let head = parse_request_head(
+            b"GET * HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            UnderscorePolicy::Reject,
+        );
+        assert!(matches!(
             canonicalize_request(&head, &ctx(), &mut BytesMut::new()),
             Err(RejectReason::TargetFormInvalid)
-        );
+        ));
 
         // 11: CONNECT host:443.
-        let head = parse_request_head(b"CONNECT host:443 HTTP/1.1\r\n\r\n", UnderscorePolicy::Reject);
+        let head = parse_request_head(
+            b"CONNECT host:443 HTTP/1.1\r\n\r\n",
+            UnderscorePolicy::Reject,
+        );
         let (req, _, form) = canonicalize_request(&head, &ctx(), &mut BytesMut::new()).unwrap();
         assert_eq!(form, TargetForm::Authority);
         assert_eq!(req.path.as_bytes(), b"/");
@@ -799,17 +882,20 @@ mod tests {
             b"CONNECT host:443 HTTP/1.1\r\ncontent-length: 5\r\n\r\n",
             UnderscorePolicy::Reject,
         );
-        assert_eq!(
+        assert!(matches!(
             canonicalize_request(&head, &ctx(), &mut BytesMut::new()),
             Err(RejectReason::BodyNotAllowedForMethod)
-        );
+        ));
 
         // 13: CONNECT /p.
-        let head = parse_request_head(b"CONNECT /p HTTP/1.1\r\nHost: example.com\r\n\r\n", UnderscorePolicy::Reject);
-        assert_eq!(
+        let head = parse_request_head(
+            b"CONNECT /p HTTP/1.1\r\nHost: example.com\r\n\r\n",
+            UnderscorePolicy::Reject,
+        );
+        assert!(matches!(
             canonicalize_request(&head, &ctx(), &mut BytesMut::new()),
             Err(RejectReason::TargetFormInvalid)
-        );
+        ));
     }
 
     #[test]
@@ -818,17 +904,30 @@ mod tests {
             b"GET / HTTP/1.1\r\nHost: example.com\r\ncontent-length: 5\r\nx-forwarded-for: 1.2.3.4\r\nexpect: 100-continue\r\n\r\n",
             UnderscorePolicy::Reject,
         );
-        let trust = TrustPolicy::HopCount(1);
-        let ctx = ctx_with(Scheme::Http, false, false, None, &trust, UnderscorePolicy::Reject);
+        let trust: &'static TrustPolicy = Box::leak(Box::new(TrustPolicy::HopCount(1)));
+        let ctx = ctx_with(
+            Scheme::Http,
+            false,
+            false,
+            None,
+            trust,
+            UnderscorePolicy::Reject,
+        );
         let (req, action, _) = canonicalize_request(&head, &ctx, &mut BytesMut::new()).unwrap();
 
         assert_eq!(req.framing, RequestFraming::Exact { len: 5 });
         assert_eq!(req.peer.source, IdentitySource::ForwardedChain);
         assert_eq!(action, ExpectAction::ForwardToUpstream);
-        assert!(matches!(req.headers.get_unique(b"content-length"), Ok(None)));
-        assert!(matches!(req.headers.get_unique(b"x-forwarded-for"), Ok(None)));
+        assert!(matches!(
+            req.headers.get_unique(b"content-length"),
+            Ok(None)
+        ));
+        assert!(matches!(
+            req.headers.get_unique(b"x-forwarded-for"),
+            Ok(None)
+        ));
         // expect is forwarded, so it survives the strip.
-        assert!(matches!(req.headers.get_unique(b"expect"), Ok(Some(&b"100-continue"[..]))));
+        assert!(matches!(req.headers.get_unique(b"expect"), Ok(Some(v)) if v == b"100-continue"));
     }
 
     #[test]
@@ -839,9 +938,19 @@ mod tests {
             b"GET / HTTP/1.1\r\nHost: example.com\r\nX_Forwarded_For: 1.2.3.4\r\n\r\n",
             UnderscorePolicy::MapToHyphen,
         );
-        let ctx = ctx_with(Scheme::Http, false, false, None, &DEFAULT_TRUST, UnderscorePolicy::MapToHyphen);
+        let ctx = ctx_with(
+            Scheme::Http,
+            false,
+            false,
+            None,
+            &DEFAULT_TRUST,
+            UnderscorePolicy::MapToHyphen,
+        );
         let (req, _, _) = canonicalize_request(&head, &ctx, &mut BytesMut::new()).unwrap();
-        assert!(matches!(req.headers.get_unique(b"x-forwarded-for"), Ok(None)));
+        assert!(matches!(
+            req.headers.get_unique(b"x-forwarded-for"),
+            Ok(None)
+        ));
     }
 
     #[test]
@@ -851,8 +960,16 @@ mod tests {
             b"GET / HTTP/1.1\r\nHost: example.com\r\nexpect: 100-continue\r\n\r\n",
             UnderscorePolicy::Reject,
         );
-        let ctx = ctx_with(Scheme::Http, false, true, None, &DEFAULT_TRUST, UnderscorePolicy::Reject);
-        let (req, action, _) = canonicalize_request(&head, &ctx, &mut BytesMut::new()).unwrap();
+        let buffering_ctx = ctx_with(
+            Scheme::Http,
+            false,
+            true,
+            None,
+            &DEFAULT_TRUST,
+            UnderscorePolicy::Reject,
+        );
+        let (req, action, _) =
+            canonicalize_request(&head, &buffering_ctx, &mut BytesMut::new()).unwrap();
         assert_eq!(action, ExpectAction::AnswerLocally);
         assert!(matches!(req.headers.get_unique(b"expect"), Ok(None)));
 
@@ -861,17 +978,21 @@ mod tests {
             b"GET / HTTP/1.1\r\nHost: example.com\r\nexpect: bogus\r\n\r\n",
             UnderscorePolicy::Reject,
         );
-        assert_eq!(
+        assert!(matches!(
             canonicalize_request(&head, &ctx(), &mut BytesMut::new()),
             Err(RejectReason::ExpectUnsupported)
-        );
+        ));
     }
 
     #[test]
     fn arena_is_reused_across_pipelined_requests() {
         let buf = b"GET /a HTTP/1.1\r\nHost: a\r\n\r\nGET /b HTTP/1.1\r\nHost: b\r\n\r\n";
         let parser = H1Parser::new(&Limits::DEFAULT.clamped(), UnderscorePolicy::Reject);
-        let first = parser.parse_request_head(buf).unwrap().into_complete().unwrap();
+        let first = parser
+            .parse_request_head(buf)
+            .unwrap()
+            .into_complete()
+            .unwrap();
         let head1 = first.0;
         let consumed1 = first.1;
         let mut arena = BytesMut::new();
@@ -892,15 +1013,15 @@ mod tests {
     #[test]
     fn long_name_lowercasing() {
         let name: Vec<u8> = std::iter::once(b'X')
-            .chain((0..198).map(|i| b'a' + (i % 26) as u8))
+            .chain((0..198).map(|i| b'a' + u8::try_from(i % 26).unwrap()))
             .collect();
         let mut head = Vec::from(&b"GET / HTTP/1.1\r\nHost: example.com\r\n"[..]);
         head.extend_from_slice(&name);
         head.extend_from_slice(b": v\r\n\r\n");
         let head = parse_request_head(&head, UnderscorePolicy::Reject);
         let (req, _, _) = canonicalize_request(&head, &ctx(), &mut BytesMut::new()).unwrap();
-        let lowered: Vec<u8> = name.iter().map(|b| b.to_ascii_lowercase()).collect();
-        assert!(matches!(req.headers.get_unique(&lowered), Ok(Some(&b"v"[..]))));
+        let lowered: Vec<u8> = name.iter().map(u8::to_ascii_lowercase).collect();
+        assert!(matches!(req.headers.get_unique(&lowered), Ok(Some(v)) if v == b"v"));
     }
 
     #[test]
@@ -913,17 +1034,21 @@ mod tests {
         };
         assert_eq!(req.authority.host(), b"example.com");
         assert_eq!(req.path.as_bytes(), b"/");
-        assert!(matches!(req.headers.get_unique(b"host"), Ok(Some(&b"example.com"[..]))));
+        assert!(matches!(req.headers.get_unique(b"host"), Ok(Some(v)) if v == b"example.com"));
     }
 
     #[test]
     fn response_declared_length_survives_the_strip() {
         let check = |head: &[u8], expected_len: Option<u64>, expected_framing: ResponseFraming| {
             let raw = parse_response_head(head, UnderscorePolicy::Reject);
-            let (resp, declared) = canonicalize_response(&raw, &Method::Head, &ctx(), &mut BytesMut::new()).unwrap();
+            let (resp, declared) =
+                canonicalize_response(&raw, &Method::Head, &ctx(), &mut BytesMut::new()).unwrap();
             assert_eq!(declared, expected_len);
             assert_eq!(resp.framing, expected_framing);
-            assert!(matches!(resp.headers.get_unique(b"content-length"), Ok(None)));
+            assert!(matches!(
+                resp.headers.get_unique(b"content-length"),
+                Ok(None)
+            ));
         };
 
         check(
@@ -936,18 +1061,24 @@ mod tests {
             Some(0),
             ResponseFraming::Empty,
         );
-        check(
-            b"HTTP/1.1 200 OK\r\n\r\n",
-            None,
-            ResponseFraming::Empty,
-        );
+        check(b"HTTP/1.1 200 OK\r\n\r\n", None, ResponseFraming::Empty);
 
         // 27c: GET with transfer-encoding: chunked.
-        let raw = parse_response_head(b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n", UnderscorePolicy::Reject);
-        let (resp, declared) = canonicalize_response(&raw, &Method::Get, &ctx(), &mut BytesMut::new()).unwrap();
+        let raw = parse_response_head(
+            b"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n",
+            UnderscorePolicy::Reject,
+        );
+        let (resp, declared) =
+            canonicalize_response(&raw, &Method::Get, &ctx(), &mut BytesMut::new()).unwrap();
         assert_eq!(declared, None);
         assert_eq!(resp.framing, ResponseFraming::Streamed);
-        assert!(matches!(resp.headers.get_unique(b"content-length"), Ok(None)));
-        assert!(matches!(resp.headers.get_unique(b"transfer-encoding"), Ok(None)));
+        assert!(matches!(
+            resp.headers.get_unique(b"content-length"),
+            Ok(None)
+        ));
+        assert!(matches!(
+            resp.headers.get_unique(b"transfer-encoding"),
+            Ok(None)
+        ));
     }
 }

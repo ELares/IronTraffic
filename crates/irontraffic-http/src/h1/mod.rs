@@ -11,6 +11,7 @@
 //! coding decoder and trailer deny-list. Unlike [`parser`] it keeps state
 //! across calls; see its own module documentation for why.
 
+pub mod canonicalize;
 pub mod chunked;
 pub mod parser;
 
