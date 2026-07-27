@@ -47,3 +47,7 @@ rcgen = { workspace = true, features = ["aws_lc_rs"] }
 [[bench]]
 name = "name"
 harness = false
+
+[[bench]]
+name = "resolve"
+harness = false

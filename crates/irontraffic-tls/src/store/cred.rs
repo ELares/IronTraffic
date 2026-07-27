@@ -102,39 +102,76 @@ pub enum CertError {
     /// intermediate; see `crate::store::arena`'s module docs for why this is the load-bearing
     /// safety check, not the hash itself.
     BlobHashCollision,
+    /// A name failed validation.
+    Name(crate::name::NameError),
+    /// A wildcard name was malformed.
+    Wildcard(crate::name::WildcardError),
+    /// A wildcard's parent has fewer than 2 labels or is a listed public suffix.
+    WildcardTooBroad,
+    /// Three independent hash keys all produced a collision between two configured names.
+    NameHashCollision,
+    /// The index would exceed `MAX_NAME_ARENA_BYTES` or `MAX_INDEX_GROUPS`, so a `u32` offset or
+    /// group index would truncate. Refusing to build is the only safe answer: a truncated index
+    /// serves the wrong name's certificate.
+    IndexTooLarge,
 }
 
 impl core::fmt::Display for CertError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(match self {
-            CertError::EmptyChain => "certificate chain is empty",
-            CertError::ChainTooDeep => "certificate chain exceeds 10 certificates",
-            CertError::EmptyDer => "a DER blob was zero bytes",
-            CertError::DerTooLarge => "a DER blob exceeds 65536 bytes",
-            CertError::LeafParse => "the leaf certificate did not parse as X.509 DER",
-            CertError::InvalidValidity => "notAfter is not after notBefore",
-            CertError::UnsupportedKeyType => {
-                "public key algorithm or curve is not one of ECDSA P-256, ECDSA P-384, RSA, Ed25519"
-            }
+        match self {
+            CertError::EmptyChain => f.write_str("certificate chain is empty"),
+            CertError::ChainTooDeep => f.write_str("certificate chain exceeds 10 certificates"),
+            CertError::EmptyDer => f.write_str("a DER blob was zero bytes"),
+            CertError::DerTooLarge => f.write_str("a DER blob exceeds 65536 bytes"),
+            CertError::LeafParse => f.write_str("the leaf certificate did not parse as X.509 DER"),
+            CertError::InvalidValidity => f.write_str("notAfter is not after notBefore"),
+            CertError::UnsupportedKeyType => f.write_str(
+                "public key algorithm or curve is not one of ECDSA P-256, ECDSA P-384, RSA, Ed25519",
+            ),
             CertError::MalformedTlsFeature => {
-                "the id-pe-tlsfeature extension is present but did not decode"
+                f.write_str("the id-pe-tlsfeature extension is present but did not decode")
             }
-            CertError::TooManySans => "the leaf carries more than 100 dNSName SANs",
+            CertError::TooManySans => f.write_str("the leaf carries more than 100 dNSName SANs"),
             CertError::KeyMismatch => {
-                "the private key did not parse or does not match the leaf public key"
+                f.write_str("the private key did not parse or does not match the leaf public key")
             }
-            CertError::TooManyDistinctBlobs => "the chain interner is at its distinct-blob limit",
+            CertError::TooManyDistinctBlobs => {
+                f.write_str("the chain interner is at its distinct-blob limit")
+            }
             CertError::ProviderNotInstalled => {
-                "no crypto provider is installed; install_process_provider must run first"
+                f.write_str("no crypto provider is installed; install_process_provider must run first")
             }
-            CertError::BlobHashCollision => {
-                "two different certificate chain blobs hashed to the same interner bucket"
+            CertError::BlobHashCollision => f.write_str(
+                "two different certificate chain blobs hashed to the same interner bucket",
+            ),
+            CertError::Name(e) => write!(f, "invalid certificate name: {e}"),
+            CertError::Wildcard(e) => write!(f, "invalid wildcard name: {e}"),
+            CertError::WildcardTooBroad => {
+                f.write_str("wildcard parent has fewer than 2 labels or is a listed public suffix")
             }
-        })
+            CertError::NameHashCollision => f.write_str(
+                "three independent name-hash keys all collided; this indicates a bug",
+            ),
+            CertError::IndexTooLarge => f.write_str(
+                "the certificate index exceeds its 1 GiB name arena or 16777216 group limit",
+            ),
+        }
     }
 }
 
 impl std::error::Error for CertError {}
+
+impl From<crate::name::NameError> for CertError {
+    fn from(e: crate::name::NameError) -> Self {
+        CertError::Name(e)
+    }
+}
+
+impl From<crate::name::WildcardError> for CertError {
+    fn from(e: crate::name::WildcardError) -> Self {
+        CertError::Wildcard(e)
+    }
+}
 
 /// BLAKE3-256 of the leaf DER, truncated to 16 bytes. This is the stable identity of a
 /// credential across reloads and is the value the admin API and logs report. Private key

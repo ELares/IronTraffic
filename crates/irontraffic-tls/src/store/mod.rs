@@ -13,6 +13,7 @@
 
 mod arena;
 mod cred;
+mod index;
 
 // `MAX_DER_BYTES` is arena's own bound (it caps a single interned blob), but `Credentials::load`
 // also uses the identical constant to cap every blob in a chain, leaf included, so it lives in
@@ -20,4 +21,8 @@ mod cred;
 pub use arena::{BlobHash, ChainInterner, MAX_DER_BYTES};
 pub use cred::{
     CertError, CertFingerprint, Credentials, KeyType, MAX_CHAIN_DEPTH, MAX_SANS, MAX_STAPLE_BYTES,
+};
+pub use index::{
+    CertIndex, CertIndexBuilder, CertStats, ClientCaps, MAX_INDEX_GROUPS, MAX_NAME_ARENA_BYTES,
+    SanIndexReport,
 };
