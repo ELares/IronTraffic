@@ -99,6 +99,63 @@ WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 export WORK
 
+# ---------------------------------------------------------------------------
+# test-census-allow (issue #556 follow-up): the two FAIL messages below have
+# told a reviewer to write "test-census-allow: <name> reason: <text>" in the
+# pull request body since this script existed, and nothing anywhere ever read
+# that line back. It was an escape hatch that could not be opened: every
+# legitimate removal or per-file assertion drop this script's own comments
+# already admit are "genuinely correct" (a test replaced by a strictly
+# stronger one, or moved into a brand-new `tests/*.rs` binary, which rule 2
+# below cannot treat as a wash the way it does a move between two EXISTING
+# files, because the destination file has no "before" count to net against)
+# had no path to a green build except a human bypassing this check entirely
+# with --admin, which is a worse outcome than the check not existing: the
+# badge claims a guarantee a bypass just proved it is not providing. Found
+# implementing #556: moving `provider_lifecycle` to its own test binary, the
+# correct fix for a real, confirmed test race, dropped
+# crates/irontraffic-tls/src/provider.rs's own assertion count with no way to
+# say so that this script would ever read.
+#
+# Reads the PR body live via the GitHub API, exactly the way
+# scripts/pr-scope-check.sh already does, and only when PR_NUMBER is set: a
+# push event (this script also runs on push, see the BASE_REF fallback above)
+# has no pull request to read, and this must not treat "could not check" as
+# "everything is allowed" by silently proceeding as if every removal were
+# pre-approved. ALLOWED_NAMES and ALLOWED_PATHS are the two id-spaces the FAIL
+# messages already promised, kept in separate files because a test name and a
+# file path can collide as strings with no relation to each other.
+ALLOWED_NAMES="$WORK/allowed.names"
+ALLOWED_PATHS="$WORK/allowed.paths"
+: > "$ALLOWED_NAMES"
+: > "$ALLOWED_PATHS"
+if [ -n "${PR_NUMBER:-}" ]; then
+  REPO="${GITHUB_REPOSITORY:-$(gh repo view --json nameWithOwner --jq .nameWithOwner 2>/dev/null)}"
+  if PR_BODY="$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.body // ""' 2>/dev/null)"; then
+    # One capture per line: the token right after "test-census-allow:" and
+    # before " reason:". Requires the reason keyword to be present at all
+    # (not that it says anything in particular) so a bare
+    # "test-census-allow: foo" typo without a reason does not silently match;
+    # the reviewer-facing point of this line is that a human wrote a sentence,
+    # not that the sentence passes any content check.
+    printf '%s\n' "$PR_BODY" \
+      | grep -oE '^test-census-allow:[[:space:]]*[^[:space:]]+[[:space:]]+reason:.+$' \
+      | sed -E 's/^test-census-allow:[[:space:]]*([^[:space:]]+)[[:space:]]+reason:.*/\1/' \
+      > "$WORK/allow.tokens" || true
+    # A token is a test NAME if it names something in base.tests' name column
+    # (computed below, after this point runs, so this file is written but not
+    # yet split here); simplest and least surprising: put every token in BOTH
+    # lists. A test name and a real file path are different enough in shape
+    # (a path contains '/', a Rust identifier never does) that a token
+    # matching neither list on its actual check does nothing, so listing a
+    # token in the list it does not apply to is inert, not a false allow.
+    cp "$WORK/allow.tokens" "$ALLOWED_NAMES" 2>/dev/null || true
+    cp "$WORK/allow.tokens" "$ALLOWED_PATHS" 2>/dev/null || true
+  else
+    echo "test-census: could not read PR #$PR_NUMBER's body (continuing with no allow-list; a genuine removal or weakening still fails below)" >&2
+  fi
+fi
+
 # rslex.py: the same literal- and comment-aware Rust scanner
 # scripts/invariant-lints.sh uses, with two census-specific helpers added at
 # the bottom. Kept as an independent copy (not a shared file read via a
@@ -458,7 +515,27 @@ FAILED=0
 # ---------------------------------------------------------------------------
 cut -f2 "$WORK/base.tests" | LC_ALL=C sort -u > "$WORK/base.names"
 cut -f2 "$WORK/head.tests" | LC_ALL=C sort -u > "$WORK/head.names"
-GONE="$(LC_ALL=C comm -23 "$WORK/base.names" "$WORK/head.names")"
+GONE_ALL="$(LC_ALL=C comm -23 "$WORK/base.names" "$WORK/head.names")"
+
+# Split GONE_ALL against the allow-list read above: a name present there was
+# a reviewed, explicit decision, not a silent disappearance. Reported either
+# way, because "allowed" is not the same thing as "invisible".
+GONE="" GONE_ALLOWED=""
+while IFS= read -r name; do
+  [ -n "$name" ] || continue
+  if LC_ALL=C grep -qxF "$name" "$ALLOWED_NAMES" 2>/dev/null; then
+    GONE_ALLOWED="$GONE_ALLOWED$name
+"
+  else
+    GONE="$GONE$name
+"
+  fi
+done <<< "$GONE_ALL"
+if [ -n "$GONE_ALLOWED" ]; then
+  echo
+  echo "test-census-allow honored (test-removed):"
+  printf '%s' "$GONE_ALLOWED" | sed 's/^/    /'
+fi
 
 if [ -n "$GONE" ]; then
   echo
@@ -492,7 +569,7 @@ fi
 # compared per file so that moving tests between files does not trip either
 # one as long as the total in a surviving file does not drop.
 # ---------------------------------------------------------------------------
-WEAKENED="$(python3 - "$WORK/base.asserts" "$WORK/head.asserts" "$WORK/base.strict" "$WORK/head.strict" <<'PY'
+WEAKENED_ALL="$(python3 - "$WORK/base.asserts" "$WORK/head.asserts" "$WORK/base.strict" "$WORK/head.strict" <<'PY'
 import sys
 def load(p):
     d = {}
@@ -520,6 +597,27 @@ for path, n in sorted(base_strict.items()):
         print(f"{path}: {n} -> {m} assert_eq!/assert_ne! ({n - m} fewer, even if the total assertion count held steady)")
 PY
 )"
+
+# Split WEAKENED_ALL against the allow-list the same way: each line is
+# "<path>: ..."; the path is everything before the first ": ", which is safe
+# because a Rust source path never itself contains ": ".
+WEAKENED="" WEAKENED_ALLOWED=""
+while IFS= read -r line; do
+  [ -n "$line" ] || continue
+  path="${line%%: *}"
+  if LC_ALL=C grep -qxF "$path" "$ALLOWED_PATHS" 2>/dev/null; then
+    WEAKENED_ALLOWED="$WEAKENED_ALLOWED$line
+"
+  else
+    WEAKENED="$WEAKENED$line
+"
+  fi
+done <<< "$WEAKENED_ALL"
+if [ -n "$WEAKENED_ALLOWED" ]; then
+  echo
+  echo "test-census-allow honored (assertions-weakened):"
+  printf '%s' "$WEAKENED_ALLOWED" | sed 's/^/    /'
+fi
 
 if [ -n "$WEAKENED" ]; then
   echo

@@ -304,6 +304,13 @@ jobs:
     name: invariant lints, dash scan, governance
     runs-on: ubuntu-latest
     timeout-minutes: 15
+    # pull-requests: read (issue #589), added alongside contents: read from the
+    # workflow default: the test census step below reads the live PR body to
+    # find test-census-allow lines, the same permission the scope job already
+    # declares for the identical reason.
+    permissions:
+      contents: read
+      pull-requests: read
     steps:
       - uses: actions/checkout@v7
         with:
@@ -374,8 +381,16 @@ jobs:
         # assertion passes too, since those lints check for presence rather
         # than strength. This compares the set of test function names, and the
         # assertion count per test file, against the base branch.
+        #
+        # PR_NUMBER and GH_TOKEN (issue #589): the script's own FAIL messages
+        # have always told a reviewer to write a test-census-allow line in the
+        # pull request body; nothing ever read it back until this. Empty on a
+        # push event (github.event.pull_request is unset then), which the
+        # script treats as "no allow-list", not "everything is allowed".
         env:
           BASE_REF: ${{ github.base_ref || github.ref_name }}
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
         run: scripts/test-census.sh
       - name: test census self-test
         # Same reasoning as the invariant lint self-test above, for the
