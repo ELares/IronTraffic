@@ -495,8 +495,9 @@ for rel in sys.stdin.read().split("\n"):
                 "span\n"
             )
             sys.exit(1)
-        # blank_region, not a slice-and-replace, so line numbers computed
-        # against the result stay correct: failure mode 2 above.
+        # item_extent (not "assume the next real { is a mod body") is what
+        # fixes failure mode 2 above; blank_region itself is unchanged from
+        # before, preserving newlines so line numbers stay correct.
         rslex.blank_region(chars, m.start(), end)
     dest = os.path.join(OUT, rel)
     os.makedirs(os.path.dirname(dest), exist_ok=True)
