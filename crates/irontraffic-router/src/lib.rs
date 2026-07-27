@@ -6,6 +6,7 @@
 
 pub mod build;
 pub mod ids;
+pub mod intern;
 pub mod limits;
 pub mod normalize;
 pub mod precedence;
@@ -20,6 +21,7 @@ pub use build::{CandInput, GroupParts, TrieBuildError, build_group};
 pub use ids::{
     ActionId, CertId, GroupId, ListenerId, MethodMask, NameId, NodeId, RouteId, SENTINEL,
 };
+pub use intern::{CompiledNameSet, MAX_NAMES, NameSetBuilder, NameSetError, is_tchar};
 pub use normalize::{
     AuthorityError, HOST_KEY_BUF_BYTES, HostKind, host_key, normalize_authority,
     normalize_host_pattern,
