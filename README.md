@@ -113,6 +113,22 @@ connection. Concretely, this version:
 See [docs/THREAT-MODEL.md](docs/THREAT-MODEL.md) for the full account of what this
 version defends against and what it does not, mechanism by mechanism.
 
+## Data-plane-only build
+
+A data-plane-only build is available for edge and k3s deployments:
+
+```
+cargo build -p irontraffic --no-default-features --features dataplane --release
+```
+
+In this build, `run` and `control` are refused with a usage error (exit code 2) before
+any configuration file is read or socket is bound. `proxy` and `validate` work exactly as
+they do in the default build.
+
+In this version, the two binaries are nearly the same size because the control plane is
+only the runtime so far. The first control-plane-only dependency must add a `cargo tree`
+allowlist assertion that proves it is not pulled into the data-plane-only build.
+
 ## Promises
 
 [COVENANTS.md](COVENANTS.md) is a set of falsifiable commitments: no paywalled security, no feature

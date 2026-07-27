@@ -74,6 +74,48 @@ enum Command {
 /// section of `serve-and-smoke-test` (#21) literally.
 pub(crate) use irontraffic::Mode;
 
+/// Why a mode word could not be turned into a [`Mode`].
+#[allow(
+    dead_code,
+    reason = "exactly one variant is dead in each feature configuration"
+)]
+enum ParseError {
+    /// A mode that exists in the full build but is not compiled into this one.
+    ModeNotInThisBuild { mode: &'static str },
+    /// Any word that is not one of the four known modes.
+    Unknown,
+}
+
+/// Parses a mode word, refusing `run` and `control` when the control-plane feature
+/// is disabled.
+fn parse_mode(word: &str) -> Result<Mode, ParseError> {
+    match word {
+        "validate" => Ok(Mode::Validate),
+        "proxy" => Ok(Mode::Proxy),
+        "run" => {
+            #[cfg(feature = "control-plane")]
+            {
+                Ok(Mode::Run)
+            }
+            #[cfg(not(feature = "control-plane"))]
+            {
+                Err(ParseError::ModeNotInThisBuild { mode: "run" })
+            }
+        }
+        "control" => {
+            #[cfg(feature = "control-plane")]
+            {
+                Ok(Mode::Control)
+            }
+            #[cfg(not(feature = "control-plane"))]
+            {
+                Err(ParseError::ModeNotInThisBuild { mode: "control" })
+            }
+        }
+        _ => Err(ParseError::Unknown),
+    }
+}
+
 /// The parsed `validate`, `run`, `proxy`, or `control` flags. Reused for all four
 /// commands rather than duplicated, per `serve-and-smoke-test` (#21): `run` ignores
 /// `print`.
@@ -210,17 +252,21 @@ fn parse(argv: &[String]) -> Result<Command, String> {
         );
     };
 
-    // `Mode::parse` is the same lookup `CommandKind` used to perform locally: it
-    // validates the command word once, up front, so the match at the bottom of this
-    // function (which builds the `Command` this word selects) matches on a type
-    // `parse` already proved exhaustive, with nothing legitimate left for a wildcard
-    // arm to catch.
-    let kind = Mode::parse(head.as_str()).ok_or_else(|| {
-        format!(
+    // `parse_mode` validates the command word once, up front, so the match at the
+    // bottom of this function (which builds the `Command` this word selects) matches
+    // on a type `parse` already proved exhaustive, with nothing legitimate left for a
+    // wildcard arm to catch.
+    let kind = parse_mode(head.as_str()).map_err(|e| match e {
+        ParseError::ModeNotInThisBuild { mode } => format!(
+            "the {mode} mode is not available in this build: this binary was built with\n       \
+             --no-default-features --features dataplane, which excludes the control \
+             plane. Use proxy."
+        ),
+        ParseError::Unknown => format!(
             "unrecognised command \"{}\"; expected \"validate\", \"run\", \"proxy\", \
              \"control\", \"--version\", or \"--help\"",
             sanitize_for_terminal(head)
-        )
+        ),
     })?;
 
     let mut config: Option<PathBuf> = None;
@@ -360,35 +406,47 @@ pub(crate) fn print_usage(out: &mut dyn std::io::Write) -> std::io::Result<()> {
         out,
         "  irontraffic validate --config <path> [--workers N] [--bind ADDR] [--upstream ADDR] [--mode MODE] [--print]"
     )?;
-    writeln!(
-        out,
-        "  irontraffic run      --config <path> [--workers N] [--bind ADDR] [--upstream ADDR] [--mode MODE] [--print]"
-    )?;
+    #[cfg(feature = "control-plane")]
+    {
+        writeln!(
+            out,
+            "  irontraffic run      --config <path> [--workers N] [--bind ADDR] [--upstream ADDR] [--mode MODE] [--print]"
+        )?;
+    }
     writeln!(
         out,
         "  irontraffic proxy    --config <path> [--workers N] [--bind ADDR] [--upstream ADDR] [--mode MODE] [--print]"
     )?;
-    writeln!(
-        out,
-        "  irontraffic control  --config <path> [--workers N] [--bind ADDR] [--upstream ADDR] [--mode MODE] [--print]"
-    )?;
+    #[cfg(feature = "control-plane")]
+    {
+        writeln!(
+            out,
+            "  irontraffic control  --config <path> [--workers N] [--bind ADDR] [--upstream ADDR] [--mode MODE] [--print]"
+        )?;
+    }
     writeln!(out, "modes:")?;
     writeln!(
         out,
         "  validate   load, validate, report, and exit without binding anything"
     )?;
-    writeln!(
-        out,
-        "  run        everything: data plane plus control-plane runtime (the default deployment)"
-    )?;
+    #[cfg(feature = "control-plane")]
+    {
+        writeln!(
+            out,
+            "  run        everything: data plane plus control-plane runtime (the default deployment)"
+        )?;
+    }
     writeln!(
         out,
         "  proxy      data plane only; does not build the control-plane runtime"
     )?;
-    writeln!(
-        out,
-        "  control    control plane only; has no work in this version and exits 0"
-    )?;
+    #[cfg(feature = "control-plane")]
+    {
+        writeln!(
+            out,
+            "  control    control plane only; has no work in this version and exits 0"
+        )?;
+    }
     writeln!(
         out,
         "flags (accepted by validate, run, proxy, and control):"

@@ -161,6 +161,50 @@ jobs:
           done < <(scripts/feature-matrix.sh matrixed-names)
           cargo check --locked --workspace "${exclude[@]}" --no-default-features
 
+  dataplane-build:
+    name: dataplane-only build, clippy, tests, and size ceiling
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      # Generous initial ceiling, not a measurement. It may only ratchet down.
+      # The pull request implementing this issue records both measured sizes so
+      # the first ratchet has a number.
+      DATAPLANE_SIZE_CEILING_BYTES: 33554432
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: build the data-plane-only release binary
+        run: |
+          set -euo pipefail
+          cargo build --locked -p irontraffic --no-default-features --features dataplane --release
+          cp target/release/irontraffic /tmp/irontraffic-dataplane
+      - name: clippy the data-plane-only build
+        run: |
+          set -euo pipefail
+          cargo clippy --locked -p irontraffic --no-default-features --features dataplane --all-targets -- -D warnings
+      - name: test the data-plane-only build
+        run: |
+          set -euo pipefail
+          cargo test --locked -p irontraffic --no-default-features --features dataplane
+      - name: build the default release binary for comparison
+        run: |
+          set -euo pipefail
+          cargo build --locked -p irontraffic --release
+      - name: assert the trimmed binary is not larger than the full binary or the ceiling
+        run: |
+          set -euo pipefail
+          dp=$(wc -c < /tmp/irontraffic-dataplane)
+          full=$(wc -c < target/release/irontraffic)
+          echo "data-plane-only size: $dp bytes"
+          echo "default build size:   $full bytes"
+          echo "ceiling:              $DATAPLANE_SIZE_CEILING_BYTES bytes"
+          test "$dp" -le "$full" || { echo "FAIL: the data-plane-only build is LARGER than the full build"; exit 1; }
+          test "$dp" -le "$DATAPLANE_SIZE_CEILING_BYTES" || { echo "FAIL: the data-plane-only build exceeds the committed ceiling"; exit 1; }
+          echo "size check: ok"
+
   feature-matrix:
     name: feature matrix (${{ matrix.crate }}, ${{ matrix.features }})
     needs: feature-matrix-discover

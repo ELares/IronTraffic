@@ -518,22 +518,18 @@ pub(crate) fn run(mode: Mode, args: &ValidateArgs) -> ExitCode {
             return ExitCode::from(4);
         }
     };
-    let control = if mode == Mode::Run {
-        match irontraffic_runtime::ControlPlane::build(&rt_cfg) {
-            Ok(c) => Some(c),
-            Err(e) => {
-                #[allow(
-                    clippy::print_stderr,
-                    reason = "a startup failure reported before any socket exists"
-                )]
-                {
-                    eprintln!("{e}");
-                }
-                return ExitCode::from(4);
+    let control = match build_control(mode, &rt_cfg) {
+        Ok(c) => c,
+        Err(e) => {
+            #[allow(
+                clippy::print_stderr,
+                reason = "a startup failure reported before any socket exists"
+            )]
+            {
+                eprintln!("{e}");
             }
+            return ExitCode::from(4);
         }
-    } else {
-        None
     };
 
     // Bind BEFORE entering the runtime: binding needs no reactor, and a bind failure
@@ -675,6 +671,41 @@ pub(crate) fn run(mode: Mode, args: &ValidateArgs) -> ExitCode {
     } else {
         ExitCode::from(6)
     }
+}
+
+/// Builds the control-plane runtime when this build has one and the mode wants one.
+///
+/// Two bodies, selected by the `control-plane` feature, returning the same type so
+/// the caller and the shutdown path are identical in both builds.
+///
+/// # Errors
+/// [`irontraffic_runtime::RuntimeError`] when the operating system refuses to create
+/// the control-plane threads. The caller maps it to exit code 4.
+#[cfg(feature = "control-plane")]
+fn build_control(
+    mode: Mode,
+    cfg: &irontraffic_runtime::RuntimeConfig,
+) -> Result<Option<irontraffic_runtime::ControlPlane>, irontraffic_runtime::RuntimeError> {
+    if mode == Mode::Run {
+        irontraffic_runtime::ControlPlane::build(cfg).map(Some)
+    } else {
+        Ok(None)
+    }
+}
+
+/// The data-plane-only build has no control plane. `run` and `control` were already
+/// refused by the argument parser, so `proxy` is the only mode that reaches this
+/// function, and `proxy` never builds one.
+#[cfg(not(feature = "control-plane"))]
+#[allow(
+    clippy::unnecessary_wraps,
+    reason = "this body must share the control-plane body's return type so the caller is identical"
+)]
+fn build_control(
+    _mode: Mode,
+    _cfg: &irontraffic_runtime::RuntimeConfig,
+) -> Result<Option<irontraffic_runtime::ControlPlane>, irontraffic_runtime::RuntimeError> {
+    Ok(None)
 }
 
 #[cfg(test)]

@@ -39,6 +39,7 @@ pub(crate) struct Origin {
     /// Requests served so far.
     hits: Arc<AtomicU64>,
     /// The exact bytes of the most recently completed request's head.
+    #[allow(dead_code, reason = "read by smoke.rs; not every test binary uses it")]
     last_request: Arc<Mutex<Vec<u8>>>,
 }
 
@@ -137,6 +138,7 @@ impl Origin {
     }
 
     /// The exact bytes of the most recently completed request's head.
+    #[allow(dead_code, reason = "read by smoke.rs; not every test binary uses it")]
     pub(crate) fn last_request(&self) -> Vec<u8> {
         self.last_request
             .lock()
@@ -215,6 +217,10 @@ pub(crate) fn wait_for_exit(child: &mut Child, timeout: Duration) -> ExitStatus 
 /// wait means a child that never exits cannot block this function forever, and a
 /// child whose stderr output fills the pipe buffer before it exits cannot deadlock
 /// against a caller that only starts reading after the wait returns.
+#[allow(
+    dead_code,
+    reason = "used by the control-mode tests, which are gated on the control-plane feature"
+)]
 pub(crate) fn wait_for_exit_capturing_stderr(
     child: &mut Child,
     timeout: Duration,
@@ -309,13 +315,22 @@ impl ProxyProcess {
     }
 }
 
-/// Starts the binary in `run` mode with a generated config and waits until the
-/// listener answers a TCP connect, up to 5 seconds.
+/// The mode `spawn_proxy` starts: `run` in a full build, `proxy` in a data-plane-only
+/// build. The two behave identically in M1 except that `run` also builds the
+/// control-plane runtime, so every existing smoke test asserts the same thing in both.
+pub(crate) const DEFAULT_SPAWN_MODE: &str = if cfg!(feature = "control-plane") {
+    "run"
+} else {
+    "proxy"
+};
+
+/// Starts the binary in [`DEFAULT_SPAWN_MODE`] with a generated config and waits
+/// until the listener answers a TCP connect, up to 5 seconds.
 ///
 /// `cfg_yaml` must contain the literal bind placeholder `127.0.0.1:0`, which this
 /// function replaces with a port it discovered is free before the child ever runs.
 pub(crate) fn spawn_proxy(cfg_yaml: &str) -> ProxyProcess {
-    spawn_proxy_with_mode(cfg_yaml, "run")
+    spawn_proxy_with_mode(cfg_yaml, DEFAULT_SPAWN_MODE)
 }
 
 /// Same as [`spawn_proxy`], for an arbitrary mode (`run`, `proxy`, or `control`).
@@ -382,6 +397,10 @@ pub(crate) fn spawn_proxy_with_mode(cfg_yaml: &str, mode: &str) -> ProxyProcess 
               reasoning); spawning the just-built binary from CARGO_BIN_EXE_irontraffic does \
               not fail on a working test host"
 )]
+#[allow(
+    dead_code,
+    reason = "used by the control-mode tests, which are gated on the control-plane feature"
+)]
 pub(crate) fn spawn_binary(cfg_yaml: &str, mode: &str) -> (Child, PathBuf) {
     let (cfg_path, dir) = write_fixture(cfg_yaml);
     let child = Command::new(env!("CARGO_BIN_EXE_irontraffic"))
@@ -408,6 +427,10 @@ pub(crate) fn spawn_binary(cfg_yaml: &str, mode: &str) -> (Child, PathBuf) {
 /// [`spawn_proxy`].
 #[cfg(target_os = "linux")]
 #[allow(
+    dead_code,
+    reason = "used only by the Linux-only descriptor-budget test"
+)]
+#[allow(
     clippy::expect_used,
     reason = "test-support setup, not itself a #[test] fn (see Origin::start's identical \
               reasoning); the shell/ulimit availability check above already ruled out the one \
@@ -427,7 +450,7 @@ pub(crate) fn spawn_proxy_under_nofile_limit(cfg_yaml: &str, nofile: u32) -> Opt
     let cfg = cfg_yaml.replace("127.0.0.1:0", &format!("127.0.0.1:{port}"));
     let (cfg_path, dir) = write_fixture(&cfg);
     let shell_cmd = format!(
-        "ulimit -n {nofile}; exec {} run --config {}",
+        "ulimit -n {nofile}; exec {} {DEFAULT_SPAWN_MODE} --config {}",
         env!("CARGO_BIN_EXE_irontraffic"),
         cfg_path.display()
     );

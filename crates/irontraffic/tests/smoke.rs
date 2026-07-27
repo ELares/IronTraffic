@@ -53,6 +53,10 @@ fn cfg_yaml_with_max_connections(upstream_port: u16, max_connections: u32) -> St
 /// A configuration with a concrete (non-zero) bind port, for the tests that must
 /// know the listener's address without going through [`support::spawn_proxy`]'s own
 /// port discovery (`control` mode never binds it, so there is nothing to discover).
+#[allow(
+    dead_code,
+    reason = "used only by the control-mode test, which is gated on the control-plane feature"
+)]
 fn cfg_yaml_with_bind(bind_port: u16, upstream_port: u16) -> String {
     format!(
         "apiVersion: irontraffic.io/v1\n\
@@ -385,6 +389,7 @@ async fn connection_cap_rejects_the_extra_connection() {
 /// still before the bind loop) would leave the port-held assertion above passing,
 /// since nothing would bind, while still building two tokio runtimes control mode is
 /// specified never to build; this assertion is what catches that case.
+#[cfg(feature = "control-plane")]
 #[test]
 fn control_mode_binds_nothing_and_exits_zero() {
     let bind_port = support::free_local_port();
