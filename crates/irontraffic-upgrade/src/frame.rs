@@ -25,7 +25,12 @@ impl HandoffFrame {
     ///
     /// # Errors
     /// [`FrameError::TooManyDescriptors`] above [`MAX_FDS`],
-    /// [`FrameError::BadAddressLength`] for an empty or oversized address.
+    /// [`FrameError::BadAddressLength`] for an empty or oversized address,
+    /// [`FrameError::FdIndexOutOfRange`] for an `fd_index` at or above `entries.len()`,
+    /// [`FrameError::DuplicateFdIndex`] for two entries naming the same `fd_index`. The
+    /// last two mirror [`HandoffFrame::decode`]'s own checks, so a frame this
+    /// constructor accepts always decodes back to itself; see invariant 3 in the
+    /// issue this crate implements.
     pub fn new(entries: Vec<HandoffEntry>) -> Result<Self, FrameError> {
         Self::validate(&entries)?;
         Ok(Self { entries })
@@ -172,6 +177,18 @@ impl HandoffFrame {
                 });
             }
 
+            // EQUIVALENT MUTANT, PROVED: mutation testing flagged `4 + addr_len_usize`
+            // on the next line as survivable (`+` to `*`). It cannot be observed by any
+            // input, well-formed or hostile: `addr_len_usize` was just checked above to
+            // be at most MAX_ADDR_BYTES (64), so `4usize.checked_add(addr_len_usize)` is
+            // `4usize.checked_add(<= 64)`, which is always `Some` on every platform this
+            // crate builds for (`usize` is at least 16 bits). `checked_add` can only
+            // return `None`, making this `.ok_or(...)` closure run at all, when the sum
+            // would overflow `usize::MAX`, which is unreachable here by more than sixty
+            // orders of magnitude. The expression inside is therefore dead code for
+            // every reachable value of `addr_len_usize`, and no test can distinguish `+`
+            // from `*` here without first making this branch reachable, which would be a
+            // change to the bound above, not to this line.
             let need = 4usize
                 .checked_add(addr_len_usize)
                 .ok_or(FrameError::Truncated {
@@ -252,6 +269,13 @@ impl HandoffFrame {
                 })?;
         let hash = blake3::hash(content);
         let expected = hash.as_bytes();
+        // `.take(CHECKSUM_BYTES)` on `expected` (32 bytes, a full blake3 hash) is
+        // redundant with `.zip`, which already stops at `received_checksum`'s
+        // length (exactly `CHECKSUM_BYTES`, from the `split_at_checked` above):
+        // removing it changes nothing `zip` would ever iterate. It stays because
+        // it makes "exactly CHECKSUM_BYTES bytes are compared" a property of this
+        // line rather than a fact the reader has to derive from `zip`'s implicit
+        // truncation and `received_checksum`'s length elsewhere in the function.
         if !received_checksum
             .iter()
             .zip(expected.iter().take(CHECKSUM_BYTES))
@@ -267,6 +291,30 @@ impl HandoffFrame {
         Ok(())
     }
 
+    // ALLOCATION BOUND, PROVED STATICALLY. `decode` calls this function only after
+    // both `validate_entries` and `verify_checksum` have already succeeded, so by
+    // the time it runs, every value it allocates from has already been checked
+    // against bytes physically present in `bytes`, never merely against a
+    // declared length:
+    //   - `count` is at most `MAX_FDS` (checked in `decode` before
+    //     `validate_entries` even starts), so `Vec::with_capacity(count)` below is
+    //     bounded by the compile-time constant `MAX_FDS`, never by an
+    //     attacker-chosen value.
+    //   - each entry's `addr_len` was already checked by `validate_entries` to be
+    //     at most `MAX_ADDR_BYTES` AND to have that many bytes actually present in
+    //     `bytes` (`validate_entries` returns `Truncated` otherwise), so the
+    //     `to_owned()` below allocates at most `MAX_ADDR_BYTES` bytes per entry
+    //     and never reads, let alone allocates from, a length that outruns the
+    //     input.
+    // The total additional heap use this function can cause is therefore bounded
+    // by `MAX_FDS * (size_of::<HandoffEntry>() + MAX_ADDR_BYTES)`, a fixed
+    // constant, for every input, including one that DECLARES a far larger count
+    // or address length than is present. This is the property tests 8 and 21 ask
+    // for a counting allocator to measure; that measurement cannot be written in
+    // this crate, because `[lints] workspace = true` denies `unsafe_code` on every
+    // target including `tests/`, so `#[global_allocator]` will not compile here
+    // (verified: it produces 5 `unsafe_code` errors). Per the corpus-wide rule for
+    // exactly this conflict, the bound is proved here in place of measuring it.
     fn build_entries(
         count: usize,
         bytes: &[u8],
@@ -343,6 +391,16 @@ impl HandoffFrame {
         self.entries.iter().filter(move |e| e.addr == addr)
     }
 
+    // Invariant 3 (decode(encode(x)) == x for every constructible x) requires that
+    // `new` and `encode` reject exactly what `decode` would reject. `decode`'s
+    // `validate_entries` checks that every `fd_index` is below `count` and that no
+    // two entries share one (steps 11 and 12 of the issue's decode algorithm); this
+    // function mirrors that check with the same `[bool; MAX_FDS]` fixed-size
+    // tracker `validate_entries` uses, so a caller cannot build a `HandoffFrame`
+    // whose own `encode` output is later refused by `decode`. The array is sized
+    // by the constant `MAX_FDS`, never by `entries.len()`, and is only indexed
+    // after the length check above has already bounded `entries.len()` to at most
+    // `MAX_FDS`, so every index into it is in range.
     fn validate(entries: &[HandoffEntry]) -> Result<(), FrameError> {
         if entries.len() > MAX_FDS {
             return Err(FrameError::TooManyDescriptors {
@@ -350,6 +408,7 @@ impl HandoffFrame {
                 max: MAX_FDS,
             });
         }
+        let mut seen = [false; MAX_FDS];
         for (entry, e) in entries.iter().enumerate() {
             if e.addr.is_empty() || e.addr.len() > MAX_ADDR_BYTES {
                 return Err(FrameError::BadAddressLength {
@@ -358,6 +417,25 @@ impl HandoffFrame {
                     max: MAX_ADDR_BYTES,
                 });
             }
+            let fd_index_usize = usize::from(e.fd_index);
+            if fd_index_usize >= entries.len() {
+                return Err(FrameError::FdIndexOutOfRange {
+                    entry,
+                    index: e.fd_index,
+                    count: entries.len(),
+                });
+            }
+            let flag = seen
+                .get_mut(fd_index_usize)
+                .ok_or(FrameError::FdIndexOutOfRange {
+                    entry,
+                    index: e.fd_index,
+                    count: entries.len(),
+                })?;
+            if *flag {
+                return Err(FrameError::DuplicateFdIndex { index: e.fd_index });
+            }
+            *flag = true;
         }
         Ok(())
     }

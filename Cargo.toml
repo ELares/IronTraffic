@@ -22,8 +22,8 @@ exclude = [
     "crates/irontraffic-config/fuzz",
     "crates/irontraffic-router/fuzz",
     "crates/irontraffic-tls/fuzz",
+    "crates/irontraffic-upgrade/fuzz",
 ]
-exclude = ["crates/irontraffic-router/fuzz", "crates/irontraffic-tls/fuzz", "crates/irontraffic-upgrade/fuzz"]
 
 [workspace.package]
 version = "0.1.0"
