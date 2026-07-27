@@ -771,8 +771,8 @@ impl ChunkedDecoder {
             if line_len > self.limits.max_field_line_bytes as usize {
                 return Err(RejectReason::FieldLineTooLong);
             }
-            // HANDMUT-DROPSTMT (verification only, reverted immediately after test):
-            // let self.trailer_budget.charge(...) call removed here.
+            self.trailer_budget
+                .charge(name_raw.len(), value_trimmed.len())?;
 
             let Some(builder) = self.trailer_builder.as_mut() else {
                 return Err(RejectReason::ChunkTerminatorInvalid);
