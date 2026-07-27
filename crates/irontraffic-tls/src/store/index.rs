@@ -51,7 +51,10 @@ pub(crate) struct CredSet {
 }
 
 /// What the `ClientHello` says the peer can verify. Built once per handshake.
-#[allow(clippy::struct_excessive_bools)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "ClientCaps mirrors four independent TLS signature-algorithm advertisement bits"
+)]
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
 pub struct ClientCaps {
     /// Client advertised `ecdsa_secp256r1_sha256`.
@@ -209,7 +212,7 @@ impl CertIndexBuilder {
     pub fn new(seed: [u8; 16]) -> Self {
         Self {
             seed,
-            entries: Vec::new(),
+            entries: Vec::new(), // it-allow: hot-path-allocation reason: builder path, not resolve; one allocation per generation build
             default_cred: None,
             #[cfg(test)]
             force_collision_on_attempt_0: false,
@@ -261,7 +264,10 @@ impl CertIndexBuilder {
     /// saturates at `u16::MAX` rather than wrapping, which is unreachable because
     /// `MAX_SANS` is 100. This method never returns an error: a certificate with one bad SAN and
     /// ninety-nine good ones is still worth indexing.
-    #[allow(clippy::needless_pass_by_value)]
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "API takes an owned Arc<Credentials> so callers can pass the original and the builder can clone it cheaply"
+    )]
     pub fn upsert_from_sans(&mut self, cred: Arc<Credentials>) -> SanIndexReport {
         let mut report = SanIndexReport::default();
         for s in cred.san_dns_names() {
@@ -384,10 +390,10 @@ impl CertIndexBuilder {
             a.cmp(&b)
         });
 
-        let mut groups = Vec::new();
+        let mut groups = Vec::new(); // it-allow: hot-path-allocation reason: builder path, not resolve; one allocation per generation build
         let mut drain = entries.drain(..).peekable();
         while let Some((name, is_wild, first_cred)) = drain.next() {
-            let mut creds = vec![(first_cred.key_type(), first_cred)];
+            let mut creds = vec![(first_cred.key_type(), first_cred)]; // it-allow: hot-path-allocation reason: builder path, not resolve; groups the sorted entries for one name
             while let Some((next_name, next_is_wild, next_cred)) = drain.peek() {
                 if next_name == &name && next_is_wild == &is_wild {
                     let kt = next_cred.key_type();
@@ -446,7 +452,10 @@ impl CertIndexBuilder {
         Err(CertError::NameHashCollision)
     }
 
-    #[allow(unused_variables)]
+    #[allow(
+        unused_variables,
+        reason = "seed is used on every production path; only the test-only forced-collision early return skips it"
+    )]
     fn hasher_for_attempt_inner(seed: [u8; 16], force_collision: bool, attempt: u32) -> NameHasher {
         #[cfg(test)]
         if force_collision && attempt == 0 {
@@ -475,11 +484,11 @@ impl CertIndexBuilder {
         default_cred: Option<Arc<Credentials>>,
         generation: u64,
     ) -> Result<CertIndex, CertError> {
-        let mut names: Vec<u8> = Vec::new();
-        let mut name_refs = Vec::with_capacity(groups.len());
-        let mut cred_sets = Vec::with_capacity(groups.len());
-        let mut creds: Vec<Arc<Credentials>> = Vec::new();
-        let mut cred_ptr_to_idx: HashMap<*const Credentials, u32> = HashMap::new();
+        let mut names: Vec<u8> = Vec::new(); // it-allow: hot-path-allocation reason: builder path, not resolve; grows into the immutable names arena
+        let mut name_refs = Vec::with_capacity(groups.len()); // it-allow: hot-path-allocation reason: builder path, not resolve; becomes the immutable name_refs slice
+        let mut cred_sets = Vec::with_capacity(groups.len()); // it-allow: hot-path-allocation reason: builder path, not resolve; becomes the immutable cred_sets slice
+        let mut creds: Vec<Arc<Credentials>> = Vec::new(); // it-allow: hot-path-allocation reason: builder path, not resolve; deduplicated Arc pointers for the immutable index
+        let mut cred_ptr_to_idx: HashMap<*const Credentials, u32> = HashMap::new(); // it-allow: hot-path-allocation reason: builder path, not resolve; temporary deduplication table discarded after build
 
         for group in groups {
             let new_len = names
@@ -511,7 +520,7 @@ impl CertIndexBuilder {
                     creds.push(Arc::clone(cred));
                     new
                 };
-                tags[slot] = *kt as u8;
+                tags[slot] = *kt as u8; // it-allow: unchecked-cast reason: KeyType is #[repr(u8)] with discriminants 1..=4, so the cast is exact
                 idx[slot] = cred_idx;
                 len_u8 = len_u8.checked_add(1).ok_or(CertError::IndexTooLarge)?;
             }
@@ -526,10 +535,10 @@ impl CertIndexBuilder {
             hasher,
             exact,
             wild,
-            names: names.into_boxed_slice(),
-            name_refs: name_refs.into_boxed_slice(),
-            cred_sets: cred_sets.into_boxed_slice(),
-            creds: creds.into_boxed_slice(),
+            names: names.into_boxed_slice(), // it-allow: hot-path-allocation reason: builder path, not resolve; converts the already-built Vec into the immutable index storage
+            name_refs: name_refs.into_boxed_slice(), // it-allow: hot-path-allocation reason: builder path, not resolve; converts the already-built Vec into the immutable index storage
+            cred_sets: cred_sets.into_boxed_slice(), // it-allow: hot-path-allocation reason: builder path, not resolve; converts the already-built Vec into the immutable index storage
+            creds: creds.into_boxed_slice(), // it-allow: hot-path-allocation reason: builder path, not resolve; converts the already-built Vec into the immutable index storage
             default_cred,
             generation,
             stats: CertStats::default(),
@@ -769,6 +778,7 @@ impl CertIndex {
         for slot in 0..usize::from(set.len) {
             let t = set.tags[slot];
             if t == KeyType::EcdsaP256 as u8 || t == KeyType::EcdsaP384 as u8 {
+                // it-allow: unchecked-cast reason: KeyType is #[repr(u8)] with discriminant 1..=4
                 return true;
             }
         }
@@ -1107,7 +1117,10 @@ mod tests {
         assert!(!index.name_has_ecdsa("missing.example.com"));
     }
 
-    #[allow(clippy::integer_division)]
+    #[allow(
+        clippy::integer_division,
+        reason = "timing median: coarse-grained nanosecond-per-call average from total elapsed"
+    )]
     #[test]
     fn resolve_flat_across_n() {
         let cred = cred_ecdsa_p256(&["example.com"]);
