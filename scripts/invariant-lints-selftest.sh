@@ -453,6 +453,100 @@ pub fn is_content_length(k: KnownHeader) -> bool {
 }
 RS
 
+# Deliberately reproduces issue #628's two failure modes plus the third real
+# instance found on `main` itself, all in build_prod_tree's #[cfg(test)]
+# detection: each file's unwrap() must be visible to no-panic once the fix
+# stops build_prod_tree from assuming the attribute always introduces a
+# `mod { ... }` body and from matching the attribute inside prose.
+
+# Failure mode 1: a #[cfg(test)]-gated struct field (ends in `,`, not `{`)
+# immediately followed by a real function with a genuine unwrap(). The old
+# build_prod_tree searched forward past the field for the next real `{` (this
+# function's own opening brace) and blanked the function's entire body,
+# hiding the unwrap() from no-panic.
+cat > "$A/crates/irontraffic-router/src/cfg_test_field_bad.rs" <<'RS'
+//! Deliberately reproduces issue #628 failure mode 1: a #[cfg(test)]-gated
+//! struct field, ended by `,` rather than `{`.
+pub struct ScanState {
+    #[cfg(test)]
+    scan_steps: std::cell::Cell<u64>,
+}
+
+/// Not test-only: always compiled. The unwrap() here must be visible to
+/// no-panic once build_prod_tree confines the field attribute's blanking to
+/// just the field.
+pub fn parse_len(s: &str) -> usize {
+    s.parse::<usize>().unwrap()
+}
+RS
+
+# Failure mode 2: a doc comment that merely MENTIONS `#[cfg(test)]` in prose
+# (the same way irontraffic-router/src/intern.rs's real comment does),
+# immediately followed by a real function with a genuine unwrap(). The old
+# trivia-blind regex matched the prose exactly like a real attribute and
+# blanked forward to the next real `{`: this function's own opening brace.
+cat > "$A/crates/irontraffic-router/src/cfg_test_prose_bad.rs" <<'RS'
+//! Deliberately reproduces issue #628 failure mode 2: prose that mentions
+//! the attribute without being it.
+///
+/// This helper's counting is enabled only under `#[cfg(test)]`; the text
+/// `#[cfg(test)]` appears here purely as prose describing that fact, not as
+/// a real attribute.
+pub fn compute_len(s: &str) -> usize {
+    s.parse::<usize>().unwrap()
+}
+RS
+
+# The third real instance measured on `main` itself while diagnosing #628: a
+# genuine #[cfg(test)] on a body-less `mod name;` file declaration (ends in
+# `;`, not `{`), the exact shape of irontraffic-router/src/lib.rs's real
+# `#[cfg(test)] pub mod testutil;`. The old build_prod_tree searched forward
+# past the semicolon for the next real `{` and blanked everything up to and
+# including it: the unrelated `pub mod real_thing;` declaration and this
+# always-compiled function's unwrap().
+cat > "$A/crates/irontraffic-router/src/cfg_test_modsemi_bad.rs" <<'RS'
+//! Deliberately reproduces the third real #628 instance found on `main`:
+//! #[cfg(test)] on a body-less `mod name;` declaration.
+#[cfg(test)]
+pub mod test_only_helpers;
+pub mod real_thing;
+
+/// Always compiled. The unwrap() here must be visible to no-panic.
+pub fn compute_thing(s: &str) -> usize {
+    s.parse::<usize>().unwrap()
+}
+RS
+
+# The other failure-mode-1 shape the GH issue's acceptance criteria name
+# explicitly, alongside a struct field: a #[cfg(test)] on a STRUCT-LITERAL
+# field entry (inside an expression, not a struct definition), immediately
+# followed by a real function with a genuine panic!().
+cat > "$A/crates/irontraffic-router/src/cfg_test_struct_literal_bad.rs" <<'RS'
+//! Deliberately reproduces the struct-LITERAL-field-entry shape issue #628's
+//! acceptance criteria name alongside a struct definition field.
+pub struct SomeConfig {
+    pub retries: u8,
+    pub timeout: u8,
+}
+
+/// Builds a config with a test-only field override.
+pub fn build() -> SomeConfig {
+    SomeConfig {
+        #[cfg(test)]
+        retries: 3,
+        timeout: 10,
+    }
+}
+
+/// Always compiled. The panic!() here must be visible to no-panic.
+pub fn triggers_panic(n: u8) -> u8 {
+    if n == 0 {
+        panic!("n must not be zero")
+    }
+    n
+}
+RS
+
 printf '[workspace.dependencies]\nserde = "1"\n' > "$A/Cargo.toml"
 
 EXPECTED='allow-needs-reason
@@ -991,6 +1085,106 @@ mod tests {
 }
 RS
 
+# Issue #628: proving the fix does not OVER-reach. Every shape below has a
+# genuine unwrap()/violation inside a genuinely test-only construct, and
+# every one of them must still be blanked out of the -prod tree exactly as
+# before, so none of them may fire any rule.
+
+# A normal #[cfg(test)] mod tests { ... } containing a real unwrap(): the
+# baseline shape build_prod_tree has always had to get right. Must still be
+# blanked in full.
+cat > "$B/crates/irontraffic-router/src/cfg_test_mod_ok.rs" <<'RS'
+//! Issue #628 no-over-reach proof: a normal #[cfg(test)] mod tests { ... }
+//! containing a genuine unwrap() must still be blanked in full.
+/// Adds one.
+#[must_use]
+pub fn add_one(n: usize) -> usize {
+    n + 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::add_one;
+    #[test]
+    fn adds_one() {
+        assert_eq!(add_one(1).checked_add(0).unwrap(), 2);
+    }
+}
+RS
+
+# A #[cfg(test)]-gated helper FUNCTION (not a mod, the irontraffic-resilience
+# limits/mod.rs shape found while measuring #628) whose own body contains an
+# unwrap(): proves a brace-bodied `fn` is recognized the same as a
+# brace-bodied `mod`, not just the literal keyword `mod`.
+cat > "$B/crates/irontraffic-router/src/cfg_test_fn_ok.rs" <<'RS'
+//! Issue #628 no-over-reach proof: a #[cfg(test)]-gated fn (not mod) whose
+//! body contains a genuine unwrap() must still be blanked in full.
+/// Tracks hits.
+pub struct Counter {
+    hits: std::sync::atomic::AtomicU64,
+}
+
+impl Counter {
+    #[cfg(test)]
+    pub(crate) fn hits_unwrapped(&self) -> u64 {
+        self.hits
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .checked_add(0)
+            .unwrap()
+    }
+}
+RS
+
+# A #[cfg(test)]-gated thread_local! block (the irontraffic-router/src/
+# intern.rs shape) whose initializer contains an unwrap(): proves a
+# macro-invocation brace body is recognized too, not just `mod`/`fn`.
+cat > "$B/crates/irontraffic-router/src/cfg_test_threadlocal_ok.rs" <<'RS'
+//! Issue #628 no-over-reach proof: a #[cfg(test)]-gated thread_local! block
+//! whose initializer contains a genuine unwrap() must still be blanked.
+#[cfg(test)]
+thread_local! {
+    static SEEDED: std::cell::Cell<u64> =
+        std::cell::Cell::new(1u64.checked_add(1).unwrap());
+}
+
+/// Always compiled, deliberately trivial.
+pub fn noop() {}
+RS
+
+# The real irontraffic-router/src/lib.rs shape (#[cfg(test)] on a body-less
+# `mod name;`) but with genuinely clean code around and after it: proves the
+# fix's narrower blanking does not itself introduce a false positive merely
+# by leaving the sibling `pub mod` declaration visible.
+cat > "$B/crates/irontraffic-router/src/cfg_test_modsemi_ok.rs" <<'RS'
+//! Issue #628 no-over-reach proof: #[cfg(test)] on a body-less `mod name;`
+//! declaration, with clean code around it, must not fire anything.
+#[cfg(test)]
+pub mod test_only_helpers;
+pub mod real_thing;
+
+/// Always compiled and clean.
+pub fn compute_thing(s: &str) -> Result<usize, std::num::ParseIntError> {
+    s.parse::<usize>()
+}
+RS
+
+# Issue #628's other named acceptance criterion: a reason = "..." string
+# that merely MENTIONS the literal text #[cfg(test)] in prose must cause no
+# blanking at all, so it can neither hide a real violation near it nor be
+# mistaken for something that needs hiding.
+cat > "$B/crates/irontraffic-router/src/cfg_test_reason_string_ok.rs" <<'RS'
+//! Issue #628 acceptance criterion: a reason = "..." string mentioning the
+//! literal text #[cfg(test)] must cause no blanking at all.
+#[allow(dead_code, reason = "mirrors the #[cfg(test)] hazard this string only mentions, not a real attribute")]
+pub fn helper() {}
+
+/// Always compiled and clean.
+#[must_use]
+pub fn safe(n: u8) -> u8 {
+    n.saturating_add(1)
+}
+RS
+
 # A legitimate reader, confined to the allowlist, proving framing-fields-confined
 # does not false-positive on the one file this whole rule exists to permit.
 mkdir -p "$B/crates/irontraffic-http/src"
@@ -1179,6 +1373,47 @@ if printf '%s\n' "$OUT_G" | grep -qF 'ignored.rs: untracked'; then
   FAILED=1
 else
   note "the gitignored file is never named, even in a failing run"
+fi
+
+# ---------------------------------------------------------------------------
+# Corpus H: build_prod_tree refuses rather than guesses (issue #628). A
+# #[cfg(test)] attribute whose extent cannot be resolved (no brace body, `;`,
+# or `,` found before end of file) must stop the WHOLE gate with a clear
+# diagnostic naming the file and line, not silently continue as if nothing
+# happened. Checked two ways: the diagnostic text, and the actual exit code
+# of the whole script. build_prod_tree runs inside a command-substitution
+# subshell from almost every call site, so a plain `exit 1` there would only
+# kill that one subshell and let the run silently carry on to print
+# "invariant-lints: clean" -- this proves the fix actually reaches the
+# top-level script, not just its immediate caller.
+# ---------------------------------------------------------------------------
+H="$WORK/refuse"
+mkdir -p "$H/crates/irontraffic-router/src"
+cat > "$H/crates/irontraffic-router/src/truncated.rs" <<'RS'
+//! Deliberately truncated: a real #[cfg(test)] attribute with nothing
+//! recognizable after it anywhere before end of file.
+pub fn noop() {}
+#[cfg(test)]
+RS
+printf '[workspace.dependencies]\nserde = "1"\n' > "$H/Cargo.toml"
+( cd "$H" && git init -q . && git config user.email t@t && git config user.name t \
+    && git add -A >/dev/null && git commit -qm t >/dev/null )
+
+echo "== corpus H: an unresolvable #[cfg(test)] refuses rather than guesses =="
+H_RC=0
+( cd "$H" && bash "$LINTS" ) > "$WORK/h_output.txt" 2>&1 || H_RC=$?
+if [ "$H_RC" -eq 0 ]; then
+  echo "FAIL: an unresolvable #[cfg(test)] did not stop the gate; it exited 0:"
+  sed 's/^/    /' "$WORK/h_output.txt"
+  FAILED=1
+elif grep -q 'FAIL \[build-prod-tree\]' "$WORK/h_output.txt" \
+    && grep -qF 'truncated.rs' "$WORK/h_output.txt"; then
+  note "unresolvable #[cfg(test)] refuses loudly (exit $H_RC) and names the file"
+else
+  echo "FAIL: the gate stopped (exit $H_RC), but not with the expected"
+  echo "      build-prod-tree diagnostic naming the offending file:"
+  sed 's/^/    /' "$WORK/h_output.txt"
+  FAILED=1
 fi
 
 echo
