@@ -732,8 +732,7 @@ mod tests {
             checks_since_reconnect: 0,
             checks_started: 0,
         };
-        let span =
-            (cfg.interval_for(IntervalState::Steady) * u32::from(cfg.jitter_bp)) / 10_000;
+        let span = (cfg.interval_for(IntervalState::Steady) * u32::from(cfg.jitter_bp)) / 10_000;
         let seed = (0u64..)
             .find(|&s| {
                 let mut probe = Rng::from_seed(s);
@@ -762,8 +761,7 @@ mod tests {
             checks_since_reconnect: 0,
             checks_started: 0,
         };
-        let span =
-            (cfg.interval_for(IntervalState::Steady) * u32::from(cfg.jitter_bp)) / 10_000;
+        let span = (cfg.interval_for(IntervalState::Steady) * u32::from(cfg.jitter_bp)) / 10_000;
         let seed = (0u64..)
             .find(|&s| {
                 let mut probe = Rng::from_seed(s);
