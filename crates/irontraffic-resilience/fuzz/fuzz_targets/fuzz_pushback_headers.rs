@@ -67,10 +67,10 @@ fuzz_target!(|input: (BackoffInputsSeed, u64)| {
     // field. We exercise it directly on both header values for extra coverage.
     if let Some(raw) = inputs.grpc_pushback {
         parse_grpc_pushback(raw);
-        let _ = parse_http_date_ms(raw, inputs.now_wall_ms);
+        let _ = parse_http_date_ms(raw, inputs.now_wall_ms); // it-allow: no-swallowed-error reason: fuzz target exercises the parser for coverage; its return value is not part of the contract
     }
     if let Some(raw) = inputs.retry_after {
         parse_retry_after(raw, inputs.now_wall_ms);
-        let _ = parse_http_date_ms(raw, inputs.now_wall_ms);
+        let _ = parse_http_date_ms(raw, inputs.now_wall_ms); // it-allow: no-swallowed-error reason: fuzz target exercises the parser for coverage; its return value is not part of the contract
     }
 });

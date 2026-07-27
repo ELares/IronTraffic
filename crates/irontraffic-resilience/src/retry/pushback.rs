@@ -792,13 +792,10 @@ mod tests {
             now_wall_ms: u64,
         ) {
             let result = parse_retry_after(&v, now_wall_ms);
-            // Purity: the same input must always produce the same output.
-            assert_eq!(result, parse_retry_after(&v, now_wall_ms));
-            // Any returned duration must fit in a u32 and therefore cannot be
-            // derived from an out-of-range calendar field.
-            if let Some(ms) = result {
-                assert!(ms <= u32::MAX);
-            }
+        // Purity: the same input must always produce the same output.
+        assert_eq!(result, parse_retry_after(&v, now_wall_ms));
+        // Any returned duration is a u32 by construction, so it is bounded;
+        // the parser clamps overflow to u32::MAX rather than wrapping.
         }
     }
 
