@@ -322,14 +322,54 @@ fn still_open(result: &std::io::Result<usize>) -> bool {
 
 /// 7. `connection_cap_rejects_the_extra_connection`.
 ///
-/// Both reads below use a bound far under `cfg_yaml`'s `half_close_ms: 5000`: with
-/// the cap disabled, an over-cap connection is never rejected and instead sits
-/// forwarded and idle until the half-close deadline, which a bound of 5 seconds (the
-/// literal wording of #21 test 7) would not distinguish from a cap rejection, since
-/// `connect`'s own 10-second read timeout comfortably outlasts a 5-second half-close.
-/// A 1-second bound on the second connection's read turns that wait into a timeout
-/// error instead of the `Ok(0)` this test asserts, which is what makes the cap doing
-/// nothing an observed failure rather than a slow pass.
+/// TWO COUNTS DECIDE THIS TEST, AND NEITHER DEPENDS ON WHICH CONNECTION WINS.
+///
+/// This test used to turn on a wall-clock bound: read the over-cap connection with a
+/// 1 second timeout and treat `Ok(0)` as proof the cap rejected it. That was flaky
+/// (see #710) and, worse, it was unsound for a reason the bound's own comment got
+/// wrong. It justified 1 second as "far under `half_close_ms: 5000`", but the same
+/// config also sets `connect_ms: 2000`, and an upstream dial failure drops the client
+/// and closes the DOWNSTREAM connection (`serve.rs`, "client is dropped here"). So a
+/// connection that was ADMITTED, never rejected, can produce exactly the same `Ok(0)`
+/// in about 100 microseconds. The real ceiling was `min(connect_ms, idle_ms,
+/// half_close_ms)`, not `half_close_ms`, and any bound is arguing about which of
+/// three deadlines fires first.
+///
+/// `connections_rejected` removes the argument. `accept.rs` bumps that counter at the
+/// single site that refuses an over-cap connection, and `serve.rs` prints it on the
+/// "shutdown complete" line, so asserting it observes THE CAP ITSELF rather than how
+/// fast a byte arrives. It cannot be satisfied by a different mechanism that happens
+/// to close the socket, which a latency bound can. It is not unconditionally immune
+/// either: a connection still queued when the drain begins is never accepted, so it is
+/// never counted. That window is far longer than anything here, but the honest claim is
+/// the narrow one, not "a counter cannot flake". It cannot be satisfied by a
+/// different mechanism that happens to close the socket. The same file already does
+/// this for `connections_accepted` and `connections_closed`.
+///
+/// What makes it discriminating: with `ConnRegistry::new` given some value other than
+/// `effective_max` (say a fixed `10_000`), nothing is ever refused, so BOTH connections
+/// are admitted. The open count is then 2 and the first assertion fails, deterministically
+/// and for the right reason. The rejected count would also be 0, and it is asserted
+/// second as an independent guard on the same property from the other side. Stating the
+/// order plainly because earlier revisions of this test claimed an assertion decided
+/// when it was never reached.
+///
+/// Reaching it is a real constraint, not a given. Every bound here must stay far under
+/// `idle_ms: 5000`, because a broken cap admits BOTH connections and leaves them idle,
+/// so any long wait lets the idle deadline close both and trip an earlier assertion
+/// instead. There is a LOWER bound too, which an earlier draft of this comment denied:
+/// `open_count` is computed from `still_open`, which reports a read that TIMED OUT, so
+/// the bound must also exceed the time for the accept loop to refuse and drop the
+/// over-cap socket. Measured at 0.00 to 0.29ms against a 200ms budget, so the headroom
+/// is about three orders of magnitude, but the constraint is two-sided and saying only
+/// "keep it small" would mislead the next person.
+///
+/// The other assertion is a COUNT for the same reason. Nothing orders the two
+/// `try_admit` calls: `reuseport` gives one accept loop per worker racing a shared
+/// registry, and the only tiebreak is a roughly 70 microsecond `connect(2)` head
+/// start, which is precisely what load takes away. Asserting WHICH connection is
+/// admitted asserts the outcome of that race. Asserting that exactly one of them
+/// remains open does not.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn connection_cap_rejects_the_extra_connection() {
     let origin = support::Origin::start("hello").await;
@@ -341,35 +381,67 @@ async fn connection_cap_rejects_the_extra_connection() {
     // from exactly zero.
     std::thread::sleep(Duration::from_millis(200));
 
-    let mut first = connect(proxy.addr); // held open, sends nothing
+    let mut a = connect(proxy.addr);
+    let mut b = connect(proxy.addr);
 
-    let mut second = connect(proxy.addr);
-    second
-        .set_read_timeout(Some(Duration::from_secs(1)))
-        .expect("bound the cap-rejection probe's read well under half_close_ms");
-    let mut buf = [0_u8; 16];
-    let n = second
-        .read(&mut buf)
-        .expect("the connection over max_connections must see EOF within 1s, not time out");
-    assert_eq!(n, 0, "the connection over max_connections must see EOF");
+    // WHICH connection the cap admits is NOT asserted, deliberately. `reuseport` is
+    // on and the listener runs one accept loop per worker, so N threads race a single
+    // shared registry and nothing orders the two `try_admit` calls except the head
+    // start of one `connect(2)`, measured at a median of about 70 microseconds. Under
+    // load that head start is exactly what gets lost, so a test that names one of them
+    // as the admitted connection is asserting the outcome of a race.
+    //
+    // A previous revision did exactly that and simply relocated its own flake: when
+    // the second connection won, the cap still refused exactly one, the counter still
+    // read 1, and the identity assertion failed instead. Reproduced at 14 of 25 with
+    // the two connects barrier-synchronised.
+    //
+    // The property that actually matters is a COUNT, not an identity: offered two
+    // against `max_connections: 1`, the cap must admit exactly one and refuse exactly
+    // one. Both assertions below are invariant under the race.
+    let mut buf_a = [0_u8; 16];
+    let mut buf_b = [0_u8; 16];
+    a.set_read_timeout(Some(Duration::from_millis(200)))
+        .expect("bound the first probe");
+    b.set_read_timeout(Some(Duration::from_millis(200)))
+        .expect("bound the second probe");
+    let ra = a.read(&mut buf_a);
+    let rb = b.read(&mut buf_b);
 
-    // The first connection, which fit under the cap, must still be open while the
-    // second is being rejected. Without this, the assertion above would equally pass
-    // if some other bug closed the FIRST connection (leaving room under the cap for
-    // the second) instead of rejecting the second.
-    first
-        .set_read_timeout(Some(Duration::from_millis(300)))
-        .expect("bound the still-open probe");
-    let mut first_buf = [0_u8; 16];
-    let first_result = first.read(&mut first_buf);
-    assert!(
-        still_open(&first_result),
-        "the first connection (under the cap) must still be open: got {first_result:?}"
+    // Exactly one of the two must still be open. `still_open` reports a read that
+    // TIMED OUT, so "open" is the timeout case and "refused" is a real `Ok(0)`.
+    let open_count = usize::from(still_open(&ra)) + usize::from(still_open(&rb));
+    assert_eq!(
+        open_count, 1,
+        "exactly one of the two connections must remain admitted, got {open_count} \
+         (first={ra:?}, second={rb:?})"
     );
 
-    drop(first);
-    drop(second);
-    proxy.shutdown();
+    drop(a);
+    drop(b);
+
+    let (status, stderr) = proxy.shutdown_capturing_stderr();
+    assert_eq!(status.code(), Some(0));
+    let line = stderr
+        .lines()
+        .find(|l| l.contains("shutdown complete"))
+        .unwrap_or_else(|| panic!("no \"shutdown complete\" line in stderr:\n{stderr}"));
+
+    // THE SECOND, INDEPENDENT GUARD, not the one that fires under the cap mutation.
+    // It is reached only when `open_count` is 1, which is precisely the vacuity case:
+    // a broken cap whose admitted connection died of some unrelated cause. Verified to
+    // catch exactly that. `accept.rs` bumps this at the single site that refuses
+    // an over-cap connection, so it observes the cap itself rather than how fast a
+    // byte arrives. `== 1` rather than `>= 1`: a cap that refuses EVERYTHING, including
+    // the connection that fits, would satisfy `>= 1` while being just as broken as one
+    // that refuses nothing.
+    let rejected =
+        field_value(line, "connections_rejected").expect("connections_rejected field present");
+    assert_eq!(
+        rejected, 1,
+        "exactly one over-cap connection must be refused, got connections_rejected={rejected} in:\n{line}"
+    );
+
     origin.stop().await;
 }
 
