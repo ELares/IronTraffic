@@ -194,6 +194,7 @@ dependencies = [
 name = "irontraffic-conn-fuzz"
 version = "0.0.0"
 dependencies = [
+ "bytes",
  "irontraffic-conn",
  "libfuzzer-sys",
 ]

@@ -44,6 +44,8 @@ use irontraffic_http::ParseStatus;
 mod v1;
 mod v2;
 
+pub mod encode;
+
 /// The 12-byte v2 signature (haproxy.org PROXY protocol specification section 2.2):
 /// `\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A`.
 const V2_SIGNATURE: [u8; 12] = [
