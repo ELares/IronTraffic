@@ -6,15 +6,15 @@ use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::Bytes;
 use http::header::CONTENT_TYPE;
 use http::{Method, Request, Response, StatusCode};
 use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
-use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client as HyperClient;
+use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
 use instant_acme::{
     Account, AccountBuilder, AccountCredentials, BodyWrapper, BytesResponse, ExternalAccountKey,
@@ -24,8 +24,8 @@ use irontraffic_tls::time::UnixSeconds;
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroizing;
 
-use crate::config::{fingerprint_hex, fingerprint_of, EabConfig, MAX_CONTACTS};
 use crate::AcmeConfig;
+use crate::config::{EabConfig, MAX_CONTACTS, fingerprint_hex, fingerprint_of};
 
 /// Why an ACME operation failed.
 #[derive(Clone, PartialEq, Eq, Debug)]
@@ -82,7 +82,10 @@ impl fmt::Display for AcmeError {
                  set acme.externalAccountBinding.kid and .hmacKey",
             ),
             Self::TermsNotAgreed => f.write_str("terms of service agreement was not asserted"),
-            Self::UnknownProfile { requested, available } => {
+            Self::UnknownProfile {
+                requested,
+                available,
+            } => {
                 let joined = available
                     .iter()
                     .map(|s| s.as_ref())
@@ -94,7 +97,9 @@ impl fmt::Display for AcmeError {
                 )
             }
             Self::RateLimited { retry_after: None } => f.write_str("rate limited by the CA"),
-            Self::RateLimited { retry_after: Some(secs) } => {
+            Self::RateLimited {
+                retry_after: Some(secs),
+            } => {
                 write!(f, "rate limited by the CA; retry after {secs} seconds")
             }
             Self::Protocol { kind, detail } => {
@@ -157,12 +162,11 @@ impl AcmeDirectory {
             return Err(protocol_error_from_response(&bytes, response.parts.status));
         }
 
-        let directory: Directory = serde_json::from_slice(&bytes).map_err(|e| {
-            AcmeError::Protocol {
+        let directory: Directory =
+            serde_json::from_slice(&bytes).map_err(|e| AcmeError::Protocol {
                 kind: "malformed-directory".into(),
                 detail: sanitize_detail(&e.to_string()),
-            }
-        })?;
+            })?;
 
         let profiles: Box<[Box<str>]> = directory
             .meta
@@ -196,7 +200,9 @@ impl AcmeDirectory {
     /// Whether the cache has expired.
     #[must_use]
     pub fn is_stale(&self, now: UnixSeconds) -> bool {
-        let expiry = self.fetched_at.saturating_add_secs(u64::from(self.ttl_secs));
+        let expiry = self
+            .fetched_at
+            .saturating_add_secs(u64::from(self.ttl_secs));
         now >= expiry
     }
 
@@ -259,12 +265,10 @@ impl AcmeAccount {
             None => None,
         };
 
-        let client = HttpClientImpl::new()
-            .await?
-            .with_directory_cache(
-                directory.directory_url.to_string(),
-                directory.directory_bytes.clone(),
-            );
+        let client = HttpClientImpl::new().await?.with_directory_cache(
+            directory.directory_url.to_string(),
+            directory.directory_bytes.clone(),
+        );
         let rate_client = RateLimitClient::new(client);
         let retry_after = rate_client.retry_after.clone();
         let builder = Account::builder_with_http(Box::new(rate_client));
@@ -286,8 +290,7 @@ impl AcmeAccount {
             directory_url: directory.directory_url.to_string(),
             account_url: account_url.clone(),
         };
-        let credentials_json = serde_json::to_vec(&envelope)
-            .map_err(|_| AcmeError::Credentials)?;
+        let credentials_json = serde_json::to_vec(&envelope).map_err(|_| AcmeError::Credentials)?;
         let fingerprint = fingerprint_of(&credentials_json);
 
         Ok(Self {
@@ -343,8 +346,7 @@ impl AcmeAccount {
                 let envelope: CredentialsEnvelope = serde_json::from_slice(&self.credentials_json)
                     .map_err(|_| AcmeError::Credentials)?;
                 let directory_bytes = Bytes::from(
-                    serde_json::to_vec(&envelope.directory)
-                        .map_err(|_| AcmeError::Credentials)?,
+                    serde_json::to_vec(&envelope.directory).map_err(|_| AcmeError::Credentials)?,
                 );
                 let client = HttpClientImpl::new()
                     .await?
@@ -557,7 +559,9 @@ fn map_directory_error(err: instant_acme::Error) -> AcmeError {
     match err {
         instant_acme::Error::Http(_)
         | instant_acme::Error::Hyper(_)
-        | instant_acme::Error::InvalidUri(_) => AcmeError::Transport(err.to_string().into_boxed_str()),
+        | instant_acme::Error::InvalidUri(_) => {
+            AcmeError::Transport(err.to_string().into_boxed_str())
+        }
         _ => AcmeError::Protocol {
             kind: "unknown".into(),
             detail: sanitize_detail(&err.to_string()),
@@ -655,7 +659,8 @@ mod tests {
             terms_of_service_agreed: true,
             external_account_binding: Some(EabConfig {
                 kid: "test-account".to_owned(),
-                hmac_key: "zWNDZM6eQGHWpSRTPal5eIUYFTu7EajVIoguysqZ9wG44nMEtx3MUAsUDkMTQ12W".to_owned(),
+                hmac_key: "zWNDZM6eQGHWpSRTPal5eIUYFTu7EajVIoguysqZ9wG44nMEtx3MUAsUDkMTQ12W"
+                    .to_owned(),
             }),
             profile: None,
             directory_ttl_secs: 86_400,
@@ -733,9 +738,8 @@ mod tests {
     }
 
     fn problem_response(status: &str, problem_type: &str, detail: &str) -> String {
-        let body = format!(
-            "{{\"type\":\"{problem_type}\",\"detail\":\"{detail}\",\"status\":{status}}}"
-        );
+        let body =
+            format!("{{\"type\":\"{problem_type}\",\"detail\":\"{detail}\",\"status\":{status}}}");
         format!(
             "HTTP/1.1 {status}\r\nContent-Type: application/problem+json\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}",
             body.len()
@@ -769,7 +773,8 @@ mod tests {
                 );
             }
             if method == "HEAD" && path == "/new-nonce" {
-                return "HTTP/1.1 200 OK\r\nReplay-Nonce: nonce1\r\nConnection: close\r\n\r\n".to_owned();
+                return "HTTP/1.1 200 OK\r\nReplay-Nonce: nonce1\r\nConnection: close\r\n\r\n"
+                    .to_owned();
             }
             if method == "POST" && path == "/new-account" {
                 return problem_response(
@@ -812,7 +817,9 @@ mod tests {
         });
         let mut cfg = config(&(base_url.clone() + "/dir"));
         cfg.profile = Some("tlsserver".to_owned());
-        let err = AcmeDirectory::fetch(&cfg, UnixSeconds::new(0)).await.unwrap_err();
+        let err = AcmeDirectory::fetch(&cfg, UnixSeconds::new(0))
+            .await
+            .unwrap_err();
         assert!(matches!(err, AcmeError::UnknownProfile { .. }));
         let msg = err.to_string();
         assert!(msg.contains("tlsserver"));
@@ -835,7 +842,9 @@ mod tests {
         });
         let mut cfg = config(&(base_url.clone() + "/dir"));
         cfg.profile = Some("anything".to_owned());
-        let dir = AcmeDirectory::fetch(&cfg, UnixSeconds::new(0)).await.unwrap();
+        let dir = AcmeDirectory::fetch(&cfg, UnixSeconds::new(0))
+            .await
+            .unwrap();
         assert!(!dir.is_stale(UnixSeconds::new(0)));
     }
 
@@ -852,7 +861,8 @@ mod tests {
                 );
             }
             if method == "HEAD" && path == "/new-nonce" {
-                return "HTTP/1.1 200 OK\r\nReplay-Nonce: nonce1\r\nConnection: close\r\n\r\n".to_owned();
+                return "HTTP/1.1 200 OK\r\nReplay-Nonce: nonce1\r\nConnection: close\r\n\r\n"
+                    .to_owned();
             }
             if method == "POST" && path == "/new-account" {
                 let body = "{\"type\":\"urn:ietf:params:acme:error:rateLimited\",\"detail\":\"too many requests\",\"status\":429}";
@@ -870,7 +880,12 @@ mod tests {
         let mut cfg = config(&(base_url + "/dir"));
         cfg.terms_of_service_agreed = true;
         let err = AcmeAccount::create(&dir, &cfg).await.unwrap_err();
-        assert!(matches!(err, AcmeError::RateLimited { retry_after: Some(120) }));
+        assert!(matches!(
+            err,
+            AcmeError::RateLimited {
+                retry_after: Some(120)
+            }
+        ));
     }
 
     #[tokio::test]
@@ -890,7 +905,8 @@ mod tests {
                     );
                 }
                 if method == "HEAD" && path == "/new-nonce" {
-                    return "HTTP/1.1 200 OK\r\nReplay-Nonce: nonce1\r\nConnection: close\r\n\r\n".to_owned();
+                    return "HTTP/1.1 200 OK\r\nReplay-Nonce: nonce1\r\nConnection: close\r\n\r\n"
+                        .to_owned();
                 }
                 if method == "POST" && path == "/new-account" {
                     let body = format!(
@@ -945,7 +961,8 @@ mod tests {
                 );
             }
             if method == "HEAD" && path == "/new-nonce" {
-                return "HTTP/1.1 200 OK\r\nReplay-Nonce: nonce1\r\nConnection: close\r\n\r\n".to_owned();
+                return "HTTP/1.1 200 OK\r\nReplay-Nonce: nonce1\r\nConnection: close\r\n\r\n"
+                    .to_owned();
             }
             if method == "POST" && path == "/new-account" {
                 return "HTTP/1.1 201 Created\r\nLocation: http://127.0.0.1:1/account/1\r\nConnection: close\r\n\r\n".to_owned();
