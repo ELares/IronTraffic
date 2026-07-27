@@ -2,9 +2,12 @@
 
 //! Decoder for the batched guest op list.
 
-use crate::abi::{guest_slice, AbiError, MAX_OP_FIELD_BYTES, OP_RECORD_BYTES};
+use crate::abi::{AbiError, MAX_OP_FIELD_BYTES, OP_RECORD_BYTES, guest_slice};
 
 const OP_RECORD_BYTES_USIZE: usize = OP_RECORD_BYTES as usize;
+
+/// One decoded guest op: operation discriminant, name bytes, optional value bytes.
+pub type GuestOp<'m> = (u8, &'m [u8], Option<&'m [u8]>);
 
 /// One mutation as the guest encodes it. Little-endian, 20 bytes, 4-byte aligned.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -35,21 +38,28 @@ pub struct RawGuestOp {
 /// # Errors
 /// `AbiError::Misaligned`, `RaggedOpList`, `TooManyOps`, `ReservedNonZero`,
 /// `BadOpRecord`, `OutOfBounds`.
-pub fn decode_op_list<'m>(
-    mem: &'m [u8],
+pub fn decode_op_list(
+    mem: &[u8],
     ptr: u32,
     len: u32,
     max_ops: u32,
-) -> Result<impl Iterator<Item = Result<(u8, &'m [u8], Option<&'m [u8]>), AbiError>> + 'm, AbiError> {
-    if ptr % 4 != 0 {
+) -> Result<impl Iterator<Item = Result<GuestOp<'_>, AbiError>> + '_, AbiError> {
+    if !ptr.is_multiple_of(4) {
         return Err(AbiError::Misaligned { ptr });
     }
-    if len % OP_RECORD_BYTES != 0 {
+    if !len.is_multiple_of(OP_RECORD_BYTES) {
         return Err(AbiError::RaggedOpList { len });
     }
+    #[allow(
+        clippy::integer_division,
+        reason = "len is a multiple of OP_RECORD_BYTES, so the quotient is exact"
+    )]
     let count = len / OP_RECORD_BYTES;
     if count > max_ops {
-        return Err(AbiError::TooManyOps { count, max: max_ops });
+        return Err(AbiError::TooManyOps {
+            count,
+            max: max_ops,
+        });
     }
     let bytes = guest_slice(mem, ptr, len)?;
     Ok(DecodeOpList {
@@ -66,7 +76,7 @@ struct DecodeOpList<'m> {
 }
 
 impl<'m> Iterator for DecodeOpList<'m> {
-    type Item = Result<(u8, &'m [u8], Option<&'m [u8]>), AbiError>;
+    type Item = Result<GuestOp<'m>, AbiError>;
 
     fn next(&mut self) -> Option<Self::Item> {
         if self.bytes.is_empty() {
@@ -80,11 +90,7 @@ impl<'m> Iterator for DecodeOpList<'m> {
     }
 }
 
-fn decode_record<'m>(
-    mem: &'m [u8],
-    record: &[u8],
-    at: u32,
-) -> Result<(u8, &'m [u8], Option<&'m [u8]>), AbiError> {
+fn decode_record<'m>(mem: &'m [u8], record: &[u8], at: u32) -> Result<GuestOp<'m>, AbiError> {
     // `record` is exactly `OP_RECORD_BYTES` bytes long because the iterator
     // only ever splits at that boundary.
     let op = read_u8(record, 0).ok_or(AbiError::BadOpRecord { at })?;
@@ -124,11 +130,13 @@ fn decode_record<'m>(
     let value = if op == 2 {
         None
     } else {
-        Some(guest_slice(mem, value_ptr, value_len).map_err(|_| AbiError::OutOfBounds {
-            ptr: value_ptr,
-            len: value_len,
-            mem_len: mem.len(),
-        })?)
+        Some(
+            guest_slice(mem, value_ptr, value_len).map_err(|_| AbiError::OutOfBounds {
+                ptr: value_ptr,
+                len: value_len,
+                mem_len: mem.len(),
+            })?,
+        )
     };
 
     Ok((op, name, value))
@@ -158,7 +166,15 @@ mod tests {
     use crate::abi::{EXPORTS, PHASE_EXPORTS};
     use irontraffic_filter::phase::Phase;
 
-    fn encode_op(op: u8, target: u8, reserved: u16, name_ptr: u32, name_len: u32, value_ptr: u32, value_len: u32) -> [u8; 20] {
+    fn encode_op(
+        op: u8,
+        target: u8,
+        reserved: u16,
+        name_ptr: u32,
+        name_len: u32,
+        value_ptr: u32,
+        value_len: u32,
+    ) -> [u8; 20] {
         let mut buf = [0u8; 20];
         buf[0] = op;
         buf[1] = target;
@@ -344,13 +360,13 @@ mod tests {
         // list and proves statically that the public API returns an iterator over
         // borrowed slices, not a collection.
         let mut mem = [0u8; 1024];
-        for i in 0..32 {
+        for i in 0..32u32 {
             let name_off = 640 + i * 4;
-            let val_off = 640 + i * 4 + 2;
-            mem[name_off..name_off + 2].copy_from_slice(b"ab");
-            mem[val_off..val_off + 2].copy_from_slice(b"cd");
-            let record = encode_op(0, 0, 0, name_off as u32, 2, val_off as u32, 2);
-            let base = i * 20;
+            let val_off = name_off + 2;
+            let base = (i as usize) * 20;
+            mem[(name_off as usize)..(name_off as usize) + 2].copy_from_slice(b"ab");
+            mem[(val_off as usize)..(val_off as usize) + 2].copy_from_slice(b"cd");
+            let record = encode_op(0, 0, 0, name_off, 2, val_off, 2);
             mem[base..base + 20].copy_from_slice(&record);
         }
         let ops: Vec<_> = decode_op_list(&mem, 0, 32 * 20, 100)
@@ -464,9 +480,8 @@ mod tests {
             len in any::<u32>(),
             max_ops in 0..=128u32,
         ) {
-            match decode_op_list(&mem, ptr, len, max_ops) {
-                Ok(iter) => { let _: Vec<_> = iter.collect(); }
-                Err(_) => {}
+            if let Ok(iter) = decode_op_list(&mem, ptr, len, max_ops) {
+                let _: Vec<_> = iter.collect();
             }
         }
 
@@ -478,12 +493,10 @@ mod tests {
             max_ops in 0..=128u32,
         ) {
             if let Ok(iter) = decode_op_list(&mem, ptr, len, max_ops) {
-                for result in iter {
-                    if let Ok((_op, name, value)) = result {
-                        assert_slice_inside(&mem, name);
-                        if let Some(v) = value {
-                            assert_slice_inside(&mem, v);
-                        }
+                for (_op, name, value) in iter.flatten() {
+                    assert_slice_inside(&mem, name);
+                    if let Some(v) = value {
+                        assert_slice_inside(&mem, v);
                     }
                 }
             }

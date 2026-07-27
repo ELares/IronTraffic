@@ -74,7 +74,7 @@ pub const RESERVED_IMPORTS: [&str; 2] = ["itx_call_service", "itx_call_result"];
 /// Bytes of one op record.
 pub const OP_RECORD_BYTES: u32 = 20;
 
-/// Largest name or value one op record may name. 65_536 bytes.
+/// Largest name or value one op record may name. `65_536` bytes.
 pub const MAX_OP_FIELD_BYTES: u32 = 65_536;
 
 /// Return code for a host import that succeeded with no length to report.
@@ -194,7 +194,7 @@ impl GuestAction {
             return Err(AbiError::GuestError { code: raw });
         }
 
-        let uraw = raw as u32;
+        let uraw = raw.cast_unsigned();
         let action = uraw & 0xF;
 
         match action {
@@ -217,7 +217,7 @@ impl GuestAction {
                     return Err(AbiError::BadPayload { raw });
                 }
                 let status_field = ((uraw >> 4) & 0x3FF) as u16;
-                if status_field < 100 || status_field > 499 {
+                if !(100..=499).contains(&status_field) {
                     return Err(AbiError::BadPayload { raw });
                 }
                 let template = ((uraw >> 14) & 0xFFFF) as u16;
@@ -309,26 +309,17 @@ impl GuestAction {
 /// # Errors
 /// `AbiError::OutOfBounds`, including when `ptr + len` overflows `u32`.
 pub fn guest_slice(mem: &[u8], ptr: u32, len: u32) -> Result<&[u8], AbiError> {
-    let end = (ptr as u64)
-        .checked_add(len as u64)
-        .ok_or(AbiError::OutOfBounds {
-            ptr,
-            len,
-            mem_len: mem.len(),
-        })?;
-    if end > mem.len() as u64 {
-        return Err(AbiError::OutOfBounds {
-            ptr,
-            len,
-            mem_len: mem.len(),
-        });
+    let mem_len = mem.len();
+    let end = u64::from(ptr)
+        .checked_add(u64::from(len))
+        .ok_or(AbiError::OutOfBounds { ptr, len, mem_len })?;
+    if end > u64::try_from(mem_len).unwrap_or(u64::MAX) {
+        return Err(AbiError::OutOfBounds { ptr, len, mem_len });
     }
-    mem.get(ptr as usize .. end as usize)
-        .ok_or(AbiError::OutOfBounds {
-            ptr,
-            len,
-            mem_len: mem.len(),
-        })
+    let start = usize::try_from(ptr).map_err(|_| AbiError::OutOfBounds { ptr, len, mem_len })?;
+    let end = usize::try_from(end).map_err(|_| AbiError::OutOfBounds { ptr, len, mem_len })?;
+    mem.get(start..end)
+        .ok_or(AbiError::OutOfBounds { ptr, len, mem_len })
 }
 
 /// The mutable twin, for host functions that fill a guest-provided buffer.
@@ -337,13 +328,15 @@ pub fn guest_slice(mem: &[u8], ptr: u32, len: u32) -> Result<&[u8], AbiError> {
 /// `AbiError::OutOfBounds`.
 pub fn guest_slice_mut(mem: &mut [u8], ptr: u32, len: u32) -> Result<&mut [u8], AbiError> {
     let mem_len = mem.len();
-    let end = (ptr as u64)
-        .checked_add(len as u64)
+    let end = u64::from(ptr)
+        .checked_add(u64::from(len))
         .ok_or(AbiError::OutOfBounds { ptr, len, mem_len })?;
-    if end > mem_len as u64 {
+    if end > u64::try_from(mem_len).unwrap_or(u64::MAX) {
         return Err(AbiError::OutOfBounds { ptr, len, mem_len });
     }
-    mem.get_mut(ptr as usize .. end as usize)
+    let start = usize::try_from(ptr).map_err(|_| AbiError::OutOfBounds { ptr, len, mem_len })?;
+    let end = usize::try_from(end).map_err(|_| AbiError::OutOfBounds { ptr, len, mem_len })?;
+    mem.get_mut(start..end)
         .ok_or(AbiError::OutOfBounds { ptr, len, mem_len })
 }
 
@@ -377,18 +370,44 @@ mod tests {
     #[test]
     fn respond_status_bounds() {
         assert_eq!(
-            GuestAction::decode(GuestAction::Respond { status: 200, template: 0 }.encode().unwrap()),
-            Ok(GuestAction::Respond { status: 200, template: 0 })
+            GuestAction::decode(
+                GuestAction::Respond {
+                    status: 200,
+                    template: 0
+                }
+                .encode()
+                .unwrap()
+            ),
+            Ok(GuestAction::Respond {
+                status: 200,
+                template: 0
+            })
         );
         assert_eq!(
-            GuestAction::decode(GuestAction::Respond { status: 599, template: 0 }.encode().unwrap()),
-            Ok(GuestAction::Respond { status: 599, template: 0 })
+            GuestAction::decode(
+                GuestAction::Respond {
+                    status: 599,
+                    template: 0
+                }
+                .encode()
+                .unwrap()
+            ),
+            Ok(GuestAction::Respond {
+                status: 599,
+                template: 0
+            })
         );
 
         for status in [99, 100, 101, 199, 600] {
             assert_eq!(
-                GuestAction::Respond { status, template: 0 }.encode(),
-                Err(AbiError::BadPayload { raw: i32::from(status) }),
+                GuestAction::Respond {
+                    status,
+                    template: 0
+                }
+                .encode(),
+                Err(AbiError::BadPayload {
+                    raw: i32::from(status)
+                }),
                 "status {status}"
             );
         }
@@ -401,7 +420,9 @@ mod tests {
         // Field 500 is the status 700, rejected by the decode range check.
         assert_eq!(
             GuestAction::decode(2 | (500 << 4)),
-            Err(AbiError::BadPayload { raw: 2 | (500 << 4) })
+            Err(AbiError::BadPayload {
+                raw: 2 | (500 << 4)
+            })
         );
     }
 
@@ -456,7 +477,10 @@ mod tests {
     #[test]
     fn unknown_action_nibble() {
         let raw = 7;
-        assert_eq!(GuestAction::decode(raw), Err(AbiError::UnknownAction { raw }));
+        assert_eq!(
+            GuestAction::decode(raw),
+            Err(AbiError::UnknownAction { raw })
+        );
     }
 
     #[test]
@@ -464,9 +488,18 @@ mod tests {
         let actions = [
             GuestAction::Continue,
             GuestAction::Pause,
-            GuestAction::Respond { status: 200, template: 0 },
-            GuestAction::Respond { status: 599, template: u16::MAX },
-            GuestAction::Respond { status: 404, template: 7 },
+            GuestAction::Respond {
+                status: 200,
+                template: 0,
+            },
+            GuestAction::Respond {
+                status: 599,
+                template: u16::MAX,
+            },
+            GuestAction::Respond {
+                status: 404,
+                template: 7,
+            },
             GuestAction::Reset { code: 0 },
             GuestAction::Reset { code: 3 },
         ];
@@ -524,9 +557,9 @@ mod tests {
     fn guest_slice_wrapping_pointer() {
         let mem = [0u8, 0, 0, 0];
         assert_eq!(
-            guest_slice(&mem, 0xFFFFFFF0, 0x20),
+            guest_slice(&mem, 0xFFFF_FFF0, 0x20),
             Err(AbiError::OutOfBounds {
-                ptr: 0xFFFFFFF0,
+                ptr: 0xFFFF_FFF0,
                 len: 0x20,
                 mem_len: 4,
             })
@@ -564,7 +597,7 @@ mod tests {
             (0, 4, 4, true),
             (4, 0, 4, true),
             (4, 1, 4, false),
-            (0xFFFFFFF0, 0x20, 4, false),
+            (0xFFFF_FFF0, 0x20, 4, false),
             (3, 2, 4, false),
             (0, 5, 4, false),
         ];

@@ -15,8 +15,8 @@ pub mod abi;
 pub mod oplist;
 
 pub use abi::{
-    guest_slice, guest_slice_mut, AbiError, GuestAction, EXPORTS, IMPORTS, ITX_ABSENT, ITX_BUDGET,
-    ITX_DUPLICATE, ITX_INVALID, ITX_OK, ITX_WRONG_PHASE, ITX_ABI_VERSION, MAX_OP_FIELD_BYTES,
-    OP_RECORD_BYTES, PHASE_EXPORTS, RESERVED_IMPORTS,
+    AbiError, EXPORTS, GuestAction, IMPORTS, ITX_ABI_VERSION, ITX_ABSENT, ITX_BUDGET,
+    ITX_DUPLICATE, ITX_INVALID, ITX_OK, ITX_WRONG_PHASE, MAX_OP_FIELD_BYTES, OP_RECORD_BYTES,
+    PHASE_EXPORTS, RESERVED_IMPORTS, guest_slice, guest_slice_mut,
 };
-pub use oplist::{decode_op_list, RawGuestOp};
+pub use oplist::{RawGuestOp, decode_op_list};
