@@ -1484,6 +1484,16 @@ mod tests {
         occurrences(&lower_hay, &lower_needle)
     }
 
+    /// Case-insensitive presence check. Field NAMES this module writes are
+    /// title-case (`Content-Length`, `Transfer-Encoding`, `Host`) while the
+    /// negative assertions below are written lowercase for readability; a
+    /// plain byte-exact `contains` would never find the lowercase needle in
+    /// the title-case haystack and so would ALWAYS report "absent" whether
+    /// or not the field is really there, making the assertion vacuous.
+    fn absent_ci(haystack: &[u8], needle: &[u8]) -> bool {
+        occurrences_ci(haystack, needle) == 0
+    }
+
     // -----------------------------------------------------------------
     // 1. corpus_table -- edge cases 1-15 (request-side; 16-18 are covered
     //    by response_bodyless_rules, 5b/5c by hop_by_hop_never_reaches_the_wire).
@@ -1510,8 +1520,8 @@ mod tests {
             &mut out,
         )
         .unwrap();
-        assert!(!contains(&out, b"content-length"));
-        assert!(!contains(&out, b"transfer-encoding"));
+        assert!(absent_ci(&out, b"content-length"));
+        assert!(absent_ci(&out, b"transfer-encoding"));
 
         // Edge case 2: BodySource::Exact { len: 0 } writes content-length: 0.
         let mut out = BytesMut::new();
@@ -1559,7 +1569,7 @@ mod tests {
         )
         .unwrap();
         assert!(contains(&out, b"Transfer-Encoding: chunked\r\n"));
-        assert!(!contains(&out, b"content-length"));
+        assert!(absent_ci(&out, b"content-length"));
 
         // Edge case 5: a section still containing content-length is
         // refused, via the test-only bypass helper.
@@ -1805,7 +1815,7 @@ mod tests {
         )
         .unwrap();
         assert!(contains(&out, b"Transfer-Encoding: chunked\r\n"));
-        assert!(!contains(&out, b"content-length"));
+        assert!(absent_ci(&out, b"content-length"));
         assert!(!contains(&out, b"Content-Length: 5"));
 
         let mut out = BytesMut::new();
@@ -1820,7 +1830,7 @@ mod tests {
         )
         .unwrap();
         assert!(contains(&out, b"Content-Length: 9\r\n"));
-        assert!(!contains(&out, b"transfer-encoding"));
+        assert!(absent_ci(&out, b"transfer-encoding"));
         assert!(!contains(&out, b": 5\r\n"), "the inbound value 5 leaked");
     }
 
@@ -1847,8 +1857,22 @@ mod tests {
                 &mut out,
             )
             .unwrap();
-            assert!(occurrences(&out, b"content-length:") <= 1, "{body:?}");
-            assert!(occurrences(&out, b"transfer-encoding:") <= 1, "{body:?}");
+            let cl = occurrences_ci(&out, b"content-length:");
+            let te = occurrences_ci(&out, b"transfer-encoding:");
+            assert!(
+                cl <= 1,
+                "{body:?}: content-length appeared {cl} times, out: {out:?}"
+            );
+            assert!(
+                te <= 1,
+                "{body:?}: transfer-encoding appeared {te} times, out: {out:?}"
+            );
+            // Never BOTH at once, whatever `body` is: exactly one framing
+            // field is written, or none (#37's own invariant list).
+            assert!(
+                cl == 0 || te == 0,
+                "{body:?}: both content-length and transfer-encoding present, out: {out:?}"
+            );
         }
     }
 
@@ -2434,8 +2458,8 @@ mod tests {
         let mut out = BytesMut::new();
         serialize_response_head(&no_content, Method::Get, BodySource::None, true, &mut out)
             .unwrap();
-        assert!(!contains(&out, b"content-length"));
-        assert!(!contains(&out, b"transfer-encoding"));
+        assert!(absent_ci(&out, b"content-length"));
+        assert!(absent_ci(&out, b"transfer-encoding"));
 
         // Edge case 16, mismatched usage: 204 with a non-None BodySource
         // debug_asserts (proving the status wins even when a caller passes
@@ -2464,8 +2488,8 @@ mod tests {
         let mut out = BytesMut::new();
         serialize_response_head(&not_modified, Method::Get, BodySource::None, true, &mut out)
             .unwrap();
-        assert!(!contains(&out, b"transfer-encoding"));
-        assert!(!contains(&out, b"content-length"));
+        assert!(absent_ci(&out, b"transfer-encoding"));
+        assert!(absent_ci(&out, b"content-length"));
 
         // Edge case 17: a response to HEAD with BodySource::Exact { len:
         // 4096 } writes content-length: 4096 and no transfer-encoding.
@@ -2480,13 +2504,13 @@ mod tests {
         )
         .unwrap();
         assert!(contains(&out, b"Content-Length: 4096\r\n"));
-        assert!(!contains(&out, b"transfer-encoding"));
+        assert!(absent_ci(&out, b"transfer-encoding"));
 
         // Same response, BodySource::None: no framing field at all.
         let mut out = BytesMut::new();
         serialize_response_head(&ok, Method::Head, BodySource::None, true, &mut out).unwrap();
-        assert!(!contains(&out, b"content-length"));
-        assert!(!contains(&out, b"transfer-encoding"));
+        assert!(absent_ci(&out, b"content-length"));
+        assert!(absent_ci(&out, b"transfer-encoding"));
 
         // Edge case 18: an unknown status (599) gets an empty reason
         // phrase, but the SP after the status code is still written.
