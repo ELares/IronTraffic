@@ -292,6 +292,21 @@ impl ChallengeCertsBuilder {
         self.entries.remove(normalized);
     }
 
+    /// Test seam that swaps in a hasher whose `hash` ignores its input and always returns
+    /// `NameKey(0)`, so every staged name lands in the same `by_name` bucket regardless of what
+    /// it is. This is what lets `challenge_lookup_is_case_insensitive` prove that
+    /// `ChallengeCerts::lookup`'s memcmp (`self.name_at(entry.name) != normalized.as_bytes()`) is
+    /// actually load-bearing rather than merely present: with a real keyed hash, two distinct
+    /// test-chosen names essentially never collide, so a lookup for a name that is not in the map
+    /// already misses at the hash probe and never reaches the memcmp at all, and removing the
+    /// memcmp check outright would still pass every other test in this module. Mirrors
+    /// `CertIndexBuilder::force_collision_on_attempt_0` / `NameHasher::degenerate_for_test`, the
+    /// identical seam `store::index::tests` uses for the same reason.
+    #[cfg(test)]
+    pub(crate) fn force_degenerate_hasher(&mut self) {
+        self.hasher = NameHasher::degenerate_for_test();
+    }
+
     /// Finish, producing an immutable [`ChallengeCerts`] carrying `generation`.
     ///
     /// # Errors
@@ -491,6 +506,39 @@ mod tests {
             built
                 .lookup("nonexistent.example.com", UnixSeconds::new(1_000))
                 .is_none()
+        );
+
+        // The memcmp inside `lookup` (`self.name_at(entry.name) != normalized.as_bytes()`) is a
+        // second independent check on top of the hash probe, not decoration: with the REAL keyed
+        // hash used above, two distinct test-chosen names essentially never collide, so the
+        // `nonexistent.example.com` check just above already misses at the hash-probe step and
+        // never actually reaches the memcmp. `force_degenerate_hasher` collapses every name into
+        // the same bucket so this map's memcmp is the thing doing the work, not the hash: without
+        // it, `different.example.com` below would incorrectly find and return `real.example.com`'s
+        // credential, because both land in `by_name`'s one and only bucket.
+        let (real_der, real_key) = gen_leaf("real.example.com");
+        let mut collision_builder = ChallengeCertsBuilder::new([4u8; 16]);
+        collision_builder.force_degenerate_hasher();
+        collision_builder
+            .insert(
+                "real.example.com",
+                ChallengeKey::from_der(&real_der, &real_key).expect("valid"),
+                UnixSeconds::new(2_000),
+            )
+            .expect("valid");
+        let collision_built = collision_builder.build_with_generation(0).expect("build");
+        assert!(
+            collision_built
+                .lookup("real.example.com", UnixSeconds::new(1_000))
+                .is_some(),
+            "the name that was actually inserted must still be found"
+        );
+        assert!(
+            collision_built
+                .lookup("different.example.com", UnixSeconds::new(1_000))
+                .is_none(),
+            "a different name that hashes into the SAME bucket as a live entry must still miss: \
+             this is the memcmp guard, not the hash probe, doing the work"
         );
     }
 }
