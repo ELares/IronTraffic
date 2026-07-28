@@ -14,8 +14,8 @@
 //! both arrive as an [`UpgradeTokens`] value the caller filled from the wire section
 //! BEFORE the strip. Looking for them in `req.headers` finds nothing, every time.
 //!
-//! **The four connection-disposal rules**, which this module cannot enforce itself
-//! because it holds no socket, and which the caller MUST implement:
+//! **The five caller rules**, which this module cannot enforce itself because it holds
+//! no socket and forwards nothing, and which the caller MUST implement:
 //!
 //! 1. An upstream connection that answered `101` is NEVER returned to the pool,
 //!    whether [`UpgradeResponse::verify`] succeeded or failed. A pooled post-`101`
@@ -31,6 +31,16 @@
 //! 4. The DOWNSTREAM connection is different: we never sent it a `101`, so a failed
 //!    upgrade (answered `400`, `426` or `502`) leaves its HTTP framing intact and it
 //!    remains reusable. Closing it on every failed upgrade would be needless churn.
+//! 5. The client's `Sec-WebSocket-Extensions` offer is NOT forwarded upstream.
+//!    [`UpgradeResponse::verify`] refuses any extension in the `101`, because we
+//!    negotiate none; that refusal is only correct if the upstream was never given an
+//!    offer to negotiate FROM. Unlike `Upgrade` and `Connection`, this field is
+//!    deliberately not hop-by-hop and is not in `RESERVED_PREFIXES`, so it survives
+//!    `strip_ingress` into the `CanonicalRequest` a forwarding chain serializes. Chrome
+//!    and Firefox send `permessage-deflate` on every WebSocket connection, so a caller
+//!    that forwards it verbatim will have every browser upgrade to a deflate-capable
+//!    upstream answered `502` by rule, not by accident. `parse` records the offer in
+//!    `offered_extensions` precisely so the caller can see what it must drop.
 //!
 //! Validating the response (rules above the fold) protects US. Disposing of the
 //! connections correctly (this list) protects the OTHER tenants of the upstream pool.

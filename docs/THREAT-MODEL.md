@@ -714,6 +714,16 @@ upgrade and then goes into byte-shovelling mode has created a bidirectional smug
 same precondition the frame-relay section above states for an already-established tunnel, moved one
 step earlier to the handshake that establishes one.
 
+- **The client's `Sec-WebSocket-Extensions` offer is not forwarded upstream.**
+  `UpgradeResponse::verify` refuses any extension in the `101` because we negotiate
+  none, and that refusal is only correct if the upstream was never handed an offer to
+  negotiate from. This field is deliberately not hop-by-hop and is not in
+  `RESERVED_PREFIXES`, so it survives `strip_ingress` and a forwarding chain that does
+  nothing will pass it on. Chrome and Firefox send `permessage-deflate` on every
+  WebSocket connection, so forwarding it verbatim answers every browser upgrade to a
+  deflate-capable upstream with `502`, by rule rather than by accident. Pinned by
+  `extension_offer_survives_the_strip_and_a_negotiated_extension_is_refused`.
+
 **Every request-side check, and what it closes:**
 
 - **`GET` with no body.** A `POST` upgrade, or a `GET` with `Content-Length: 5`, means there are

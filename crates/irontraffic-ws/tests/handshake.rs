@@ -1040,3 +1040,65 @@ fn handshake_round_trip_is_within_the_per_handshake_budget() {
          sign that something is allocating per handshake"
     );
 }
+
+/// Caller rule 5: the client's `Sec-WebSocket-Extensions` offer must not be forwarded.
+///
+/// `verify` refuses ANY extension in the `101` because we negotiate none. That refusal
+/// is only correct if the upstream was never given an offer to negotiate from. Unlike
+/// `Upgrade` and `Connection`, this field is deliberately not hop-by-hop and is not in
+/// `RESERVED_PREFIXES`, so it survives `strip_ingress` into the `CanonicalRequest` a
+/// forwarding chain serializes.
+///
+/// This pins both halves of that premise so the rule cannot quietly stop being true:
+/// the offer DOES survive the strip (so a caller really can forward it by doing
+/// nothing), and if it is forwarded and honoured, we answer 502. Chrome and Firefox
+/// send `permessage-deflate` on every WebSocket connection, so a caller that forwards
+/// verbatim fails every browser upgrade to a deflate-capable upstream by rule.
+#[test]
+fn extension_offer_survives_the_strip_and_a_negotiated_extension_is_refused() {
+    let head = b"GET /chat HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Extensions: permessage-deflate\r\n\r\n";
+    let (req, tokens) = upgrade(head).expect("test fixture must parse and canonicalize");
+
+    // Half one: the offer survives into the CanonicalRequest a forwarding chain would
+    // serialize. This is what makes rule 5 a real obligation rather than a precaution.
+    assert!(
+        req.headers
+            .slots()
+            .iter()
+            .enumerate()
+            .any(|(i, _)| req.headers.name_at(i) == Some(b"sec-websocket-extensions".as_slice())),
+        "the extension offer must survive strip_ingress, or rule 5 would be unnecessary"
+    );
+
+    let upgrade_req = UpgradeRequest::parse(&req, tokens).unwrap().unwrap();
+    let accept = accept_key(upgrade_req.key_b64());
+
+    // Half two: an upstream that honoured the forwarded offer is refused.
+    let negotiated = build_section(&[
+        (b"upgrade", b"websocket"),
+        (b"connection", b"Upgrade"),
+        (b"sec-websocket-accept", &accept[..]),
+        (b"sec-websocket-extensions", b"permessage-deflate"),
+    ])
+    .expect("test fixture fields must be valid");
+    assert_eq!(
+        UpgradeResponse::verify(&upgrade_req, 101, &negotiated, response_tokens(&negotiated))
+            .unwrap_err(),
+        HandshakeError::UnrequestedExtension,
+        "a negotiated extension must be refused; rule 5 is what keeps that from firing \
+         on every browser connection"
+    );
+
+    // And the same upstream response WITHOUT the extension is accepted, so the refusal
+    // above is attributable to the extension and nothing else.
+    let clean = build_section(&[
+        (b"upgrade", b"websocket"),
+        (b"connection", b"Upgrade"),
+        (b"sec-websocket-accept", &accept[..]),
+    ])
+    .expect("test fixture fields must be valid");
+    assert!(
+        UpgradeResponse::verify(&upgrade_req, 101, &clean, response_tokens(&clean)).is_ok(),
+        "the control must be accepted, or the refusal above proves nothing"
+    );
+}
