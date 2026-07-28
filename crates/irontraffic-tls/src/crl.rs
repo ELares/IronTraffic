@@ -252,21 +252,35 @@ impl<'a> Iterator for SerialIter<'a> {
         if self.bytes.is_empty() {
             return None;
         }
+        // Every early return below MUST clear `self.bytes` first. `SerialIter` is not a
+        // std `Fuse`: once `next` has returned `Some(Err(_))` for a malformed entry, there
+        // is no well-defined "resume point" in `self.bytes` to continue from, so the only
+        // safe move is to make the iterator empty and therefore terminate on the very next
+        // call. Without this, a caller that drains the iterator with `.count()`, `.collect()`
+        // or a `for` loop over attacker-controlled bytes that decode as an endless run of
+        // invalid entry TLVs never returns; see the issue this fixes for the 50,000,001-item
+        // probe that only stopped because it had its own hard break.
         let Ok(mut reader) = der::SliceReader::new(self.bytes) else {
+            self.bytes = &[];
             return Some(Err(CrlError::Parse));
         };
         let Ok(entry_tlv) = reader.tlv_bytes() else {
+            self.bytes = &[];
             return Some(Err(CrlError::Parse));
         };
         let consumed = entry_tlv.len();
         let Some(rest) = self.bytes.get(consumed..) else {
+            self.bytes = &[];
             return Some(Err(CrlError::Parse));
         };
         self.bytes = rest;
 
         let serial = match serial_from_entry(entry_tlv) {
             Ok(s) => s,
-            Err(e) => return Some(Err(e)),
+            Err(e) => {
+                self.bytes = &[];
+                return Some(Err(e));
+            }
         };
         Some(Ok(serial))
     }
@@ -1637,6 +1651,57 @@ mod tests {
             verify_signature(parsed, &cert_der),
             Err(CrlError::IssuerMismatch)
         );
+    }
+
+    #[test]
+    fn crl_serials_iterator_terminates_on_invalid_entry() {
+        // #729 BLOCKING 1: a revokedCertificates SEQUENCE whose content is one byte, 0xFF
+        // (`30 01 FF`), is a well-formed outer TLV, but that content byte is not a valid
+        // nested entry TLV on its own, so read_revoked_certificates hands the unvalidated
+        // content straight to SerialIter. Before this fix, both of SerialIter::next's
+        // early-error paths returned Some(Err(CrlError::Parse)) without advancing
+        // self.bytes, so the iterator was never emptied and yielded Err(Parse) forever; a
+        // probe drained 50,000,001 items before its own hard break stopped it. This test
+        // hangs the suite on a real regression rather than merely failing: it asserts the
+        // iterator is well-behaved (exactly one Err, then None) rather than bounding a
+        // .count() with an external watchdog, which would still pass while the underlying
+        // loop never terminates on its own.
+        let mut tbs_items = vec![
+            der_enc::encode_integer(&[0x01]),
+            der_enc::encode_algorithm_identifier("1.2.840.113549.1.1.11"),
+            der_enc::encode_name("2.5.4.3", "Test CA"),
+            der_enc::encode_utctime(1_704_000_000),
+            der_enc::encode_utctime(1_704_086_400),
+        ];
+        // revokedCertificates SEQUENCE with one content byte, 0xFF: `30 01 FF`. 0xFF is not a
+        // valid TLV by itself (its tag byte signals a multi-byte tag form with no
+        // continuation byte present), so SerialIter::next hits its tlv_bytes error path on
+        // the very first call.
+        tbs_items.push(vec![0x30, 0x01, 0xFF]);
+        let tbs = der_enc::encode_sequence(&tbs_items);
+        let der = der_enc::encode_sequence(&[
+            tbs,
+            der_enc::encode_algorithm_identifier("1.2.840.113549.1.1.11"),
+            der_enc::encode_bit_string(&[0u8; 256]),
+        ]);
+
+        let cfg = default_cfg();
+        let parsed = parse(&der, &cfg).expect("the outer shape is well-formed; parse succeeds");
+
+        let mut serials = parsed.serials();
+        assert_eq!(
+            serials.next(),
+            Some(Err(CrlError::Parse)),
+            "the single malformed entry must surface as one Err"
+        );
+        assert_eq!(
+            serials.next(),
+            None,
+            "the iterator must terminate after the error, not loop forever yielding Err(Parse)"
+        );
+        // Draining the whole iterator, the idiom crl_no_revoked_list and crl_single_entry
+        // already use (.count()), must also terminate rather than hang.
+        assert_eq!(parsed.serials().count(), 1);
     }
 
     // -----------------------------------------------------------------------
