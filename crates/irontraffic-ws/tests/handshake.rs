@@ -693,6 +693,13 @@ fn no_allocation_in_the_handshake() {
         .map(|line| line.split("//").next().unwrap_or(""))
         .collect::<Vec<_>>()
         .join("\n");
+    // A CLOSED SET of spellings, which is this check's real limitation and is stated
+    // here rather than left implied. The original list omitted the single most common
+    // way to allocate in Rust: a plain `vec![]` walked straight through it. A real,
+    // unconditional 64-byte heap allocation added to `UpgradeRequest::parse`'s hot path
+    // left every test passing. The additions below close the spellings that omission
+    // exposed; the check still cannot see an allocation reached through a helper in
+    // another module, and no text scan can.
     for needle in [
         "with_capacity",
         "Vec::new",
@@ -702,6 +709,14 @@ fn no_allocation_in_the_handshake() {
         "format!",
         ".collect(",
         "Box::new",
+        "vec![",
+        "String::from",
+        "Vec::from",
+        "Box::pin",
+        ".repeat(",
+        ".to_string()",
+        ".into_bytes()",
+        ".into_boxed_slice()",
     ] {
         assert!(
             !production.contains(needle),
@@ -974,4 +989,54 @@ fn display_does_not_leak_the_wrapped_reject_reason() {
     // The detail is still reachable where it belongs.
     assert!(format!("{err:?}").contains("FieldNameEmpty"));
     assert_eq!(err.metric_label(), "field_name_empty");
+}
+
+/// The measurement #203's Benchmarks section requires: `parse` plus `accept_key` plus
+/// `verify`, over 100,000 iterations, against a 3 microsecond budget.
+///
+/// #203 says "Not a criterion group. Report in the PR description, from a test-driven
+/// 100,000 iteration measurement". It was never taken, so the budget was unverified and
+/// no timing figure appeared anywhere in the diff. This runs it and asserts the budget,
+/// so the number cannot silently stop being true; the PR description carries the figure.
+///
+/// The assertion is against the issue's own "something is allocating per handshake"
+/// ceiling of 20 microseconds rather than the 3 microsecond target, because a shared CI
+/// runner under load is not a quiet benchmark host and a tight bound here would be a
+/// flake generator. The measured figure is reported either way.
+#[test]
+fn handshake_round_trip_is_within_the_per_handshake_budget() {
+    const ITERATIONS: u32 = 100_000;
+
+    let (req, tokens) = upgrade(BROWSER_UPGRADE).expect("test fixture must parse and canonicalize");
+    let baseline = UpgradeRequest::parse(&req, tokens).unwrap().unwrap();
+    let headers = accepting_response(&baseline).expect("test fixture response must be valid");
+    let htokens = response_tokens(&headers);
+
+    let start = std::time::Instant::now();
+    let mut done: u32 = 0;
+    for _ in 0..ITERATIONS {
+        let parsed = UpgradeRequest::parse(&req, tokens).unwrap().unwrap();
+        let accept = accept_key(parsed.key_b64());
+        std::hint::black_box(&accept);
+        let verified = UpgradeResponse::verify(&parsed, 101, &headers, htokens).unwrap();
+        std::hint::black_box(&verified);
+        done += 1;
+    }
+    let per_iter = start.elapsed() / ITERATIONS;
+
+    // Pinned to a literal, not to ITERATIONS, so emptying the loop fails rather than
+    // dividing by a smaller number and passing. This is the tautology shape that has
+    // bitten this corpus repeatedly.
+    assert_eq!(
+        done, 100_000,
+        "every iteration must run; emptying the loop must FAIL this test"
+    );
+    // The corpus denies `println!` in tests, so the figure rides on the assertion
+    // message instead of a bare print: it is visible exactly when it matters.
+    assert!(
+        per_iter < std::time::Duration::from_micros(20),
+        "parse + accept_key + verify measured {per_iter:?} per handshake over \
+         {ITERATIONS} iterations, above the 20 microsecond ceiling #203 calls the \
+         sign that something is allocating per handshake"
+    );
 }
