@@ -12,13 +12,18 @@
 //! consumes it is a later issue; this module compiles, is fully tested, and is wired in there.
 
 mod arena;
+mod challenge;
 mod cred;
 mod index;
+mod resolver;
 
 // `MAX_DER_BYTES` is arena's own bound (it caps a single interned blob), but `Credentials::load`
 // also uses the identical constant to cap every blob in a chain, leaf included, so it lives in
 // arena and is re-exported here rather than duplicated.
 pub use arena::{BlobHash, ChainInterner, MAX_DER_BYTES};
+pub use challenge::{
+    ChallengeCerts, ChallengeCertsBuilder, ChallengeError, ChallengeKey, MAX_CHALLENGES,
+};
 pub use cred::{
     CertError, CertFingerprint, Credentials, KeyType, MAX_CHAIN_DEPTH, MAX_SANS, MAX_STAPLE_BYTES,
 };
@@ -26,3 +31,4 @@ pub use index::{
     CertIndex, CertIndexBuilder, CertStats, ClientCaps, MAX_INDEX_GROUPS, MAX_NAME_ARENA_BYTES,
     SanIndexReport,
 };
+pub use resolver::{IronResolver, ResolverStats, TimeView};

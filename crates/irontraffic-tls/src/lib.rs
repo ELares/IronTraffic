@@ -23,4 +23,6 @@ pub use provider::{
     ProviderError, ProviderKind, fips_active, install_process_provider, post_quantum_available,
     provider_kind,
 };
-pub use store::{CertIndex, CertIndexBuilder, ClientCaps};
+pub use store::{
+    CertIndex, CertIndexBuilder, ChallengeCerts, ChallengeCertsBuilder, ClientCaps, IronResolver,
+};
