@@ -979,6 +979,61 @@ mod tests {
     }
 
     #[test]
+    fn max_depth_nested_parens_within_128_kib_stack_is_ok() {
+        // #738 SHOULD_FIX 1: #269's acceptance criterion is "a test runs
+        // parse on a MAXIMALLY DEEP input inside a thread with a 128 KiB
+        // stack and asserts no overflow". `many_bangs_one_frame` and
+        // `long_postfix_chain_one_frame` above are the only tests that use
+        // a 128 KiB stack, and neither is deep (both reach `ast.depth ==
+        // 1`); the two tests that actually reach the default `max_depth`
+        // (`depth_cap_trips` and `depth_cap_accepts_at_the_boundary_and_
+        // rejects_one_over`) run on the default 8 MiB stack. This is the
+        // missing combination: 15 nested parens reaches depth 16, exactly
+        // `PolicyLimits::defaults().max_depth`, inside a 128 KiB stack.
+        let mut src = "(".repeat(15);
+        src.push_str("true");
+        src.push_str(&")".repeat(15));
+        let limits = default_limits();
+
+        let handle = std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(move || {
+                let toks = lex(src.as_bytes(), &limits).expect("lex must accept 15 nested parens");
+                parse(&toks, src.as_bytes(), &limits)
+            })
+            .expect("spawn 128 KiB thread");
+        let result = handle.join().expect("must not stack overflow or panic");
+        let ast = result.expect("15 nested parens must parse within a 128 KiB stack");
+        assert_eq!(
+            ast.depth, 16,
+            "15 parens plus the literal itself reaches max_depth"
+        );
+    }
+
+    #[test]
+    fn max_depth_plus_one_nested_parens_within_128_kib_stack_is_too_deep() {
+        // The "one over" half of the same criterion, same small stack: 16
+        // nested parens needs a 17th `expr` entry just to parse the
+        // literal, one past the default `max_depth` of 16, so it must be
+        // refused with `TooDeep` rather than overflow the 128 KiB stack.
+        let mut src = "(".repeat(16);
+        src.push_str("true");
+        src.push_str(&")".repeat(16));
+        let limits = default_limits();
+
+        let handle = std::thread::Builder::new()
+            .stack_size(128 * 1024)
+            .spawn(move || {
+                let toks = lex(src.as_bytes(), &limits).expect("lex must accept 16 nested parens");
+                parse(&toks, src.as_bytes(), &limits)
+            })
+            .expect("spawn 128 KiB thread");
+        let result = handle.join().expect("must not stack overflow or panic");
+        let err = result.expect_err("16 nested parens exceeds max_depth = 16");
+        assert_eq!(err, ParseError::TooDeep { at: 16, max: 16 });
+    }
+
+    #[test]
     fn index_with_string_literal() {
         let src = br#"request.headers["x-a"]"#;
         let ast = parse_src(src, default_limits()).unwrap();
