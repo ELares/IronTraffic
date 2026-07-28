@@ -1133,3 +1133,97 @@ them, every time, with no exception for a namespace-tenant-supplied config. `iro
 already carries a fuzz lane (see the lexer section above), so unlike the lexer defect this section's
 introduction responds to, this one is not a fuzz-lane gap: the risk here is a caller-discipline gap,
 and the discipline it requires is written down here and on the two functions it constrains.
+
+## Health check response parsing
+
+**What `HttpCheckCodec` and `TcpCheckCodec` parse.** The bytes an upstream endpoint sends back to
+an active health check probe, in `crates/irontraffic-resilience/src/health/http.rs` and
+`crates/irontraffic-resilience/src/health/tcp.rs`. This is an unauthenticated request-response
+exchange against a machine that may be compromised: a probe target is not held to the same trust
+level as a normal upstream serving real traffic, because reaching it requires none of the
+authentication a real request would need, and a broken or hostile probe target is exactly the
+condition active health checking exists to detect. The response is therefore attacker chosen in
+the same sense as anything read from a downstream socket: an infinite body, a `Content-Length`
+that lies, a status line of unbounded length, a header block that never terminates, or a connection
+that never sends anything at all.
+
+**Abuse cases.** A malicious or broken upstream that answers a health probe with a multi-gigabyte
+body, aiming to make the proxy retain the whole thing in memory. A status line or header block
+that never reaches `CRLF CRLF`, aiming to make the proxy scan forever. A `receive` pattern list
+configured with long, highly self-similar patterns (`"aaaa...ab"`), aiming to make the per-check
+pattern search expensive; this one needs a cooperating configuration as well as a hostile response,
+not the response alone. A response engineered to look like it ends cleanly at a message boundary
+when it does not, aiming to make the proxy reuse a connection that still has unread bytes on it,
+which would make the NEXT check on that connection misparse those bytes as a new status line.
+
+**Structural controls: three independent hard caps, each with a defined behaviour at the limit.**
+
+- **`max_head_bytes`** (default `1024`, maximum `8192`) bounds the status line plus header bytes
+  `HttpCheckCodec` will scan before giving up. The 12-byte status-line prefix counts toward it.
+  Exceeding it is `Fail(Protocol)` with the connection closed, checked on every byte the instant
+  after it is counted, so the cap cannot be bypassed by any status-line or header shape.
+- **`response_buffer_size`** (default `1024`, maximum `4096`) bounds the body bytes either codec
+  will ever retain. Once the buffer is full, further body bytes offered to `on_bytes` are counted
+  but never appended; the codec decides pass or fail from exactly the retained prefix and reports
+  `ConnectionFate::Close`. A response of any size, delivered in any chunking, costs at most
+  `response_buffer_size` bytes of memory: `infinite_body_bounded` (`health::http::tests`) and
+  `tcp_codec_never_allocates_after_construction` (`health::tcp::tests`) each feed 1 MB or more of
+  filler through a small buffer and assert the retained length never exceeds the cap and the
+  buffer's `Vec::capacity` never changes from what `new` allocated. `prop_never_exceeds_caps`
+  (`health::http::tests`) asserts the same property under proptest-generated arbitrary chunkings.
+- **`timeout_ms`**, the scheduler's per-check deadline (`HealthCheckConfig::timeout_ms`, default
+  `1000`, in `health/schedule.rs`, `health-check-scheduling-policy` #92), bounds the wall time a
+  check may occupy regardless of how the two caps above are approached. The codecs themselves read
+  no clock; the runner that owns the socket and calls `on_bytes`/`on_eof` is responsible for this
+  bound. It is listed here because all three caps together are what make a hostile response cost a
+  fixed, small, and bounded amount of the proxy's resources rather than an amount the peer chooses.
+
+**Bounded pattern-match cost, not merely bounded memory.** Retaining the response bytes is not by
+itself enough: `patterns_match` (`health/mod.rs`) re-scans the retained buffer with `slice::windows`
+each time it runs, so if it ran on every appended byte the cost would be quadratic in
+`response_buffer_size` for a pathological single-byte-at-a-time delivery. Both codecs instead run
+it only when the retained body has grown by at least 64 bytes since the last run, or when the
+buffer just filled, or once on `on_eof`; that batching turns the worst case into
+`(response_buffer_size / 64) * response_buffer_size * S`, where `S` is the sum of the configured
+`receive` pattern lengths. Validation caps `S` at `512` and `response_buffer_size` at `4096`, which
+bounds the worst case at roughly 134 million byte comparisons per check, a number that needs both a
+hostile upstream (to keep re-sending the same near-match prefix) and a pathological configuration
+(long, self-similar patterns) to approach; an operator running into this cost in practice should
+shorten the configured pattern. The bound holds independent of how many endpoints are configured,
+because it is a per-check cost and checks run on the check runner's own task, never on the control
+task that also owns the ejection and uneject timers.
+
+**The codec-pool memory bound.** Neither codec is allocated one per endpoint. `HttpCheckCodec` and
+`TcpCheckCodec` are drawn from a pool sized to `max_concurrent_checks` and `reset` between checks,
+so total retained memory is `max_concurrent_checks * (response_buffer_size + a few dozen bytes of
+state)`, independent of the endpoint count `H`. One codec per endpoint instead would cost
+`H * response_buffer_size`, which at the endpoint ceiling of `1_048_576` and the maximum buffer of
+`4096` is 4 GB of idle buffers; at a routine `H = 50_000` with the default `1024` byte buffer it is
+still 51 MB of memory in use for microseconds per interval. `reset()` clears parse state and keeps
+the buffer's allocated capacity, so drawing a codec from the pool for the next check is
+allocation-free.
+
+**The close-on-unresolved-framing rule.** Neither codec decodes `Content-Length` or
+`Transfer-Encoding`, and neither decodes chunked transfer coding: `HttpCheckCodec` scans only far
+enough to find `CRLF CRLF` and then reads up to `response_buffer_size` body bytes, never resolving
+where the body actually ends. Because of that, the codec can prove a connection is at a message
+boundary, and therefore safe to reuse, in exactly three cases: the request method was `HEAD`, or
+the response status was `204`, or the response status was `304`. All three are responses RFC 9110
+guarantees carry no body. Every other `Done` reports `ConnectionFate::Close`, including a passing
+check whose body matched every `receive` pattern before the buffer filled, because stopping early
+still leaves an unknown number of body bytes unread on the socket. `TcpCheckCodec` has no framing
+signal at all and reports `ConnectionFate::Close` unconditionally. Reusing a connection whose
+framing did not resolve would let the next check's `HttpCheckCodec::on_bytes` parse the previous
+response's leftover body bytes as a new status line, which fails as `Fail(Protocol)` and looks
+exactly like an upstream that broke between checks; always closing in the unresolved case is the
+only choice that cannot produce that false signal. This is the same connection-purity rule IronTraffic
+decision ledger entry 19 states for the forwarding data plane, applied here to the health-check
+connection pool.
+
+**Fuzzing.** `fuzz_health_response_parser` (`crates/irontraffic-resilience/fuzz`) drives both
+codecs with an `Arbitrary`-derived response byte stream delivered through arbitrary chunk
+boundaries, against a spec whose method, status ranges, `receive` patterns, and both caps are
+mapped into the valid range rather than passed through unmodified, so every generated input reaches
+`on_bytes`/`on_eof` instead of being rejected by `HttpCheckSpec::validate` before the parser runs.
+It asserts the retained body never exceeds `response_buffer_size`, the buffer never reallocates
+after construction, and both codecs always reach `Done` once `on_eof` is called.

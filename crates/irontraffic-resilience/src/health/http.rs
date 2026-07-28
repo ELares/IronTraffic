@@ -211,8 +211,8 @@ impl HttpCheckSpec {
         }
 
         let check_ranges = |field: &'static str,
-                             ranges: &[StatusRange],
-                             must_be_nonempty: bool|
+                            ranges: &[StatusRange],
+                            must_be_nonempty: bool|
          -> Result<(), ConfigError> {
             if must_be_nonempty && ranges.is_empty() {
                 return Err(ConfigError::new(field, "", "must not be empty"));
@@ -334,8 +334,7 @@ impl HttpCheckSpec {
         // with a `usize::MAX` fallback is used instead of `as` so the conversion
         // is checked rather than a silent truncating cast, per the widening/
         // narrowing conversion rule.
-        let response_buffer_size =
-            usize::try_from(self.response_buffer_size).unwrap_or(usize::MAX);
+        let response_buffer_size = usize::try_from(self.response_buffer_size).unwrap_or(usize::MAX);
         let max_head_bytes = usize::try_from(self.max_head_bytes).unwrap_or(usize::MAX);
         let method_is_head = self.method == HttpCheckMethod::Head;
         Ok(CompiledHttpCheck {
@@ -529,10 +528,10 @@ impl HttpCheckCodec {
                 Phase::Head => self.consume_head_byte(byte, compiled),
                 Phase::Body => self.consume_body_byte(byte, compiled),
                 Phase::Finished => {
-                    // Unreachable: the check above already returned once `phase`
-                    // is `Finished`. Kept as a safe no-op arm, never
-                    // `unreachable!()`, because this codec must never panic on
-                    // any input.
+                    // Not reachable: the check above already returned once
+                    // `phase` is `Finished`. Kept as a safe no-op arm rather
+                    // than a panicking macro, because this codec must never
+                    // panic on any input.
                     None
                 }
             };
@@ -545,9 +544,10 @@ impl HttpCheckCodec {
     /// The peer closed. Decides the check.
     pub fn on_eof(&mut self, compiled: &CompiledHttpCheck) -> CodecStep {
         match self.phase {
-            Phase::StatusLine | Phase::Head => {
-                self.finish(CheckOutcome::Fail(FailKind::Protocol), ConnectionFate::Close)
-            }
+            Phase::StatusLine | Phase::Head => self.finish(
+                CheckOutcome::Fail(FailKind::Protocol),
+                ConnectionFate::Close,
+            ),
             Phase::Body => {
                 if patterns_match(&self.body, &compiled.receive) {
                     self.finish(CheckOutcome::Pass, ConnectionFate::Close)
@@ -582,22 +582,37 @@ impl HttpCheckCodec {
 
         let buf = self.status_buf;
         if buf.get(0..5) != Some(b"HTTP/".as_slice()) {
-            return Some(self.finish(CheckOutcome::Fail(FailKind::Protocol), ConnectionFate::Close));
+            return Some(self.finish(
+                CheckOutcome::Fail(FailKind::Protocol),
+                ConnectionFate::Close,
+            ));
         }
         let version_ok = buf.get(5) == Some(&b'1')
             && buf.get(6) == Some(&b'.')
             && matches!(buf.get(7), Some(&b'0' | &b'1'));
         if !version_ok {
-            return Some(self.finish(CheckOutcome::Fail(FailKind::Protocol), ConnectionFate::Close));
+            return Some(self.finish(
+                CheckOutcome::Fail(FailKind::Protocol),
+                ConnectionFate::Close,
+            ));
         }
         if buf.get(8) != Some(&b' ') {
-            return Some(self.finish(CheckOutcome::Fail(FailKind::Protocol), ConnectionFate::Close));
+            return Some(self.finish(
+                CheckOutcome::Fail(FailKind::Protocol),
+                ConnectionFate::Close,
+            ));
         }
         let Some(((&d0, &d1), &d2)) = buf.get(9).zip(buf.get(10)).zip(buf.get(11)) else {
-            return Some(self.finish(CheckOutcome::Fail(FailKind::Protocol), ConnectionFate::Close));
+            return Some(self.finish(
+                CheckOutcome::Fail(FailKind::Protocol),
+                ConnectionFate::Close,
+            ));
         };
         if !(d0.is_ascii_digit() && d1.is_ascii_digit() && d2.is_ascii_digit()) {
-            return Some(self.finish(CheckOutcome::Fail(FailKind::Protocol), ConnectionFate::Close));
+            return Some(self.finish(
+                CheckOutcome::Fail(FailKind::Protocol),
+                ConnectionFate::Close,
+            ));
         }
         let status = u16::from(d0 - b'0') * 100 + u16::from(d1 - b'0') * 10 + u16::from(d2 - b'0');
         self.status = status;
@@ -612,7 +627,10 @@ impl HttpCheckCodec {
     fn consume_head_byte(&mut self, byte: u8, compiled: &CompiledHttpCheck) -> Option<CodecStep> {
         self.head_scanned = self.head_scanned.saturating_add(1);
         if self.head_scanned > compiled.max_head_bytes {
-            return Some(self.finish(CheckOutcome::Fail(FailKind::Protocol), ConnectionFate::Close));
+            return Some(self.finish(
+                CheckOutcome::Fail(FailKind::Protocol),
+                ConnectionFate::Close,
+            ));
         }
         let expected = CRLF_SEQ.get(usize::from(self.crlf)).copied();
         if expected == Some(byte) {
@@ -657,8 +675,7 @@ impl HttpCheckCodec {
             self.body.push(byte);
         }
         let full = self.body.len() == compiled.response_buffer_size;
-        let grew_enough =
-            self.body.len().saturating_sub(self.matched_at_len) >= MATCH_BATCH_BYTES;
+        let grew_enough = self.body.len().saturating_sub(self.matched_at_len) >= MATCH_BATCH_BYTES;
         if !(full || grew_enough) {
             return None;
         }
@@ -742,94 +759,154 @@ mod tests {
         assert!(base.validate().is_ok(), "fixture must itself be valid");
 
         let cases: Vec<(&str, HttpCheckSpec)> = vec![
-            ("health.http.path", HttpCheckSpec {
-                path: String::new(),
-                ..base.clone()
-            }),
-            ("health.http.path", HttpCheckSpec {
-                path: "health".into(),
-                ..base.clone()
-            }),
-            ("health.http.path", HttpCheckSpec {
-                path: "/a b".into(),
-                ..base.clone()
-            }),
-            ("health.http.host", HttpCheckSpec {
-                host: None,
-                ..base.clone()
-            }),
-            ("health.http.expected_statuses", HttpCheckSpec {
-                expected_statuses: Vec::new(),
-                ..base.clone()
-            }),
-            ("health.http.expected_statuses", HttpCheckSpec {
-                expected_statuses: vec![StatusRange { lo: 300, hi: 300 }],
-                ..base.clone()
-            }),
-            ("health.http.expected_statuses", HttpCheckSpec {
-                expected_statuses: vec![StatusRange { lo: 200, hi: 700 }],
-                ..base.clone()
-            }),
-            ("health.http.receive", HttpCheckSpec {
-                receive: vec![Vec::new()],
-                ..base.clone()
-            }),
-            ("health.http.receive", HttpCheckSpec {
-                receive: vec![vec![b'x'; 257]],
-                ..base.clone()
-            }),
-            ("health.http.receive", HttpCheckSpec {
-                receive: (0..9).map(|_| vec![b'x']).collect(),
-                ..base.clone()
-            }),
-            ("health.http.receive", HttpCheckSpec {
-                receive: (0..3).map(|_| vec![b'x'; 200]).collect(),
-                ..base.clone()
-            }),
-            ("health.http.expected_statuses", HttpCheckSpec {
-                expected_statuses: (0..9)
-                    .map(|i| StatusRange {
-                        lo: i * 10,
-                        hi: i * 10 + 1,
-                    })
-                    .collect(),
-                ..base.clone()
-            }),
-            ("health.http.response_buffer_size", HttpCheckSpec {
-                response_buffer_size: 0,
-                ..base.clone()
-            }),
-            ("health.http.response_buffer_size", HttpCheckSpec {
-                response_buffer_size: 4097,
-                ..base.clone()
-            }),
-            ("health.http.max_head_bytes", HttpCheckSpec {
-                max_head_bytes: 15,
-                ..base.clone()
-            }),
-            ("health.http.max_head_bytes", HttpCheckSpec {
-                max_head_bytes: 8193,
-                ..base.clone()
-            }),
-            ("health.http.headers", HttpCheckSpec {
-                headers: (0..17).map(|i| (format!("x-{i}"), "v".into())).collect(),
-                ..base.clone()
-            }),
-            ("health.http.headers.value", HttpCheckSpec {
-                headers: vec![("x-probe".into(), "a\rb".into())],
-                ..base.clone()
-            }),
-            ("health.http.request_size", HttpCheckSpec {
-                headers: (0..16)
-                    .map(|i| (format!("x-pad-{i}"), "v".repeat(600)))
-                    .collect(),
-                ..base.clone()
-            }),
-            ("health.http.receive", HttpCheckSpec {
-                method: HttpCheckMethod::Head,
-                receive: vec![vec![b'x']],
-                ..base.clone()
-            }),
+            (
+                "health.http.path",
+                HttpCheckSpec {
+                    path: String::new(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "health.http.path",
+                HttpCheckSpec {
+                    path: "health".into(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "health.http.path",
+                HttpCheckSpec {
+                    path: "/a b".into(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "health.http.host",
+                HttpCheckSpec {
+                    host: None,
+                    ..base.clone()
+                },
+            ),
+            (
+                "health.http.expected_statuses",
+                HttpCheckSpec {
+                    expected_statuses: Vec::new(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "health.http.expected_statuses",
+                HttpCheckSpec {
+                    expected_statuses: vec![StatusRange { lo: 300, hi: 300 }],
+                    ..base.clone()
+                },
+            ),
+            (
+                "health.http.expected_statuses",
+                HttpCheckSpec {
+                    expected_statuses: vec![StatusRange { lo: 200, hi: 700 }],
+                    ..base.clone()
+                },
+            ),
+            (
+                "health.http.receive",
+                HttpCheckSpec {
+                    receive: vec![Vec::new()],
+                    ..base.clone()
+                },
+            ),
+            (
+                "health.http.receive",
+                HttpCheckSpec {
+                    receive: vec![vec![b'x'; 257]],
+                    ..base.clone()
+                },
+            ),
+            (
+                "health.http.receive",
+                HttpCheckSpec {
+                    receive: (0..9).map(|_| vec![b'x']).collect(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "health.http.receive",
+                HttpCheckSpec {
+                    receive: (0..3).map(|_| vec![b'x'; 200]).collect(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "health.http.expected_statuses",
+                HttpCheckSpec {
+                    expected_statuses: (0..9)
+                        .map(|i| StatusRange {
+                            lo: i * 10,
+                            hi: i * 10 + 1,
+                        })
+                        .collect(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "health.http.response_buffer_size",
+                HttpCheckSpec {
+                    response_buffer_size: 0,
+                    ..base.clone()
+                },
+            ),
+            (
+                "health.http.response_buffer_size",
+                HttpCheckSpec {
+                    response_buffer_size: 4097,
+                    ..base.clone()
+                },
+            ),
+            (
+                "health.http.max_head_bytes",
+                HttpCheckSpec {
+                    max_head_bytes: 15,
+                    ..base.clone()
+                },
+            ),
+            (
+                "health.http.max_head_bytes",
+                HttpCheckSpec {
+                    max_head_bytes: 8193,
+                    ..base.clone()
+                },
+            ),
+            (
+                "health.http.headers",
+                HttpCheckSpec {
+                    headers: (0..17).map(|i| (format!("x-{i}"), "v".into())).collect(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "health.http.headers.value",
+                HttpCheckSpec {
+                    headers: vec![("x-probe".into(), "a\rb".into())],
+                    ..base.clone()
+                },
+            ),
+            (
+                "health.http.request_size",
+                HttpCheckSpec {
+                    headers: (0..16)
+                        .map(|i| (format!("x-pad-{i}"), "v".repeat(600)))
+                        .collect(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "health.http.receive",
+                HttpCheckSpec {
+                    method: HttpCheckMethod::Head,
+                    receive: vec![vec![b'x']],
+                    ..base.clone()
+                },
+            ),
         ];
 
         for (expected_field, spec) in cases {
@@ -862,7 +939,10 @@ x-probe: 1\r\n\
     fn pass_2xx_no_receive() {
         let compiled = valid_spec().compile().expect("valid spec");
         let mut codec = HttpCheckCodec::new(&compiled);
-        let step = codec.on_bytes(b"HTTP/1.1 200 OK\r\ncontent-length: 3\r\n\r\nok\n", &compiled);
+        let step = codec.on_bytes(
+            b"HTTP/1.1 200 OK\r\ncontent-length: 3\r\n\r\nok\n",
+            &compiled,
+        );
         assert_eq!(
             step,
             CodecStep::Done {
@@ -1055,7 +1135,10 @@ x-probe: 1\r\n\
     fn eof_before_head_fails() {
         let compiled = valid_spec().compile().expect("valid spec");
         let mut codec = HttpCheckCodec::new(&compiled);
-        assert_eq!(codec.on_bytes(b"HTTP/1.1 200", &compiled), CodecStep::NeedMore);
+        assert_eq!(
+            codec.on_bytes(b"HTTP/1.1 200", &compiled),
+            CodecStep::NeedMore
+        );
         assert_eq!(
             codec.on_eof(&compiled),
             CodecStep::Done {
@@ -1209,10 +1292,7 @@ x-probe: 1\r\n\
         };
         let compiled = spec.compile().expect("valid spec");
         let mut codec = HttpCheckCodec::new(&compiled);
-        let step = codec.on_bytes(
-            b"HTTP/1.1 200 OK\r\n\r\nxxxxxxxxxxNEEDLE",
-            &compiled,
-        );
+        let step = codec.on_bytes(b"HTTP/1.1 200 OK\r\n\r\nxxxxxxxxxxNEEDLE", &compiled);
         assert_eq!(
             step,
             CodecStep::Done {
@@ -1280,7 +1360,10 @@ x-probe: 1\r\n\
         let compiled = valid_spec().compile().expect("valid spec");
         let mut codec = HttpCheckCodec::new(&compiled);
 
-        let step4 = codec.on_bytes(b"HTTP/1.1 200 OK\r\ncontent-length: 3\r\n\r\nok\n", &compiled);
+        let step4 = codec.on_bytes(
+            b"HTTP/1.1 200 OK\r\ncontent-length: 3\r\n\r\nok\n",
+            &compiled,
+        );
         assert_eq!(
             step4,
             CodecStep::Done {

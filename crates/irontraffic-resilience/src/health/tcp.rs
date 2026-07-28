@@ -109,8 +109,7 @@ impl TcpCheckSpec {
         // Bounded to [1, 4096] by `validate()` above, which fits in `usize` on
         // every target this workspace supports; see the identical comment in
         // `HttpCheckSpec::compile`.
-        let response_buffer_size =
-            usize::try_from(self.response_buffer_size).unwrap_or(usize::MAX);
+        let response_buffer_size = usize::try_from(self.response_buffer_size).unwrap_or(usize::MAX);
         Ok(CompiledTcpCheck {
             send: self.send.into_boxed_slice(),
             receive,
