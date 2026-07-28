@@ -64,6 +64,30 @@ impl HttpCheckMethod {
     }
 }
 
+/// Header names `validate` refuses in a configured `headers` entry because
+/// [`serialize_request`] already emits them itself (`host`, `connection`) or
+/// because they would let a configured header contradict the framing this
+/// codec regenerates rather than copies from config (`content-length`,
+/// `transfer-encoding`, `te`, `upgrade`).
+///
+/// #739 should-fix 2: without this denylist, a config could produce a probe
+/// with two `host:` headers (RFC 9112 requires exactly one and recipients must
+/// reject), a `content-length` on a bodyless GET that a conforming upstream
+/// blocks on waiting for bytes that never arrive, ejecting the whole cluster,
+/// or a `connection` value that contradicts the codec's own `keep-alive`.
+/// `#94` never listed this among invariant 7's clauses; it is added here as a
+/// spec gap fix, not a deviation, per the workspace's `framing-fields-confined`
+/// principle that framing is regenerated from what is actually sent and never
+/// copied from config.
+const FRAMING_DENYLIST: [&str; 6] = [
+    "host",
+    "content-length",
+    "transfer-encoding",
+    "connection",
+    "te",
+    "upgrade",
+];
+
 /// True when `b` is an RFC 9110 Section 5.6.2 `tchar`: an ASCII digit, an ASCII
 /// letter, or one of `!`, `#`, `$`, `%`, `&`, `'`, `*`, `+`, `-`, `.`, `^`, `_`,
 /// `` ` ``, `|`, or `~`.
@@ -199,6 +223,22 @@ impl HttpCheckSpec {
                     "health.http.headers.name",
                     name,
                     "must be a non-empty sequence of RFC 9110 tchar bytes",
+                ));
+            }
+            // Checked case-insensitively: RFC 9110 header names are
+            // case-insensitive on the wire regardless of how an operator
+            // capitalizes them in configuration, and `is_tchar` above has
+            // already confirmed `name` holds nothing `eq_ignore_ascii_case`
+            // could misread (no CR, LF, or non-ASCII bytes).
+            if FRAMING_DENYLIST
+                .iter()
+                .any(|d| name.eq_ignore_ascii_case(d))
+            {
+                return Err(ConfigError::new(
+                    "health.http.headers.name",
+                    name,
+                    "must not set a framing header the codec already generates \
+                     (host, content-length, transfer-encoding, connection, te, upgrade)",
                 ));
             }
             if value.bytes().any(|b| b == b'\r' || b == b'\n') {
@@ -916,6 +956,48 @@ mod tests {
                 "health.http.headers.value",
                 HttpCheckSpec {
                     headers: vec![("x-probe".into(), "a\rb".into())],
+                    ..base.clone()
+                },
+            ),
+            (
+                "health.http.headers.name",
+                HttpCheckSpec {
+                    headers: vec![("host".into(), "evil.example".into())],
+                    ..base.clone()
+                },
+            ),
+            (
+                "health.http.headers.name",
+                HttpCheckSpec {
+                    headers: vec![("Content-Length".into(), "100".into())],
+                    ..base.clone()
+                },
+            ),
+            (
+                "health.http.headers.name",
+                HttpCheckSpec {
+                    headers: vec![("transfer-encoding".into(), "chunked".into())],
+                    ..base.clone()
+                },
+            ),
+            (
+                "health.http.headers.name",
+                HttpCheckSpec {
+                    headers: vec![("Connection".into(), "close".into())],
+                    ..base.clone()
+                },
+            ),
+            (
+                "health.http.headers.name",
+                HttpCheckSpec {
+                    headers: vec![("te".into(), "trailers".into())],
+                    ..base.clone()
+                },
+            ),
+            (
+                "health.http.headers.name",
+                HttpCheckSpec {
+                    headers: vec![("Upgrade".into(), "h2c".into())],
                     ..base.clone()
                 },
             ),
