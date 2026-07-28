@@ -1050,10 +1050,17 @@ version = "0.1.0"
 dependencies = [
  "base64",
  "blake3",
+ "bytes",
+ "http",
+ "http-body-util",
+ "hyper",
+ "hyper-rustls",
+ "hyper-util",
  "instant-acme",
  "irontraffic-tls",
  "schemars",
  "serde",
+ "serde_json",
  "tokio",
  "zeroize",
 ]

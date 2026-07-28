@@ -1484,12 +1484,15 @@ balance_drop_only_hits() {
 
 # ---------------------------------------------------------------------------
 # 16. transport-seam: the data plane is generic over hyper::rt::Read/Write, so
-#     tokio may be named directly only in the two crates that implement the
-#     seam. Without this rule the runtime is theoretically swappable rather
-#     than actually swappable, and the seam rots in about three months.
-# ---------------------------------------------------------------------------
+#     tokio may be named directly only in the three crates that implement or
+#     use the seam plus the ACME crate, which is control-plane-only and never
+#     linked into the request path. `irontraffic-acme` is allowlisted because
+#     `instant-acme` is tokio-native, and this crate is a control-plane
+#     consumer of it, not a transport-seam implementor. Without this rule the
+#     runtime is theoretically swappable rather than actually swappable, and
+#     the seam rots in about three months.
 hits="$(scan_prod transport-seam '(^|[^A-Za-z_])tokio::|^[[:space:]]*use tokio' \
-  | grep -vE '^crates/irontraffic-(io|runtime)/' || true)"
+  | grep -vE '^crates/irontraffic-(io|runtime|acme)/' || true)"
 [ -n "$hits" ] && fail transport-seam \
 "tokio:: and \`use tokio\` are permitted only in crates/irontraffic-io and
 crates/irontraffic-runtime, the two crates that implement the transport seam.
