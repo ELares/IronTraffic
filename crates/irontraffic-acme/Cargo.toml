@@ -2,9 +2,7 @@
 name = "irontraffic-acme"
 version.workspace = true
 edition.workspace = true
-rust-version.workspace = true
 license.workspace = true
-repository.workspace = true
 
 [features]
 default = []
@@ -15,6 +13,7 @@ schema = ["dep:schemars"]
 [dependencies]
 instant-acme = "0.8.5"
 serde = { workspace = true }
+serde_json = { workspace = true }
 schemars = { workspace = true, optional = true }
 zeroize = { workspace = true }
 blake3 = { workspace = true }
@@ -22,6 +21,13 @@ blake3 = { workspace = true }
 base64 = "0.22"
 tokio = { version = "1", default-features = false, features = ["time", "fs"] }
 irontraffic-tls = { path = "../irontraffic-tls", version = "0.1.0" }
+# HTTP client for directory fetch; all are transitive deps of instant-acme so no new crate tree
+http = "1"
+bytes = { workspace = true }
+hyper = { workspace = true }
+hyper-util = { workspace = true }
+http-body-util = "0.1"
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "tls12"] }
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
