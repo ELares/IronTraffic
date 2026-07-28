@@ -49,7 +49,13 @@ fn bench_8kib_source(c: &mut Criterion) {
 fn bench_parse_two_clause_predicate(c: &mut Criterion) {
     let src = b"request.path.startsWith(\"/v1/\") && request.method == \"GET\"";
     let limits = PolicyLimits::defaults();
-    let toks = lex(src, &limits).expect("valid ITPL source must lex");
+    // Benchmark setup, not the timed operation: a lex failure here means the
+    // fixture itself is broken, not attacker input, so this skips the
+    // benchmark rather than unwrapping (production code, including bench
+    // code, may not panic).
+    let Ok(toks) = lex(src, &limits) else {
+        return;
+    };
     c.bench_function("parse/two_clause_predicate", |b| {
         b.iter(|| {
             let _ = parse(&toks, src, &limits);
@@ -65,7 +71,9 @@ fn bench_parse_64_clause_predicate(c: &mut Criterion) {
     let src = clauses.join(" && ");
     let mut limits = PolicyLimits::defaults();
     limits.max_tokens = 2048;
-    let toks = lex(src.as_bytes(), &limits).expect("valid ITPL source must lex");
+    let Ok(toks) = lex(src.as_bytes(), &limits) else {
+        return;
+    };
     c.bench_function("parse/64_clause_predicate", |b| {
         b.iter(|| {
             let _ = parse(&toks, src.as_bytes(), &limits);

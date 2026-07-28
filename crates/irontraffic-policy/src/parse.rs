@@ -129,12 +129,11 @@ fn relop_of(t: Tok) -> Option<BinOp> {
 /// panic on an input an operator can write. Past the end, this returns an empty
 /// span at the end of the source.
 fn span_at(toks: &[Spanned], src: &[u8], pos: usize) -> Span {
-    match toks.get(pos) {
-        Some(s) => s.span,
-        None => {
-            let end = u32::try_from(src.len()).unwrap_or(u32::MAX);
-            Span::empty(end)
-        }
+    if let Some(s) = toks.get(pos) {
+        s.span
+    } else {
+        let end = u32::try_from(src.len()).unwrap_or(u32::MAX);
+        Span::empty(end)
     }
 }
 
@@ -154,7 +153,7 @@ struct Parser<'a> {
     args: Vec<NodeId>,
 }
 
-impl<'a> Parser<'a> {
+impl Parser<'_> {
     fn span_at(&self, pos: usize) -> Span {
         span_at(self.toks, self.src, pos)
     }
@@ -539,9 +538,9 @@ mod tests {
         PolicyLimits::defaults()
     }
 
-    fn parse_src(src: &[u8], limits: &PolicyLimits) -> Result<Ast, ParseError> {
-        let toks = lex(src, limits).expect("valid ITPL source must lex");
-        parse(&toks, src, limits)
+    fn parse_src(src: &[u8], limits: PolicyLimits) -> Result<Ast, ParseError> {
+        let toks = lex(src, &limits).expect("valid ITPL source must lex");
+        parse(&toks, src, &limits)
     }
 
     #[test]
@@ -553,7 +552,7 @@ mod tests {
 
     #[test]
     fn single_literal() {
-        let ast = parse_src(b"true", &default_limits()).unwrap();
+        let ast = parse_src(b"true", default_limits()).unwrap();
         assert_eq!(ast.nodes, vec![Node::Bool(true)]);
         assert_eq!(ast.root, NodeId(0));
         assert_eq!(ast.depth, 1);
@@ -565,7 +564,7 @@ mod tests {
         // `And { a, And { b, c } }`: a permutation-blind test (for example one
         // that only counts `And` nodes) cannot catch a right-associative
         // regression, so this asserts the exact arena.
-        let ast = parse_src(b"a && b && c", &default_limits()).unwrap();
+        let ast = parse_src(b"a && b && c", default_limits()).unwrap();
         assert_eq!(
             ast.nodes,
             vec![
@@ -588,7 +587,7 @@ mod tests {
     #[test]
     fn or_binds_looser_than_and() {
         // `a || b && c` must be `Or { a, And { b, c } }`.
-        let ast = parse_src(b"a || b && c", &default_limits()).unwrap();
+        let ast = parse_src(b"a || b && c", default_limits()).unwrap();
         assert_eq!(
             ast.nodes,
             vec![
@@ -613,7 +612,7 @@ mod tests {
         // `!a == b` is CEL's precedence: `Bin { Eq, Not { a }, b }`, not
         // `Not { Bin { Eq, a, b } }`, which is the common misconception this
         // test exists to pin.
-        let ast = parse_src(b"!a == b", &default_limits()).unwrap();
+        let ast = parse_src(b"!a == b", default_limits()).unwrap();
         assert_eq!(
             ast.nodes,
             vec![
@@ -633,7 +632,7 @@ mod tests {
     #[test]
     fn ternary_is_right_associative() {
         // `a ? b : c ? d : e` must be `Ternary { a, b, Ternary { c, d, e } }`.
-        let ast = parse_src(b"a ? b : c ? d : e", &default_limits()).unwrap();
+        let ast = parse_src(b"a ? b : c ? d : e", default_limits()).unwrap();
         let Node::Ternary { cond, then_, else_ } = ast.nodes[ast.root.index()] else {
             panic!("root is not a Ternary: {:?}", ast.nodes[ast.root.index()]);
         };
@@ -676,7 +675,7 @@ mod tests {
 
     #[test]
     fn parens_produce_no_node() {
-        let ast = parse_src(b"(true)", &default_limits()).unwrap();
+        let ast = parse_src(b"(true)", default_limits()).unwrap();
         assert_eq!(ast.nodes, vec![Node::Bool(true)]);
         assert_eq!(ast.root, NodeId(0));
     }
@@ -697,7 +696,7 @@ mod tests {
 
     #[test]
     fn empty_list_literal() {
-        let ast = parse_src(b"[]", &default_limits()).unwrap();
+        let ast = parse_src(b"[]", default_limits()).unwrap();
         assert_eq!(ast.nodes, vec![Node::List { from: 0, len: 0 }]);
         assert!(ast.args.is_empty());
     }
@@ -721,7 +720,7 @@ mod tests {
         limits.max_list_elems = 64;
         let elems: Vec<String> = (0..64).map(|i| i.to_string()).collect();
         let src = format!("[{}]", elems.join(", "));
-        let ast = parse_src(src.as_bytes(), &limits).unwrap();
+        let ast = parse_src(src.as_bytes(), limits).unwrap();
         // 64 `Int` literal nodes are pushed first, one per element, then the
         // `List` node referencing all of them through `args`.
         assert_eq!(ast.nodes.len(), 65);
@@ -828,7 +827,7 @@ mod tests {
         // nested parens reaches depth N + 1. depth == 3 is therefore 2
         // parens, accepted; 3 parens reaches depth 4, rejected.
         let accepted_src = format!("{}true{}", "(".repeat(2), ")".repeat(2));
-        let ast = parse_src(accepted_src.as_bytes(), &limits).unwrap();
+        let ast = parse_src(accepted_src.as_bytes(), limits).unwrap();
         assert_eq!(ast.depth, 3);
 
         let rejected_src = format!("{}true{}", "(".repeat(3), ")".repeat(3));
@@ -842,7 +841,7 @@ mod tests {
         // A "5-deep" expression: 4 nested parens plus the literal itself
         // reaches depth 5 (see the boundary test above for the arithmetic).
         let src = format!("{}true{}", "(".repeat(4), ")".repeat(4));
-        let ast = parse_src(src.as_bytes(), &default_limits()).unwrap();
+        let ast = parse_src(src.as_bytes(), default_limits()).unwrap();
         assert_eq!(ast.depth, 5);
     }
 
@@ -891,7 +890,7 @@ mod tests {
     #[test]
     fn index_with_string_literal() {
         let src = br#"request.headers["x-a"]"#;
-        let ast = parse_src(src, &default_limits()).unwrap();
+        let ast = parse_src(src, default_limits()).unwrap();
         let Node::Index { index, .. } = ast.nodes[ast.root.index()] else {
             panic!("root is not an Index");
         };
@@ -901,7 +900,7 @@ mod tests {
     #[test]
     fn index_with_dynamic_expression_parses() {
         let src = b"request.headers[request.method]";
-        let ast = parse_src(src, &default_limits()).unwrap();
+        let ast = parse_src(src, default_limits()).unwrap();
         let Node::Index { index, .. } = ast.nodes[ast.root.index()] else {
             panic!("root is not an Index");
         };
@@ -913,14 +912,16 @@ mod tests {
         // Exercises every variant that carries a `NodeId`, including `Call`
         // and `List`, whose children are reached through `args_of` rather
         // than a direct field.
+        use std::fmt::Write as _;
+
         let mut src = String::from(r#"a.startsWith("x") && b0"#);
         for i in 1..48 {
-            src.push_str(&format!(" && b{i}"));
+            write!(src, " && b{i}").expect("write! to a String never fails");
         }
         src.push_str(" && (c in [1, 2, 3])");
         let mut limits = default_limits();
         limits.max_tokens = 4096;
-        let ast = parse_src(src.as_bytes(), &limits).unwrap();
+        let ast = parse_src(src.as_bytes(), limits).unwrap();
         assert!(ast.nodes.len() >= 50);
         for (i, node) in ast.nodes.iter().enumerate() {
             let children: Vec<NodeId> = match *node {
@@ -956,7 +957,7 @@ mod tests {
 
     #[test]
     fn root_is_last_node() {
-        let ast = parse_src(b"a && b || c", &default_limits()).unwrap();
+        let ast = parse_src(b"a && b || c", default_limits()).unwrap();
         assert_eq!(ast.root.index(), ast.nodes.len() - 1);
     }
 
@@ -964,9 +965,9 @@ mod tests {
     fn parse_is_deterministic() {
         let src = b"request.path.startsWith(\"/v1/\") && request.method == \"GET\"";
         let limits = default_limits();
-        let first = parse_src(src, &limits).unwrap();
+        let first = parse_src(src, limits).unwrap();
         for _ in 0..100 {
-            let again = parse_src(src, &limits).unwrap();
+            let again = parse_src(src, limits).unwrap();
             assert_eq!(again.nodes, first.nodes);
             assert_eq!(again.args, first.args);
             assert_eq!(again.root, first.root);
