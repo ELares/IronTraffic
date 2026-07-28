@@ -227,9 +227,13 @@ fn exercise(bytes: &[u8], cfg: &CrlConfig) {
     // Coarse allocation-proportionality check, approximating the issue's stated fuzz contract
     // ("must not allocate more than 4 * input.len() + 1 MiB") with the built structure's own
     // reported size rather than a second global allocator layered under libFuzzer's sanitizer
-    // allocator, which the crate's real allocation-bound test in crl.rs already covers
-    // end to end at r = 1,000,000 using the thread-local counting allocator declared in
-    // name.rs; that hook is `pub(crate)` and not reachable from this separate fuzz crate.
+    // allocator. crl.rs's own crl_parse_1e6_allocation_bounded test measures a real
+    // allocated-byte DELTA for build() via the thread-local counting probe in name.rs's
+    // alloc_probe module, but that hook is `pub(crate)` and not reachable from this separate
+    // fuzz crate, and it is instrumented only at build()'s known allocation sites, not at every
+    // allocation libFuzzer's sanitizer allocator would see. This assertion is therefore a
+    // weaker, size-based proxy for the same contract, not a claim that this target reaches the
+    // same coverage as that test.
     assert!(
         idx.len() <= cfg.max_entries,
         "index holds more entries than max_entries allows"

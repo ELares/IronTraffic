@@ -611,8 +611,10 @@ impl RevocationIndex {
     /// authenticated.
     ///
     /// # Errors
-    /// `CrlError::TooManyEntries`, `CrlError::SerialTooLong`, `CrlError::AlreadyExpired`,
-    /// `CrlError::NotYetValid`.
+    /// `CrlError::Parse`, `CrlError::TooManyEntries`, `CrlError::SerialTooLong`,
+    /// `CrlError::AlreadyExpired`, `CrlError::NotYetValid`. `Parse` propagates from the
+    /// `Result` the serial iterator yields (see `SerialIter::next`) via the `?` on `item`
+    /// below; `parse` itself is infallible once it has already returned a `ParsedCrl`.
     pub fn build(
         verified: &VerifiedCrl<'_>,
         now: UnixSeconds,
@@ -624,10 +626,22 @@ impl RevocationIndex {
             return Err(CrlError::NotYetValid);
         }
 
-        if let Some(next) = verified.next_update()
-            && next.get().saturating_add(skew) < now.get()
-        {
-            return Err(CrlError::AlreadyExpired);
+        if let Some(next) = verified.next_update() {
+            if next.get().saturating_add(skew) < now.get() {
+                return Err(CrlError::AlreadyExpired);
+            }
+        } else {
+            // No nextUpdate: apply the same refusal using freshness's own synthetic expiry
+            // (thisUpdate + no_next_update_ttl_secs), so a CRL cannot be installed already past
+            // its own synthetic expiry window. Without this, build returned Ok for a CRL whose
+            // freshness() already reported Expired at the instant of construction: a CRL 22
+            // years past its synthetic expiry built successfully (#729 SHOULD_FIX 5).
+            let synthetic_next = verified
+                .this_update()
+                .saturating_add_secs(u64::from(cfg.no_next_update_ttl_secs));
+            if synthetic_next.get().saturating_add(skew) < now.get() {
+                return Err(CrlError::AlreadyExpired);
+            }
         }
 
         let mut serials_vec: Vec<u128> = Vec::new();
@@ -642,18 +656,48 @@ impl RevocationIndex {
                 return Err(CrlError::SerialTooLong);
             }
             if serial.len() > 16 {
+                #[cfg(test)]
+                crate::name::alloc_probe::record(serial.len());
                 wide_set.insert(serial.to_vec().into_boxed_slice());
             } else {
+                #[cfg(test)]
+                let cap_before = serials_vec.capacity();
                 serials_vec.push(pack_serial(serial));
+                #[cfg(test)]
+                {
+                    let cap_after = serials_vec.capacity();
+                    if cap_after > cap_before {
+                        // Vec's growth strategy performs exactly one reallocation per capacity
+                        // increase; the delta in capacity is the delta in bytes actually
+                        // allocated for this element type, independent of how many elements
+                        // are logically present yet. This is what lets
+                        // crl_parse_1e6_allocation_bounded see the transient over-allocation
+                        // from push()'s doubling growth, not just the final structure's size.
+                        crate::name::alloc_probe::record(
+                            (cap_after - cap_before) * core::mem::size_of::<u128>(),
+                        );
+                    }
+                }
             }
         }
 
         serials_vec.sort_unstable();
         serials_vec.dedup();
 
+        #[cfg(test)]
+        if serials_vec.capacity() != serials_vec.len() {
+            // into_boxed_slice() below reallocates to the exact length when capacity and
+            // length differ (the common case after dedup shrinks the logical length below the
+            // capacity push() grew).
+            crate::name::alloc_probe::record(serials_vec.len() * core::mem::size_of::<u128>());
+        }
+
         let bloom = build_bloom(&serials_vec, &wide_set);
         let blocks = u32::try_from(bloom.len() / (BLOOM_BLOCK_BYTES / 8))
             .map_err(|_| CrlError::TooManyEntries)?;
+
+        #[cfg(test)]
+        crate::name::alloc_probe::record(verified.parsed.issuer_dn.len());
 
         Ok(Self {
             issuer_dn: verified.parsed.issuer_dn.to_vec().into_boxed_slice(),
@@ -796,6 +840,8 @@ fn build_bloom(serials: &[u128], wide: &HashSet<Box<[u8]>>) -> Box<[u64]> {
     let bits = bits.div_ceil(512) * 512;
     let words = bits / 64;
     let mut bloom = vec![0u64; words];
+    #[cfg(test)]
+    crate::name::alloc_probe::record(words * core::mem::size_of::<u64>());
     let blocks = u64::try_from(words / (BLOOM_BLOCK_BYTES / 8)).unwrap_or(1);
 
     for packed in serials {
@@ -914,6 +960,7 @@ impl CrlSet {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::name::alloc_probe;
     use proptest::prelude::*;
 
     // -----------------------------------------------------------------------
@@ -1852,19 +1899,30 @@ mod tests {
     #[test]
     fn crl_all_ff_refused() {
         // 256 MiB of 0xFF
-        let cfg = default_cfg();
-        let _ = cfg;
         let big = vec![0xffu8; 268_435_456];
-        // Should be refused by size check since max_bytes default is 268_435_456
+        // One byte under the input length: refused by the size check before any parse
+        // attempt, per edge case 4 ("max_bytes exactly and one over").
         let mut cfg_small = default_cfg();
         cfg_small.max_bytes = 268_435_455;
         assert_eq!(parse(&big, &cfg_small), Err(CrlError::TooLarge));
 
-        // With a raised max_bytes, should fail DER parse (not OOM)
-        let cfg_large = default_cfg();
-        let _ = cfg_large;
+        // With a raised max_bytes, parse is attempted and must fail as a decode error, not an
+        // OOM: 0xFF is not a valid outer SEQUENCE tag, so the walk fails on the first header it
+        // reads. Assert the exact variant, not is_err() (#729 SHOULD_FIX 2).
+        alloc_probe::reset();
         let result = parse(&big, &default_cfg());
-        assert!(result.is_err());
+        let delta = alloc_probe::bytes();
+        assert_eq!(result, Err(CrlError::Parse));
+        // Edge case 18: must not OOM. parse borrows the input and never copies it, so the
+        // allocated-byte delta for this call must be far under twice the input length; in
+        // practice it is exactly zero, since parse never allocates at all. If a future change
+        // makes parse allocate, it must also call alloc_probe::record at the new site (see
+        // name.rs's alloc_probe doc) or this assertion silently stops measuring anything.
+        assert!(
+            delta < 2 * big.len(),
+            "parse allocated {delta} bytes for a {}-byte input, exceeding the 2x bound",
+            big.len()
+        );
     }
 
     #[test]
@@ -1956,8 +2014,14 @@ mod tests {
 
     #[test]
     fn crl_parse_1e6_allocation_bounded() {
-        // Build a CRL with 1,000,000 entries and verify build succeeds with
-        // bounded memory (final memory_bytes < 200 MB).
+        // Build a CRL with 1,000,000 entries and assert the ALLOCATED-BYTE DELTA of the
+        // build() call itself is under 200 MB, using the thread-local counting probe in
+        // name.rs's alloc_probe module (#123's acceptance criterion). This is a different and
+        // stricter quantity than the final structure's own memory_bytes(), which
+        // crl_memory_bytes_under_20mb already asserts on this same fixture with a 10x tighter
+        // bound: memory_bytes() cannot see the transient over-allocation from Vec's doubling
+        // growth strategy while push() is still running, only what survives into the final
+        // boxed slices. #729 BLOCKING 3.
         let cfg = default_cfg();
         let serials: Vec<Vec<u8>> = (0u64..1_000_000)
             .map(|i| {
@@ -1971,8 +2035,17 @@ mod tests {
         let parsed = parse(&der, &cfg).expect("should parse 1M CRL");
         let verified =
             verify_signature(parsed, &ca_fixture().issuer_der).expect("fixture CRL must verify");
+        alloc_probe::reset();
         let idx = RevocationIndex::build(&verified, UnixSeconds::new(1_704_000_000), &cfg)
             .expect("build should succeed");
+        let delta = alloc_probe::bytes();
+        assert!(
+            alloc_probe::count() > 0,
+            "alloc_probe recorded zero events; the instrumented allocation sites in \
+             RevocationIndex::build were not reached, so this assertion is not measuring \
+             anything"
+        );
+        assert!(delta < 200 * 1024 * 1024, "allocated-byte delta {delta} >= 200 MB");
         let bytes = idx.memory_bytes();
         assert!(bytes < 200 * 1024 * 1024, "memory_bytes {bytes} >= 200 MB");
     }

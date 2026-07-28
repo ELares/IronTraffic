@@ -380,7 +380,15 @@ pub fn label_count(name: &str) -> usize {
 ///
 /// NOT a `#[global_allocator]`: `unsafe` is denied in this crate and a process-wide allocator is
 /// unsound in a parallel test binary anyway. Instead, tests that need to bound allocation call
-/// `record` explicitly at known allocation sites or use `memory_bytes()` on the final structure.
+/// `record` explicitly at known allocation sites, either directly or, for `crl.rs`, through
+/// `#[cfg(test)]`-gated instrumentation inside `RevocationIndex::build` and `build_bloom` that
+/// records the exact size of every heap allocation those functions make (a `Vec` capacity growth
+/// observed via `capacity()` before and after each push, a boxed slice's known length, or a
+/// single `vec![0u64; words]` fill). `crl_parse_1e6_allocation_bounded` calls `reset` before
+/// `RevocationIndex::build` and reads `bytes()` after, so the counter reports the ALLOCATED-BYTE
+/// DELTA for that one call, a different and stricter quantity than `memory_bytes()` on the
+/// resulting structure: `memory_bytes()` is the final structure's own size, and does not see the
+/// transient over-allocation from `Vec`'s doubling growth strategy that this counter does.
 ///
 /// Added by issue #123 to bound the peak memory of a 1,000,000-entry CRL index build. The existing
 /// allocation counter in this module (a `thread_local!` `Cell<usize>` counting allocation events)
@@ -397,40 +405,28 @@ pub(crate) mod alloc_probe {
         static BYTES: Cell<usize> = const { Cell::new(0) };
     }
 
-    /// Record an allocation of `n` bytes.
-    #[allow(
-        dead_code,
-        reason = "alloc probe counters for issue #123 CRL memory tests; no test currently calls record because the allocation-bounded tests use memory_bytes() on the final index instead"
-    )]
+    /// Record an allocation of `n` bytes. Called from `crl.rs`'s `RevocationIndex::build` and
+    /// `build_bloom` at each known allocation site.
     pub(crate) fn record(n: usize) {
         COUNT.with(|c| c.set(c.get() + 1));
         BYTES.with(|c| c.set(c.get() + n));
     }
 
-    /// Reset both counters.
-    #[allow(
-        dead_code,
-        reason = "same as record: kept for symmetry with the existing COUNT/BYTES probe API"
-    )]
+    /// Reset both counters. Called before the section of code under measurement.
     pub(crate) fn reset() {
         COUNT.with(|c| c.set(0));
         BYTES.with(|c| c.set(0));
     }
 
-    /// Allocation event count.
-    #[allow(
-        dead_code,
-        reason = "same as record: kept for symmetry with the existing COUNT/BYTES probe API"
-    )]
+    /// Allocation event count: how many `record` calls have fired since the last `reset`.
+    /// `crl_parse_1e6_allocation_bounded` asserts this is nonzero, so a future edit that routes
+    /// around the instrumented allocation sites (rather than removing the need for them) still
+    /// leaves a signal that the probe stopped observing anything.
     pub(crate) fn count() -> usize {
         COUNT.with(std::cell::Cell::get)
     }
 
-    /// Allocated byte count.
-    #[allow(
-        dead_code,
-        reason = "same as record: kept for symmetry with the existing COUNT/BYTES probe API"
-    )]
+    /// Allocated byte count since the last `reset`.
     pub(crate) fn bytes() -> usize {
         BYTES.with(std::cell::Cell::get)
     }
