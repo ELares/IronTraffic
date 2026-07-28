@@ -383,7 +383,10 @@ mod tests {
     fn selected_by_key_type_counts_the_served_key_type() {
         let ecdsa = gen_cred(&rcgen::PKCS_ECDSA_P256_SHA256, "a.example.com");
         let idx = ecdsa.key_type() as usize;
-        assert_ne!(idx, 0, "slot 0 is never written; the fixture must not land there");
+        assert_ne!(
+            idx, 0,
+            "slot 0 is never written; the fixture must not land there"
+        );
 
         let mut certs_builder = CertIndexBuilder::new([1u8; 16]);
         certs_builder
@@ -419,9 +422,14 @@ mod tests {
         for (i, (b, a)) in before.iter().zip(after.iter()).enumerate() {
             let expected = if i == idx { b + 1 } else { *b };
             assert_eq!(
-                *a, expected,
+                *a,
+                expected,
                 "slot {i} must {} after one resolve of a {:?} credential",
-                if i == idx { "increment" } else { "be untouched" },
+                if i == idx {
+                    "increment"
+                } else {
+                    "be untouched"
+                },
                 ecdsa.key_type()
             );
         }
@@ -527,7 +535,10 @@ mod tests {
         let mut schemes = vec![rustls::SignatureScheme::ECDSA_NISTP256_SHA256];
         schemes.resize(200, rustls::SignatureScheme::RSA_PKCS1_SHA256);
         let caps = caps_from_schemes(&schemes);
-        assert!(caps.ecdsa_p256, "a scheme inside the 64 window must be seen");
+        assert!(
+            caps.ecdsa_p256,
+            "a scheme inside the 64 window must be seen"
+        );
 
         // A scheme placed past the window must NOT be seen, which is what makes the cap
         // observable rather than merely present in the source.
