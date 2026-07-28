@@ -248,6 +248,20 @@ pub enum HandshakeError {
     /// rather than `#[from]`; `parse_ws_version` and the field helpers report a
     /// `RejectReason` and this module propagates them with `?`.
     Field(RejectReason),
+    /// The selected subprotocol sits at a byte offset the `(u16, u16)` range this type
+    /// returns cannot represent, so the range would not resolve to the bytes `verify`
+    /// validated.
+    ///
+    /// [`FieldSlot`](irontraffic_http::section::FieldSlot)'s offsets are `u32` and
+    /// `Limits::CEILING.max_header_list_bytes` is 1 MiB, so a response header section
+    /// above 65,535 bytes is a supported configuration. Clamping with
+    /// `unwrap_or(u16::MAX)` was the original behaviour and it failed OPEN: `verify`
+    /// returned `Ok` while handing back either an out-of-bounds empty range or, worse,
+    /// an in-bounds TRUNCATED range resolving to a different, plausible-looking name
+    /// (`supe` where the validated value was `superchat`). That is verbatim the hazard
+    /// [`UpgradeResponse`]'s own doc says the design exists to prevent, so the
+    /// unrepresentable case now refuses instead.
+    SubprotocolRangeUnrepresentable,
 }
 
 impl core::fmt::Display for HandshakeError {
@@ -307,6 +321,10 @@ impl core::fmt::Display for HandshakeError {
             HandshakeError::DuplicateUpgrade => write!(f, "more than one upgrade field line"),
             HandshakeError::Duplicate(_) => write!(f, "field appeared more than once"),
             HandshakeError::Field(reason) => write!(f, "field rejected: {reason:?}"),
+            HandshakeError::SubprotocolRangeUnrepresentable => write!(
+                f,
+                "selected subprotocol sits past the representable range of the response header section"
+            ),
         }
     }
 }
@@ -381,6 +399,9 @@ impl HandshakeError {
             HandshakeError::DuplicateUpgrade => "ws_duplicate_upgrade",
             HandshakeError::Duplicate(_) => "ws_duplicate_field",
             HandshakeError::Field(reason) => reason.metric_label(),
+            HandshakeError::SubprotocolRangeUnrepresentable => {
+                "ws_subprotocol_range_unrepresentable"
+            }
         }
     }
 }
@@ -427,20 +448,26 @@ fn parse_ws_version(value: &[u8]) -> Result<u32, RejectReason> {
 /// returned `Ok(Some(_))`, which proves exactly one such slot exists; the loop below
 /// therefore always finds it; the panic-free fallback exists only because this
 /// function's return type has no way to express "impossible".
-fn subprotocol_value_range(headers: &FieldSection) -> (u16, u16) {
+/// Returns `None` when the slot's offsets do not fit the `(u16, u16)` return type, which
+/// is the FAIL-CLOSED half of this function. Clamping with `unwrap_or(u16::MAX)` was the
+/// original behaviour and it failed open: past a 65,535-byte arena the caller received a
+/// range that did not resolve to the bytes `verify` had validated, while `verify` still
+/// returned `Ok`. `FieldSlot`'s offsets are `u32` and `Limits::CEILING` permits a 1 MiB
+/// header list, so that arena size is a supported configuration, not a hypothetical.
+fn subprotocol_value_range(headers: &FieldSection) -> Option<(u16, u16)> {
     for (i, slot) in headers.slots().iter().enumerate() {
         if headers.name_at(i) == Some(SEC_WEBSOCKET_PROTOCOL) {
-            let start = u16::try_from(slot.value_off).unwrap_or(u16::MAX);
+            let start = u16::try_from(slot.value_off).ok()?;
             let value_end = u64::from(slot.value_off).saturating_add(u64::from(slot.value_len));
-            let end = u16::try_from(value_end).unwrap_or(u16::MAX);
-            return (start, end);
+            let end = u16::try_from(value_end).ok()?;
+            return Some((start, end));
         }
     }
     debug_assert!(
         false,
         "sec-websocket-protocol slot vanished between get_unique and this scan"
     );
-    (0, 0)
+    None
 }
 
 impl UpgradeRequest {
@@ -743,9 +770,12 @@ impl UpgradeResponse {
             None => Ok(UpgradeResponse {
                 selected_subprotocol: None,
             }),
-            Some(p) if req.offered(p) => Ok(UpgradeResponse {
-                selected_subprotocol: Some(subprotocol_value_range(headers)),
-            }),
+            Some(p) if req.offered(p) => match subprotocol_value_range(headers) {
+                Some(range) => Ok(UpgradeResponse {
+                    selected_subprotocol: Some(range),
+                }),
+                None => Err(HandshakeError::SubprotocolRangeUnrepresentable),
+            },
             Some(_) => Err(HandshakeError::UnofferedSubprotocol),
         }
     }
@@ -801,18 +831,19 @@ mod tests {
             HandshakeError::DuplicateUpgrade => 16,
             HandshakeError::Duplicate(_) => 17,
             HandshakeError::Field(_) => 18,
+            HandshakeError::SubprotocolRangeUnrepresentable => 19,
         }
     }
 
     #[allow(
         clippy::too_many_lines,
-        reason = "one table of 19 HandshakeError variants, each with its expected metric \
+        reason = "one table of 20 HandshakeError variants, each with its expected metric \
                   label and status; splitting it would break the 1:1 mapping to the enum \
                   the ordinal function above enforces"
     )]
     #[test]
     fn handshake_error_mappings_are_exhaustive_and_pinned() {
-        let cases: [(HandshakeError, &str, u16); 19] = [
+        let cases: [(HandshakeError, &str, u16); 20] = [
             (
                 HandshakeError::UpgradeTokenNotWebsocket,
                 "ws_upgrade_token_not_websocket",
@@ -884,6 +915,11 @@ mod tests {
             (
                 HandshakeError::Field(RejectReason::FieldNameEmpty),
                 RejectReason::FieldNameEmpty.metric_label(),
+                400,
+            ),
+            (
+                HandshakeError::SubprotocolRangeUnrepresentable,
+                "ws_subprotocol_range_unrepresentable",
                 400,
             ),
         ];

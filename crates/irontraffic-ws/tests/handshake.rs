@@ -811,3 +811,78 @@ proptest::proptest! {
         }
     }
 }
+
+/// A response header section whose arena pushes `sec-websocket-protocol` past the
+/// 65,535-byte offset that `UpgradeResponse`'s `(u16, u16)` range can represent.
+///
+/// Built with `Limits::CEILING`, not `Limits::DEFAULT`: the ceiling permits a 1 MiB
+/// header list and `limits.rs`'s own module doc says `Limits` "is populated by an
+/// operator-supplied configuration in a later milestone", so this is a supported
+/// configuration rather than a synthetic one.
+fn build_oversized_section(fields: &[(&[u8], &[u8])], pad_to: usize) -> Option<FieldSection> {
+    let limits = Limits::CEILING.clamped();
+    let mut arena = BytesMut::new();
+    let mut builder = FieldSectionBuilder::new(&arena, &limits);
+    let filler = vec![b'x'; 1024];
+    let mut i = 0_u32;
+    while arena.len() < pad_to {
+        let name = format!("x-pad-{i}");
+        builder.push(&mut arena, name.as_bytes(), &filler).ok()?;
+        i += 1;
+    }
+    for (name, value) in fields {
+        builder.push(&mut arena, name, value).ok()?;
+    }
+    Some(builder.finish(&mut arena))
+}
+
+/// The selected subprotocol sits past the representable range, so `verify` REFUSES
+/// rather than returning `Ok` with a range that does not resolve to what it validated.
+///
+/// Before this was fixed, `subprotocol_value_range` clamped both offsets with
+/// `u16::try_from(..).unwrap_or(u16::MAX)` and `verify` returned `Ok`. Two shapes came
+/// out of that: an out-of-bounds `(65535, 65535)` that panics any caller doing the
+/// obvious `&arena[s..e]`, and, worse, an in-bounds TRUNCATED range resolving to a
+/// different plausible name, `supe` where the value checked against `offered()` was
+/// `superchat`. `UpgradeResponse`'s own doc names that as the hazard the design exists
+/// to prevent, and clamping reintroduced it in the fail-OPEN direction.
+#[test]
+fn response_subprotocol_past_u16_range_is_refused_not_clamped() {
+    let head = b"GET /chat HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: superchat\r\n\r\n";
+    let (req, tokens) = upgrade(head).expect("test fixture must parse and canonicalize");
+    let upgrade_req = UpgradeRequest::parse(&req, tokens).unwrap().unwrap();
+    let accept = accept_key(upgrade_req.key_b64());
+
+    // `superchat` IS offered, so step 5 reaches the range computation rather than
+    // refusing earlier for an unoffered name. Only the offset is out of range.
+    let big = build_oversized_section(
+        &[
+            (b"upgrade", b"websocket"),
+            (b"connection", b"Upgrade"),
+            (b"sec-websocket-accept", &accept[..]),
+            (b"sec-websocket-protocol", b"superchat"),
+        ],
+        70_000,
+    )
+    .expect("an oversized but ceiling-legal section must build");
+
+    let slot_off = big
+        .slots()
+        .iter()
+        .enumerate()
+        .find(|(i, _)| big.name_at(*i) == Some(b"sec-websocket-protocol".as_slice()))
+        .map(|(_, s)| s.value_off)
+        .expect("the protocol slot must exist");
+    assert!(
+        slot_off > u32::from(u16::MAX),
+        "fixture must place the slot past u16::MAX to exercise the guard, got {slot_off}"
+    );
+
+    let big_tokens = response_tokens(&big);
+    assert_eq!(
+        UpgradeResponse::verify(&upgrade_req, 101, &big, big_tokens).unwrap_err(),
+        HandshakeError::SubprotocolRangeUnrepresentable,
+        "an unrepresentable offset must REFUSE; clamping it returned Ok with a range \
+         resolving to bytes verify never validated"
+    );
+}
