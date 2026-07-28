@@ -950,9 +950,12 @@ takes bytes; it has no opinion about where they came from. Whatever fetches a CR
 MUST apply the same URL policy `ocsp-staple-validation-and-updater` (#122) requires for OCSP AIA
 URLs, and for the identical reason: a CRL distribution point is a URL taken out of a certificate,
 so it is not operator-supplied in every deployment, and fetching it unchecked is a server-side
-request forgery primitive pointed at the cloud metadata service. `crate::ocsp::validate_aia_url` is
-`pub` for exactly this reuse; a fetcher that calls it on the distribution point URL but not on
-every redirect target has applied only half the policy.
+request forgery primitive pointed at the cloud metadata service. Neither an `ocsp` module nor a
+CRL fetcher exists in this tree yet (#122 has not landed as of this writing), so this is a
+requirement on work that has not been written, not a claim about a helper that can be checked
+today: when #122 lands its URL-validation helper, a CRL fetcher MUST call it on the distribution
+point URL and on every redirect target, since calling it only on the first URL applies just half
+the policy.
 
 **Delta CRLs are refused, not partially applied.** `parse` reads only the extension OIDs inside
 `crlExtensions` looking for `deltaCRLIndicator` (`2.5.29.27`); finding it is

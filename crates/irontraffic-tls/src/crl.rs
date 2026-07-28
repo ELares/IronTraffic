@@ -194,7 +194,16 @@ pub struct ParsedCrl<'a> {
     this_update: UnixSeconds,
     next_update: Option<UnixSeconds>,
     tbs_span: &'a [u8],
-    sig_alg_der: &'a [u8],
+    /// `TBSCertList`'s own `signature AlgorithmIdentifier` (RFC 5280 5.1.1.2): inside
+    /// `tbs_span`, therefore covered by the signature. `verify_signature` selects the
+    /// verification algorithm from THIS field, not `outer_sig_alg_der`.
+    inner_sig_alg_der: &'a [u8],
+    /// The outer `CertificateList.signatureAlgorithm`: outside `tbs_span`, therefore NOT
+    /// covered by the signature. RFC 5280 5.1.1.2 requires it be identical to
+    /// `inner_sig_alg_der`; `verify_signature` checks that before it selects an algorithm from
+    /// either field, so this one is never used to pick the verification algorithm itself
+    /// (issue #729, should fix item 4).
+    outer_sig_alg_der: &'a [u8],
     signature: &'a [u8],
     serials: &'a [u8],
 }
@@ -223,12 +232,10 @@ impl<'a> ParsedCrl<'a> {
         SerialIter::new(self.serials)
     }
 
-    /// The encoded `TBSCertList` span, which is the signed message.
+    /// The encoded `TBSCertList` span, which is the signed message. Used by
+    /// `prop_parse_never_panics`'s anti-splicing property to restrict a fuzzed byte flip to
+    /// the signed region rather than an unauthenticated trailing one.
     #[cfg(test)]
-    #[allow(
-        dead_code,
-        reason = "convenience accessor matching the pattern of issuer_dn, this_update, etc; no test currently reads tbs_span directly because the field is pub(crate)"
-    )]
     pub(crate) fn tbs_span(&self) -> &'a [u8] {
         self.tbs_span
     }
@@ -341,7 +348,7 @@ pub fn parse<'a>(der: &'a [u8], cfg: &CrlConfig) -> Result<ParsedCrl<'a>, CrlErr
     let tbs_span = tbs_tlv;
     let parsed_tbs = parse_tbs_cert_list(tbs_tlv)?;
 
-    let sig_alg_tlv = read_next_tlv(&mut outer)?;
+    let outer_sig_alg_tlv = read_next_tlv(&mut outer)?;
     let sig_value_tlv = read_next_tlv(&mut outer)?;
     let signature = signature_bytes(sig_value_tlv)?;
 
@@ -350,7 +357,8 @@ pub fn parse<'a>(der: &'a [u8], cfg: &CrlConfig) -> Result<ParsedCrl<'a>, CrlErr
         this_update: parsed_tbs.this_update,
         next_update: parsed_tbs.next_update,
         tbs_span,
-        sig_alg_der: sig_alg_tlv,
+        inner_sig_alg_der: parsed_tbs.inner_sig_alg,
+        outer_sig_alg_der: outer_sig_alg_tlv,
         signature,
         serials: parsed_tbs.serials,
     })
@@ -377,6 +385,9 @@ struct ParsedTbs<'a> {
     issuer_dn: &'a [u8],
     this_update: UnixSeconds,
     next_update: Option<UnixSeconds>,
+    /// `TBSCertList`'s own `signature AlgorithmIdentifier` TLV: inside the signed span, unlike
+    /// the outer `CertificateList.signatureAlgorithm` (RFC 5280 5.1.1.2).
+    inner_sig_alg: &'a [u8],
     serials: &'a [u8],
 }
 
@@ -395,8 +406,11 @@ fn parse_tbs_cert_list(tbs_tlv: &[u8]) -> Result<ParsedTbs<'_>, CrlError> {
         }
     }
 
-    // signature AlgorithmIdentifier (captured via TLV).
-    let _sig_alg_tlv = read_next_tlv(&mut tbs)?;
+    // signature AlgorithmIdentifier: TBSCertList's own copy, inside the signed span. Captured
+    // (not discarded) so verify_signature can compare it against the outer
+    // signatureAlgorithm and select the verification algorithm from this one (RFC 5280
+    // 5.1.1.2; #729 SHOULD_FIX 4).
+    let inner_sig_alg = read_next_tlv(&mut tbs)?;
 
     // issuer Name.
     let issuer_tlv = read_next_tlv(&mut tbs)?;
@@ -420,6 +434,7 @@ fn parse_tbs_cert_list(tbs_tlv: &[u8]) -> Result<ParsedTbs<'_>, CrlError> {
         issuer_dn,
         this_update,
         next_update,
+        inner_sig_alg,
         serials,
     })
 }
@@ -548,15 +563,27 @@ pub fn verify_signature<'a>(
     // `rustls_pki_types::AlgorithmIdentifier` holds the SEQUENCE CONTENTS of an
     // AlgorithmIdentifier, not the full TLV: see its own doc example, which builds
     // `RSA_ENCRYPTION` from bytes starting at 0x06 (OBJECT IDENTIFIER) with no leading
-    // `0x30 <len>` SEQUENCE header. `parsed.sig_alg_der` and `spki_alg_der` are both full
+    // `0x30 <len>` SEQUENCE header. `parsed.inner_sig_alg_der` and `spki_alg_der` are both full
     // TLVs (one captured via `der::Reader::tlv_bytes`, the other emitted by `Encode::to_der`),
     // so comparing them directly against the constants can never match. Strip the outer
     // SEQUENCE header from each with a real DER parser before comparing contents to contents;
     // a SEQUENCE header is not a fixed-width prefix, so this cannot be a hardcoded byte
     // offset. The parameters field (for example RSA's `NULL {}`) stays part of the compared
     // content on both sides, since it is part of the algorithm's identity.
-    let sig_alg_content = read_sequence_content(parsed.sig_alg_der)?;
+    let inner_sig_alg_content = read_sequence_content(parsed.inner_sig_alg_der)?;
     let spki_alg_content = read_sequence_content(spki_alg_der.as_slice())?;
+
+    // RFC 5280 5.1.1.2: TBSCertList's own `signature` field and the outer
+    // `signatureAlgorithm` MUST be identical. The outer field sits OUTSIDE `tbs_span`, so it
+    // is not covered by the signature; selecting the verification algorithm from it (as
+    // opposed to the inner, signed copy) would let an off-path attacker who controls only the
+    // outer bytes steer which algorithm this function trusts, without ever having the issuing
+    // key. Compare before selecting, and select from the inner field, never the outer one
+    // (#729 SHOULD_FIX 4).
+    let outer_sig_alg_content = read_sequence_content(parsed.outer_sig_alg_der)?;
+    if inner_sig_alg_content != outer_sig_alg_content {
+        return Err(CrlError::UnsupportedSignatureAlgorithm);
+    }
 
     let provider = crate::provider::provider().ok_or(CrlError::ProviderNotInstalled)?;
     let alg = provider
@@ -564,7 +591,7 @@ pub fn verify_signature<'a>(
         .all
         .iter()
         .find(|a| {
-            a.signature_alg_id().as_ref() == sig_alg_content
+            a.signature_alg_id().as_ref() == inner_sig_alg_content
                 && a.public_key_alg_id().as_ref() == spki_alg_content
         })
         .ok_or(CrlError::UnsupportedSignatureAlgorithm)?;
@@ -1053,10 +1080,9 @@ mod tests {
             buf
         }
 
-        #[allow(
-            dead_code,
-            reason = "kept for symmetry with encode_utctime; may be used by future tests that need GeneralizedTime"
-        )]
+        /// Used by `crl_generalized_time_this_update_parses`: #123's design allows
+        /// `thisUpdate`/`nextUpdate` to be encoded as either `UTCTime` or `GeneralizedTime`, and
+        /// every other fixture in this module only ever encodes `UTCTime`.
         pub(crate) fn encode_generalized_time(secs: u64) -> Vec<u8> {
             let dt = date_time_from_unix(secs);
             let t = GeneralizedTime::from_date_time(dt);
@@ -1495,7 +1521,7 @@ mod tests {
         with_padding.extend_from_slice(&[0xff; 16]);
         assert!(idx.is_revoked(&with_padding));
         // Should have 0 wide serials
-        assert!(idx.wide.is_empty());
+        assert!(idx.wide().is_empty());
     }
 
     #[test]
@@ -1598,6 +1624,66 @@ mod tests {
             idx.freshness(UnixSeconds::new(now + 172_801), &cfg),
             Freshness::Expired
         );
+    }
+
+    #[test]
+    fn crl_no_next_update_already_expired_at_install_is_refused() {
+        // #729 SHOULD_FIX 5: the AlreadyExpired guard in build only looked at an explicit
+        // nextUpdate, so a CRL with no nextUpdate at all skipped the staleness check entirely,
+        // and build returned Ok for a CRL already Expired by its own freshness() at the instant
+        // of construction. Apply the same refusal using the synthetic expiry
+        // (thisUpdate + no_next_update_ttl_secs) freshness() itself uses when nextUpdate is
+        // absent: a CRL decades past that synthetic expiry must be refused at build time, not
+        // installed and merely reported stale later.
+        let fx = ca_fixture();
+        let long_ago = 1_000_000_000u64; // 2001-09-09: decades before "now" below
+        let tbs_items: Vec<Vec<u8>> = vec![
+            der_enc::encode_integer(&[0x01]),
+            der_enc::encode_algorithm_identifier("1.2.840.113549.1.1.11"),
+            fx.subject_dn.clone(),
+            der_enc::encode_utctime(long_ago), // thisUpdate
+            // no nextUpdate
+            der_enc::encode_sequence(&[der_enc::encode_sequence(&[
+                der_enc::encode_integer(&[0x01]),
+                der_enc::encode_utctime(long_ago),
+            ])]),
+        ];
+        let der = sign_tbs_into_crl(&tbs_items, fx);
+
+        let cfg = default_cfg();
+        let parsed = parse(&der, &cfg).expect("should parse");
+        assert!(parsed.next_update().is_none());
+        let verified = verify_signature(parsed, &fx.issuer_der).expect("fixture CRL must verify");
+        assert_eq!(
+            RevocationIndex::build(&verified, UnixSeconds::new(1_704_000_000), &cfg),
+            Err(CrlError::AlreadyExpired)
+        );
+    }
+
+    #[test]
+    fn crl_generalized_time_this_update_parses() {
+        // #123's design allows thisUpdate/nextUpdate to be encoded as either UTCTime or
+        // GeneralizedTime (step 4d/4e); every other fixture in this module only ever encodes
+        // UTCTime, leaving read_time's GeneralizedTime branch and der_enc::encode_generalized_time
+        // both untested (#729 NOTE: dead code whose allow-reason documents its own uselessness).
+        let fx = ca_fixture();
+        let now = 1_704_000_000u64;
+        let tbs_items: Vec<Vec<u8>> = vec![
+            der_enc::encode_integer(&[0x01]),
+            der_enc::encode_algorithm_identifier("1.2.840.113549.1.1.11"),
+            fx.subject_dn.clone(),
+            der_enc::encode_generalized_time(now), // thisUpdate as GeneralizedTime
+            der_enc::encode_utctime(now + 86_400), // nextUpdate as UtcTime; mixing forms is legal
+        ];
+        let der = sign_tbs_into_crl(&tbs_items, fx);
+
+        let cfg = default_cfg();
+        let parsed = parse(&der, &cfg).expect("GeneralizedTime thisUpdate should parse");
+        assert_eq!(parsed.this_update(), UnixSeconds::new(now));
+        let verified = verify_signature(parsed, &fx.issuer_der).expect("fixture CRL must verify");
+        let idx = RevocationIndex::build(&verified, UnixSeconds::new(now), &cfg)
+            .expect("build should succeed");
+        assert_eq!(idx.len(), 0);
     }
 
     #[test]
@@ -1751,6 +1837,53 @@ mod tests {
         assert_eq!(parsed.serials().count(), 1);
     }
 
+    #[test]
+    fn crl_outer_sequence_tag_is_checked() {
+        // #729 SURVIVED M1: read_sequence_content dropping its SEQUENCE tag assertion. DER's
+        // length encoding does not depend on the tag, so a reader that skipped this assertion
+        // would happily treat any constructed universal tag's content as if it were a
+        // SEQUENCE's; this assertion is the structural half of the #726 fix, not the
+        // length-based slicing that follows it. Flip only the outer tag byte, SEQUENCE (0x30)
+        // to SET (0x31), leaving the length and every nested byte untouched: without the tag
+        // check this would parse identically to the unmutated CRL.
+        let der = build_single_signed_crl(&[0x2a]);
+        let mut mutated = der.clone();
+        if let Some(byte) = mutated.get_mut(0) {
+            assert_eq!(
+                *byte, 0x30,
+                "test fixture's outer tag is not SEQUENCE as expected"
+            );
+            *byte = 0x31;
+        }
+        assert_eq!(parse(&mutated, &default_cfg()), Err(CrlError::Parse));
+    }
+
+    #[test]
+    fn crl_unsupported_version_rejected() {
+        // #729 SURVIVED M26: parse_tbs_cert_list accepted any version integer. The CRL version
+        // field is present only for v2 and RFC 5280 requires its value be exactly 1 (meaning
+        // v2); a v1 CRL omits it entirely (crl_empty and friends never encode a version field
+        // either). Any other explicit value is a version this parser does not understand, and
+        // it must refuse rather than silently walk the rest of the structure as if it were v2.
+        let items: Vec<Vec<u8>> = vec![
+            der_enc::encode_integer(&[0x02]), // version value 2: not accepted
+            der_enc::encode_algorithm_identifier("1.2.840.113549.1.1.11"),
+            der_enc::encode_name("2.5.4.3", "Test CA"),
+            der_enc::encode_utctime(1_704_000_000),
+            der_enc::encode_utctime(1_704_086_400),
+        ];
+        let tbs = der_enc::encode_sequence(&items);
+        let der = der_enc::encode_sequence(&[
+            tbs,
+            der_enc::encode_algorithm_identifier("1.2.840.113549.1.1.11"),
+            der_enc::encode_bit_string(&[0u8; 256]),
+        ]);
+        assert_eq!(
+            parse(&der, &default_cfg()),
+            Err(CrlError::UnsupportedVersion)
+        );
+    }
+
     // -----------------------------------------------------------------------
     // #726 acceptance: verify_signature must accept a genuinely valid signature and reject
     // an invalid one. Every other test in this module reaches RevocationIndex::build through
@@ -1864,6 +1997,43 @@ mod tests {
     }
 
     #[test]
+    fn crl_inner_outer_signature_algorithm_mismatch_rejected() {
+        // #729 SHOULD_FIX 4 (RFC 5280 5.1.1.2): TBSCertList's own signature AlgorithmIdentifier
+        // and the outer signatureAlgorithm MUST be identical. The outer field sits outside
+        // tbs_span and is therefore not covered by the signature, so an attacker who controls
+        // only the outer bytes (a MITM without the issuing key) could otherwise steer which
+        // algorithm verify_signature selects. Build a genuinely, validly signed CRL
+        // (sha256WithRSA inner and outer), then splice in a DIFFERENT outer
+        // AlgorithmIdentifier (sha384WithRSA) after signing, leaving the signed TBS bytes
+        // untouched. verify_signature must reject this before it ever reaches the provider's
+        // algorithm lookup, which would otherwise select sha384's verifier for a signature
+        // actually computed over sha256 and simply fail as BadSignature instead: the point of
+        // this guard is to reject on the mismatch itself, not rely on that downstream failure.
+        let fx = ca_fixture();
+        let tbs_items: Vec<Vec<u8>> = vec![
+            der_enc::encode_integer(&[0x01]),
+            der_enc::encode_algorithm_identifier("1.2.840.113549.1.1.11"), // inner: sha256WithRSA
+            fx.subject_dn.clone(),
+            der_enc::encode_utctime(1_704_000_000),
+            der_enc::encode_utctime(1_704_086_400),
+        ];
+        let tbs = der_enc::encode_sequence(&tbs_items);
+        let signature = rcgen::SigningKey::sign(&fx.key_pair, &tbs)
+            .expect("RSA signing must not fail for a well-formed TBS in a test fixture");
+        let sig_value = der_enc::encode_bit_string(&signature);
+        // Outer AlgorithmIdentifier differs from the inner one: sha384WithRSAEncryption.
+        let outer_sig_alg = der_enc::encode_algorithm_identifier("1.2.840.113549.1.1.12");
+        let der = der_enc::encode_sequence(&[tbs, outer_sig_alg, sig_value]);
+
+        let cfg = default_cfg();
+        let parsed = parse(&der, &cfg).expect("should parse");
+        assert_eq!(
+            verify_signature(parsed, &fx.issuer_der),
+            Err(CrlError::UnsupportedSignatureAlgorithm)
+        );
+    }
+
+    #[test]
     fn crl_truncated_every_97_bytes() {
         use rcgen::{CertificateParams, KeyPair};
         let key_pair = KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256).unwrap();
@@ -1887,12 +2057,22 @@ mod tests {
         let serial_refs: Vec<&[u8]> = serials.iter().map(std::vec::Vec::as_slice).collect();
         let der = build_crl_der(&serial_refs, None, None, false);
 
-        // Truncate at every 97th byte and assert no panic, just Err
+        // Truncate at every 97th byte and assert the exact Err variant, not is_err() (#729
+        // SHOULD_FIX 2: `result.is_err() || result.is_ok()` is true of every Result and asserts
+        // nothing beyond absence of panic). None of these truncation points can produce
+        // TooManyEntries, SerialTooLong, UnsupportedVersion or DeltaCrlUnsupported (the fixture
+        // has none of those shapes to truncate into), and none can equal the full, untruncated
+        // length (der.len() is excluded by the range), so every truncation must fail as a
+        // structural decode error.
         for end in (0..der.len()).step_by(97).skip(1) {
             let truncated = &der[..end];
             let result = parse(truncated, &default_cfg());
-            assert!(result.is_err() || result.is_ok());
-            // The point is that it doesn't panic, not what error it returns
+            assert_eq!(
+                result,
+                Err(CrlError::Parse),
+                "truncation at {end} of {} bytes produced an unexpected result",
+                der.len()
+            );
         }
     }
 
@@ -1951,7 +2131,12 @@ mod tests {
         let start = std::time::Instant::now();
         let result = parse(&inner, &default_cfg());
         let elapsed = start.elapsed();
-        assert!(result.is_err());
+        // Exact variant, not is_err() (#729 SHOULD_FIX 2). The walk reads a fixed structure and
+        // never recurses into unknown content, so it never sees past the first nesting level:
+        // the outer SEQUENCE's content is handed to parse_tbs_cert_list, which reads it as
+        // {version?, algorithm, issuer, thisUpdate, ...} and fails as soon as it expects a
+        // second sibling field that the single nested SEQUENCE does not provide.
+        assert_eq!(result, Err(CrlError::Parse));
         assert!(
             elapsed.as_millis() < 100,
             "nested bomb took {} ms",
@@ -1988,6 +2173,38 @@ mod tests {
         // Should keep the one with later thisUpdate (serial 2)
         assert!(found.is_revoked(&[0x02]));
         assert!(!found.is_revoked(&[0x01]));
+    }
+
+    #[test]
+    fn crl_for_issuer_confirms_byte_for_byte() {
+        // #729 SURVIVED M20: CrlSet::for_issuer dropping its byte-for-byte issuer_dn
+        // confirmation after the hash lookup. blake3(issuer_dn)[..16] is the HashMap key, so a
+        // genuine hash collision would otherwise let one issuer's revocation list answer for a
+        // certificate issued by someone else. A real BLAKE3 collision is infeasible to search
+        // for, so simulate the shape directly: store an index built for one issuer under a
+        // DIFFERENT issuer's hash (indistinguishable, at the HashMap lookup level, from a real
+        // collision landing there), and confirm for_issuer for that different issuer still
+        // returns None because the candidate's own issuer_dn does not match.
+        let der = build_signed_crl_der(&[&[0x01]], None, None);
+        let cfg = default_cfg();
+        let parsed = parse(&der, &cfg).unwrap();
+        let verified = verify_signature(parsed, &ca_fixture().issuer_der).unwrap();
+        let idx = RevocationIndex::build(&verified, UnixSeconds::new(1_704_000_000), &cfg).unwrap();
+        // idx's own issuer_dn is ca_fixture().subject_dn; store it under a different issuer's
+        // hash to simulate a collision landing on that entry.
+        let other_issuer_dn = b"not the fixture's issuer".as_slice();
+        let mut hash = [0u8; 16];
+        let full = blake3::hash(other_issuer_dn);
+        if let Some(src) = full.as_bytes().get(..16) {
+            hash.copy_from_slice(src);
+        }
+        let mut by_issuer = std::collections::HashMap::new();
+        by_issuer.insert(hash, Arc::new(idx));
+        let set = CrlSet {
+            by_issuer,
+            generation: 1,
+        };
+        assert!(set.for_issuer(other_issuer_dn).is_none());
     }
 
     #[test]
@@ -2045,9 +2262,135 @@ mod tests {
              RevocationIndex::build were not reached, so this assertion is not measuring \
              anything"
         );
-        assert!(delta < 200 * 1024 * 1024, "allocated-byte delta {delta} >= 200 MB");
+        assert!(
+            delta < 200 * 1024 * 1024,
+            "allocated-byte delta {delta} >= 200 MB"
+        );
         let bytes = idx.memory_bytes();
         assert!(bytes < 200 * 1024 * 1024, "memory_bytes {bytes} >= 200 MB");
+    }
+
+    // -----------------------------------------------------------------------
+    // Bloom prefilter (#729 SHOULD_FIX 1: the entire subsystem shipped with no test of its
+    // own; 6 of 27 total mutations run were Bloom-related and every one survived).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn crl_bloom_sizing_matches_literal_table() {
+        // #729 SURVIVED M7 (BLOOM_CAP_BYTES), M8 (BLOOM_FLOOR_BYTES), M9 (BLOOM_BITS_PER_ENTRY).
+        // Both #123's design note and THREAT-MODEL.md's Certificate revocation section claim
+        // "10 bits per entry, floored at 2,048 bytes and capped at 4,194,304 bytes", and the
+        // sizing is observable, so this table compares against LITERAL numbers this test owns,
+        // not against the constants it is meant to be checking: a test that recomputed the
+        // expectation from BLOOM_BITS_PER_ENTRY / BLOOM_FLOOR_BYTES / BLOOM_CAP_BYTES would
+        // still pass after any of those three constants was mutated, because both sides of the
+        // comparison would move together (the exact shape #721 found proved nothing in a
+        // sibling crate's cap test). build_bloom is exercised directly with synthetic u128
+        // vectors: only the COUNT matters to its sizing arithmetic, so this needs no CRL
+        // parsing or signing.
+        let cases: &[(usize, usize)] = &[
+            (0, 2_048),             // floor: no entries
+            (1, 2_048),             // floor: 10 bits does not clear it
+            (1_000, 2_048),         // floor: 10,000 bits does not clear it either
+            (100_000, 125_056),     // 1,000,000 bits, rounded up to a 512-bit block
+            (1_000_000, 1_250_048), // 10,000,000 bits, rounded up; matches the issue's ~1.25 MB
+            (4_000_000, 4_194_304), // 40,000,000 bits exceeds the cap; clamped to it exactly
+        ];
+        for &(entries, expected_bytes) in cases {
+            let serials: Vec<u128> = (0..u128::try_from(entries).unwrap_or(0)).collect();
+            let empty_wide: HashSet<Box<[u8]>> = HashSet::new();
+            let bloom = build_bloom(&serials, &empty_wide);
+            assert_eq!(
+                bloom.len() * 8,
+                expected_bytes,
+                "entries={entries}: bloom is {} bytes, expected {expected_bytes}",
+                bloom.len() * 8
+            );
+        }
+    }
+
+    #[test]
+    fn crl_bloom_rejects_absent_serials_without_binary_search() {
+        // #729 SURVIVED M11, the single most important Bloom mutation: bloom_probe
+        // accumulating with OR instead of AND. Starting from `present = true` and OR-ing keeps
+        // it true unconditionally (short of an out-of-bounds word, which does not happen here),
+        // so a mutated bloom_probe answers "maybe present" for essentially every input,
+        // silently turning every lookup into a binary search: is_revoked's boolean OUTPUT is
+        // unchanged either way, because the binary search is authoritative and still returns
+        // the correct answer, so a test that only checks is_revoked's return value (like
+        // prop_is_revoked_matches_hashset) cannot distinguish "answered from the Bloom" from
+        // "fell through to the binary search". The only externally observable signal is
+        // RevocationStats::bloom_rejects, so this test probes many CLEARLY ABSENT serials and
+        // asserts most of them were rejected by the prefilter alone.
+        // Minimally-encoded big-endian content, the same trimming crl_memory_bytes_under_20mb
+        // and crl_parse_1e6_allocation_bounded use: a DER INTEGER must not carry redundant
+        // leading zero octets.
+        let serials: Vec<Vec<u8>> = (1u64..=200)
+            .map(|i| {
+                let bytes = i.to_be_bytes();
+                let start = bytes.iter().position(|b| *b != 0).unwrap_or(7);
+                bytes.get(start..).unwrap_or(&bytes).to_vec()
+            })
+            .collect();
+        let serial_refs: Vec<&[u8]> = serials.iter().map(std::vec::Vec::as_slice).collect();
+        let der = build_signed_crl_der(&serial_refs, None, None);
+        let cfg = default_cfg();
+        let parsed = parse(&der, &cfg).expect("should parse");
+        let verified =
+            verify_signature(parsed, &ca_fixture().issuer_der).expect("fixture CRL must verify");
+        let idx = RevocationIndex::build(&verified, UnixSeconds::new(1_704_000_000), &cfg)
+            .expect("build should succeed");
+
+        let before = idx.stats.bloom_rejects.load(Ordering::Relaxed);
+        let probes = 1_000u64;
+        for i in 0..probes {
+            // Far outside the revoked set (1..=200), so every one is a true negative.
+            let probe = (1_000_000 + i).to_be_bytes();
+            assert!(
+                !idx.is_revoked(&probe),
+                "probe {} must not be revoked",
+                1_000_000 + i
+            );
+        }
+        let after = idx.stats.bloom_rejects.load(Ordering::Relaxed);
+        let rejected = after - before;
+        assert!(
+            rejected > 0,
+            "no lookups were rejected by the Bloom filter alone; with OR-accumulation \
+             (mutation M11) this reads 0 because every probe falls through to the binary search \
+             instead"
+        );
+        // At 10 bits per entry and k = 7, #123's design states a false-positive rate under
+        // 0.1% at this load factor (r = 200, well below the 2,048-byte floor's break-even
+        // point), so the overwhelming majority of 1,000 clearly absent probes must be rejected
+        // by the prefilter alone. A generous 90% floor comfortably separates "the prefilter
+        // works" from "the prefilter never rejects anything" without being sensitive to the
+        // exact false-positive rate.
+        assert!(
+            rejected >= probes * 9 / 10,
+            "bloom filter rejected only {rejected} of {probes} clearly absent probes"
+        );
+    }
+
+    #[test]
+    fn crl_build_bloom_inserts_wide_serials() {
+        // #729 SURVIVED M12: build_bloom never inserting wide serials into the filter.
+        // is_revoked's wide-length path returns from the overflow HashSet before ever probing
+        // the Bloom (design: "Wide serials skip the Bloom filter"), so this insertion has no
+        // effect reachable through the public API; that is exactly why the mutation survived
+        // every other test in this module. Assert build_bloom's own output directly: filling it
+        // with a wide serial present must set bits a fill without it does not.
+        let narrow: Vec<u128> = Vec::new();
+        let mut wide: HashSet<Box<[u8]>> = HashSet::new();
+        wide.insert(vec![0xAAu8; 17].into_boxed_slice());
+        let without_wide = build_bloom(&narrow, &HashSet::new());
+        let with_wide = build_bloom(&narrow, &wide);
+        assert_ne!(
+            without_wide, with_wide,
+            "build_bloom must set bits for wide serials per #123's build algorithm step 3 \
+             (fill from the deduplicated set of BOTH containers), even though is_revoked never \
+             probes them for a wide-length lookup"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -2142,34 +2485,74 @@ mod tests {
             valid_crl_der in proptest::collection::vec(any::<u8>(), 50..=2000usize),
             flip_offset in 0..2000usize,
         ) {
-            // We can't generate a valid CRL randomly, but we can ensure parse never panics.
-            // Use a valid CRL and flip one byte inside it.
-            let base_der = build_crl_der(&[&[0x01], &[0x02]], None, None, false);
-            if flip_offset >= base_der.len() {
-                return Ok(());
-            }
-            let mut corrupted = base_der;
-            corrupted[flip_offset] ^= 0xff;
-            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                parse(&corrupted, &default_cfg())
-            }));
-            prop_assert!(
-                result.is_ok(),
-                "parse must not panic on any input; flipped byte at offset {flip_offset}"
-            );
-            // Also test with random byte sequences
+            // parse must never panic on arbitrary random byte sequences, regardless of shape.
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 parse(&valid_crl_der, &default_cfg())
             }));
             prop_assert!(result.is_ok(), "parse must not panic on random byte sequences");
+
+            // parse must never panic on a single flipped byte anywhere in an otherwise
+            // well-formed (unsigned) CRL either.
+            let base_der = build_crl_der(&[&[0x01], &[0x02]], None, None, false);
+            if flip_offset < base_der.len() {
+                let mut corrupted = base_der;
+                if let Some(byte) = corrupted.get_mut(flip_offset) {
+                    *byte ^= 0xff;
+                }
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    parse(&corrupted, &default_cfg())
+                }));
+                prop_assert!(
+                    result.is_ok(),
+                    "parse must not panic on any input; flipped byte at offset {flip_offset}"
+                );
+            }
+
+            // Anti-splicing property (#123's own property spec; #729 SHOULD_FIX 3). Flip one
+            // byte STRICTLY INSIDE the signed TBS span of a genuinely, validly signed CRL. If
+            // parse still returns Ok after the flip, the flip must have broken the signature,
+            // because the flipped byte is inside the region verify_signature hashes. A flip
+            // landing in an unauthenticated trailing region (the outer signatureAlgorithm or
+            // the signature bytes themselves) could still verify, which is why the flip is
+            // restricted to tbs_span rather than the whole blob.
+            let signed_der = build_single_signed_crl(&[0x2a]);
+            let (tbs_start, tbs_len) = {
+                let parsed =
+                    parse(&signed_der, &default_cfg()).expect("the signed fixture CRL must parse");
+                let tbs = parsed.tbs_span();
+                (
+                    tbs.as_ptr() as usize - signed_der.as_ptr() as usize,
+                    tbs.len(),
+                )
+            };
+            if tbs_len > 0 {
+                let offset_in_tbs = flip_offset % tbs_len;
+                let mut spliced = signed_der.clone();
+                if let Some(byte) = spliced.get_mut(tbs_start + offset_in_tbs) {
+                    *byte ^= 0xff;
+                }
+                let flip_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    parse(&spliced, &default_cfg())
+                }));
+                prop_assert!(
+                    flip_result.is_ok(),
+                    "parse must not panic on a flipped byte inside the TBS span"
+                );
+                if let Ok(Ok(parsed)) = flip_result {
+                    let verified = verify_signature(parsed, &ca_fixture().issuer_der);
+                    prop_assert!(
+                        verified.is_err(),
+                        "flipping a byte inside the TBS span must break the signature, but \
+                         verify_signature returned Ok"
+                    );
+                }
+            }
         }
     }
 
-    // Helper to access wide set for assertions in crl_serial_leading_zero_16_bytes
-    #[allow(
-        dead_code,
-        reason = "kept for test assertions; the field is private and the accessor exists in case a future test needs to inspect the wide set"
-    )]
+    // Test-only accessor for the private wide set, used by
+    // crl_serial_leading_zero_16_bytes to confirm a 16-byte-after-normalization serial did
+    // NOT go into the overflow set.
     impl RevocationIndex {
         fn wide(&self) -> &HashSet<Box<[u8]>> {
             &self.wide
