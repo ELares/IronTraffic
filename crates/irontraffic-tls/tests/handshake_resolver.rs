@@ -345,6 +345,20 @@ fn handshake_normal_client_gets_real_cert_when_challenge_live() {
             UnixSeconds::new(2_000),
         )
         .expect("valid");
+    // A second name that has a live challenge entry and NO real certificate at all, so that a
+    // mutant which makes the normal branch fall back to the challenge map ONLY when
+    // `CertIndex::resolve` misses (rather than never consulting it at all) has somewhere to be
+    // caught: the first name above always has a real credential too, so `certs.resolve` never
+    // misses there and such a fallback would never fire.
+    let (challenge_only_der, challenge_only_key) = gen_leaf("challenge-only.example.com");
+    challenge_builder
+        .insert(
+            "challenge-only.example.com",
+            ChallengeKey::from_der(&challenge_only_der, &challenge_only_key).expect("valid"),
+            UnixSeconds::new(2_000),
+        )
+        .expect("valid");
+
     let challenge = Arc::new(challenge_builder.build_with_generation(0).expect("build"));
     assert_ne!(
         blake3::hash(&real_der),
@@ -358,8 +372,8 @@ fn handshake_normal_client_gets_real_cert_when_challenge_live() {
 
     // A normal listener ALPN policy, deliberately NOT including `acme-tls/1` (see the Do NOT note
     // in `handshake_acme_alpn_gets_challenge_cert` above).
-    let server_cfg = build_server_config(resolver, &[b"h2"]);
-    let mut server = rustls::ServerConnection::new(Arc::new(server_cfg)).expect("server conn");
+    let server_cfg = Arc::new(build_server_config(resolver, &[b"h2"]));
+    let mut server = rustls::ServerConnection::new(Arc::clone(&server_cfg)).expect("server conn");
     let mut client = build_client("a.example.com", &[&real_der], &[b"h2"]);
 
     assert!(
@@ -376,6 +390,21 @@ fn handshake_normal_client_gets_real_cert_when_challenge_live() {
         served_hash,
         blake3::hash(&challenge_der),
         "a normal ALPN client must never be served the live challenge certificate"
+    );
+
+    // The other half of the same isolation property: a normal-ALPN client asking for a name that
+    // has ONLY a live challenge entry (no real certificate anywhere in CertIndex) must get NO
+    // certificate at all, never the challenge certificate as a fallback.
+    let mut miss_server = rustls::ServerConnection::new(server_cfg).expect("server conn");
+    let mut miss_client = build_client("challenge-only.example.com", &[], &[b"h2"]);
+    assert!(
+        pump_handshake(&mut miss_client, &mut miss_server).is_some(),
+        "a normal ALPN client for a name with only a live challenge entry must fail, not fall \
+         back to the challenge certificate"
+    );
+    assert!(
+        miss_client.peer_certificates().is_none(),
+        "no certificate, and in particular not the challenge certificate, may have been sent"
     );
 }
 
