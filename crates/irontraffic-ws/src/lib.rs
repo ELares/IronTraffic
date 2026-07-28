@@ -45,8 +45,12 @@
 //! std;` dance in every module.
 
 mod frame;
+pub mod handshake;
 
 pub use frame::{
     CloseCode, DEFAULT_MAX_FRAME_BYTES, Direction, FrameDecoder, FrameHeader, MAX_CONTROL_PAYLOAD,
     Opcode, TunnelBudget, WsError, mask_in_place,
+};
+pub use handshake::{
+    HandshakeError, HandshakeSide, UpgradeRequest, UpgradeResponse, UpgradeTokens, accept_key,
 };

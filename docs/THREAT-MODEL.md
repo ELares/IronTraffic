@@ -702,6 +702,94 @@ than the configured capacity, regardless of how large the apparent elapsed time 
   fragment-count limit could protect is one this codec does not consume; adding one would break a
   legitimate streaming application for no gain. `TunnelBudget` already bounds the RATE (200 frames
   per second sustained by default), which is the resource a flood actually spends.
+
+### Upgrade handshake (`irontraffic-ws`'s `handshake` module)
+
+**A connection becomes a tunnel only when BOTH directions validate.** After a `101` the connection
+has no HTTP framing at all; whatever the two endpoints do with the bytes from then on is by mutual
+agreement. If they did not actually agree, because one of them did not think this was a WebSocket,
+then one side is framing WebSocket and the other is framing HTTP, and an attacker who controls the
+payload controls what the second side parses as a request. A proxy that forwards a malformed
+upgrade and then goes into byte-shovelling mode has created a bidirectional smuggling channel, the
+same precondition the frame-relay section above states for an already-established tunnel, moved one
+step earlier to the handshake that establishes one.
+
+**Every request-side check, and what it closes:**
+
+- **`GET` with no body.** A `POST` upgrade, or a `GET` with `Content-Length: 5`, means there are
+  body bytes whose position relative to the `101` is ambiguous. We reject any upgrade request whose
+  resolved framing is not `RequestFraming::Empty`.
+- **`Upgrade` must be exactly one value, `websocket`, ASCII case-insensitive.** `Upgrade: websocket,
+  h2c` is a request to become two things, and honouring the first while an origin honours the second
+  is a disagreement. Two `Upgrade` field lines are refused for the same reason: choosing one of them
+  is deciding on the client's behalf which of two disagreeing signals to honour.
+- **`Connection` must contain the `upgrade` token**, parsed by `irontraffic_http::strip::connection_has_token`,
+  the same tokenizer `strip_ingress` uses to decide which fields to delete, so the token that
+  authorises an upgrade and the token that strips a field cannot disagree about `Upgrade ` with a
+  trailing space.
+- **`Sec-WebSocket-Version: 13` exactly.** Any other version means the client expects a different
+  handshake; we reply `426` with a `Sec-WebSocket-Version` header, not `400`, because the client can
+  act on it.
+- **`Sec-WebSocket-Key` must decode to exactly 16 bytes.** The accept computation needs the exact
+  bytes, and a key of the wrong length is a client that is not speaking RFC 6455.
+
+**Every response-side check, and what it closes:**
+
+- **`Sec-WebSocket-Accept` must equal `base64(sha1(key_bytes_ascii + GUID))`.** We recompute it from
+  the key we forwarded, in constant time (`subtle::ConstantTimeEq`), and compare. An upstream that
+  echoes a wrong accept value is an upstream that did not perform the handshake, which usually means
+  it is not a WebSocket server and is about to interpret frames as HTTP. **This is the check that
+  stops us forwarding frames to something that is not a WebSocket server**, and it is why validating
+  only the request (on the theory that "the client will check the accept value anyway") is not
+  enough: the client checking it protects the client, not us and not the other tenants of the
+  upstream connection pool.
+- **`Sec-WebSocket-Extensions` in the response must be a subset of what was requested**, and this
+  milestone requests none and therefore accepts none. An upstream that negotiates
+  `permessage-deflate` when nobody asked would set RSV1 on frames that the frame-relay codec above,
+  configured with `reserved_allowed: 0`, would then reject mid-stream. Refusing at the handshake
+  turns a confusing mid-tunnel failure into a clear one.
+- **`Sec-WebSocket-Protocol` in the response must be one of the values requested**, or absent. A
+  subprotocol the client did not offer is an agreement it is not party to.
+
+**`Upgrade` and `Connection` are consumed, never forwarded; h2c is never honoured, and it is already
+impossible.** Both fields are in the hop-by-hop strip set, so a downstream `Upgrade: h2c` plus
+`Connection: Upgrade, HTTP2-Settings` cannot even be forwarded: the strip removes them before a
+`CanonicalRequest` is built, and `CanonicalRequestBuilder::build` refuses to build a request that
+still carries either. The handshake module therefore never looks for `Upgrade` or `Connection` in a
+`CanonicalRequest` (doing so would find nothing, every time, and silently disable the feature); the
+evidence arrives instead as an `UpgradeTokens` value the caller reads from the wire section BEFORE
+the strip, and this module consumes it rather than forwarding it, synthesising a fresh upgrade
+toward the upstream when the route is a WebSocket route. Bishop Fox's h2cSmuggler bypasses
+path-based routing, authentication and WAF processing precisely by getting an intermediary to
+forward an upgrade it should have consumed; refusing `Upgrade: h2c` at the handshake, on top of the
+strip already making it unforwardable, is the second, explicit half of the remediation.
+
+**The connection-disposal rules, which protect the OTHER tenants of the upstream pool rather than
+us.** Validating the response (above) protects us: it is what stops us forwarding bytes to something
+that never agreed to speak WebSocket. Disposing of the connections correctly is a separate rule that
+protects everyone else sharing the upstream pool, and it holds regardless of which side failed:
+
+1. An upstream connection that answered `101` is **never** returned to the pool, whether
+   verification succeeded or failed. After a `101` the upstream has no HTTP framing, so a pooled
+   socket reads the next tenant's request line as a masked binary frame, which is upstream request
+   smuggling with us as the vector, exactly the hazard `upstream-pool-purity-ledger` (#45) exists to
+   track.
+2. A successfully verified `101` makes the connection a tunnel, owned by the tunnel until it ends and
+   then closed. It is still never pooled.
+3. An unsolicited `101`, one answering a request that was not a validated upgrade at all, is not
+   forwarded and its connection is closed. RFC 9110 permits `101` only in response to an `Upgrade`
+   request, so an unsolicited one means we and the upstream disagree about which request it just
+   answered, which is the desync condition itself.
+4. The downstream connection is different: we never sent it a `101`, so its HTTP framing is intact
+   and it remains reusable after we answer `400`, `426` or `502` for a failed upgrade. Closing it on
+   every failed upgrade would be needless connection churn on every probe.
+
+`UpgradeRequest::parse` and `UpgradeResponse::verify` hold no socket and cannot enforce the
+disposal rules themselves; they exist so the rule is written down before the caller that does hold a
+socket exists. **Nothing in this corpus yet wires a connection handler to call these functions**;
+they are reachable only from their own tests and the fuzz target until a follow-up issue against the
+connection handler lands.
+
 ## Connection admission and accept-error handling
 
 ### What a connection flood costs us

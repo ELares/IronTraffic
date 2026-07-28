@@ -367,6 +367,37 @@ pub const fn is_identity_field(k: KnownHeader) -> bool {
     )
 }
 
+/// True when any `Connection` field line in `section` lists `token`.
+///
+/// The ONE tokenizer over connection-options in the workspace. [`strip_ingress`] uses
+/// the same split on `,`, the same [`trim_ows`] and the same ASCII-case-insensitive
+/// comparison in its own step 1; this is the exported form so that a caller deciding
+/// whether an upgrade was authorised and the strip deciding which fields to delete
+/// cannot disagree about `Upgrade ` with a trailing space. `ws-upgrade-handshake`
+/// (#203) is what makes this true: it is the one caller outside this file, and it
+/// contains no tokenizer of its own.
+///
+/// Unlike [`strip_ingress`] step 1 this does not lowercase into a 64-byte buffer and
+/// has no `FieldLineTooLong` error: a token longer than 64 bytes cannot equal any
+/// token a caller asks about, so the cap cannot change the answer.
+///
+/// `strip_ingress` is NOT rewritten to call this: it keeps its own loop because it
+/// needs the lowercased token bytes for its own step 6 field-name comparison. What
+/// this function guarantees instead is that the two agree, which
+/// `crates/irontraffic-ws/tests/handshake.rs`'s `connection_token_table` test asserts
+/// over the whole `Connection` token table.
+#[must_use]
+pub fn connection_has_token(section: &FieldSection, token: &[u8]) -> bool {
+    for value in section.get_all_known(KnownHeader::Connection) {
+        for element in value.split(|&b| b == b',') {
+            if trim_ows(element).eq_ignore_ascii_case(token) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// True for exactly the six fields RFC 9113 Section 8.2.2 makes a
 /// multiplexed message malformed if present: `Connection`,
 /// `ProxyConnection`, `KeepAlive`, `TransferEncoding`, `Upgrade` and
