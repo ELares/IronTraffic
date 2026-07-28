@@ -320,7 +320,17 @@ impl core::fmt::Display for HandshakeError {
             }
             HandshakeError::DuplicateUpgrade => write!(f, "more than one upgrade field line"),
             HandshakeError::Duplicate(_) => write!(f, "field appeared more than once"),
-            HandshakeError::Field(reason) => write!(f, "field rejected: {reason:?}"),
+            // Deliberately does NOT render `reason`. `RejectReason`'s own doc states the
+            // rule: it implements neither `Display` nor `std::error::Error` because "a
+            // `Display` impl would put it in reach of `format!(\"{err}\")` in a responder,
+            // handing an attacker the exact branch that refused their message". This type
+            // DOES implement `Display`, and every `HandshakeError` carries a status the
+            // caller answers the downstream client with, so it is precisely the value a
+            // responder will format. Rendering the wrapped reason with `{:?}` routed the
+            // withheld detail straight back into that path. The detail is still available
+            // for logs through this enum's derived `Debug`, and through
+            // `metric_label()`, which is the interface designed to carry it.
+            HandshakeError::Field(_) => write!(f, "field rejected"),
             HandshakeError::SubprotocolRangeUnrepresentable => write!(
                 f,
                 "selected subprotocol sits past the representable range of the response header section"

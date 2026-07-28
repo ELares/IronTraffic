@@ -886,3 +886,92 @@ fn response_subprotocol_past_u16_range_is_refused_not_clamped() {
          resolving to bytes verify never validated"
     );
 }
+
+/// The `101` guards in `UpgradeResponse::verify` each refuse on their own.
+///
+/// Before this, `DuplicateUpgrade`, `ConnectionTokenMissing` and `AcceptMissing` could
+/// each be DELETED outright with all 388 tests still green. Test 19
+/// `response_tokens_are_required_too` passes `UpgradeTokens::default()`, which trips the
+/// earlier `UpgradeTokenNotWebsocket` branch and never reaches the other two, and every
+/// other response fixture carries `upgrade`, `connection: Upgrade` AND an accept header,
+/// so nothing ever built a `101` missing exactly one of them.
+///
+/// Note this is the shape `cargo mutants` cannot express. It generates condition
+/// NEGATION, which breaks the happy path and so is caught; it does not generate
+/// DELETION, which is what survived. A 0-missed mutants run on this file is real but
+/// bounded, and this is where the boundary lies.
+#[test]
+fn response_each_101_guard_refuses_on_its_own() {
+    let head = b"GET /chat HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    let (req, tokens) = upgrade(head).expect("test fixture must parse and canonicalize");
+    let upgrade_req = UpgradeRequest::parse(&req, tokens).unwrap().unwrap();
+    let accept = accept_key(upgrade_req.key_b64());
+
+    // A section that is otherwise a perfectly good 101, so each case below differs from
+    // acceptance in exactly one respect and nothing else can account for the refusal.
+    let good = build_section(&[
+        (b"upgrade", b"websocket"),
+        (b"connection", b"Upgrade"),
+        (b"sec-websocket-accept", &accept[..]),
+    ])
+    .expect("test fixture fields must be valid");
+    assert!(
+        UpgradeResponse::verify(&upgrade_req, 101, &good, response_tokens(&good)).is_ok(),
+        "the control fixture must be accepted, or the cases below prove nothing"
+    );
+
+    // 1. duplicate_upgrade set, everything else valid. Fails OPEN if the guard regresses.
+    let dup_tokens = UpgradeTokens {
+        duplicate_upgrade: true,
+        ..response_tokens(&good)
+    };
+    assert_eq!(
+        UpgradeResponse::verify(&upgrade_req, 101, &good, dup_tokens).unwrap_err(),
+        HandshakeError::DuplicateUpgrade,
+        "more than one Upgrade line in a 101 must refuse"
+    );
+
+    // 2. the Connection token absent, upgrade still websocket. Also fails OPEN.
+    let no_conn = UpgradeTokens {
+        connection_has_upgrade: false,
+        ..response_tokens(&good)
+    };
+    assert_eq!(
+        UpgradeResponse::verify(&upgrade_req, 101, &good, no_conn).unwrap_err(),
+        HandshakeError::ConnectionTokenMissing,
+        "a 101 whose Connection carries no upgrade token must refuse"
+    );
+
+    // 3. sec-websocket-accept absent entirely. This one is the redundant-guard case: the
+    //    length check below it would still reject, so behaviour stays fail-closed either
+    //    way and only the variant and metric label change. Pinning it keeps the operator
+    //    signal honest.
+    let no_accept = build_section(&[(b"upgrade", b"websocket"), (b"connection", b"Upgrade")])
+        .expect("test fixture fields must be valid");
+    assert_eq!(
+        UpgradeResponse::verify(&upgrade_req, 101, &no_accept, response_tokens(&no_accept))
+            .unwrap_err(),
+        HandshakeError::AcceptMissing,
+        "a 101 with no sec-websocket-accept must refuse as AcceptMissing specifically"
+    );
+}
+
+/// `Display` must not render the wrapped `RejectReason`.
+///
+/// `RejectReason` withholds `Display` so it cannot reach `format!("{err}")` in a
+/// responder; `HandshakeError` implements `Display` and carries the status the caller
+/// answers the client with, so rendering the reason with `{:?}` routed that detail back
+/// into the exact path the rule exists to close.
+#[test]
+fn display_does_not_leak_the_wrapped_reject_reason() {
+    let err = HandshakeError::Field(irontraffic_http::RejectReason::FieldNameEmpty);
+    let rendered = format!("{err}");
+    assert_eq!(rendered, "field rejected");
+    assert!(
+        !rendered.contains("FieldNameEmpty"),
+        "Display leaked the RejectReason variant: {rendered}"
+    );
+    // The detail is still reachable where it belongs.
+    assert!(format!("{err:?}").contains("FieldNameEmpty"));
+    assert_eq!(err.metric_label(), "field_name_empty");
+}
