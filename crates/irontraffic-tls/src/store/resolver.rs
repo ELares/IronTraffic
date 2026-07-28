@@ -466,11 +466,42 @@ mod tests {
         let verdict = alpn_verdict(Some(entries.iter().copied()));
         assert_eq!(verdict, AlpnVerdict::RefuseAcmeMixed);
 
-        let certs = CertIndexBuilder::new([1u8; 16]).build().expect("build");
-        let challenge = ChallengeCerts::empty([9u8; 16]);
+        // BOTH stores are populated for the queried name. An earlier version of this test
+        // built an empty CertIndex AND an empty ChallengeCerts, which made `is_none()` true
+        // no matter what the RefuseAcmeMixed arm did: a mutant that fell through to the
+        // normal path, and a mutant that returned `self.challenge.lookup(..)` and served the
+        // live self-signed challenge leaf to a client also offering h2, both passed. The
+        // counter assertion did not rescue it either, because a mutant can increment the
+        // counter and still return a certificate. Assert `is_none()` only against fixtures
+        // that could have been returned.
+        let (challenge_der, challenge_key) =
+            gen_leaf(&rcgen::PKCS_ECDSA_P256_SHA256, "a.example.com");
+        let mut challenge_builder = ChallengeCertsBuilder::new([9u8; 16]);
+        challenge_builder
+            .insert(
+                "a.example.com",
+                ChallengeKey::from_der(&challenge_der, &challenge_key).expect("valid"),
+                UnixSeconds::new(2_000),
+            )
+            .expect("valid");
+        let challenge = challenge_builder.build_with_generation(0).expect("build");
+
+        let real = gen_cred(&rcgen::PKCS_ECDSA_P256_SHA256, "a.example.com");
+        let mut certs_builder = CertIndexBuilder::new([1u8; 16]);
+        certs_builder
+            .upsert_exact("a.example.com", Arc::clone(&real))
+            .expect("valid");
+        let certs = certs_builder.build().expect("build");
+
         let resolver = test_resolver(certs, challenge, false, UnixSeconds::new(1_000));
         let got = resolver.resolve_parts(verdict, Some("a.example.com"), ClientCaps::all());
-        assert!(got.is_none());
+        assert!(
+            got.is_none(),
+            "a mixed acme-tls/1 plus h2 ALPN list must be served nothing, but got a \
+             certificate; leaf hash {:?}, challenge leaf {:?}",
+            got.as_ref().map(leaf_hash),
+            blake3::hash(&challenge_der),
+        );
         assert_eq!(
             resolver.stats().alpn_acme_refused.load(Ordering::Relaxed),
             1
@@ -483,11 +514,36 @@ mod tests {
         let verdict = alpn_verdict(Some(entries.iter().copied()));
         assert_eq!(verdict, AlpnVerdict::RefuseAcmeMixed);
 
-        let certs = CertIndexBuilder::new([1u8; 16]).build().expect("build");
-        let challenge = ChallengeCerts::empty([9u8; 16]);
+        // Populated for the same reason as `alpn_acme_with_h2_refused`: with both stores
+        // empty this assertion held for every mutant of the RefuseAcmeMixed arm.
+        let (challenge_der, challenge_key) =
+            gen_leaf(&rcgen::PKCS_ECDSA_P256_SHA256, "a.example.com");
+        let mut challenge_builder = ChallengeCertsBuilder::new([9u8; 16]);
+        challenge_builder
+            .insert(
+                "a.example.com",
+                ChallengeKey::from_der(&challenge_der, &challenge_key).expect("valid"),
+                UnixSeconds::new(2_000),
+            )
+            .expect("valid");
+        let challenge = challenge_builder.build_with_generation(0).expect("build");
+
+        let real = gen_cred(&rcgen::PKCS_ECDSA_P256_SHA256, "a.example.com");
+        let mut certs_builder = CertIndexBuilder::new([1u8; 16]);
+        certs_builder
+            .upsert_exact("a.example.com", Arc::clone(&real))
+            .expect("valid");
+        let certs = certs_builder.build().expect("build");
+
         let resolver = test_resolver(certs, challenge, false, UnixSeconds::new(1_000));
         let got = resolver.resolve_parts(verdict, Some("a.example.com"), ClientCaps::all());
-        assert!(got.is_none());
+        assert!(
+            got.is_none(),
+            "acme-tls/1 in second position must be served nothing, but got a certificate; \
+             leaf hash {:?}, challenge leaf {:?}",
+            got.as_ref().map(leaf_hash),
+            blake3::hash(&challenge_der),
+        );
         assert_eq!(
             resolver.stats().alpn_acme_refused.load(Ordering::Relaxed),
             1
