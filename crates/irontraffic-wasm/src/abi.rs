@@ -247,15 +247,12 @@ impl GuestAction {
             GuestAction::Continue => 0,
             GuestAction::Pause => 1,
             GuestAction::Respond { status, template } => {
-                let field = status.checked_sub(100).ok_or(AbiError::BadPayload {
-                    raw: i32::from(status), // it-allow: no-std-io reason: this value is only used for diagnostics and never escapes to the guest.
-                })?;
-                if field > 499 {
+                if status < 200 || status > 599 {
                     return Err(AbiError::BadPayload {
                         raw: i32::from(status),
                     });
                 }
-                2 | ((i32::from(field)) << 4) | ((i32::from(template)) << 14)
+                2 | ((i32::from(status - 100)) << 4) | ((i32::from(template)) << 14)
             }
             GuestAction::Reset { code } => {
                 if code > 3 {

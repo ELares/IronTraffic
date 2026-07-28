@@ -427,14 +427,14 @@ mod tests {
         }
 
         // Value too large on a Set.
-        let record = encode_op(1, 0, 0, 0, 0, 0, big);
+        let record = encode_op(1, 0, 0, 0, 0, 0, MAX_OP_FIELD_BYTES + 1);
         mem[..20].copy_from_slice(&record);
         match decode_op_list(&mem, 0, 20, 10) {
             Err(e) => assert_eq!(
                 e,
                 AbiError::FieldTooLarge {
                     at: 0,
-                    len: big,
+                    len: MAX_OP_FIELD_BYTES + 1,
                     max: MAX_OP_FIELD_BYTES,
                 }
             ),
@@ -449,6 +449,48 @@ mod tests {
         assert_eq!(op, 2);
         assert!(name.is_empty());
         assert_eq!(value, None);
+    }
+
+    #[test]
+    fn name_too_large_with_one_extra_byte_is_rejected() {
+        let mem_len = 16 * 1024 * 1024;
+        let mut mem = vec![0u8; mem_len];
+
+        // First record: Name too large with length one byte larger than max.
+        let record = encode_op(0, 0, 0, 0, MAX_OP_FIELD_BYTES + 1, 0, 0);
+        mem[..20].copy_from_slice(&record);
+        match decode_op_list(&mem, 0, 20, 10) {
+            Err(e) => assert_eq!(
+                e,
+                AbiError::FieldTooLarge {
+                    at: 0,
+                    len: MAX_OP_FIELD_BYTES + 1,
+                    max: MAX_OP_FIELD_BYTES,
+                }
+            ),
+            Ok(_) => panic!("expected FieldTooLarge"),
+        }
+    }
+
+    #[test]
+    fn oversized_value_is_rejected() {
+        let mem_len = 16 * 1024 * 1024;
+        let mut mem = vec![0u8; mem_len];
+
+        // Value too large on a Set.
+        let record = encode_op(1, 0, 0, 0, 0, 0, MAX_OP_FIELD_BYTES + 1);
+        mem[..20].copy_from_slice(&record);
+        match decode_op_list(&mem, 0, 20, 10) {
+            Err(e) => assert_eq!(
+                e,
+                AbiError::FieldTooLarge {
+                    at: 0,
+                    len: MAX_OP_FIELD_BYTES + 1,
+                    max: MAX_OP_FIELD_BYTES,
+                }
+            ),
+            Ok(_) => panic!("expected FieldTooLarge"),
+        }
     }
 
     #[test]

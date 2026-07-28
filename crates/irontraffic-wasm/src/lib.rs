@@ -3,11 +3,6 @@
 //! The ITX core-module WebAssembly ABI: wire-level names, return encoding,
 //! the one function that turns a guest pointer into a Rust slice, and the
 //! decoder for the batched guest op list.
-//!
-//! Nothing in this crate depends on a WebAssembly runtime, does I/O, or holds
-//! a lock. The functions here are pure transforms over byte slices and will be
-//! driven by `{{wasm-host-imports-caller-allocates}}` and
-//! `{{wasm-filter-adapter-and-lifecycle}}`.
 
 #![deny(unsafe_code)]
 
