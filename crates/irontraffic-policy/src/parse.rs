@@ -577,6 +577,18 @@ mod tests {
     }
 
     #[test]
+    fn false_literal_parses_to_bool_false() {
+        // #738 SHOULD_FIX 4: every boolean literal in the test module was
+        // `true` before this test existed, so `Tok::Bool(b) =>
+        // push(Bool(b))` degrading to `Tok::Bool(_) => push(Bool(true))`
+        // survived every mutation. In a policy language that turns `when
+        // false then deny` into `when true then deny`.
+        let ast = parse_src(b"false", default_limits()).unwrap();
+        assert_eq!(ast.nodes, vec![Node::Bool(false)]);
+        assert_eq!(ast.root, NodeId(0));
+    }
+
+    #[test]
     fn and_is_left_associative() {
         // `a && b && c` must be `And { And { a, b }, c }`, never
         // `And { a, And { b, c } }`: a permutation-blind test (for example one
