@@ -16,22 +16,38 @@ use crate::token::Span;
 pub struct NodeId(pub u16);
 
 impl NodeId {
-    /// A `NodeId` for a raw index, or `None` when it exceeds `u16::MAX`.
+    /// A `NodeId` for a raw index, or `None` when the index would leave no
+    /// room to keep `Ast::nodes.len()` within `u16::MAX`.
+    ///
+    /// #738 should-fix 5: this used to accept `i == 0xFFFF` (`u16::MAX`)
+    /// too, which let the arena reach 65,536 nodes, one more than
+    /// invariant 1 (`ast.nodes.len() <= u16::MAX`) allows; the shipped
+    /// property assertion encoding that invariant
+    /// (`u16::try_from(ast.nodes.len()).is_ok()`) could be made false by
+    /// parsing exactly that many nodes. Fixed here, in `NodeId::new`,
+    /// rather than by weakening the invariant: `0xFFFF` itself is now
+    /// reserved and never assigned to a real node, so the largest valid
+    /// index is `0xFFFE` (65,534) and `Ast::nodes.len()` can never exceed
+    /// `u16::MAX` (65,535). Nothing keys off the exact boundary elsewhere
+    /// in this crate (the reachable node count under any limit this crate
+    /// accepts without a deliberately raised `max_tokens` is far smaller
+    /// than either number), so tightening this one comparison is the
+    /// smaller, more local change.
     #[must_use]
     pub const fn new(i: usize) -> Option<NodeId> {
         // `u16::try_from` is not yet usable in a `const fn` on this crate's
         // MSRV, so the bound is a literal and the narrowing cast below is
         // guarded by the check on the line above it rather than expressed
         // with `try_from`.
-        if i > 0xFFFF {
+        if i >= 0xFFFF {
             None
         } else {
             #[allow(
                 clippy::cast_possible_truncation,
-                reason = "guarded by the i > 0xFFFF check immediately above: i is proven to fit in u16 before this cast runs"
+                reason = "guarded by the i >= 0xFFFF check immediately above: i is proven to fit in u16, strictly less than u16::MAX, before this cast runs"
             )]
             {
-                Some(NodeId(i as u16)) // it-allow: unchecked-cast reason: guarded by the i > 0xFFFF check above; i is proven to fit in u16 before this line runs.
+                Some(NodeId(i as u16)) // it-allow: unchecked-cast reason: guarded by the i >= 0xFFFF check above; i is proven to fit in u16, strictly less than u16::MAX, before this line runs.
             }
         }
     }
@@ -280,8 +296,14 @@ mod tests {
 
     #[test]
     fn node_id_new_accepts_zero_and_u16_max() {
+        // #738 should-fix 5: `NodeId::new(65_535)` used to be `Some`, which
+        // let `Ast::nodes.len()` reach 65,536, one more than invariant 1
+        // (`ast.nodes.len() <= u16::MAX`) allows. `0xFFFF` (`u16::MAX`,
+        // 65,535) is now reserved: the largest valid index is `0xFFFE`
+        // (65,534), so `Ast::nodes.len()` can never exceed `u16::MAX`.
         assert_eq!(NodeId::new(0), Some(NodeId(0)));
-        assert_eq!(NodeId::new(65_535), Some(NodeId(65_535)));
+        assert_eq!(NodeId::new(65_534), Some(NodeId(65_534)));
+        assert_eq!(NodeId::new(65_535), None);
         assert_eq!(NodeId::new(65_536), None);
         assert_eq!(NodeId::new(usize::MAX), None);
     }

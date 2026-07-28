@@ -79,7 +79,9 @@ pub enum ParseError {
     },
     /// More nodes than `NodeId` can index.
     TooManyNodes {
-        /// The largest index `NodeId` can represent.
+        /// The largest number of nodes `Ast::nodes` can hold (`u16::MAX`;
+        /// see `NodeId::new`, which reserves `u16::MAX` itself as an index
+        /// so this count can never be exceeded).
         max: u16,
     },
     /// Tokens remain after a complete expression.
