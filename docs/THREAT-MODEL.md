@@ -870,6 +870,98 @@ because at that point the bytes cannot be a valid header either.
 - **The wall-clock dependency of the HTTP-date form is isolated.** `parse_retry_after` takes `now_wall_ms` as a parameter and never reads the clock itself, so the parser remains pure and testable; the caller supplies the same wall clock the deadline layer already uses.
 
 **Accepted risk.** A compromised upstream can suppress our retries by returning a large pushback (capped above by the deadline) or accelerate them by returning a zero pushback (capped below by the jittered floor and the budget). Those two bounds are the entire containment; the parser's job is only to be total, allocation-free, and length-bounded so the header itself cannot be the attack.
+
+## Certificate revocation (`crl-parser-and-revocation-index`, #123)
+
+*Status: the streaming parser and the compiled index ship in `irontraffic-tls`'s `crl` module;
+nothing calls it yet, which is deliberate. The client certificate verifier that consults it is
+`mtls-client-auth-fail-closed` (#124); the CRL fetcher that supplies the bytes in the first place
+is later work still.*
+
+**What `crl::parse` parses.** A CRL is remote input in the same sense a certificate itself is: a
+certificate names a distribution point URL, something outside this module fetches it, and every
+byte that comes back is chosen by whatever answered that request, attacker or merely compromised
+or misconfigured. `parse` walks the DER once with a size-capped reader and extracts only the
+issuer name, the two validity timestamps and each revoked serial, never materializing a parsed
+object graph for the fields it discards (the per-entry revocation date and entry extensions). This
+module exists because a mass-revocation event can produce a CRL with millions of entries and
+hundreds of megabytes of DER, and handing that to `rustls-webpki` as a
+`Vec<CertificateRevocationListDer>` is an O(r) linear scan on every client-certificate
+verification; at r in the millions and one handshake per millisecond, that scan is not a slow
+path, it is an outage.
+
+**The signature is verified before an index is built, and the type system is what enforces the
+order.** `RevocationIndex::build` takes `&VerifiedCrl<'_>`, never a `&ParsedCrl<'_>`, and the only
+function that produces a `VerifiedCrl` is `verify_signature`, which consumes the `ParsedCrl` it is
+given so the same parsed value cannot be handed to `build` twice, once verified and once not.
+There is no path from parsed-but-unverified bytes to a built index. An unverified CRL would let an
+attacker serve an empty one, silently un-revoking every certificate under that issuer, or one that
+revokes everything, a denial of service, and a large unverified one would let them spend hundreds
+of megabytes of memory building an index that is about to be thrown away. The expensive work, an
+O(r) collection, an O(r log r) sort and a Bloom fill, runs strictly after a signature check that
+costs one hash over the input and one public-key verification.
+
+**Peak memory and the two caps that bound it.** `CrlConfig::max_bytes` defaults to 268,435,456
+(256 MiB); a CRL larger than that is refused before any parse is attempted at all.
+`CrlConfig::max_entries` defaults to 8,000,000; `RevocationIndex::build` counts entries as it
+drains the serial iterator and refuses the whole CRL, dropping everything collected so far, on the
+entry after the cap. At the default cap the narrow-serial array (serials of 16 bytes or fewer,
+packed into a sorted `Box<[u128]>`) tops out at 128 MB. The Bloom prefilter behind `is_revoked` is
+sized at 10 bits per entry, floored at 2,048 bytes and capped at 4,194,304 bytes (4 MiB), so it
+never grows past that cap no matter how high `max_entries` is configured. At the two defaults
+together, one `build` call transiently holds the input slice (up to 256 MiB, owned by the caller),
+the narrow-serial vector growing toward its final 128 MB with a further transient spike while its
+backing allocation doubles, and the capped Bloom fill; the issue that specifies this module puts
+the combined transient peak at roughly 460 MB above the input for a single hostile but correctly
+signed CRL. Two consequences follow either way:
+
+1. `build` runs one CRL at a time on the control-plane task. Building several concurrently
+   multiplies this figure; nothing inside this module enforces that, so the caller must not.
+2. An operator running with a container memory limit below about 1 GB must lower `max_bytes` and
+   `max_entries` together. Lowering only `max_bytes` does not bound the index (a CRL with very few,
+   very long serials needs little DER), and lowering only `max_entries` does not bound the parse
+   (a large `max_bytes` still admits a huge blob before it is refused).
+
+**Residual risk: the wide-serial path is not the same shape as the narrow one.** A serial longer
+than 16 bytes (legal up to RFC 5280's own 20-octet ceiling) goes into an overflow
+`HashSet<Box<[u8]>>` rather than the packed array, and `max_entries` bounds the count of narrow and
+wide serials combined, not the wide fraction specifically. A CRL built entirely out of maximum-length
+serials is legal and routes every entry through the overflow set, whose per-entry cost (a scattered
+heap allocation plus hash table overhead) is materially higher than the packed array's flat 16
+bytes; the peak-memory figure above describes the narrow-heavy shape the design assumes, not this
+one. `RevocationIndex::memory_bytes`, the exported `tls_crl_index_bytes` gauge, undercounts a
+wide-heavy index for the same reason: it sums each wide serial's own bytes plus a fixed constant,
+not the hash table's real bucket and allocator overhead.
+
+**Fail-closed staleness, stated because it surprises everyone.** `rustls-webpki`'s client verifier
+defaults are `RevocationCheckDepth::Chain` and `UnknownStatusPolicy::Deny`, and this module keeps
+them, which means an intermediate whose CRL could not be refreshed fails every client certificate
+on that chain, not only the ones checked while it happens to be stale. A CRL whose `nextUpdate` is
+already in the past at install time is refused outright (`CrlError::AlreadyExpired`): installing a
+known-stale CRL is worse than having none, because it looks like coverage while proving nothing. A
+CRL that later passes its own `nextUpdate` keeps being used for `CrlConfig::stale_grace_secs`
+(default 86,400 seconds, one day) with a warn alarm, and once that grace period elapses too,
+`RevocationIndex::freshness` reports `Expired` and the issuer must move to fail-closed. Both the
+grace period and what happens once it ends are explicit fields on `CrlConfig`, never a silent
+default an operator has to go read the source to discover.
+
+**The URL rule any CRL fetcher must apply, stated here because nothing fetches yet.** This module
+takes bytes; it has no opinion about where they came from. Whatever fetches a CRL, now or later,
+MUST apply the same URL policy `ocsp-staple-validation-and-updater` (#122) requires for OCSP AIA
+URLs, and for the identical reason: a CRL distribution point is a URL taken out of a certificate,
+so it is not operator-supplied in every deployment, and fetching it unchecked is a server-side
+request forgery primitive pointed at the cloud metadata service. Neither an `ocsp` module nor a
+CRL fetcher exists in this tree yet (#122 has not landed as of this writing), so this is a
+requirement on work that has not been written, not a claim about a helper that can be checked
+today: when #122 lands its URL-validation helper, a CRL fetcher MUST call it on the distribution
+point URL and on every redirect target, since calling it only on the first URL applies just half
+the policy.
+
+**Delta CRLs are refused, not partially applied.** `parse` reads only the extension OIDs inside
+`crlExtensions` looking for `deltaCRLIndicator` (`2.5.29.27`); finding it is
+`CrlError::DeltaCrlUnsupported` rather than an attempt to apply the delta without the base CRL it
+presupposes, which would silently under-report revocations.
+
 ## The assembled proxy: what M1 defends and what it does not
 
 This is the summary an operator reads before deploying `run` or `proxy`. It is a list of plain

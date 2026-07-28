@@ -10,6 +10,7 @@
 #![deny(missing_docs)]
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
+pub mod crl;
 pub mod name;
 pub mod policy;
 pub mod provider;

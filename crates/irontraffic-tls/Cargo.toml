@@ -28,6 +28,7 @@ rustls = { workspace = true }
 siphasher = { workspace = true }
 blake3 = { workspace = true }
 x509-cert = { workspace = true }
+der = { workspace = true }
 irontraffic-rand = { path = "../irontraffic-rand", version = "0.1.0" }
 serde = { workspace = true }
 schemars = { workspace = true, optional = true }
@@ -50,4 +51,8 @@ harness = false
 
 [[bench]]
 name = "resolve"
+harness = false
+
+[[bench]]
+name = "crl"
 harness = false
