@@ -379,6 +379,73 @@ mod tests {
         assert_eq!(err.field, "health.tcp.receive");
     }
 
+    /// #739 should-fix 1's TCP half: `tcp_validate_rejects` above only proves the
+    /// reject side. The worst case the finding names is
+    /// `response_buffer_size`'s `in_range_u32(.., 1, 4096)` clause, which had ZERO
+    /// coverage in either direction; this closes both directions for every cap in
+    /// invariant 8.
+    #[test]
+    fn tcp_validate_accepts_every_cap_at_its_limit() {
+        let base = TcpCheckSpec {
+            send: Vec::new(),
+            receive: Vec::new(),
+            response_buffer_size: 1024,
+        };
+
+        let cases: Vec<(&str, TcpCheckSpec)> = vec![
+            (
+                "send length (4096)",
+                TcpCheckSpec {
+                    send: vec![0u8; 4096],
+                    ..base.clone()
+                },
+            ),
+            (
+                "response_buffer_size lo (1)",
+                TcpCheckSpec {
+                    response_buffer_size: 1,
+                    ..base.clone()
+                },
+            ),
+            (
+                "response_buffer_size hi (4096)",
+                TcpCheckSpec {
+                    response_buffer_size: 4096,
+                    ..base.clone()
+                },
+            ),
+            (
+                "receive pattern length (256)",
+                TcpCheckSpec {
+                    receive: vec![vec![0u8; 256]],
+                    ..base.clone()
+                },
+            ),
+            (
+                "receive pattern count (8)",
+                TcpCheckSpec {
+                    receive: (0..8).map(|_| vec![0u8]).collect(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "receive sum of pattern lengths (512)",
+                TcpCheckSpec {
+                    receive: vec![vec![0u8; 256], vec![1u8; 256]],
+                    ..base.clone()
+                },
+            ),
+        ];
+
+        for (label, spec) in cases {
+            assert!(
+                spec.validate().is_ok(),
+                "{label}: expected Ok at the exact limit, got {:?}",
+                spec.validate()
+            );
+        }
+    }
+
     #[test]
     fn tcp_codec_never_allocates_after_construction() {
         let compiled = TcpCheckSpec {

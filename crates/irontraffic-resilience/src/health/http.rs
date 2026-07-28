@@ -944,6 +944,147 @@ mod tests {
         }
     }
 
+    /// #739 should-fix 1: `validate_rejects_table` above asserts only the reject
+    /// side of every cap, mostly far past the boundary, so nothing proved that an
+    /// AT-LIMIT value is ACCEPTED. That let a mutant tighten fifteen of the sixteen
+    /// caps in invariants 7 and 8 by one (for example `<= 4096` to `<= 4095`) with
+    /// the whole suite green, silently rejecting configs the docs call legal. This
+    /// mirrors the shape `head_cap_boundary` already uses for `max_head_bytes`, one
+    /// row per cap, each exactly at its documented limit.
+    #[test]
+    fn validate_accepts_every_cap_at_its_limit() {
+        let base = valid_spec();
+
+        let cases: Vec<(&str, HttpCheckSpec)> = vec![
+            (
+                "response_buffer_size lo (1)",
+                HttpCheckSpec {
+                    response_buffer_size: 1,
+                    ..base.clone()
+                },
+            ),
+            (
+                "response_buffer_size hi (4096)",
+                HttpCheckSpec {
+                    response_buffer_size: 4096,
+                    ..base.clone()
+                },
+            ),
+            (
+                "max_head_bytes lo (16)",
+                HttpCheckSpec {
+                    max_head_bytes: 16,
+                    ..base.clone()
+                },
+            ),
+            (
+                "max_head_bytes hi (8192)",
+                HttpCheckSpec {
+                    max_head_bytes: 8192,
+                    ..base.clone()
+                },
+            ),
+            (
+                "expected_statuses range hi (600)",
+                HttpCheckSpec {
+                    expected_statuses: vec![StatusRange { lo: 0, hi: 600 }],
+                    ..base.clone()
+                },
+            ),
+            (
+                "expected_statuses count (8)",
+                HttpCheckSpec {
+                    expected_statuses: (0..8)
+                        .map(|i| StatusRange {
+                            lo: i * 10,
+                            hi: i * 10 + 1,
+                        })
+                        .collect(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "retriable_statuses count (8)",
+                HttpCheckSpec {
+                    retriable_statuses: (0..8)
+                        .map(|i| StatusRange {
+                            lo: i * 10,
+                            hi: i * 10 + 1,
+                        })
+                        .collect(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "receive pattern length (256)",
+                HttpCheckSpec {
+                    receive: vec![vec![b'x'; 256]],
+                    ..base.clone()
+                },
+            ),
+            (
+                "receive pattern count (8)",
+                HttpCheckSpec {
+                    receive: (0..8).map(|_| vec![b'x']).collect(),
+                    ..base.clone()
+                },
+            ),
+            (
+                "receive sum of pattern lengths (512)",
+                HttpCheckSpec {
+                    receive: vec![vec![b'x'; 256], vec![b'y'; 256]],
+                    ..base.clone()
+                },
+            ),
+        ];
+
+        for (label, spec) in cases {
+            assert!(
+                spec.validate().is_ok(),
+                "{label}: expected Ok at the exact limit, got {:?}",
+                spec.validate()
+            );
+        }
+
+        // Serialized request size exactly at the 8192-byte cap (invariant 7's
+        // last clause), computed rather than guessed so the mutation this row
+        // guards against (`> 8192` tightened to `>= 8192`) cannot hide behind an
+        // off-by-a-few fixture. Sixteen headers with equal-length values, one
+        // trimmed by exactly the overshoot, lands the total on the cap exactly.
+        let over_spec = HttpCheckSpec {
+            headers: (0..16)
+                .map(|i| (format!("x-pad-{i}"), "v".repeat(500)))
+                .collect(),
+            ..base.clone()
+        };
+        let over_len = serialize_request(&over_spec).len();
+        assert!(
+            over_len > 8192,
+            "fixture must start over the cap to compute the exact trim"
+        );
+        let trim = over_len - 8192;
+        let mut headers = over_spec.headers.clone();
+        let (_, last_value) = headers.last_mut().expect("16 headers configured");
+        assert!(
+            last_value.len() > trim,
+            "trim must not empty the last header value"
+        );
+        last_value.truncate(last_value.len() - trim);
+        let at_cap_spec = HttpCheckSpec {
+            headers,
+            ..base.clone()
+        };
+        assert_eq!(
+            serialize_request(&at_cap_spec).len(),
+            8192,
+            "fixture must land exactly on the cap"
+        );
+        assert!(
+            at_cap_spec.validate().is_ok(),
+            "a request of exactly 8192 bytes must be accepted"
+        );
+    }
+
     #[test]
     fn compiled_request_bytes_exact() {
         let spec = HttpCheckSpec {
