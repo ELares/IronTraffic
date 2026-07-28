@@ -131,6 +131,24 @@ mod tests {
         assert!(patterns_match(b"aaab", &[aab]));
     }
 
+    // Edge case 26 from the issue: a repeated pattern needs a SECOND, disjoint
+    // occurrence, not the same one counted twice. `pos` must advance past the
+    // whole match (`found + pat.len()`), not just to the match start
+    // (`found`): advancing only to the start lets the second search re-find
+    // the identical occurrence the first search already consumed. This is
+    // exactly what a mutant that drops `.saturating_add(pat.len())` from
+    // `patterns_match`'s `pos` update produces, and it is NOT caught by
+    // `patterns_match_in_order_no_overlap` above, whose negative case
+    // ("b", "a" against "ab") happens to still fail correctly under that
+    // mutant by coincidence.
+    #[test]
+    fn patterns_match_duplicate_pattern_needs_two_occurrences() {
+        let a1: Box<[u8]> = Box::from(*b"a");
+        let a2: Box<[u8]> = Box::from(*b"a");
+        assert!(patterns_match(b"aa", &[a1.clone(), a2.clone()]));
+        assert!(!patterns_match(b"a", &[a1, a2]));
+    }
+
     #[test]
     fn patterns_match_empty_pattern_list_is_vacuously_true() {
         assert!(patterns_match(b"anything", &[]));

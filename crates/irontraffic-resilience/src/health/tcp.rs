@@ -199,6 +199,15 @@ impl TcpCheckCodec {
             };
             idx = idx.saturating_add(1);
 
+            // `<` here is defense in depth, not the actual enforcement, for the
+            // same reason `HttpCheckCodec::consume_body_byte` documents: `full`
+            // below always triggers a `return self.finish(...)` on the exact byte
+            // that takes `body.len()` to `response_buffer_size` (both the matched
+            // and the not-matched arm return), so no later iteration of this loop
+            // ever runs with `self.body.len() >= compiled.response_buffer_size` on
+            // entry. Confirmed by mutating this to `<=` and rerunning the suite,
+            // including `tcp_codec_never_allocates_after_construction`, which
+            // stayed green.
             if self.body.len() < compiled.response_buffer_size {
                 self.body.push(byte);
             }

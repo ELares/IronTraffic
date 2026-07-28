@@ -671,6 +671,17 @@ impl HttpCheckCodec {
     /// `receive` patterns all matched or the buffer filled without a match,
     /// `None` otherwise.
     fn consume_body_byte(&mut self, byte: u8, compiled: &CompiledHttpCheck) -> Option<CodecStep> {
+        // `<` here (rather than `<=`) is defense in depth, not the actual
+        // enforcement: `full` below becomes true on the exact byte that takes
+        // `body.len()` to `response_buffer_size`, and whenever `full` is true
+        // this function unconditionally calls `finish`, which moves `phase` to
+        // `Finished`. A `Finished` codec never reaches this function again (see
+        // `on_bytes`'s phase check), so no later call can ever observe
+        // `self.body.len() >= compiled.response_buffer_size` on entry, and
+        // widening this guard to `<=` cannot be distinguished by any input: it
+        // was confirmed equivalent by mutating it and rerunning the suite,
+        // including `infinite_body_bounded` and `prop_never_exceeds_caps`,
+        // which both stayed green.
         if self.body.len() < compiled.response_buffer_size {
             self.body.push(byte);
         }
