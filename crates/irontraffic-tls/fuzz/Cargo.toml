@@ -24,6 +24,14 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 irontraffic-tls = { path = ".." }
+# fuzz_crl_parse's own dependency, not shared by the other two targets: it builds a real,
+# validly signed CRL per input (see that target's module doc for why a signature must actually
+# verify) using rcgen's CertificateRevocationListParams builder. rcgen's `ring`-only default
+# features cannot generate RSA keys at all (RSA key generation is gated behind the `aws_lc_rs`
+# feature; see rcgen's own KeyPair::generate_for), so this mirrors the same feature addition
+# crates/irontraffic-tls/Cargo.toml's own dev-dependency on rcgen already makes, on top of the
+# workspace default rather than instead of it.
+rcgen = { version = "0.14.8", features = ["aws_lc_rs"] }
 
 [[bin]]
 name = "fuzz_sni_normalize"
@@ -35,6 +43,13 @@ bench = false
 [[bin]]
 name = "fuzz_cert_load"
 path = "fuzz_targets/fuzz_cert_load.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_crl_parse"
+path = "fuzz_targets/fuzz_crl_parse.rs"
 test = false
 doc = false
 bench = false
