@@ -383,8 +383,9 @@ pub fn label_count(name: &str) -> usize {
 /// `record` explicitly at known allocation sites, either directly or, for `crl.rs`, through
 /// `#[cfg(test)]`-gated instrumentation inside `RevocationIndex::build` and `build_bloom` that
 /// records the exact size of every heap allocation those functions make (a `Vec` capacity growth
-/// observed via `capacity()` before and after each push, a boxed slice's known length, or a
-/// single `vec![0u64; words]` fill). `crl_parse_1e6_allocation_bounded` calls `reset` before
+/// observed via `capacity()` before and after each push, a boxed slice's known length, or the
+/// one-shot fill that allocates the Bloom filter's backing words). `crl_parse_1e6_allocation_bounded`
+/// calls `reset` before
 /// `RevocationIndex::build` and reads `bytes()` after, so the counter reports the ALLOCATED-BYTE
 /// DELTA for that one call, a different and stricter quantity than `memory_bytes()` on the
 /// resulting structure: `memory_bytes()` is the final structure's own size, and does not see the
