@@ -38,7 +38,7 @@ fn authority() -> Authority {
     let limits = clamped();
     let mut out = BytesMut::new();
     Authority::parse_into(b"example.com", Scheme::Https, &limits, &mut out)
-        .expect("well formed authority")
+        .expect("well formed authority") // it-allow: no-panic reason: fuzz target reports a finding by panicking; the input is the fixed literal b"example.com", which parses by construction
 }
 
 fn peer() -> PeerIdentity {
@@ -58,10 +58,10 @@ fn build_fields() -> FieldSection {
     let mut builder = FieldSectionBuilder::new(&arena, &limits);
     builder
         .push(&mut arena, b"accept", b"text/html")
-        .expect("valid field");
+        .expect("valid field"); // it-allow: no-panic reason: fuzz target reports a finding by panicking; the name and value are fixed literals that satisfy the field grammar by construction
     builder
         .push(&mut arena, b"x-custom", b"value")
-        .expect("valid field");
+        .expect("valid field"); // it-allow: no-panic reason: fuzz target reports a finding by panicking; the name and value are fixed literals that satisfy the field grammar by construction
     builder.finish(&mut arena)
 }
 
