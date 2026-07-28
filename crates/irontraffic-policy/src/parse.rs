@@ -1107,89 +1107,361 @@ mod tests {
         assert!(matches!(err, ParseError::TrailingTokens { .. }));
     }
 
+    // ------------------------------------------------------------------
+    // #738 BLOCKING 2: `token_stream_strategy` and its supporting
+    // strategies used to draw independent, uniformly random tokens from the
+    // closed `Tok` alphabet. Random token soup is never a complete, fully
+    // consumed ITPL expression, so `parse` returned `Err` on every one of
+    // proptest's 256 default cases, `if let Ok(ast) = parse(..)` never ran,
+    // and every `prop_assert!` inside it was dead code: replacing either
+    // one with `prop_assert!(false)` left the suite green (#738 M57, M58).
+    // The doc comment that used to sit on `tok_strategy` claimed this
+    // generator was "the shape #721 named as the fix" for exactly that
+    // failure mode; measurement proved the opposite, so that claim and the
+    // generator it described are both gone, replaced by one that builds a
+    // small expression tree shaped like the grammar and renders it to real
+    // ITPL source `lex` and `parse` can actually consume.
+    // ------------------------------------------------------------------
+
+    /// A small expression tree, shaped like the ITPL grammar. `render`
+    /// turns one of these into source text.
+    #[derive(Clone, Debug)]
+    enum GenExpr {
+        Bool(bool),
+        Int(i64),
+        Str(String),
+        Null,
+        Ident(&'static str),
+        Field(Box<GenExpr>, &'static str),
+        Index(Box<GenExpr>, Box<GenExpr>),
+        Call(Box<GenExpr>, Method, Vec<GenExpr>),
+        Not(Box<GenExpr>),
+        Bin(BinOp, Box<GenExpr>, Box<GenExpr>),
+        And(Box<GenExpr>, Box<GenExpr>),
+        Or(Box<GenExpr>, Box<GenExpr>),
+        Ternary(Box<GenExpr>, Box<GenExpr>, Box<GenExpr>),
+        List(Vec<GenExpr>),
+    }
+
+    /// A handful of safe identifiers, none of them a keyword (`true`,
+    /// `false`, `null`, `in`): the lexer would hand any of those back as
+    /// their own token, never as `Tok::Ident`.
+    const GEN_IDENTS: &[&str] = &["a", "b", "c", "x", "y", "req", "hdr"];
+
+    const GEN_METHODS: &[Method] = &[
+        Method::StartsWith,
+        Method::EndsWith,
+        Method::Contains,
+        Method::Matches,
+        Method::EqualsIgnoreCase,
+        Method::StartsWithIgnoreCase,
+        Method::Size,
+    ];
+
+    const GEN_BINOPS: &[BinOp] = &[
+        BinOp::Eq,
+        BinOp::Ne,
+        BinOp::Lt,
+        BinOp::Le,
+        BinOp::Gt,
+        BinOp::Ge,
+        BinOp::In,
+    ];
+
+    /// The grammar level a `GenExpr` renders at: 0 is loosest (ternary), 6
+    /// is tightest (an atomic primary, or a list, which is a primary too).
+    /// `render` wraps a child in parentheses exactly when its level is
+    /// looser than the minimum level the calling production allows in that
+    /// slot, mirroring the real precedence chain (`expr > or > and > rel >
+    /// unary > postfix > primary`) instead of wrapping every child and
+    /// paying extra parser depth for parentheses the grammar never needed.
+    fn expr_level(e: &GenExpr) -> u8 {
+        match e {
+            GenExpr::Ternary(..) => 0,
+            GenExpr::Or(..) => 1,
+            GenExpr::And(..) => 2,
+            GenExpr::Bin(..) => 3,
+            GenExpr::Not(..) => 4,
+            GenExpr::Field(..) | GenExpr::Index(..) | GenExpr::Call(..) => 5,
+            GenExpr::Bool(_)
+            | GenExpr::Int(_)
+            | GenExpr::Str(_)
+            | GenExpr::Null
+            | GenExpr::Ident(_)
+            | GenExpr::List(_) => 6,
+        }
+    }
+
+    fn binop_spelling(op: BinOp) -> &'static str {
+        match op {
+            BinOp::Eq => "==",
+            BinOp::Ne => "!=",
+            BinOp::Lt => "<",
+            BinOp::Le => "<=",
+            BinOp::Gt => ">",
+            BinOp::Ge => ">=",
+            BinOp::In => "in",
+        }
+    }
+
+    fn render(e: &GenExpr, min_level: u8, out: &mut String) {
+        use std::fmt::Write as _;
+
+        if expr_level(e) < min_level {
+            out.push('(');
+            render(e, 0, out);
+            out.push(')');
+            return;
+        }
+        match e {
+            GenExpr::Bool(true) => out.push_str("true"),
+            GenExpr::Bool(false) => out.push_str("false"),
+            GenExpr::Int(v) => {
+                let _ = write!(out, "{v}");
+            }
+            GenExpr::Str(s) => {
+                out.push('"');
+                out.push_str(s);
+                out.push('"');
+            }
+            GenExpr::Null => out.push_str("null"),
+            GenExpr::Ident(name) => out.push_str(name),
+            GenExpr::Field(base, name) => {
+                render(base, 5, out);
+                out.push('.');
+                out.push_str(name);
+            }
+            GenExpr::Index(base, idx) => {
+                render(base, 5, out);
+                out.push('[');
+                render(idx, 0, out);
+                out.push(']');
+            }
+            GenExpr::Call(base, method, args) => {
+                render(base, 5, out);
+                out.push('.');
+                out.push_str(method.as_str());
+                out.push('(');
+                for (i, a) in args.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    render(a, 0, out);
+                }
+                out.push(')');
+            }
+            GenExpr::Not(inner) => {
+                out.push('!');
+                render(inner, 5, out);
+            }
+            GenExpr::Bin(op, l, r) => {
+                render(l, 4, out);
+                out.push(' ');
+                out.push_str(binop_spelling(*op));
+                out.push(' ');
+                render(r, 4, out);
+            }
+            GenExpr::And(l, r) => {
+                render(l, 3, out);
+                out.push_str(" && ");
+                render(r, 3, out);
+            }
+            GenExpr::Or(l, r) => {
+                render(l, 2, out);
+                out.push_str(" || ");
+                render(r, 2, out);
+            }
+            GenExpr::Ternary(c, t, e2) => {
+                render(c, 1, out);
+                out.push_str(" ? ");
+                render(t, 0, out);
+                out.push_str(" : ");
+                render(e2, 0, out);
+            }
+            GenExpr::List(elems) => {
+                out.push('[');
+                for (i, el) in elems.iter().enumerate() {
+                    if i > 0 {
+                        out.push_str(", ");
+                    }
+                    render(el, 0, out);
+                }
+                out.push(']');
+            }
+        }
+    }
+
+    fn arb_method() -> impl Strategy<Value = Method> {
+        (0..GEN_METHODS.len()).prop_map(|i| GEN_METHODS[i])
+    }
+
+    fn arb_binop() -> impl Strategy<Value = BinOp> {
+        (0..GEN_BINOPS.len()).prop_map(|i| GEN_BINOPS[i])
+    }
+
+    /// A call generated with exactly the argument count its method's arity
+    /// demands (0 for `size`, 1 for everything else). `arity_errors` already
+    /// pins `BadArity` directly; this property is about the invariants a
+    /// well-formed program must hold, so generated calls are well formed.
+    fn arb_call(budget: u32) -> BoxedStrategy<GenExpr> {
+        arb_method()
+            .prop_flat_map(move |method| {
+                let arity = usize::from(method.arity());
+                (
+                    arb_expr(budget),
+                    proptest::collection::vec(arb_expr(budget), arity..=arity),
+                )
+                    .prop_map(move |(base, args)| GenExpr::Call(Box::new(base), method, args))
+            })
+            .boxed()
+    }
+
+    /// Recursive expression-tree strategy. `budget` bounds how many more
+    /// levels of composite nesting are allowed; only leaves are drawn once
+    /// it reaches 0. Kept small (`arb_itpl_src` calls this with 3): only
+    /// `Ternary`, `Index`, a non-empty `Call`'s arguments and a non-empty
+    /// `List`'s elements cost the parser's own depth counter (each re-enters
+    /// `expr`), so even a modest budget can chain a few of those before
+    /// approaching `PolicyLimits::defaults().max_depth` (16), and a small
+    /// budget keeps the rendered source easy to reason about.
+    fn arb_expr(budget: u32) -> BoxedStrategy<GenExpr> {
+        let leaf = prop_oneof![
+            3 => any::<bool>().prop_map(GenExpr::Bool),
+            3 => any::<i32>().prop_map(|v| GenExpr::Int(i64::from(v))),
+            2 => "[a-zA-Z ]{0,8}".prop_map(GenExpr::Str),
+            1 => Just(GenExpr::Null),
+            4 => (0..GEN_IDENTS.len()).prop_map(|i| GenExpr::Ident(GEN_IDENTS[i])),
+        ];
+
+        if budget == 0 {
+            return leaf.boxed();
+        }
+
+        let next = budget - 1;
+        prop_oneof![
+            6 => leaf,
+            2 => (arb_expr(next), 0..GEN_IDENTS.len())
+                .prop_map(|(base, i)| GenExpr::Field(Box::new(base), GEN_IDENTS[i])),
+            1 => (arb_expr(next), arb_expr(next))
+                .prop_map(|(base, idx)| GenExpr::Index(Box::new(base), Box::new(idx))),
+            2 => arb_call(next),
+            1 => arb_expr(next).prop_map(|inner| GenExpr::Not(Box::new(inner))),
+            2 => (arb_binop(), arb_expr(next), arb_expr(next))
+                .prop_map(|(op, l, r)| GenExpr::Bin(op, Box::new(l), Box::new(r))),
+            2 => (arb_expr(next), arb_expr(next))
+                .prop_map(|(l, r)| GenExpr::And(Box::new(l), Box::new(r))),
+            2 => (arb_expr(next), arb_expr(next))
+                .prop_map(|(l, r)| GenExpr::Or(Box::new(l), Box::new(r))),
+            1 => (arb_expr(next), arb_expr(next), arb_expr(next))
+                .prop_map(|(c, t, e)| GenExpr::Ternary(Box::new(c), Box::new(t), Box::new(e))),
+            1 => proptest::collection::vec(arb_expr(next), 0..4).prop_map(GenExpr::List),
+        ]
+        .boxed()
+    }
+
+    /// Renders a generated tree to ITPL source, then sometimes damages it:
+    /// about one case in eight gets a trailing identifier appended (a
+    /// guaranteed `TrailingTokens`, since `parse` requires the whole stream
+    /// consumed) and about one in eight is truncated by one byte (usually
+    /// `UnexpectedEof` or `Unexpected`, occasionally still a shorter valid
+    /// program). The rest renders untouched. This keeps the property
+    /// exercising real `Err` paths too, without making `Err` the only
+    /// reachable outcome the way the byte-soup generator it replaced did.
+    fn arb_itpl_src() -> impl Strategy<Value = Vec<u8>> {
+        (arb_expr(3), 0u8..8).prop_map(|(expr, roll)| {
+            let mut src = String::new();
+            render(&expr, 0, &mut src);
+            match roll {
+                0 => src.push_str(" then"),
+                1 => {
+                    src.pop();
+                }
+                _ => {}
+            }
+            src.into_bytes()
+        })
+    }
+
+    /// The `(from, len)` arg-range a `Call` or `List` names, or `None` for
+    /// every other variant.
+    fn args_range_of(node: Node) -> Option<(u16, u16)> {
+        match node {
+            Node::Call {
+                args_from,
+                args_len,
+                ..
+            } => Some((args_from, args_len)),
+            Node::List { from, len } => Some((from, len)),
+            _ => None,
+        }
+    }
+
+    /// Every `NodeId` a node carries directly or through `Ast::args_of`, for
+    /// the "every child id is strictly less than its own" invariant.
+    /// Mirrors `node_children_have_smaller_ids`'s inline match, generalized
+    /// to run against whatever tree the property generator produced rather
+    /// than one fixed 50-node expression.
+    fn node_children_ids(ast: &Ast, node: Node) -> Vec<NodeId> {
+        match node {
+            Node::Field { base, .. } | Node::Not { inner: base } => vec![base],
+            Node::Index { base, index } => vec![base, index],
+            Node::Bin { lhs, rhs, .. } | Node::And { lhs, rhs } | Node::Or { lhs, rhs } => {
+                vec![lhs, rhs]
+            }
+            Node::Ternary { cond, then_, else_ } => vec![cond, then_, else_],
+            Node::Call {
+                base,
+                args_from,
+                args_len,
+                ..
+            } => {
+                let mut c = vec![base];
+                c.extend_from_slice(ast.args_of(args_from, args_len));
+                c
+            }
+            Node::List { from, len } => ast.args_of(from, len).to_vec(),
+            Node::Bool(_) | Node::Int(_) | Node::Str(_) | Node::Null | Node::Ident(_) => vec![],
+        }
+    }
+
     proptest! {
         #[test]
-        fn prop_parse_never_panics(
-            toks in token_stream_strategy(),
-            src in proptest::collection::vec(any::<u8>(), 0..256)
-        ) {
+        fn prop_parse_never_panics(src in arb_itpl_src()) {
             let limits = default_limits();
-            let stream = TokenStream { toks, strings: Vec::new() };
-            // Must never panic for any input, which `#[test]` alone already
-            // enforces (a panic fails the case). The real, checkable
-            // invariants beyond mere totality: every accepted arena is
-            // bounded by `NodeId`'s own range and the root is a valid index
-            // into it. `prop_depth_never_exceeds_cap` below covers the depth
-            // cap specifically, so it is not duplicated here.
-            if let Ok(ast) = parse(&stream, &src, &limits) {
+            // `lex` failing is a legitimate outcome (the truncation and
+            // trailing-token damage in `arb_itpl_src` can produce that), not
+            // something to route around: only a successfully lexed,
+            // successfully parsed program is checked below.
+            if let Ok(toks) = lex(&src, &limits)
+                && let Ok(ast) = parse(&toks, &src, &limits)
+            {
                 prop_assert!(u16::try_from(ast.nodes.len()).is_ok());
                 prop_assert!(ast.root.index() < ast.nodes.len());
+                for (i, node) in ast.nodes.iter().enumerate() {
+                    if let Some((from, len)) = args_range_of(*node) {
+                        let end = usize::from(from) + usize::from(len);
+                        prop_assert!(
+                            end <= ast.args.len(),
+                            "node {i} args range {from}..{end} exceeds args.len() {}",
+                            ast.args.len()
+                        );
+                    }
+                    for child in node_children_ids(&ast, *node) {
+                        prop_assert!(child.index() < i, "node {i} has child {child:?}");
+                    }
+                }
             }
         }
 
         #[test]
-        fn prop_depth_never_exceeds_cap(
-            toks in token_stream_strategy(),
-            src in proptest::collection::vec(any::<u8>(), 0..256)
-        ) {
+        fn prop_depth_never_exceeds_cap(src in arb_itpl_src()) {
             let limits = default_limits();
-            let stream = TokenStream { toks, strings: Vec::new() };
-            if let Ok(ast) = parse(&stream, &src, &limits) {
+            if let Ok(toks) = lex(&src, &limits)
+                && let Ok(ast) = parse(&toks, &src, &limits)
+            {
                 prop_assert!(ast.depth <= limits.max_depth);
                 prop_assert!(ast.root.index() == ast.nodes.len().saturating_sub(1));
             }
         }
-    }
-
-    fn span_strategy() -> impl Strategy<Value = Span> {
-        (0u32..300, 0u32..300).prop_map(|(a, b)| {
-            if a <= b {
-                Span { start: a, end: b }
-            } else {
-                Span { start: b, end: a }
-            }
-        })
-    }
-
-    /// Draws from the closed `Tok` alphabet the grammar defines, the shape
-    /// #721 named as the fix for a property test that dies at a gate before
-    /// it: every variant `parse` can actually see, none excluded, so a
-    /// generated stream exercises `primary`, `postfix`, `rel`'s
-    /// double-relop check, `elem_list`'s cap and every other branch, not
-    /// only the ones a byte-level generator happens to stumble into.
-    fn tok_strategy() -> impl Strategy<Value = Tok> {
-        prop_oneof![
-            span_strategy().prop_map(Tok::Ident),
-            any::<i64>().prop_map(Tok::Int),
-            span_strategy().prop_map(Tok::Str),
-            any::<bool>().prop_map(Tok::Bool),
-            Just(Tok::Null),
-            Just(Tok::LParen),
-            Just(Tok::RParen),
-            Just(Tok::LBracket),
-            Just(Tok::RBracket),
-            Just(Tok::Comma),
-            Just(Tok::Dot),
-            Just(Tok::Question),
-            Just(Tok::Colon),
-            Just(Tok::Bang),
-            Just(Tok::AndAnd),
-            Just(Tok::OrOr),
-            Just(Tok::EqEq),
-            Just(Tok::BangEq),
-            Just(Tok::Lt),
-            Just(Tok::Le),
-            Just(Tok::Gt),
-            Just(Tok::Ge),
-            Just(Tok::In),
-        ]
-    }
-
-    fn spanned_strategy() -> impl Strategy<Value = Spanned> {
-        (tok_strategy(), span_strategy()).prop_map(|(tok, span)| Spanned { tok, span })
-    }
-
-    fn token_stream_strategy() -> impl Strategy<Value = Vec<Spanned>> {
-        proptest::collection::vec(spanned_strategy(), 0..=1024)
     }
 }
