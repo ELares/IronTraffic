@@ -912,3 +912,55 @@ detail for each of the surfaces named here.
 **Trust boundaries.** The configuration file and the environment are trusted (they are process
 identity, set by whoever operates the process). Every byte on every socket, in both directions, downstream
 and upstream, is not.
+
+## The ITPL policy expression lexer
+
+**What `irontraffic-policy` parses.** `lex` (`crates/irontraffic-policy/src/lex.rs`) turns the
+source bytes of one ITPL expression into a token stream. An ITPL expression is admitted at config
+time, never on the request path, but admission input is not always operator authored: the
+extensibility design anticipates a Kubernetes deployment where a policy and the limits it is
+checked against arrive from a resource a namespace tenant writes. Treat every byte `lex` receives
+as attacker chosen.
+
+**Abuse cases.** A crafted expression built to hang the config thread with a pathological scan, to
+allocate without bound while decoding an unclosed string literal or a long run of escapes, to
+overflow an integer or a byte offset, or to panic the process on malformed UTF-8, an embedded NUL,
+or an unterminated literal. A config thread that dies or hangs on one hostile expression stops
+every subsequent admission from succeeding, which is why this surface is fuzzed and bounded even
+though it never runs on the request path.
+
+**Structural controls.**
+
+- **A compiled DFA, never a backtracking matcher.** The token definitions are a `logos` enum
+  compiled to a deterministic automaton at build time, so lexing one source is one linear pass with
+  no input shape that goes quadratic or worse. Rewriting these definitions as `regex` patterns
+  evaluated at admission time is disallowed by design, not merely undone by today's implementation.
+- **Every budget is checked inside the loop, never after it.** `max_source_bytes` is checked once
+  before scanning starts; `max_tokens` is checked on every token the scan produces; and
+  `max_string_bytes` is checked on every decoded byte of every string literal, so an oversized or
+  adversarial input is refused after a bounded amount of work rather than after the whole input has
+  already been scanned or decoded.
+- **`max_string_bytes` bounds one literal, not the whole expression.** A literal's decoded length is
+  checked against the arena offset at which that literal started, not against the arena's running
+  total, so an expression built from many small literals is bounded by its largest single literal
+  rather than by the sum of all of them.
+- **Decoding never expands.** Every escape sequence is at least two source bytes and produces at
+  most four decoded bytes, so the decoded string arena for one expression can never exceed
+  `max_source_bytes`, however many literals or escapes it contains.
+- **No token owns heap memory.** `Tok` and `Spanned` are `Copy` types whose payloads are ranges into
+  the source or into the decoded arena, never owned buffers, so the only growth an adversarial
+  input can cause is the two `Vec`s `TokenStream` owns, both bounded by the limits above.
+- **`#![forbid(unsafe_code)]`.** The crate contains no `unsafe` block, so an out of bounds read on
+  an attacker chosen offset is a compile error, not a property a reviewer has to verify by hand.
+- **Fuzzed directly.** `crates/irontraffic-policy/fuzz` lexes arbitrary byte input against
+  `PolicyLimits::defaults()` on every fuzz lane run and asserts the token count and every span bound
+  this section states, not merely the absence of a crash.
+
+**Accepted risk.** `lex` does not call `PolicyLimits::validate()` itself. A caller that admits a
+policy without validating its limits first gets whatever bound the caller passed, which may be
+looser than the hard caps `docs/ITPL.md` publishes, but this is a config admission bug for that
+caller to fix, not a crash in `lex`: every size bounding field of `PolicyLimits` is a `u32`, and the
+source length check `lex` runs before anything else already bounds every byte offset it produces to
+`u32::MAX` regardless of what limits were passed. Nothing in this crate is wired to the data plane
+yet, so the blast radius of a config side defect here is a failed or delayed config push, never a
+request.

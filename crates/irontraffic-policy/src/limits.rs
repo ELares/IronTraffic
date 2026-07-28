@@ -376,4 +376,41 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn defaults_and_caps_match_the_published_literal_values() {
+        // `every_limit_field_has_a_cap` above proves CAPS is applied
+        // consistently with itself; it reads both sides of every assertion
+        // from `PolicyLimits::CAPS`, so a wrong value there (or in
+        // `defaults()`) makes the test agree with itself and stays green. The
+        // ten defaults and ten (field, cap) pairs below are transcribed by
+        // hand from docs/ITPL.md's Limits table and from CAPS's own rustdoc,
+        // owned by this test, never read from the source under test, so a
+        // single wrong constant anywhere in `limits.rs` fails exactly this
+        // assertion instead of validating against itself.
+        let defaults = PolicyLimits::defaults();
+        assert_eq!(defaults.max_source_bytes, 8_192, "max_source_bytes default");
+        assert_eq!(defaults.max_tokens, 1_024, "max_tokens default");
+        assert_eq!(defaults.max_string_bytes, 1_024, "max_string_bytes default");
+        assert_eq!(defaults.max_depth, 16, "max_depth default");
+        assert_eq!(defaults.max_ops, 256, "max_ops default");
+        assert_eq!(defaults.max_consts, 128, "max_consts default");
+        assert_eq!(defaults.max_attr_slots, 16, "max_attr_slots default");
+        assert_eq!(defaults.max_regex, 8, "max_regex default");
+        assert_eq!(defaults.max_regex_size, 65_536, "max_regex_size default");
+        assert_eq!(defaults.max_list_elems, 64, "max_list_elems default");
+
+        let caps = PolicyLimits::CAPS;
+        assert_eq!(caps.len(), 10, "CAPS must have exactly one entry per field");
+        assert_eq!(caps[0], ("max_source_bytes", 65_536));
+        assert_eq!(caps[1], ("max_tokens", 8_192));
+        assert_eq!(caps[2], ("max_string_bytes", 8_192));
+        assert_eq!(caps[3], ("max_depth", 16));
+        assert_eq!(caps[4], ("max_ops", 4_096));
+        assert_eq!(caps[5], ("max_consts", 1_024));
+        assert_eq!(caps[6], ("max_attr_slots", 16));
+        assert_eq!(caps[7], ("max_regex", 64));
+        assert_eq!(caps[8], ("max_regex_size", 1_048_576));
+        assert_eq!(caps[9], ("max_list_elems", 1_024));
+    }
 }

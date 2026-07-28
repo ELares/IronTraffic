@@ -146,9 +146,16 @@ impl Span {
     }
 
     /// Length in bytes.
+    ///
+    /// Returns 0 for an inverted span (`end < start`) rather than panicking or
+    /// wrapping. `Span` has public fields and no constructor besides `empty`
+    /// enforces `start <= end`, so a caller assembling one from two positions
+    /// (the parser this crate feeds is the first one that will) can hand this
+    /// an inverted span; a total function here is cheaper than proving every
+    /// caller never will be wrong.
     #[must_use]
     pub const fn len(self) -> u32 {
-        self.end - self.start
+        self.end.saturating_sub(self.start)
     }
 
     /// True when the span covers no bytes.
@@ -236,6 +243,17 @@ mod tests {
             Some(b"ell".as_slice())
         );
         assert_eq!(Span { start: 10, end: 12 }.slice(src), None);
+    }
+
+    #[test]
+    fn span_len_saturates_on_an_inverted_span() {
+        // `Span` has public fields and no constructor enforces `start <=
+        // end`, so this must not overflow-panic in debug or wrap to roughly
+        // 4 billion in release; `len` returning 0 for a span that names no
+        // real range is the total, always-correct answer.
+        let s = Span { start: 5, end: 0 };
+        assert_eq!(s.len(), 0);
+        assert!(!s.is_empty(), "is_empty is start == end, not len == 0");
     }
 
     #[test]
