@@ -49,7 +49,7 @@ use crate::field::{name_byte_ok, value_byte_ok};
 use crate::h1::chunked::trailer_denied;
 use crate::known::KnownHeader;
 use crate::peer::{ForwardEmit, write_forwarded_element};
-use crate::scalar::{StatusCode, WireVersion};
+use crate::scalar::WireVersion;
 use crate::section::FieldSection;
 use crate::strip::{is_hop_by_hop, is_reserved_prefix};
 
@@ -689,7 +689,7 @@ pub fn serialize_response_head_len(
     // Status line: "HTTP/1.1 " (9) + 3-digit status
     len = len.saturating_add(9);
     len = len.saturating_add(3); // status code digits
-    let reason = StatusCode::canonical_reason(res.status);
+    let reason = canonical_reason(res.status.as_u16());
     if !reason.is_empty() {
         len = len.saturating_add(1); // SP
         len = len.saturating_add(reason.len());
@@ -731,7 +731,7 @@ pub fn serialize_response_head(
     // Status line: "HTTP/1.1 " + status code + optional reason + CRLF
     out.extend_from_slice(b"HTTP/1.1 ");
     write_status_code(res.status.as_u16(), out);
-    let reason = StatusCode::canonical_reason(res.status);
+    let reason = canonical_reason(res.status.as_u16());
     if !reason.is_empty() {
         out.put_u8(b' ');
         out.extend_from_slice(reason);
@@ -758,11 +758,83 @@ pub fn serialize_response_head(
 }
 
 // ---------------------------------------------------------------------------
+// Reason phrases
+// ---------------------------------------------------------------------------
+
+/// The canonical reason phrase for `code`, or an empty slice for a code with
+/// no entry in this table (RFC 9112 Section 4 permits a zero-length
+/// `reason-phrase`).
+///
+/// Used only by [`serialize_response_head`] and
+/// [`serialize_response_head_len`]: the phrase never comes from the
+/// upstream, always from this fixed table, so a response we emit is
+/// byte-identical for a given status regardless of what the origin said.
+/// Deliberately omits 418, 425, 506, 507, 508 and 510 (an empty phrase is
+/// correct for those codes here, even though they have standard phrases in
+/// the wider registry).
+#[must_use]
+const fn canonical_reason(code: u16) -> &'static [u8] {
+    match code {
+        100 => b"Continue",
+        101 => b"Switching Protocols",
+        103 => b"Early Hints",
+        200 => b"OK",
+        201 => b"Created",
+        202 => b"Accepted",
+        203 => b"Non-Authoritative Information",
+        204 => b"No Content",
+        205 => b"Reset Content",
+        206 => b"Partial Content",
+        300 => b"Multiple Choices",
+        301 => b"Moved Permanently",
+        302 => b"Found",
+        303 => b"See Other",
+        304 => b"Not Modified",
+        305 => b"Use Proxy",
+        307 => b"Temporary Redirect",
+        308 => b"Permanent Redirect",
+        400 => b"Bad Request",
+        401 => b"Unauthorized",
+        402 => b"Payment Required",
+        403 => b"Forbidden",
+        404 => b"Not Found",
+        405 => b"Method Not Allowed",
+        406 => b"Not Acceptable",
+        407 => b"Proxy Authentication Required",
+        408 => b"Request Timeout",
+        409 => b"Conflict",
+        410 => b"Gone",
+        411 => b"Length Required",
+        412 => b"Precondition Failed",
+        413 => b"Content Too Large",
+        414 => b"URI Too Long",
+        415 => b"Unsupported Media Type",
+        416 => b"Range Not Satisfiable",
+        417 => b"Expectation Failed",
+        421 => b"Misdirected Request",
+        422 => b"Unprocessable Content",
+        426 => b"Upgrade Required",
+        429 => b"Too Many Requests",
+        431 => b"Request Header Fields Too Large",
+        451 => b"Unavailable For Legal Reasons",
+        500 => b"Internal Server Error",
+        501 => b"Not Implemented",
+        502 => b"Bad Gateway",
+        503 => b"Service Unavailable",
+        504 => b"Gateway Timeout",
+        505 => b"HTTP Version Not Supported",
+        511 => b"Network Authentication Required",
+        _ => b"",
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Shared writing helpers
 // ---------------------------------------------------------------------------
 
 /// Writes the three ASCII digits of a status code into `out`. `code` is
-/// guaranteed by [`StatusCode`] construction to be in `100..=599`.
+/// guaranteed by [`crate::scalar::StatusCode`] construction to be in
+/// `100..=599`.
 fn write_status_code(code: u16, out: &mut BytesMut) {
     let hundreds = code.checked_div(100).unwrap_or(0);
     let remaining = code.checked_rem(100).unwrap_or(0);
