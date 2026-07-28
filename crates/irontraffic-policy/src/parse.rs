@@ -495,6 +495,21 @@ impl Parser<'_> {
 /// Parses one ITPL expression from a token stream, requiring that it consumes the
 /// whole stream.
 ///
+/// # Preconditions
+/// `parse` does not call `limits.validate()` itself, and unlike `lex` (see its own
+/// doc comment), that omission does not stay harmless for every field: `max_depth`
+/// buys `expr` re-entries directly, one per unit of nesting, and its only hard cap
+/// (16, from `PolicyLimits::CAPS`) is enforced by `validate()` alone. A caller that
+/// admits a policy and the limits it is checked against without validating the
+/// limits first, then calls `parse` with an oversized `max_depth`, hands whoever
+/// wrote the policy a stack-overflow primitive: deeply nested parentheses, an index
+/// expression, or a ternary chain each cost one `expr` re-entry, uncapped past
+/// whatever `max_depth` the caller supplied. See `docs/THREAT-MODEL.md`'s "The ITPL
+/// parser" section for the measured blast radius and why this is documented as a
+/// precondition here rather than fixed by calling `validate()` from inside `parse`.
+/// Every caller MUST call `limits.validate()` (or reuse limits it already
+/// validated) before calling `parse` or `parse_expr_at`.
+///
 /// # Errors
 /// Every `ParseError` variant. `NotImplemented` names the construct and the config
 /// error surfaces it with a pointer to `docs/ITPL.md`.
@@ -517,6 +532,11 @@ pub fn parse(toks: &TokenStream, src: &[u8], limits: &PolicyLimits) -> Result<As
 /// ends where the `then` identifier begins, and the rule parser needs that position
 /// back. `parse` is exactly `parse_expr_at(toks, src, limits, 0)` plus the check
 /// that the returned position equals `toks.toks.len()`.
+///
+/// # Preconditions
+/// Same as `parse`: the caller must validate `limits` (`limits.validate().is_ok()`)
+/// before calling this. See `parse`'s own doc comment and `docs/THREAT-MODEL.md`'s
+/// "The ITPL parser" section.
 ///
 /// # Errors
 /// Every `ParseError` variant except `TrailingTokens`.
