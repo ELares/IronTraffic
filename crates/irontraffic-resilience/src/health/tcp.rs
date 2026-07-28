@@ -27,7 +27,7 @@ use crate::health::{CodecStep, ConnectionFate, patterns_match};
 const MATCH_BATCH_BYTES: usize = 64;
 
 /// Configured TCP health check.
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct TcpCheckSpec {
     /// Bytes to send after connecting. Empty means send nothing.
     pub send: Vec<u8>,
@@ -36,6 +36,16 @@ pub struct TcpCheckSpec {
     pub receive: Vec<Vec<u8>>,
     /// Maximum response bytes retained. Default 1024, maximum 4096.
     pub response_buffer_size: u32,
+}
+
+impl Default for TcpCheckSpec {
+    fn default() -> Self {
+        Self {
+            send: Vec::new(),
+            receive: Vec::new(),
+            response_buffer_size: 1024,
+        }
+    }
 }
 
 impl TcpCheckSpec {
@@ -208,6 +218,15 @@ impl TcpCheckCodec {
             // entry. Confirmed by mutating this to `<=` and rerunning the suite,
             // including `tcp_codec_never_allocates_after_construction`, which
             // stayed green.
+            //
+            // As with the HTTP codec, this rests on
+            // `compiled.response_buffer_size >= 1`, guaranteed by
+            // `TcpCheckSpec::validate`'s
+            // `in_range_u32("health.tcp.response_buffer_size", .., 1, 4096)`
+            // clause, which every `CompiledTcpCheck` passes through before this
+            // loop can run; see `tcp_validate_accepts_every_cap_at_its_limit`'s
+            // `response_buffer_size lo (1)` row, the row this clause had zero
+            // coverage on before #739 SHOULD_FIX 1.
             if self.body.len() < compiled.response_buffer_size {
                 self.body.push(byte);
             }
@@ -262,6 +281,20 @@ impl TcpCheckCodec {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// #739 NOTE: the derived `Default` gave `response_buffer_size: 0`, which
+    /// contradicted this field's own rustdoc ("Default 1024") and would have
+    /// been the value `dataplane-resilience-wiring` got from the
+    /// `..Default::default()` idiom `HttpCheckSpec::default()`'s hand-written
+    /// impl already invites elsewhere in this module tree. This is the same
+    /// assertion shape as `http::tests::default_spec_values`.
+    #[test]
+    fn tcp_default_spec_values() {
+        let spec = TcpCheckSpec::default();
+        assert_eq!(spec.send, Vec::<u8>::new());
+        assert_eq!(spec.receive, Vec::<Vec<u8>>::new());
+        assert_eq!(spec.response_buffer_size, 1024);
+    }
 
     #[test]
     fn connect_only_flags() {

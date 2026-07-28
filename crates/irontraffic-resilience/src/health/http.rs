@@ -732,6 +732,18 @@ impl HttpCheckCodec {
         // was confirmed equivalent by mutating it and rerunning the suite,
         // including `infinite_body_bounded` and `prop_never_exceeds_caps`,
         // which both stayed green.
+        //
+        // This equivalence rests on a precondition this codec does not itself
+        // enforce: `compiled.response_buffer_size >= 1`. At `0` the two guards
+        // differ (`full` could never become true, since `body.len()` can never
+        // reach a `response_buffer_size` of `0` the way it can reach any
+        // positive value on the exact byte that fills it), so the codec would
+        // read forever instead of ever calling `finish`. The precondition is
+        // guaranteed by `HttpCheckSpec::validate`'s
+        // `in_range_u32("health.http.response_buffer_size", .., 1, 4096)`
+        // clause, which every `CompiledHttpCheck` passes through before this
+        // function can run; see `validate_accepts_every_cap_at_its_limit`'s
+        // `response_buffer_size lo (1)` row for the boundary this depends on.
         if self.body.len() < compiled.response_buffer_size {
             self.body.push(byte);
         }
@@ -1573,6 +1585,58 @@ x-probe: 1\r\n\
                 outcome: CheckOutcome::Pass,
                 fate: ConnectionFate::Close,
             }
+        );
+    }
+
+    /// #739 NOTE: `MATCH_BATCH_BYTES` (64) was unpinned; raising it to, say,
+    /// 4096 left the whole suite green, because no test exercised a pattern
+    /// that completes strictly BETWEEN two batch boundaries. `"NEEDLE"` (6
+    /// bytes) is placed so it completes at body byte 65, one past the first
+    /// boundary at 64: the match check that runs when `body.len()` reaches 64
+    /// sees only `"...NEEDL"` (the pattern is not yet complete there), and
+    /// byte 65 alone, which completes it, is not itself a boundary, so the
+    /// codec must not decide until the NEXT boundary at 128.
+    #[test]
+    fn match_batch_bytes_defers_until_next_boundary() {
+        let spec = HttpCheckSpec {
+            receive: vec![b"NEEDLE".to_vec()],
+            response_buffer_size: 200,
+            ..valid_spec()
+        };
+        let compiled = spec.compile().expect("valid spec");
+        let mut codec = HttpCheckCodec::new(&compiled);
+
+        let mut body = vec![b'x'; 59];
+        body.extend_from_slice(b"NEEDLE");
+        assert_eq!(
+            body.len(),
+            65,
+            "fixture must complete NEEDLE at body byte 65"
+        );
+        let mut response = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
+        response.extend_from_slice(&body);
+
+        let step = codec.on_bytes(&response, &compiled);
+        assert_eq!(
+            step,
+            CodecStep::NeedMore,
+            "the match at the 64-byte boundary must not yet see the completed \
+             NEEDLE, and byte 65 alone must not trigger another match check \
+             before the next 64-byte boundary at 128"
+        );
+        assert_eq!(codec.body_len_for_test(), 65);
+
+        // 65 + 63 = 128, the next batch boundary.
+        let filler = vec![b'y'; 63];
+        let step = codec.on_bytes(&filler, &compiled);
+        assert_eq!(
+            step,
+            CodecStep::Done {
+                outcome: CheckOutcome::Pass,
+                fate: ConnectionFate::Close,
+            },
+            "the match must run at the 128-byte boundary and find NEEDLE, \
+             which has been sitting in the buffer since byte 65"
         );
     }
 
