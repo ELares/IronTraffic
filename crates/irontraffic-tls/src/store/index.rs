@@ -777,8 +777,7 @@ impl CertIndex {
         let set = &self.cred_sets[i.0 as usize];
         for slot in 0..usize::from(set.len) {
             let t = set.tags[slot];
-            if t == KeyType::EcdsaP256 as u8 || t == KeyType::EcdsaP384 as u8 {
-                // it-allow: unchecked-cast reason: KeyType is #[repr(u8)] with discriminant 1..=4
+            if t == 1 || t == 2 {
                 return true;
             }
         }
