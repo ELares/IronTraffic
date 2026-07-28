@@ -1,4 +1,31 @@
 # One package name per line. A name here means "this package is permitted to declare a
 # preinstall/install/postinstall script, and the gate will run `npm rebuild` for it".
 # Adding a line requires a written justification in the pull request.
-# This file is intentionally empty below this header.
+#
+# Justification for every entry below (issue #377, see the PR comment and issue #728): each of
+# these packages declares only a `prepare` or `prepublish` script in its published package.json,
+# left over from its own git-clone developer workflow (husky hooks, build-before-publish). Neither
+# hook is part of npm's install lifecycle for a registry-resolved dependency, only for the root
+# project and git dependencies, so nothing executes here. Verified with
+# `npm rebuild --foreground-scripts <name>` against each one after a clean `npm ci`: every run
+# printed "rebuilt dependencies successfully" with no script output and exit 0.
+@bramus/specificity
+@preact/preset-vite
+@rollup/pluginutils
+css-select
+css-what
+dom-serializer
+domelementtype
+domhandler
+domutils
+entities
+jsdom
+lightningcss
+lru-cache
+node-html-parser
+nth-check
+preact
+tinyexec
+tr46
+undici
+whatwg-url

@@ -7,11 +7,22 @@
     "node": "24.11.0"
   },
   "scripts": {
-    "gate": "npm run -s format:check",
+    "gate": "npm run -s format:check && npm run -s typecheck && npm run -s test && npm run -s build",
     "format": "prettier --write .",
-    "format:check": "prettier --check ."
+    "format:check": "prettier --check .",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run --passWithNoTests",
+    "build": "node scripts/check-build-output.mjs --preflight && vite build && node scripts/check-build-output.mjs"
+  },
+  "dependencies": {
+    "preact": "10.29.7"
   },
   "devDependencies": {
-    "prettier": "3.9.6"
+    "@preact/preset-vite": "2.10.6",
+    "jsdom": "29.1.1",
+    "prettier": "3.9.6",
+    "typescript": "7.0.2",
+    "vite": "8.1.5",
+    "vitest": "4.1.10"
   }
 }
