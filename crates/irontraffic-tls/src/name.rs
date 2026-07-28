@@ -155,6 +155,11 @@ impl core::fmt::Debug for NameKey {
 #[derive(Clone)]
 pub struct NameHasher {
     key: [u8; 16],
+    /// Test seam: every name maps to `NameKey(0)`. Used only by the certificate index's
+    /// collision-retry test, where forcing a collision on the first hash attempt proves that the
+    /// builder falls back to a second key and still produces a correct index.
+    #[cfg(test)]
+    degenerate: bool,
 }
 
 impl NameHasher {
@@ -172,7 +177,11 @@ impl NameHasher {
     pub fn from_entropy() -> Result<Self, irontraffic_rand::EntropyError> {
         let mut key = [0u8; 16];
         irontraffic_rand::SecureRng::fill(&mut key)?;
-        Ok(Self { key })
+        Ok(Self {
+            key,
+            #[cfg(test)]
+            degenerate: false,
+        })
     }
 
     /// Build a hasher from an explicit 16-byte key.
@@ -182,7 +191,24 @@ impl NameHasher {
     /// not a style problem.
     #[must_use]
     pub const fn new(key: [u8; 16]) -> Self {
-        Self { key }
+        Self {
+            key,
+            #[cfg(test)]
+            degenerate: false,
+        }
+    }
+
+    /// Test seam that returns a hasher whose `hash` ignores its input and returns `NameKey(0)`.
+    ///
+    /// This lets the certificate index builder test exercise the collision-retry path without
+    /// computing a real 64-bit `SipHash` collision.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn degenerate_for_test() -> Self {
+        Self {
+            key: [0u8; 16],
+            degenerate: true,
+        }
     }
 
     /// Hash an already-normalized name.
@@ -191,6 +217,10 @@ impl NameHasher {
     /// is a logic error that produces a key nothing will ever match.
     #[must_use]
     pub fn hash(&self, normalized: &str) -> NameKey {
+        #[cfg(test)]
+        if self.degenerate {
+            return NameKey(0);
+        }
         let mut hasher = SipHasher13::new_with_key(&self.key);
         core::hash::Hasher::write(&mut hasher, normalized.as_bytes());
         let h128 = hasher.finish128();
