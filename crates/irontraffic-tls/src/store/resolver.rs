@@ -374,6 +374,207 @@ mod tests {
         alpn_verdict(Some(entries.iter().copied()))
     }
 
+    /// `selected_by_key_type` must count the served credential's own key type.
+    ///
+    /// Nothing asserted this array, so both "never increment" and "always write slot 0"
+    /// survived. Slot 0 is deliberately never written: `KeyType` is `#[repr(u8)]` with
+    /// discriminants 1..=4, so a nonzero slot moving is the only correct outcome.
+    #[test]
+    fn selected_by_key_type_counts_the_served_key_type() {
+        let ecdsa = gen_cred(&rcgen::PKCS_ECDSA_P256_SHA256, "a.example.com");
+        let idx = ecdsa.key_type() as usize;
+        assert_ne!(idx, 0, "slot 0 is never written; the fixture must not land there");
+
+        let mut certs_builder = CertIndexBuilder::new([1u8; 16]);
+        certs_builder
+            .upsert_exact("a.example.com", Arc::clone(&ecdsa))
+            .expect("valid");
+        let certs = certs_builder.build().expect("build");
+        let resolver = test_resolver(
+            certs,
+            ChallengeCerts::empty([9u8; 16]),
+            false,
+            UnixSeconds::new(1_000),
+        );
+
+        let before: Vec<u64> = resolver
+            .stats()
+            .selected_by_key_type
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .collect();
+        assert!(
+            resolver
+                .resolve_parts(normal_verdict(), Some("a.example.com"), ClientCaps::all())
+                .is_some(),
+            "the control resolve must succeed, or the counter deltas prove nothing"
+        );
+        let after: Vec<u64> = resolver
+            .stats()
+            .selected_by_key_type
+            .iter()
+            .map(|c| c.load(Ordering::Relaxed))
+            .collect();
+
+        for (i, (b, a)) in before.iter().zip(after.iter()).enumerate() {
+            let expected = if i == idx { b + 1 } else { *b };
+            assert_eq!(
+                *a, expected,
+                "slot {i} must {} after one resolve of a {:?} credential",
+                if i == idx { "increment" } else { "be untouched" },
+                ecdsa.key_type()
+            );
+        }
+        assert_eq!(after[0], 0, "slot 0 must never be written");
+    }
+
+    /// Each conjunct of the ECDSA-forcing gate must be load-bearing on its own.
+    ///
+    /// Three of its five were untested, and one of those changes real behaviour for an
+    /// Ed25519 client. Each case below flips exactly one conjunct away from the refusing
+    /// combination and asserts the request is SERVED, so a conjunct that stopped
+    /// mattering would show up as a refusal that no longer happens.
+    #[test]
+    fn every_ecdsa_gate_conjunct_is_load_bearing() {
+        fn resolver_with(require_ecdsa: bool, also_ecdsa_for_name: bool) -> IronResolver {
+            let rsa = gen_cred(&rcgen::PKCS_RSA_SHA256, "a.example.com");
+            let mut b = CertIndexBuilder::new([1u8; 16]);
+            b.upsert_exact("a.example.com", rsa).expect("valid");
+            if also_ecdsa_for_name {
+                let ec = gen_cred(&rcgen::PKCS_ECDSA_P256_SHA256, "a.example.com");
+                b.upsert_exact("a.example.com", ec).expect("valid");
+            }
+            test_resolver(
+                b.build().expect("build"),
+                ChallengeCerts::empty([9u8; 16]),
+                require_ecdsa,
+                UnixSeconds::new(1_000),
+            )
+        }
+        let rsa_only = ClientCaps {
+            rsa: true,
+            ..Default::default()
+        };
+
+        // The refusing combination: policy on, client has neither ECDSA curve, the
+        // resolved credential is RSA, and the name also has an ECDSA credential.
+        let r = resolver_with(true, true);
+        assert!(
+            r.resolve_parts(normal_verdict(), Some("a.example.com"), rsa_only)
+                .is_none(),
+            "the control combination must refuse, or the flips below prove nothing"
+        );
+
+        // Conjunct 1: policy off.
+        let r = resolver_with(false, true);
+        assert!(
+            r.resolve_parts(normal_verdict(), Some("a.example.com"), rsa_only)
+                .is_some(),
+            "with require_ecdsa_capable_clients off the request must be served"
+        );
+
+        // Conjuncts 2 and 3: the client advertises an ECDSA curve. Both P-256 and P-384
+        // are checked because either alone disarms the gate.
+        for caps in [
+            ClientCaps {
+                rsa: true,
+                ecdsa_p256: true,
+                ..Default::default()
+            },
+            ClientCaps {
+                rsa: true,
+                ecdsa_p384: true,
+                ..Default::default()
+            },
+        ] {
+            let r = resolver_with(true, true);
+            assert!(
+                r.resolve_parts(normal_verdict(), Some("a.example.com"), caps)
+                    .is_some(),
+                "an ECDSA-capable client must be served even with the policy on"
+            );
+        }
+
+        // Conjunct 5: the name has no ECDSA credential to switch to, so refusing would
+        // strand a client we could have served.
+        let r = resolver_with(true, false);
+        assert!(
+            r.resolve_parts(normal_verdict(), Some("a.example.com"), rsa_only)
+                .is_some(),
+            "with no ECDSA credential for the name the gate must not refuse"
+        );
+    }
+
+    /// `acme-tls/1` in third position is still a mixed list and must be refused.
+    ///
+    /// #117's Do NOT list names this bound and nothing tested it: `alpn_verdict` inspects
+    /// at most three entries, so third position is the last one that can trip it.
+    #[test]
+    fn alpn_acme_third_position_refused() {
+        let entries: [&[u8]; 3] = [b"h2", b"http/1.1", b"acme-tls/1"];
+        assert_eq!(
+            alpn_verdict(Some(entries.iter().copied())),
+            AlpnVerdict::RefuseAcmeMixed
+        );
+    }
+
+    /// `caps_from_schemes` folds at most 64 schemes, the other named Do NOT bound.
+    ///
+    /// A client offering more must not cause unbounded work, and the schemes inside the
+    /// window must still be honoured.
+    #[test]
+    fn caps_from_schemes_folds_at_most_64_schemes() {
+        let mut schemes = vec![rustls::SignatureScheme::ECDSA_NISTP256_SHA256];
+        schemes.resize(200, rustls::SignatureScheme::RSA_PKCS1_SHA256);
+        let caps = caps_from_schemes(&schemes);
+        assert!(caps.ecdsa_p256, "a scheme inside the 64 window must be seen");
+
+        // A scheme placed past the window must NOT be seen, which is what makes the cap
+        // observable rather than merely present in the source.
+        let mut past = vec![rustls::SignatureScheme::RSA_PKCS1_SHA256; 64];
+        past.push(rustls::SignatureScheme::ECDSA_NISTP384_SHA384);
+        let caps = caps_from_schemes(&past);
+        assert!(
+            !caps.ecdsa_p384,
+            "a scheme past the 64-entry fold cap must not be folded in"
+        );
+    }
+
+    /// The `Challenge` verdict with no SNI takes the miss path and serves nothing.
+    ///
+    /// This arm of `resolve_parts` was entirely uncovered. A challenge lookup needs a
+    /// name; without one there is nothing to look up, and falling through to the normal
+    /// path would serve a real certificate on the ACME-only ALPN.
+    #[test]
+    fn challenge_verdict_without_sni_serves_nothing() {
+        // A DEFAULT credential is configured deliberately. Without one, a mutant that
+        // falls through to the normal path still returns None (there is nothing to serve),
+        // so the assertion below would hold either way. The first version of this test
+        // omitted it and the fall-through mutation SURVIVED; this is the fixture doing the
+        // discriminating, not the assertion.
+        let real = gen_cred(&rcgen::PKCS_ECDSA_P256_SHA256, "a.example.com");
+        let mut certs_builder = CertIndexBuilder::new([1u8; 16]);
+        certs_builder
+            .upsert_exact("a.example.com", Arc::clone(&real))
+            .expect("valid");
+        certs_builder.set_default(real);
+        let resolver = test_resolver(
+            certs_builder.build().expect("build"),
+            ChallengeCerts::empty([9u8; 16]),
+            false,
+            UnixSeconds::new(1_000),
+        );
+
+        let got = resolver.resolve_parts(acme_only_verdict(), None, ClientCaps::all());
+        assert!(
+            got.is_none(),
+            "a challenge verdict with no SNI must serve nothing, not fall through to the \
+             normal path and hand out a real certificate"
+        );
+        assert_eq!(resolver.stats().challenge_misses.load(Ordering::Relaxed), 1);
+        assert_eq!(resolver.stats().challenge_hits.load(Ordering::Relaxed), 0);
+    }
+
     /// The `Normal` counterpart to [`acme_only_verdict`], computed by driving
     /// `alpn_verdict` over a real single-entry `["h2"]` list rather than naming the
     /// variant directly.
