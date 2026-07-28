@@ -8,6 +8,7 @@
 use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use irontraffic_policy::PolicyLimits;
 use irontraffic_policy::lex::lex;
+use irontraffic_policy::parse::parse;
 
 fn bench_two_clause_predicate(c: &mut Criterion) {
     let src = b"request.path.startsWith(\"/v1/\") && request.method == \"GET\"";
@@ -45,5 +46,38 @@ fn bench_8kib_source(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_two_clause_predicate, bench_8kib_source);
+fn bench_parse_two_clause_predicate(c: &mut Criterion) {
+    let src = b"request.path.startsWith(\"/v1/\") && request.method == \"GET\"";
+    let limits = PolicyLimits::defaults();
+    let toks = lex(src, &limits).expect("valid ITPL source must lex");
+    c.bench_function("parse/two_clause_predicate", |b| {
+        b.iter(|| {
+            let _ = parse(&toks, src, &limits);
+        });
+    });
+}
+
+fn bench_parse_64_clause_predicate(c: &mut Criterion) {
+    let mut clauses = Vec::with_capacity(64);
+    for i in 0..64 {
+        clauses.push(format!("request.headers.size() == {i}"));
+    }
+    let src = clauses.join(" && ");
+    let mut limits = PolicyLimits::defaults();
+    limits.max_tokens = 2048;
+    let toks = lex(src.as_bytes(), &limits).expect("valid ITPL source must lex");
+    c.bench_function("parse/64_clause_predicate", |b| {
+        b.iter(|| {
+            let _ = parse(&toks, src.as_bytes(), &limits);
+        });
+    });
+}
+
+criterion_group!(
+    benches,
+    bench_two_clause_predicate,
+    bench_8kib_source,
+    bench_parse_two_clause_predicate,
+    bench_parse_64_clause_predicate
+);
 criterion_main!(benches);
