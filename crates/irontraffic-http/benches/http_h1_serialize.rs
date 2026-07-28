@@ -16,13 +16,17 @@
 //! Its own bench target, one per surface, never appended to a shared file
 //! (issue #630).
 //!
-//! Budget (reference runner: GitHub Actions `ubuntu-latest`, 4 vCPU, release
-//! profile with `lto = "thin"`, see `[profile.bench]` in the workspace
-//! `Cargo.toml`): under 800 nanoseconds for the 10-field typical request and
-//! under 15 microseconds for the 100-field request. Criterion does not enforce
-//! a budget itself; compare the reported throughput against these numbers by
-//! hand. The allocation counts are asserted by
-//! `tests/alloc_gate_h1_serialize.rs`, not here.
+//! `bench_h1_serialize` covers three inputs (#37's Benchmarks section): a
+//! 10-field head with `BodySource::Exact`, the same with `BodySource::Streaming`,
+//! and a 100-field head. Budget (reference runner: GitHub Actions
+//! `ubuntu-latest`, 4 vCPU, release profile with `lto = "thin"`, see
+//! `[profile.bench]` in the workspace `Cargo.toml`): under 700 nanoseconds
+//! for the two 10-field cases and under 7 microseconds for the 100-field
+//! case. `bench_chunk_encode` covers a 32 KiB chunk: under 2 microseconds
+//! (dominated by the memcpy; exists to catch a per-byte formatting mistake).
+//! Criterion does not enforce a budget itself; compare the reported
+//! throughput against these numbers by hand. The allocation counts are
+//! asserted by `tests/alloc_gate_h1_serialize.rs`, not here.
 
 use std::hint::black_box;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
@@ -34,9 +38,10 @@ use irontraffic_http::authority::Authority;
 use irontraffic_http::canonical::{CanonicalRequest, CanonicalRequestBuilder};
 use irontraffic_http::framing::RequestFraming;
 use irontraffic_http::h1::serialize::{
-    BodySource, ConnectionMode, serialize_request_head, serialize_request_head_len,
+    BodySource, ChunkedEncoder, ConnectionMode, serialize_request_head, serialize_request_head_len,
 };
 use irontraffic_http::path::PathPolicy;
+use irontraffic_http::path::TargetForm;
 use irontraffic_http::peer::{ForwardEmit, IdentitySource, PeerIdentity};
 use irontraffic_http::scalar::{Method, Scheme, WireVersion};
 use irontraffic_http::section::{FieldSection, FieldSectionBuilder};
@@ -110,7 +115,50 @@ fn local_addr() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 8080)
 }
 
-fn bench_h1_serialize_request_head(c: &mut Criterion) {
+#[allow(
+    clippy::too_many_arguments,
+    reason = "bench helper mirroring the full serialize_request_head call site"
+)]
+fn bench_one(
+    group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
+    name: &str,
+    req: &CanonicalRequest,
+    body: BodySource,
+    emit: ForwardEmit,
+    local: SocketAddr,
+    reserve: usize,
+) {
+    let predicted_len = serialize_request_head_len(
+        req,
+        TargetForm::Origin,
+        body,
+        ConnectionMode::KeepAlive,
+        emit,
+        local,
+    )
+    .unwrap();
+    group.throughput(Throughput::Bytes(predicted_len as u64));
+    group.bench_function(name, |b| {
+        let mut buf = BytesMut::new();
+        buf.reserve(reserve);
+        b.iter(|| {
+            buf.clear();
+            let result = serialize_request_head(
+                black_box(req),
+                TargetForm::Origin,
+                body,
+                ConnectionMode::KeepAlive,
+                emit,
+                local,
+                &mut buf,
+            );
+            result.unwrap();
+            black_box(());
+        });
+    });
+}
+
+fn bench_h1_serialize(c: &mut Criterion) {
     let typical = build_request(10);
     let adversarial = build_request(100);
 
@@ -120,62 +168,55 @@ fn bench_h1_serialize_request_head(c: &mut Criterion) {
     };
     let local = local_addr();
 
-    let mut group = c.benchmark_group("bench_h1_serialize_request_head");
+    let mut group = c.benchmark_group("bench_h1_serialize");
 
-    let typical_len = serialize_request_head_len(
+    bench_one(
+        &mut group,
+        "typical_10_fields_exact",
         &typical,
         BodySource::Exact { len: 42 },
-        ConnectionMode::KeepAlive,
         emit,
         local,
+        4096,
     );
-    group.throughput(Throughput::Bytes(typical_len as u64));
-    group.bench_function("typical_10_fields", |b| {
-        let mut buf = BytesMut::new();
-        buf.reserve(4096);
-        b.iter(|| {
-            buf.clear();
-            let result = serialize_request_head(
-                black_box(&typical),
-                BodySource::Exact { len: 42 },
-                ConnectionMode::KeepAlive,
-                emit,
-                local,
-                &mut buf,
-            );
-            result.unwrap();
-            black_box(());
-        });
-    });
-
-    let adversarial_len = serialize_request_head_len(
+    bench_one(
+        &mut group,
+        "typical_10_fields_streaming",
+        &typical,
+        BodySource::Streaming,
+        emit,
+        local,
+        4096,
+    );
+    bench_one(
+        &mut group,
+        "adversarial_100_fields",
         &adversarial,
         BodySource::Streaming,
-        ConnectionMode::KeepAlive,
         emit,
         local,
+        16 * 1024,
     );
-    group.throughput(Throughput::Bytes(adversarial_len as u64));
-    group.bench_function("adversarial_100_fields", |b| {
-        let mut buf = BytesMut::new();
-        buf.reserve(16 * 1024);
-        b.iter(|| {
-            buf.clear();
-            let result = serialize_request_head(
-                black_box(&adversarial),
-                BodySource::Streaming,
-                ConnectionMode::KeepAlive,
-                emit,
-                local,
-                &mut buf,
-            );
-            result.unwrap();
-            black_box(());
-        });
-    });
 
     group.finish();
 }
 
-criterion_group!(benches, bench_h1_serialize_request_head);
+fn bench_chunk_encode(c: &mut Criterion) {
+    let data = vec![b'x'; 32 * 1024];
+    let mut group = c.benchmark_group("bench_chunk_encode");
+    group.throughput(Throughput::Bytes(data.len() as u64));
+    group.bench_function("32kib_chunk", |b| {
+        let mut buf = BytesMut::new();
+        buf.reserve(64 * 1024);
+        b.iter(|| {
+            buf.clear();
+            let mut encoder = ChunkedEncoder::new();
+            encoder.write_chunk(black_box(&data), &mut buf);
+            black_box(());
+        });
+    });
+    group.finish();
+}
+
+criterion_group!(benches, bench_h1_serialize, bench_chunk_encode);
 criterion_main!(benches);
