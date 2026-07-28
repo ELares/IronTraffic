@@ -1170,7 +1170,15 @@ which would make the NEXT check on that connection misparse those bytes as a new
   `tcp_codec_never_allocates_after_construction` (`health::tcp::tests`) each feed 1 MB or more of
   filler through a small buffer and assert the retained length never exceeds the cap and the
   buffer's `Vec::capacity` never changes from what `new` allocated. `prop_never_exceeds_caps`
-  (`health::http::tests`) asserts the same property under proptest-generated arbitrary chunkings.
+  (`health::http::tests`) asserts the same property under proptest-generated inputs delivered
+  through arbitrary chunkings. Its response generator mixes fully arbitrary byte strings with
+  responses seeded with a well-formed HTTP head (a fixed passing status, and a status drawn from
+  the full range), because a uniformly random byte string essentially never begins with the 5-byte
+  `HTTP/` magic; without that seeding every generated case would fail in the status-line scan and
+  the property would never exercise `Phase::Body`, `response_buffer_size`, or `patterns_match` at
+  all, which is exactly the gap an earlier version of this section overclaimed as covered. The test
+  itself asserts that a nonzero fraction of cases reach `Phase::Body` on every run, so that gap
+  cannot reopen silently.
 - **`timeout_ms`**, the scheduler's per-check deadline (`HealthCheckConfig::timeout_ms`, default
   `1000`, in `health/schedule.rs`, `health-check-scheduling-policy` #92), bounds the wall time a
   check may occupy regardless of how the two caps above are approached. The codecs themselves read

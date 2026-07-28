@@ -455,6 +455,13 @@ pub struct HttpCheckCodec {
     /// The verdict, stored the instant any `Done` is produced. `Phase::Finished` returns
     /// it verbatim, which is what makes `on_bytes` after `Done` idempotent.
     verdict_pending: Option<(CheckOutcome, ConnectionFate)>,
+    /// Set once, the instant `phase` first becomes `Body` (see `consume_head_byte`).
+    /// `Phase::Finished` loses the information of which phase preceded it, so this
+    /// is what lets test and fuzz code confirm a case actually reached `Phase::Body`
+    /// rather than only inferring it from a nonzero `body_len_for_test()`, which
+    /// would miss a case where the peer closed with zero body bytes retained. Exists
+    /// for `prop_never_exceeds_caps`'s nonzero-fraction guard; see #739 BLOCKING 1.
+    entered_body: bool,
 }
 
 impl HttpCheckCodec {
@@ -471,6 +478,7 @@ impl HttpCheckCodec {
             body: Vec::with_capacity(compiled.response_buffer_size),
             matched_at_len: 0,
             verdict_pending: None,
+            entered_body: false,
         }
     }
 
@@ -485,6 +493,7 @@ impl HttpCheckCodec {
         self.body.clear();
         self.matched_at_len = 0;
         self.verdict_pending = None;
+        self.entered_body = false;
     }
 
     /// The parsed status, once the status line has been read.
@@ -664,6 +673,7 @@ impl HttpCheckCodec {
         self.body.clear();
         self.matched_at_len = 0;
         self.phase = Phase::Body;
+        self.entered_body = true;
         None
     }
 
@@ -726,6 +736,14 @@ impl HttpCheckCodec {
     #[must_use]
     pub fn body_capacity_for_test(&self) -> usize {
         self.body.capacity()
+    }
+
+    /// True once this codec ever reached `Phase::Body`, even if it later
+    /// finished with an empty retained body. Test and fuzz introspection only;
+    /// see the field doc on `entered_body`.
+    #[must_use]
+    pub fn entered_body_for_test(&self) -> bool {
+        self.entered_body
     }
 }
 
@@ -1436,16 +1454,186 @@ x-probe: 1\r\n\
         assert!(patterns_match(b"ab", &patterns));
     }
 
-    proptest! {
-        #[test]
-        fn prop_never_exceeds_caps(
-            response_buffer_size in 1u32..=4096,
-            max_head_bytes in 16u32..=8192,
-            pattern_count in 0usize..=3,
-            pattern_len in 1usize..=8,
-            response in proptest::collection::vec(any::<u8>(), 0..=16 * 1024),
-            chunk_sizes in proptest::collection::vec(1usize..=37, 0..=200),
-        ) {
+    /// Response generator shared by [`prop_never_exceeds_caps`] and
+    /// [`prop_chunking_invariant`].
+    ///
+    /// #739 BLOCKING 1: the original generator was
+    /// `proptest::collection::vec(any::<u8>(), ..)`, uniformly random bytes. A
+    /// uniformly random byte string begins with the 5-byte `HTTP/` magic with
+    /// probability roughly `256^-5`, so every one of the 256-or-more generated
+    /// cases died in `consume_status_line_byte` and returned `Fail(Protocol)`
+    /// without ever reaching `Phase::Head`, `Phase::Body`,
+    /// `response_buffer_size`, or `patterns_match`. This generator instead
+    /// mixes three shapes: fully arbitrary bytes (kept, so the `StatusLine`
+    /// rejection paths of edge cases 5, 6, 7, and 9 are not lost), a
+    /// well-formed head with a fixed passing status (weighted heaviest, so
+    /// `Phase::Body` is reached often enough that `prop_never_exceeds_caps`'s
+    /// nonzero-fraction assertion is not a coin flip), and a well-formed head
+    /// with a status drawn from the full range (so `Fail(Status)` and
+    /// `Fail(RetriableStatus)` stay reachable too).
+    fn response_strategy() -> impl Strategy<Value = Vec<u8>> {
+        prop_oneof![
+            1 => proptest::collection::vec(any::<u8>(), 0..=16 * 1024),
+            3 => proptest::collection::vec(any::<u8>(), 0..=16 * 1024).prop_map(|tail| {
+                let mut v = b"HTTP/1.1 200 OK\r\n\r\n".to_vec();
+                v.extend(tail);
+                v
+            }),
+            1 => (0u16..1000, proptest::collection::vec(any::<u8>(), 0..=16 * 1024)).prop_map(
+                |(status, tail)| {
+                    let mut v = format!("HTTP/1.1 {status:03} OK\r\n\r\n").into_bytes();
+                    v.extend(tail);
+                    v
+                }
+            ),
+        ]
+    }
+
+    /// Independent, non-incremental reference for the head-parsing and status
+    /// classification `HttpCheckCodec` computes incrementally, used only by
+    /// [`prop_chunking_invariant`].
+    ///
+    /// #739 BLOCKING 1's second problem: comparing two chunkings of the SAME
+    /// codec can never disagree, because `on_bytes` is a pure per-byte loop
+    /// whose only per-call state is the local `idx` in `on_bytes` itself;
+    /// chunking never enters any decision the codec makes, so a bug in the
+    /// per-byte transition logic (for example the wrong HTTP version digit,
+    /// or a `crlf` mismatch rule that resets to zero instead of
+    /// `u8::from(byte == b'\r')`) reproduces identically under every
+    /// chunking of the same byte sequence. That made the property
+    /// unfalsifiable: it could pass on a codec that was simply wrong, as
+    /// long as it was wrong the same way regardless of chunking. This oracle
+    /// recomputes the verdict from the whole buffer at once with a different
+    /// technique (`slice::windows` over the literal `\r\n\r\n`, proven
+    /// equivalent to the codec's incremental matcher by the `head_cap_boundary`
+    /// and `crlf_matcher_extra_cr` tests already tracing that equivalence by
+    /// hand), so a divergence between the codec's incremental result and this
+    /// batch recomputation is a real correctness signal, not just a
+    /// chunk-boundary artifact. The two-chunking comparison is kept alongside
+    /// it: cheap, and still a real regression guard against a future
+    /// refactor that accidentally makes `on_bytes` depend on `chunk.len()`.
+    fn oracle_verdict(
+        spec: &HttpCheckSpec,
+        response: &[u8],
+        max_head_bytes: usize,
+        response_buffer_size: usize,
+    ) -> (CheckOutcome, ConnectionFate) {
+        if response.len() < 12 || response[0..5] != *b"HTTP/" {
+            return (
+                CheckOutcome::Fail(FailKind::Protocol),
+                ConnectionFate::Close,
+            );
+        }
+        let version_ok =
+            response[5] == b'1' && response[6] == b'.' && matches!(response[7], b'0' | b'1');
+        if !version_ok || response[8] != b' ' {
+            return (
+                CheckOutcome::Fail(FailKind::Protocol),
+                ConnectionFate::Close,
+            );
+        }
+        let (d0, d1, d2) = (response[9], response[10], response[11]);
+        if !(d0.is_ascii_digit() && d1.is_ascii_digit() && d2.is_ascii_digit()) {
+            return (
+                CheckOutcome::Fail(FailKind::Protocol),
+                ConnectionFate::Close,
+            );
+        }
+        let status = u16::from(d0 - b'0') * 100 + u16::from(d1 - b'0') * 10 + u16::from(d2 - b'0');
+
+        let search_window = &response[..response.len().min(max_head_bytes)];
+        let Some(term) = search_window.windows(4).position(|w| w == b"\r\n\r\n") else {
+            return (
+                CheckOutcome::Fail(FailKind::Protocol),
+                ConnectionFate::Close,
+            );
+        };
+        let head_len = term + 4;
+        if head_len > max_head_bytes {
+            return (
+                CheckOutcome::Fail(FailKind::Protocol),
+                ConnectionFate::Close,
+            );
+        }
+
+        let retriable = spec.retriable_statuses.iter().any(|r| r.contains(status));
+        let outcome = if retriable {
+            CheckOutcome::Fail(FailKind::RetriableStatus)
+        } else if !spec.expected_statuses.iter().any(|r| r.contains(status)) {
+            CheckOutcome::Fail(FailKind::Status)
+        } else {
+            CheckOutcome::Pass
+        };
+        let method_is_head = spec.method == HttpCheckMethod::Head;
+        let fate = if method_is_head || status == 204 || status == 304 {
+            ConnectionFate::Reusable
+        } else {
+            ConnectionFate::Close
+        };
+        if matches!(outcome, CheckOutcome::Fail(_)) {
+            return (outcome, fate);
+        }
+        if spec.receive.is_empty() || method_is_head {
+            return (CheckOutcome::Pass, fate);
+        }
+
+        let body: Vec<u8> = response[head_len..]
+            .iter()
+            .copied()
+            .take(response_buffer_size)
+            .collect();
+        let patterns: Box<[Box<[u8]>]> = spec
+            .receive
+            .iter()
+            .map(|p| p.clone().into_boxed_slice())
+            .collect();
+        if patterns_match(&body, &patterns) {
+            (CheckOutcome::Pass, ConnectionFate::Close)
+        } else {
+            (CheckOutcome::Fail(FailKind::Body), ConnectionFate::Close)
+        }
+    }
+
+    #[test]
+    fn prop_never_exceeds_caps() {
+        use proptest::test_runner::{Config, TestRunner};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let strategy = (
+            1u32..=4096u32,
+            16u32..=8192u32,
+            0usize..=3,
+            1usize..=8,
+            response_strategy(),
+            proptest::collection::vec(1usize..=37, 0..=200),
+        );
+
+        // #739 BLOCKING 1: "add an assertion that a nonzero fraction of cases
+        // reach Phase::Body, so this cannot silently go vacuous again." A
+        // per-case `prop_assert!` cannot express "nonzero fraction of ALL
+        // cases"; it can only express a fact about one case. `TestRunner::run`
+        // is called directly (instead of going through the `proptest!` macro)
+        // specifically so these counters can be inspected once every
+        // generated case has run, which `Config::default()` still sizes from
+        // `PROPTEST_CASES` exactly as the macro does (`contextualize_config`
+        // reads the environment either way).
+        let total = Arc::new(AtomicUsize::new(0));
+        let reached_body = Arc::new(AtomicUsize::new(0));
+        let total_in = Arc::clone(&total);
+        let reached_body_in = Arc::clone(&reached_body);
+
+        let mut runner = TestRunner::new(Config::default());
+        let run_result = runner.run(&strategy, move |params| {
+            let (
+                response_buffer_size,
+                max_head_bytes,
+                pattern_count,
+                pattern_len,
+                response,
+                chunk_sizes,
+            ) = params;
+            total_in.fetch_add(1, Ordering::Relaxed);
             let receive: Vec<Vec<u8>> = (0..pattern_count)
                 .map(|i| {
                     let byte = b'a' + u8::try_from(i % 26).unwrap_or(0);
@@ -1499,23 +1687,50 @@ x-probe: 1\r\n\
                     <= usize::try_from(max_head_bytes).unwrap_or(usize::MAX) + 1
             );
             prop_assert_eq!(codec.body_capacity_for_test(), initial_capacity);
-        }
+            if codec.entered_body_for_test() {
+                reached_body_in.fetch_add(1, Ordering::Relaxed);
+            }
+            Ok(())
+        });
+        run_result.unwrap();
 
-        #[test]
-        fn prop_chunking_invariant(
-            response in proptest::collection::vec(any::<u8>(), 0..=2048),
-            chunk_sizes_a in proptest::collection::vec(1usize..=17, 0..=200),
-            chunk_sizes_b in proptest::collection::vec(1usize..=31, 0..=200),
-        ) {
-            let spec = HttpCheckSpec {
-                host: Some("h".into()),
-                receive: vec![b"NEEDLE".to_vec()],
-                response_buffer_size: 256,
-                max_head_bytes: 256,
-                ..HttpCheckSpec::default()
-            };
-            let compiled = spec.compile().expect("constructed spec is always valid");
+        let total = total.load(Ordering::Relaxed);
+        let reached = reached_body.load(Ordering::Relaxed);
+        assert!(total > 0, "the property ran zero cases");
+        assert!(
+            reached > 0,
+            "0 of {total} cases reached Phase::Body; the response generator is \
+             seeding an unparseable stream again, so Phase::Body, \
+             response_buffer_size, and patterns_match are going untested (see \
+             #739 BLOCKING 1)"
+        );
+    }
 
+    #[test]
+    fn prop_chunking_invariant() {
+        use proptest::test_runner::{Config, TestRunner};
+
+        let strategy = (
+            response_strategy(),
+            proptest::collection::vec(1usize..=17, 0..=200),
+            proptest::collection::vec(1usize..=31, 0..=200),
+        );
+        let spec = HttpCheckSpec {
+            host: Some("h".into()),
+            receive: vec![b"NEEDLE".to_vec()],
+            response_buffer_size: 256,
+            max_head_bytes: 256,
+            ..HttpCheckSpec::default()
+        };
+        let compiled = spec
+            .clone()
+            .compile()
+            .expect("constructed spec is always valid");
+
+        let mut runner = TestRunner::new(Config::default());
+        let run_result = runner.run(&strategy, move |params| {
+            let (response, chunk_sizes_a, chunk_sizes_b): (Vec<u8>, Vec<usize>, Vec<usize>) =
+                params;
             let drive = |chunk_sizes: &[usize]| -> (CheckOutcome, ConnectionFate) {
                 let mut codec = HttpCheckCodec::new(&compiled);
                 let n = response.len();
@@ -1532,13 +1747,25 @@ x-probe: 1\r\n\
                 }
                 match codec.on_eof(&compiled) {
                     CodecStep::Done { outcome, fate } => (outcome, fate),
-                    CodecStep::NeedMore => (CheckOutcome::Fail(FailKind::Protocol), ConnectionFate::Close),
+                    CodecStep::NeedMore => (
+                        CheckOutcome::Fail(FailKind::Protocol),
+                        ConnectionFate::Close,
+                    ),
                 }
             };
 
             let a = drive(&chunk_sizes_a);
             let b = drive(&chunk_sizes_b);
-            prop_assert_eq!(a, b);
-        }
+            prop_assert_eq!(a, b, "two chunkings of the same response disagreed");
+
+            let oracle = oracle_verdict(&spec, &response, 256, 256);
+            prop_assert_eq!(
+                a,
+                oracle,
+                "codec verdict disagreed with the independent oracle"
+            );
+            Ok(())
+        });
+        run_result.unwrap();
     }
 }
