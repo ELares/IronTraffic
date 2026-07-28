@@ -110,7 +110,7 @@ impl ChallengeKey {
         let provider = crate::provider::provider().ok_or(CertError::ProviderNotInstalled)?;
         let certified = rustls::sign::CertifiedKey::from_der(chain, key, provider)
             .map_err(|_| CertError::KeyMismatch)?;
-        Ok(Self(Arc::new(certified)))
+        Ok(Self(Arc::new(certified))) // it-allow: hot-path-allocation reason: solver-facing constructor, called once per ACME order, never on the resolve path
     }
 }
 
@@ -251,7 +251,7 @@ impl ChallengeCertsBuilder {
             }
         }
         Self {
-            hasher: prev.hasher.clone(),
+            hasher: prev.hasher.clone(), // it-allow: hot-path-allocation reason: builder path, not lookup; NameHasher::clone is a 16-byte key copy, not an allocation, but the plain `.clone()` spelling still matches this rule's text scan
             entries,
         }
     }
