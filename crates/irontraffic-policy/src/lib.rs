@@ -39,9 +39,13 @@
 
 #![forbid(unsafe_code)]
 
+pub mod ast;
 pub mod lex;
 pub mod limits;
+pub mod parse;
 pub mod token;
 
+pub use ast::{Ast, BinOp, Method, Node, NodeId};
 pub use limits::PolicyLimits;
+pub use parse::{ParseError, parse, parse_expr_at};
 pub use token::{LexError, Span, Spanned, Tok, TokenStream};

@@ -1056,3 +1056,80 @@ source length check `lex` runs before anything else already bounds every byte of
 `u32::MAX` regardless of what limits were passed. Nothing in this crate is wired to the data plane
 yet, so the blast radius of a config side defect here is a failed or delayed config push, never a
 request.
+
+## The ITPL parser
+
+**What `irontraffic-policy` parses.** `parse` (`crates/irontraffic-policy/src/parse.rs`) turns
+`lex`'s token stream into a flat `Ast` arena, with an explicit depth counter that refuses to
+descend past `PolicyLimits::max_depth`. Same admission point, same source of hostile input as
+`lex` above: an ITPL expression, and the limits it is checked against, can both arrive from a
+Kubernetes resource a namespace tenant writes, never only from an operator's own keyboard. Treat
+every token `parse` receives as attacker chosen, exactly like `lex`'s bytes.
+
+**Abuse cases.** A 100,000-term boolean tree built to force deep recursion before the depth cap
+can act on it; a list of lists, or a call whose argument is itself a call, built to make the parser
+attribute one node's children to another's range; a list or argument list one element past
+`max_list_elems`; more nodes than `NodeId` can index. The one this section exists to name
+separately from the general "any of these can happen" list: a config admitted with an unvalidated,
+oversized `max_depth` and then handed a deeply nested expression is a stack-overflow primitive, not
+merely a slow or oversized parse.
+
+**Structural controls.**
+
+- **The depth counter is checked before every recursive descent, not after the tree is built.**
+  `Parser::enter` increments `depth` and compares it against `limits.max_depth` before the caller
+  is allowed to recurse further, so the deepest input costs `max_depth` re-entries into `expr` and
+  no more; a parser that built the tree first and measured depth afterward would have already paid
+  the stack cost of the failure mode `max_depth` exists to refuse.
+- **Only one production recurses into the depth-tracked entry point.** `expr` is the sole
+  production that re-enters itself (through a parenthesized expression, an index expression, a
+  ternary branch, or an element of a list or call-argument list), so it is the sole depth-tracked
+  function; the rest of the precedence chain (`or`, `and`, `rel`, `unary`, `postfix`, `primary`)
+  each call the next one down exactly once per `expr` entry and never recurse on their own. Real
+  Rust stack cost per unit of AST depth is therefore a small, fixed number of frames, not one.
+- **Repeated unary operators and postfix chains cost one frame, not one per repetition.** `unary`
+  counts leading `!` in a loop and `postfix` walks `.field`/`.method()`/`[index]` chains in a loop,
+  so 8,000 leading `!` or a 1,000-segment postfix chain each cost a single stack frame regardless of
+  length; without this, the depth cap alone would stand between an adversary and deep recursion from
+  shapes that are long but not actually nested.
+- **Every arena index is a checked `u16::try_from`, never a truncating cast.** `grep -rn " as u16"
+  crates/irontraffic-policy/src/parse.rs` returns nothing: a truncated `args_from` would not fail
+  loudly, it would silently point a `Call` or `List` at another node's operands, so a policy would
+  evaluate a predicate nobody wrote. `elem_list`'s own element count (not the shared argument arena)
+  is what a list or call's cap and length are computed from, so a nested list or a call argument
+  that is itself a call cannot be miscounted as its parent's own element.
+- **`#![forbid(unsafe_code)]`.** Same crate-wide guarantee `lex` relies on: no out of bounds read on
+  an attacker-chosen index is possible without an explicit `unsafe` block to review.
+- **Covered by the existing fuzz lane, not yet by a dedicated one.** `crates/irontraffic-policy/fuzz`
+  fuzzes `lex` directly today; `parse` is not yet an independent fuzz target, so it is exercised only
+  through the unit and property tests in `parse.rs`, not through the corpus-guided search the lexer
+  gets. Property-testing `parse` against a grammar-shaped generator (not the lexer's byte-level one)
+  is the standing coverage for now; a dedicated `fuzz_itpl_parse` target is future work, not a gap
+  this section is silent about.
+
+**Accepted risk, and why it is NOT the same shape as `lex`'s.** `parse` does not call
+`PolicyLimits::validate()` itself, but unlike `lex`, the argument that makes skipping `validate()`
+harmless there does not carry over here. Every size-bounding field `lex` uses is a `u32`, and the
+source-length check `lex` runs before anything else already bounds every byte offset to `u32::MAX`
+regardless of what limits were passed, so an unvalidated limit only loosens what `lex` accepts, it
+never crashes it. `max_depth` is not a size bound on output, it is a bound on live recursion: every
+unit of nesting costs one real stack frame group (`expr` plus the fixed chain beneath it), and its
+only hard cap (16, published in `PolicyLimits::CAPS`) is enforced by `validate()` alone. A caller
+that admits a policy, and the limits it is checked against, without calling `limits.validate()`
+first, and then parses a deeply nested expression under that unvalidated `max_depth`, hands whoever
+supplied the policy a stack-overflow primitive. Measured directly against a release build with an
+8 MiB stack and `max_depth` raised to `u16::MAX`: 8,000 nested parentheses parse without incident;
+20,000 nested parentheses overflow the stack and abort the process.
+
+This is documented here as a precondition on `parse` and `parse_expr_at` (see their own doc
+comments), not fixed by calling `validate()` from inside `parse`: `parse` takes `&PolicyLimits` by
+reference from a caller that owns exactly one validation point, at config admission, before either
+`lex`ing or `parse`ing with those limits; a config is validated once when it is loaded, then parsed
+once per expression it contains, potentially many times over the life of the process, and folding a
+second `validate()` call into every one of those parses would duplicate work the admission-time
+caller already does once, for no additional safety once that caller has actually done it. The
+requirement is therefore on every caller, not on this function: validate limits before parsing with
+them, every time, with no exception for a namespace-tenant-supplied config. `irontraffic-policy`
+already carries a fuzz lane (see the lexer section above), so unlike the lexer defect this section's
+introduction responds to, this one is not a fuzz-lane gap: the risk here is a caller-discipline gap,
+and the discipline it requires is written down here and on the two functions it constrains.
