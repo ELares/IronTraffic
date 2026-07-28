@@ -431,6 +431,13 @@ fn handshake_no_allocations_in_resolver() {
     // even though there is no counter here to read a baseline of.
     const ITERATIONS_PER_BRANCH: u32 = 25;
 
+    // Counts branches actually exercised. Without this the whole body could be emptied
+    // (`ITERATIONS_PER_BRANCH = 0`) and the test would still pass, which is the
+    // zero-iteration defect this crate's own `alloc_gate.rs` module doc records as found
+    // and fixed by #719 in the very passage this test cites as its model. It was the third
+    // instance of that shape in this PR.
+    let mut branches_exercised: u32 = 0;
+
     let (exact_der, exact_key) = gen_leaf("exact.example.com");
     let exact_cred = load_cred(&exact_der, &exact_key);
     let (wild_der, wild_key) = gen_leaf("*.wild.example.com");
@@ -474,6 +481,7 @@ fn handshake_no_allocations_in_resolver() {
         let mut client = build_client("exact.example.com", &[&exact_der], &[b"h2"]);
         assert!(pump_handshake(&mut client, &mut server).is_none());
         assert_eq!(peer_leaf_hash(&client), blake3::hash(&exact_der));
+        branches_exercised += 1;
 
         // Wildcard-hit branch.
         let mut server =
@@ -481,12 +489,14 @@ fn handshake_no_allocations_in_resolver() {
         let mut client = build_client("sub.wild.example.com", &[&wild_der], &[b"h2"]);
         assert!(pump_handshake(&mut client, &mut server).is_none());
         assert_eq!(peer_leaf_hash(&client), blake3::hash(&wild_der));
+        branches_exercised += 1;
 
         // Miss branch: no default configured, no matching name.
         let mut server =
             rustls::ServerConnection::new(Arc::clone(&normal_server_cfg)).expect("server conn");
         let mut client = build_client("missing.example.com", &[], &[b"h2"]);
         assert!(pump_handshake(&mut client, &mut server).is_some());
+        branches_exercised += 1;
 
         // Challenge branch.
         let mut server =
@@ -494,5 +504,16 @@ fn handshake_no_allocations_in_resolver() {
         let mut client = build_client("challenge.example.com", &[&challenge_der], &[b"acme-tls/1"]);
         assert!(pump_handshake(&mut client, &mut server).is_none());
         assert_eq!(peer_leaf_hash(&client), blake3::hash(&challenge_der));
+        branches_exercised += 1;
     }
+    // Compared against a LITERAL, deliberately, not against `ITERATIONS_PER_BRANCH * 4`.
+    // The first version of this assertion did the latter, and at `ITERATIONS_PER_BRANCH = 0`
+    // both sides were 0, so it passed: a tautology written while fixing a tautology, caught
+    // only by running the mutation rather than trusting the change. The literal is what makes
+    // emptying the loop fail.
+    assert_eq!(
+        branches_exercised, 100,
+        "all four branches must run 25 times each; emptying the loop must FAIL this test, \
+         not pass it silently"
+    );
 }

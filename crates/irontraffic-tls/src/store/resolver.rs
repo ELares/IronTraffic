@@ -374,6 +374,51 @@ mod tests {
         alpn_verdict(Some(entries.iter().copied()))
     }
 
+    /// The `Normal` counterpart to [`acme_only_verdict`], computed by driving
+    /// `alpn_verdict` over a real single-entry `["h2"]` list rather than naming the
+    /// variant directly.
+    ///
+    /// Eight tests used to hand-feed `AlpnVerdict::Normal`, which is the same
+    /// artifact-instead-of-computation shape that let the single-entry ACME mutation
+    /// survive on the Challenge side until `acme_only_verdict` was added. A test that
+    /// names the verdict cannot observe `alpn_verdict` deciding it wrongly.
+    fn normal_verdict() -> AlpnVerdict {
+        let entries: [&[u8]; 1] = [b"h2"];
+        alpn_verdict(Some(entries.iter().copied()))
+    }
+
+    /// Every near-miss single-entry token must be `Normal`, so the `first == ACME`
+    /// comparison is pinned as EXACT rather than only in the matching direction.
+    ///
+    /// No test previously fed `alpn_verdict` a single-entry list that was not exactly
+    /// `acme-tls/1`, so weakening the comparison to `starts_with` or to a
+    /// case-insensitive match both survived the whole suite.
+    #[test]
+    fn alpn_single_entry_near_misses_are_normal() {
+        for token in [
+            b"acme-tls/1-evil".as_slice(),
+            b"acme-tls/10".as_slice(),
+            b"acme-tls/1\0".as_slice(),
+            b"ACME-TLS/1".as_slice(),
+            b"acme-tls/1 ".as_slice(),
+            b" acme-tls/1".as_slice(),
+            b"acme-tls/".as_slice(),
+            b"h2".as_slice(),
+        ] {
+            let entries: [&[u8]; 1] = [token];
+            assert_eq!(
+                alpn_verdict(Some(entries.iter().copied())),
+                AlpnVerdict::Normal,
+                "single-entry {:?} must not be treated as the ACME challenge ALPN",
+                core::str::from_utf8(token).unwrap_or("<non-utf8>")
+            );
+        }
+
+        // And the exact token still IS the challenge, so the test above cannot pass by
+        // the comparison having been broken in the other direction.
+        assert_eq!(acme_only_verdict(), AlpnVerdict::Challenge);
+    }
+
     #[test]
     fn alpn_absent_uses_normal_branch() {
         let verdict = alpn_verdict(None::<std::iter::Empty<&[u8]>>);
@@ -593,7 +638,7 @@ mod tests {
         let challenge = ChallengeCerts::empty([9u8; 16]);
         let resolver = test_resolver(certs, challenge, false, UnixSeconds::new(1_000));
 
-        let got = resolver.resolve_parts(AlpnVerdict::Normal, None, ClientCaps::all());
+        let got = resolver.resolve_parts(normal_verdict(), None, ClientCaps::all());
         let key = got.expect("a configured default must be served with no SNI");
         assert_eq!(leaf_hash(&key), cred_hash(&default_cred));
         assert_eq!(resolver.stats().no_sni.load(Ordering::Relaxed), 1);
@@ -605,7 +650,7 @@ mod tests {
         let challenge = ChallengeCerts::empty([9u8; 16]);
         let resolver = test_resolver(certs, challenge, false, UnixSeconds::new(1_000));
 
-        let got = resolver.resolve_parts(AlpnVerdict::Normal, None, ClientCaps::all());
+        let got = resolver.resolve_parts(normal_verdict(), None, ClientCaps::all());
         assert!(got.is_none());
         assert_eq!(resolver.stats().no_sni.load(Ordering::Relaxed), 1);
     }
@@ -619,7 +664,7 @@ mod tests {
         let challenge = ChallengeCerts::empty([9u8; 16]);
         let resolver = test_resolver(certs, challenge, false, UnixSeconds::new(1_000));
 
-        let got = resolver.resolve_parts(AlpnVerdict::Normal, Some(""), ClientCaps::all());
+        let got = resolver.resolve_parts(normal_verdict(), Some(""), ClientCaps::all());
         let key = got.expect("an unparseable SNI falls back to the configured default");
         assert_eq!(leaf_hash(&key), cred_hash(&default_cred));
     }
@@ -638,7 +683,7 @@ mod tests {
         let challenge = ChallengeCerts::empty([9u8; 16]);
         let resolver = test_resolver(certs, challenge, false, UnixSeconds::new(1_000));
 
-        let got = resolver.resolve_parts(AlpnVerdict::Normal, Some("a.example.com"), caps);
+        let got = resolver.resolve_parts(normal_verdict(), Some("a.example.com"), caps);
         assert!(got.is_none());
     }
 
@@ -659,7 +704,7 @@ mod tests {
         let challenge = ChallengeCerts::empty([9u8; 16]);
         let resolver = test_resolver(certs, challenge, false, UnixSeconds::new(1_000));
 
-        let got = resolver.resolve_parts(AlpnVerdict::Normal, Some("a.example.com"), caps);
+        let got = resolver.resolve_parts(normal_verdict(), Some("a.example.com"), caps);
         assert!(got.is_none());
     }
 
@@ -682,7 +727,7 @@ mod tests {
             rsa: true,
             ..Default::default()
         };
-        let got = resolver.resolve_parts(AlpnVerdict::Normal, Some("a.example.com"), caps);
+        let got = resolver.resolve_parts(normal_verdict(), Some("a.example.com"), caps);
         assert!(got.is_none());
         assert_eq!(
             resolver
@@ -708,7 +753,7 @@ mod tests {
             rsa: true,
             ..Default::default()
         };
-        let got = resolver.resolve_parts(AlpnVerdict::Normal, Some("a.example.com"), caps);
+        let got = resolver.resolve_parts(normal_verdict(), Some("a.example.com"), caps);
         let key = got.expect("a name with only an RSA credential must still be served");
         assert_eq!(leaf_hash(&key), cred_hash(&rsa));
         assert_eq!(
@@ -739,7 +784,7 @@ mod tests {
             rsa: true,
             ..Default::default()
         };
-        let got = resolver.resolve_parts(AlpnVerdict::Normal, Some("a.example.com"), caps);
+        let got = resolver.resolve_parts(normal_verdict(), Some("a.example.com"), caps);
         let key = got.expect("policy off must never refuse");
         assert_eq!(leaf_hash(&key), cred_hash(&rsa));
         assert_eq!(
