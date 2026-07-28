@@ -821,6 +821,51 @@ mod tests {
     }
 
     #[test]
+    fn bang_chain_beyond_u16_max_is_too_many_nodes() {
+        // #738 SHOULD_FIX 2 / #269 edge case 21: "More nodes than u16::MAX...
+        // tested by constructing the parser with a raised token limit."
+        // `unary` pushes one `Not` node per leading `!`, with no recursion
+        // (see `many_bangs_one_frame`), so a long enough bang chain drives
+        // `Parser::push`'s own `NodeId::new` guard past its limit without
+        // needing a deliberately raised `max_depth`.
+        let n = 70_000;
+        let mut src = "!".repeat(n);
+        src.push_str("true");
+
+        let mut limits = default_limits();
+        limits.max_source_bytes = 200_000;
+        limits.max_tokens = 200_000;
+
+        let toks = lex(src.as_bytes(), &limits).expect("lex must accept 70_000 bangs");
+        let err = parse(&toks, src.as_bytes(), &limits).unwrap_err();
+        assert_eq!(err, ParseError::TooManyNodes { max: u16::MAX });
+    }
+
+    #[test]
+    fn list_elements_beyond_u16_max_is_too_many_nodes() {
+        // #269 edge case 21b: "More argument entries than u16::MAX... the
+        // same treatment and the same error: arg_list and list_elems narrow
+        // with u16::try_from, so the failure is a diagnostic and never a
+        // wrapped index." This drives the SAME `TooManyNodes` error, but
+        // reached while `elem_list` is parsing a list's elements (each `!x`
+        // element pushes two nodes, an `Ident` and a `Not`) rather than by a
+        // bare literal, so the failure is exercised from inside `elem_list`'s
+        // own loop and not only from `Parser::push`'s bang-chain path above.
+        let n = 40_000;
+        let elems: Vec<&str> = std::iter::repeat_n("!x", n).collect();
+        let src = format!("[{}]", elems.join(", "));
+
+        let mut limits = default_limits();
+        limits.max_source_bytes = 500_000;
+        limits.max_tokens = 500_000;
+        limits.max_list_elems = u16::MAX;
+
+        let toks = lex(src.as_bytes(), &limits).expect("lex must accept 40_000 `!x` elements");
+        let err = parse(&toks, src.as_bytes(), &limits).unwrap_err();
+        assert_eq!(err, ParseError::TooManyNodes { max: u16::MAX });
+    }
+
+    #[test]
     fn has_macro_not_implemented() {
         let toks = lex(b"has(request.headers)", &default_limits()).unwrap();
         let err = parse(&toks, b"has(request.headers)", &default_limits()).unwrap_err();
