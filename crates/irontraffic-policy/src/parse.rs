@@ -427,28 +427,41 @@ impl Parser<'_> {
     /// Parses the comma-separated expression list following an already-consumed
     /// opening delimiter, expecting `close` to end it, and returns `(from, len)`
     /// into `self.args`. Shared by `arg_list` (parens) and `list_elems`
-    /// (brackets): the grammar for the two is otherwise identical. Enforces
-    /// `limits.max_list_elems` inside the loop, before parsing the element that
-    /// would exceed it, not after parsing every element and counting.
+    /// (brackets): the grammar for the two is otherwise identical.
+    ///
+    /// Element ids are buffered in a local `Vec`, never pushed into `self.args`
+    /// as they are parsed. `self.args` is the SHARED arena: the element being
+    /// parsed here is `self.expr()`, which for a list-of-lists or a call whose
+    /// argument is itself a call re-enters `elem_list` before this one
+    /// returns, and that nested call pushes into the same `self.args`. Taking
+    /// `from` before the loop and `len` from `self.args.len()` after it (the
+    /// shape this replaced) counts every one of those nested pushes as this
+    /// list's own element: a two-element list whose second element is a call
+    /// reports three elements, and the cap enforces against the arena instead
+    /// of against the list. Counting locally in `elems` and appending it to
+    /// `self.args` in one contiguous slice ONLY after the loop finishes fixes
+    /// both: the cap check below counts exactly this list's own elements, and
+    /// every already-fixed inner range (built by a nested `elem_list` call
+    /// that already returned) stays valid because appending happens once, in
+    /// creation order, after every nested contribution is already committed.
     fn elem_list(&mut self, close: Tok) -> Result<(u16, u16), ParseError> {
-        let from = self.args.len();
-        let from_id =
-            u16::try_from(from).map_err(|_| ParseError::TooManyNodes { max: u16::MAX })?;
-
         if self.eat(close) {
+            let from_id = u16::try_from(self.args.len())
+                .map_err(|_| ParseError::TooManyNodes { max: u16::MAX })?;
             return Ok((from_id, 0));
         }
 
         let max = usize::from(self.limits.max_list_elems);
+        let mut elems: Vec<NodeId> = Vec::new();
         loop {
-            if self.args.len().saturating_sub(from) >= max {
+            if elems.len() >= max {
                 return Err(ParseError::ListTooLong {
                     at: self.span_at(self.pos).start,
                     max: self.limits.max_list_elems,
                 });
             }
             let e = self.expr()?;
-            self.args.push(e);
+            elems.push(e);
             if self.eat(Tok::Comma) {
                 continue;
             }
@@ -456,8 +469,11 @@ impl Parser<'_> {
             break;
         }
 
-        let len = self.args.len().saturating_sub(from);
-        let len_id = u16::try_from(len).map_err(|_| ParseError::TooManyNodes { max: u16::MAX })?;
+        let from_id = u16::try_from(self.args.len())
+            .map_err(|_| ParseError::TooManyNodes { max: u16::MAX })?;
+        let len_id =
+            u16::try_from(elems.len()).map_err(|_| ParseError::TooManyNodes { max: u16::MAX })?;
+        self.args.extend(elems);
         Ok((from_id, len_id))
     }
 
@@ -732,6 +748,76 @@ mod tests {
         assert_eq!(ast.nodes[ast.root.index()], Node::List { from: 0, len: 64 });
         assert_eq!(ast.args.len(), 64);
         assert_eq!(ast.args_of(0, 64).len(), 64);
+    }
+
+    #[test]
+    fn list_element_that_is_a_call_does_not_inflate_len() {
+        // #738 BLOCKING 1: `elem_list` used to count `self.expr()`'s nested
+        // pushes into the shared `self.args` arena as if they belonged to
+        // the outer list. `x.startsWith("/b")` pushes one entry into
+        // `self.args` for its own argument; before the fix that entry was
+        // miscounted as a second element of the outer two-element list.
+        let src = br#"["/a", x.startsWith("/b")]"#;
+        let ast = parse_src(src, default_limits()).unwrap();
+        let Node::List { from, len } = ast.nodes[ast.root.index()] else {
+            panic!("root is not a List: {:?}", ast.nodes[ast.root.index()]);
+        };
+        assert_eq!(len, 2, "the source has exactly two elements");
+        let elems = ast.args_of(from, len);
+        assert_eq!(elems.len(), 2);
+        assert!(matches!(ast.node(elems[0]), Some(Node::Str(_))));
+        assert!(matches!(ast.node(elems[1]), Some(Node::Call { .. })));
+    }
+
+    #[test]
+    fn nested_list_in_list_counts_outer_elements_only() {
+        // #738 BLOCKING 1's other example: the inner lists' own two elements
+        // each must not leak into the outer list's count. The outer list has
+        // exactly two elements, the two inner `List` nodes, never six.
+        let ast = parse_src(b"[[1, 2], [3, 4]]", default_limits()).unwrap();
+        let Node::List { from, len } = ast.nodes[ast.root.index()] else {
+            panic!("root is not a List: {:?}", ast.nodes[ast.root.index()]);
+        };
+        assert_eq!(len, 2, "the outer list has exactly two elements");
+        let outer = ast.args_of(from, len);
+        assert_eq!(outer.len(), 2);
+        for &id in outer {
+            let Some(Node::List { len: inner_len, .. }) = ast.node(id) else {
+                panic!("outer element is not a List");
+            };
+            assert_eq!(inner_len, 2, "each inner list has exactly two elements");
+        }
+    }
+
+    #[test]
+    fn list_of_call_elements_respects_cap_by_element_count_not_arena_size() {
+        // #738 BLOCKING 1's third symptom: with the arena-counting bug, a
+        // list of 33 one-argument-call elements (66 arena entries) was
+        // refused at `max_list_elems = 64`, a cap the list is 31 elements
+        // short of. Pin the real, corrected boundary: 64 call elements
+        // (128 arena entries once every call's own argument is counted) is
+        // accepted, and 65 is rejected, both against a per-item cap counted
+        // per element, not per arena entry.
+        let mut limits = default_limits();
+        limits.max_list_elems = 64;
+        limits.max_tokens = 4096;
+
+        let elems_64: Vec<String> = (0..64).map(|i| format!("a.startsWith(\"{i}\")")).collect();
+        let src_64 = format!("[{}]", elems_64.join(", "));
+        let ast = parse_src(src_64.as_bytes(), limits).unwrap();
+        let Node::List { len, .. } = ast.nodes[ast.root.index()] else {
+            panic!("root is not a List");
+        };
+        assert_eq!(len, 64, "64 call elements must count as 64, not 128");
+
+        let elems_65: Vec<String> = (0..65).map(|i| format!("a.startsWith(\"{i}\")")).collect();
+        let src_65 = format!("[{}]", elems_65.join(", "));
+        let toks = lex(src_65.as_bytes(), &limits).unwrap();
+        let err = parse(&toks, src_65.as_bytes(), &limits).unwrap_err();
+        assert!(
+            matches!(err, ParseError::ListTooLong { max: 64, .. }),
+            "expected ListTooLong at the 65th call element, got {err:?}"
+        );
     }
 
     #[test]
