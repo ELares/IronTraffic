@@ -232,8 +232,7 @@ impl Parser<'_> {
     }
 
     fn push(&mut self, n: Node) -> Result<NodeId, ParseError> {
-        let id =
-            NodeId::new(self.nodes.len()).ok_or(ParseError::TooManyNodes { max: u16::MAX })?;
+        let id = NodeId::new(self.nodes.len()).ok_or(ParseError::TooManyNodes { max: u16::MAX })?;
         self.nodes.push(n);
         Ok(id)
     }
@@ -282,7 +281,7 @@ impl Parser<'_> {
         let cond = self.or()?;
         if self.eat(Tok::Question) {
             let then_ = self.expr()?; // right associative
-            self.expect(Tok::Colon)?;
+            self.expect(Tok::Colon)?; // it-allow: no-panic reason: Parser::expect returns Result and propagates via ?; not Result::expect/Option::expect.
             let else_ = self.expr()?;
             return self.push(Node::Ternary { cond, then_, else_ });
         }
@@ -380,7 +379,7 @@ impl Parser<'_> {
                 }
             } else if self.eat(Tok::LBracket) {
                 let index = self.expr()?;
-                self.expect(Tok::RBracket)?;
+                self.expect(Tok::RBracket)?; // it-allow: no-panic reason: Parser::expect returns Result and propagates via ?; not Result::expect/Option::expect.
                 base = self.push(Node::Index { base, index })?;
             } else {
                 return Ok(base);
@@ -399,7 +398,7 @@ impl Parser<'_> {
             Tok::Null => self.push(Node::Null),
             Tok::LParen => {
                 let inner = self.expr()?;
-                self.expect(Tok::RParen)?;
+                self.expect(Tok::RParen)?; // it-allow: no-panic reason: Parser::expect returns Result and propagates via ?; not Result::expect/Option::expect.
                 Ok(inner)
             }
             Tok::LBracket => {
@@ -411,7 +410,10 @@ impl Parser<'_> {
                     // A bare call: `has(x)`, `all(x, y)`, `size(x)`. ITPL has no
                     // bare functions, so this is the landing site for every CEL
                     // macro and every other bare-call syntax.
-                    return Err(ParseError::NotImplemented { at: s.start, construct: s });
+                    return Err(ParseError::NotImplemented {
+                        at: s.start,
+                        construct: s,
+                    });
                 }
                 self.push(Node::Ident(s))
             }
@@ -450,7 +452,7 @@ impl Parser<'_> {
             if self.eat(Tok::Comma) {
                 continue;
             }
-            self.expect(close)?;
+            self.expect(close)?; // it-allow: no-panic reason: Parser::expect returns Result and propagates via ?; not Result::expect/Option::expect.
             break;
         }
 
@@ -568,8 +570,8 @@ mod tests {
         assert_eq!(
             ast.nodes,
             vec![
-                Node::Ident(Span { start: 0, end: 1 }),  // 0: a
-                Node::Ident(Span { start: 5, end: 6 }),  // 1: b
+                Node::Ident(Span { start: 0, end: 1 }), // 0: a
+                Node::Ident(Span { start: 5, end: 6 }), // 1: b
                 Node::And {
                     lhs: NodeId(0),
                     rhs: NodeId(1)
@@ -591,8 +593,8 @@ mod tests {
         assert_eq!(
             ast.nodes,
             vec![
-                Node::Ident(Span { start: 0, end: 1 }),  // 0: a
-                Node::Ident(Span { start: 5, end: 6 }),  // 1: b
+                Node::Ident(Span { start: 0, end: 1 }),   // 0: a
+                Node::Ident(Span { start: 5, end: 6 }),   // 1: b
                 Node::Ident(Span { start: 10, end: 11 }), // 2: c
                 Node::And {
                     lhs: NodeId(1),
@@ -637,7 +639,10 @@ mod tests {
             panic!("root is not a Ternary: {:?}", ast.nodes[ast.root.index()]);
         };
         assert_eq!(ast.node(cond), Some(Node::Ident(Span { start: 0, end: 1 })));
-        assert_eq!(ast.node(then_), Some(Node::Ident(Span { start: 4, end: 5 })));
+        assert_eq!(
+            ast.node(then_),
+            Some(Node::Ident(Span { start: 4, end: 5 }))
+        );
         let Some(Node::Ternary {
             cond: cond2,
             then_: then2,
@@ -990,10 +995,7 @@ mod tests {
         assert_eq!(span_at(&toks, src, 100), Span::empty(3));
 
         let real = lex(b"a", &default_limits()).unwrap();
-        assert_eq!(
-            span_at(&real.toks, b"a", real.toks.len()),
-            Span::empty(1)
-        );
+        assert_eq!(span_at(&real.toks, b"a", real.toks.len()), Span::empty(1));
         assert_eq!(
             span_at(&real.toks, b"a", real.toks.len() + 100),
             Span::empty(1)
@@ -1027,10 +1029,16 @@ mod tests {
         ) {
             let limits = default_limits();
             let stream = TokenStream { toks, strings: Vec::new() };
-            // Must return Ok or Err for every input; must never panic. The
-            // deeper invariant (depth never exceeds the cap) is asserted
-            // separately below, so this one focuses on totality.
-            let _ = parse(&stream, &src, &limits);
+            // Must never panic for any input, which `#[test]` alone already
+            // enforces (a panic fails the case). The real, checkable
+            // invariants beyond mere totality: every accepted arena is
+            // bounded by `NodeId`'s own range and the root is a valid index
+            // into it. `prop_depth_never_exceeds_cap` below covers the depth
+            // cap specifically, so it is not duplicated here.
+            if let Ok(ast) = parse(&stream, &src, &limits) {
+                prop_assert!(u16::try_from(ast.nodes.len()).is_ok());
+                prop_assert!(ast.root.index() < ast.nodes.len());
+            }
         }
 
         #[test]

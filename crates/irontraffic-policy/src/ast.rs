@@ -31,7 +31,7 @@ impl NodeId {
                 reason = "guarded by the i > 0xFFFF check immediately above: i is proven to fit in u16 before this cast runs"
             )]
             {
-                Some(NodeId(i as u16))
+                Some(NodeId(i as u16)) // it-allow: unchecked-cast reason: guarded by the i > 0xFFFF check above; i is proven to fit in u16 before this line runs.
             }
         }
     }
