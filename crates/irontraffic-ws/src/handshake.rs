@@ -120,7 +120,8 @@ pub struct UpgradeTokens<'a> {
 /// A validated RFC 6455 upgrade request.
 ///
 /// Constructing one is the ONLY way to conclude that a request is a WebSocket
-/// upgrade. There is no boolean `is_websocket` anywhere.
+/// upgrade. There is no separate yes/no query method anywhere in this module: holding
+/// a value of this type is itself the only affirmative answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UpgradeRequest {
     /// The 16 decoded key bytes.
