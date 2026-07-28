@@ -549,6 +549,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "der_hack"
+version = "0.1.0"
+dependencies = [
+ "der",
+]
+
+[[package]]
 name = "deranged"
 version = "0.5.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"

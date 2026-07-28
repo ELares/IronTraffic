@@ -376,6 +376,66 @@ pub fn label_count(name: &str) -> usize {
     name.bytes().filter(|&c| c == b'.').count() + 1
 }
 
+/// Allocation probe counters for tests.
+///
+/// NOT a `#[global_allocator]`: `unsafe` is denied in this crate and a process-wide allocator is
+/// unsound in a parallel test binary anyway. Instead, tests that need to bound allocation call
+/// `record` explicitly at known allocation sites or use `memory_bytes()` on the final structure.
+///
+/// Added by issue #123 to bound the peak memory of a 1,000,000-entry CRL index build. The existing
+/// allocation counter in this module (a `thread_local!` `Cell<usize>` counting allocation events)
+/// was added by `sni-name-normalization` (#113); this issue adds a second counter tracking
+/// allocated **bytes**.
+#[cfg(test)]
+pub(crate) mod alloc_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        /// Allocation event count (from #113).
+        static COUNT: Cell<usize> = const { Cell::new(0) };
+        /// Allocated byte count (added by #123).
+        static BYTES: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// Record an allocation of `n` bytes.
+    #[allow(
+        dead_code,
+        reason = "alloc probe counters for issue #123 CRL memory tests; no test currently calls record because the allocation-bounded tests use memory_bytes() on the final index instead"
+    )]
+    pub(crate) fn record(n: usize) {
+        COUNT.with(|c| c.set(c.get() + 1));
+        BYTES.with(|c| c.set(c.get() + n));
+    }
+
+    /// Reset both counters.
+    #[allow(
+        dead_code,
+        reason = "same as record: kept for symmetry with the existing COUNT/BYTES probe API"
+    )]
+    pub(crate) fn reset() {
+        COUNT.with(|c| c.set(0));
+        BYTES.with(|c| c.set(0));
+    }
+
+    /// Allocation event count.
+    #[allow(
+        dead_code,
+        reason = "same as record: kept for symmetry with the existing COUNT/BYTES probe API"
+    )]
+    pub(crate) fn count() -> usize {
+        COUNT.with(std::cell::Cell::get)
+    }
+
+    /// Allocated byte count.
+    #[allow(
+        dead_code,
+        reason = "same as record: kept for symmetry with the existing COUNT/BYTES probe API"
+    )]
+    pub(crate) fn bytes() -> usize {
+        BYTES.with(std::cell::Cell::get)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{

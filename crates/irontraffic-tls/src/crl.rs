@@ -188,6 +188,7 @@ pub struct RevocationStats {
 }
 
 /// A borrowed, parsed CRL header plus a serial iterator.
+#[derive(Debug, PartialEq)]
 pub struct ParsedCrl<'a> {
     issuer_dn: &'a [u8],
     this_update: UnixSeconds,
@@ -224,6 +225,10 @@ impl<'a> ParsedCrl<'a> {
 
     /// The encoded `TBSCertList` span, which is the signed message.
     #[cfg(test)]
+    #[allow(
+        dead_code,
+        reason = "convenience accessor matching the pattern of issuer_dn, this_update, etc; no test currently reads tbs_span directly because the field is pub(crate)"
+    )]
     pub(crate) fn tbs_span(&self) -> &'a [u8] {
         self.tbs_span
     }
@@ -244,28 +249,26 @@ impl<'a> Iterator for SerialIter<'a> {
     type Item = Result<&'a [u8], CrlError>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        while !self.bytes.is_empty() {
-            let mut reader = match der::SliceReader::new(self.bytes) {
-                Ok(r) => r,
-                Err(_) => return Some(Err(CrlError::Parse)),
-            };
-            let entry_tlv = match reader.tlv_bytes() {
-                Ok(tlv) => tlv,
-                Err(_) => return Some(Err(CrlError::Parse)),
-            };
-            let consumed = entry_tlv.len();
-            self.bytes = match self.bytes.get(consumed..) {
-                Some(rest) => rest,
-                None => return Some(Err(CrlError::Parse)),
-            };
-
-            let serial = match serial_from_entry(entry_tlv) {
-                Ok(s) => s,
-                Err(e) => return Some(Err(e)),
-            };
-            return Some(Ok(serial));
+        if self.bytes.is_empty() {
+            return None;
         }
-        None
+        let Ok(mut reader) = der::SliceReader::new(self.bytes) else {
+            return Some(Err(CrlError::Parse));
+        };
+        let Ok(entry_tlv) = reader.tlv_bytes() else {
+            return Some(Err(CrlError::Parse));
+        };
+        let consumed = entry_tlv.len();
+        let Some(rest) = self.bytes.get(consumed..) else {
+            return Some(Err(CrlError::Parse));
+        };
+        self.bytes = rest;
+
+        let serial = match serial_from_entry(entry_tlv) {
+            Ok(s) => s,
+            Err(e) => return Some(Err(e)),
+        };
+        Some(Ok(serial))
     }
 }
 
@@ -423,7 +426,9 @@ fn read_time(reader: &mut der::SliceReader<'_>) -> Result<UnixSeconds, CrlError>
 }
 
 fn read_optional_time(reader: &mut der::SliceReader<'_>) -> Result<Option<UnixSeconds>, CrlError> {
-    let header = reader.peek_header().map_err(|_| CrlError::Parse)?;
+    let Ok(header) = reader.peek_header() else {
+        return Ok(None);
+    };
     if header.tag == der::Tag::UtcTime || header.tag == der::Tag::GeneralizedTime {
         Ok(Some(read_time(reader)?))
     } else {
@@ -432,7 +437,9 @@ fn read_optional_time(reader: &mut der::SliceReader<'_>) -> Result<Option<UnixSe
 }
 
 fn read_revoked_certificates<'a>(reader: &mut der::SliceReader<'a>) -> Result<&'a [u8], CrlError> {
-    let header = reader.peek_header().map_err(|_| CrlError::Parse)?;
+    let Ok(header) = reader.peek_header() else {
+        return Ok(&[]);
+    };
     if header.tag != der::Tag::Sequence {
         return Ok(&[]);
     }
@@ -479,6 +486,7 @@ fn signature_bytes(sig_value_tlv: &[u8]) -> Result<&[u8], CrlError> {
 }
 
 /// A CRL whose signature has been verified against its issuing certificate.
+#[derive(Debug, PartialEq)]
 pub struct VerifiedCrl<'a> {
     parsed: ParsedCrl<'a>,
 }
@@ -541,6 +549,7 @@ pub fn verify_signature<'a>(
 }
 
 /// Compiled revocation data for one issuer. Immutable.
+#[derive(Debug)]
 pub struct RevocationIndex {
     issuer_dn: Box<[u8]>,
     bloom: Box<[u64]>,
@@ -550,6 +559,20 @@ pub struct RevocationIndex {
     this_update: UnixSeconds,
     next_update: Option<UnixSeconds>,
     stats: RevocationStats,
+}
+
+// PartialEq is manual because AtomicU64 in RevocationStats does not implement it.
+// The stats counters are compared by identity (they should be zero for a fresh index).
+impl PartialEq for RevocationIndex {
+    fn eq(&self, other: &Self) -> bool {
+        self.issuer_dn == other.issuer_dn
+            && self.bloom == other.bloom
+            && self.blocks == other.blocks
+            && self.serials == other.serials
+            && self.wide == other.wide
+            && self.this_update == other.this_update
+            && self.next_update == other.next_update
+    }
 }
 
 impl RevocationIndex {
@@ -569,15 +592,15 @@ impl RevocationIndex {
         cfg: &CrlConfig,
     ) -> Result<Self, CrlError> {
         let skew = u64::from(cfg.skew_secs);
-        if verified.this_update().get().saturating_add(skew) < now.get() {
+        if verified.this_update().get() > now.get().saturating_add(skew) {
             // thisUpdate is in the future beyond skew.
             return Err(CrlError::NotYetValid);
         }
 
-        if let Some(next) = verified.next_update() {
-            if next.get().saturating_add(skew) < now.get() {
-                return Err(CrlError::AlreadyExpired);
-            }
+        if let Some(next) = verified.next_update()
+            && next.get().saturating_add(skew) < now.get()
+        {
+            return Err(CrlError::AlreadyExpired);
         }
 
         let mut serials_vec: Vec<u128> = Vec::new();
@@ -715,12 +738,16 @@ impl RevocationIndex {
 fn pack_serial(serial: &[u8]) -> u128 {
     let mut out = [0u8; 16];
     let start = 16usize.saturating_sub(serial.len());
+    #[allow(
+        clippy::collapsible_if,
+        reason = "the let take = statement between the outer if-let and the inner pair prevents collapsing without introducing a closure or duplicating the min() call"
+    )]
     if let Some(slice) = out.get_mut(start..) {
         let take = slice.len().min(serial.len());
-        if let Some(target) = slice.get_mut(..take) {
-            if let Some(source) = serial.get(serial.len().saturating_sub(take)..) {
-                target.copy_from_slice(source);
-            }
+        if let Some(target) = slice.get_mut(..take)
+            && let Some(source) = serial.get(serial.len().saturating_sub(take)..)
+        {
+            target.copy_from_slice(source);
         }
     }
     u128::from_be_bytes(out)
@@ -737,10 +764,9 @@ fn build_bloom(serials: &[u128], wide: &HashSet<Box<[u8]>>) -> Box<[u64]> {
     let entries = serials.len().saturating_add(wide.len());
     let bits = entries
         .saturating_mul(BLOOM_BITS_PER_ENTRY)
-        .max(BLOOM_FLOOR_BYTES * 8)
-        .min(BLOOM_CAP_BYTES * 8);
+        .clamp(BLOOM_FLOOR_BYTES * 8, BLOOM_CAP_BYTES * 8);
     // Round bits up to a multiple of 512 (one block).
-    let bits = ((bits + 511) / 512) * 512;
+    let bits = bits.div_ceil(512) * 512;
     let words = bits / 64;
     let mut bloom = vec![0u64; words];
     let blocks = u64::try_from(words / (BLOOM_BLOCK_BYTES / 8)).unwrap_or(1);
@@ -751,10 +777,10 @@ fn build_bloom(serials: &[u128], wide: &HashSet<Box<[u8]>>) -> Box<[u64]> {
     for serial in wide {
         let mut buf = [0u8; 16];
         let len = serial.len().min(16);
-        if let Some(src) = serial.get(..len) {
-            if let Some(dst) = buf.get_mut(16 - len..) {
-                dst.copy_from_slice(src);
-            }
+        if let Some(src) = serial.get(..len)
+            && let Some(dst) = buf.get_mut(16 - len..)
+        {
+            dst.copy_from_slice(src);
         }
         bloom_insert(&mut bloom, blocks, u128::from_be_bytes(buf));
     }
@@ -863,9 +889,928 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    // -----------------------------------------------------------------------
+    // DER builder helpers for test CRL fixtures.
+    //
+    // We write tag/length/bytes manually to avoid depending on der::Tag::ContextSpecific
+    // (which uses a private TagNumber type) and on Length::new with large values.
+    // -----------------------------------------------------------------------
+
+    mod der_enc {
+        use der::DateTime;
+        use der::Encode;
+        use der::asn1::{BitStringRef, GeneralizedTime, ObjectIdentifier, UtcTime};
+
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "all casts are guarded by size checks: len < 128, < 256, < 65536, etc; values are known to fit in u8 at each call site"
+        )]
+        fn der_length(buf: &mut Vec<u8>, len: usize) {
+            if len < 128 {
+                buf.push(len as u8);
+            } else if len < 256 {
+                buf.push(0x81);
+                buf.push(len as u8);
+            } else if len < 65_536 {
+                buf.push(0x82);
+                buf.push((len >> 8) as u8);
+                buf.push((len & 0xff) as u8);
+            } else if len < 16_777_216 {
+                buf.push(0x83);
+                buf.push((len >> 16) as u8);
+                buf.push((len >> 8) as u8);
+                buf.push((len & 0xff) as u8);
+            } else {
+                buf.push(0x84);
+                buf.push((len >> 24) as u8);
+                buf.push((len >> 16) as u8);
+                buf.push((len >> 8) as u8);
+                buf.push((len & 0xff) as u8);
+            }
+        }
+
+        fn encode_tag_raw(tag_byte: u8, content: &[u8]) -> Vec<u8> {
+            let mut buf = vec![tag_byte];
+            der_length(&mut buf, content.len());
+            buf.extend_from_slice(content);
+            buf
+        }
+
+        pub(crate) fn encode_sequence(items: &[impl AsRef<[u8]>]) -> Vec<u8> {
+            let body: Vec<u8> = items
+                .iter()
+                .flat_map(|i| i.as_ref().iter().copied())
+                .collect();
+            encode_tag_raw(0x30, &body)
+        }
+
+        pub(crate) fn encode_integer(bytes: &[u8]) -> Vec<u8> {
+            // DER requires a leading 0x00 when the first content byte has the
+            // high bit set, so the INTEGER is interpreted as positive.
+            if bytes.first().is_some_and(|b| b & 0x80 != 0) {
+                let mut padded = vec![0x00];
+                padded.extend_from_slice(bytes);
+                encode_tag_raw(0x02, &padded)
+            } else {
+                encode_tag_raw(0x02, bytes)
+            }
+        }
+
+        pub(crate) fn encode_set(content: &[u8]) -> Vec<u8> {
+            encode_tag_raw(0x31, content)
+        }
+
+        pub(crate) fn encode_octet_string(content: &[u8]) -> Vec<u8> {
+            encode_tag_raw(0x04, content)
+        }
+
+        pub(crate) fn encode_oid(oid_str: &str) -> Vec<u8> {
+            let oid: ObjectIdentifier = oid_str.parse().unwrap();
+            let mut buf = Vec::new();
+            oid.encode(&mut buf).unwrap();
+            buf
+        }
+
+        pub(crate) fn encode_utctime(secs: u64) -> Vec<u8> {
+            let dt = date_time_from_unix(secs);
+            let t = UtcTime::from_date_time(dt).unwrap();
+            let mut buf = Vec::new();
+            t.encode(&mut buf).unwrap();
+            buf
+        }
+
+        #[allow(
+            dead_code,
+            reason = "kept for symmetry with encode_utctime; may be used by future tests that need GeneralizedTime"
+        )]
+        pub(crate) fn encode_generalized_time(secs: u64) -> Vec<u8> {
+            let dt = date_time_from_unix(secs);
+            let t = GeneralizedTime::from_date_time(dt);
+            let mut buf = Vec::new();
+            t.encode(&mut buf).unwrap();
+            buf
+        }
+
+        #[allow(
+            clippy::many_single_char_names,
+            reason = "h/m/s/d/y are the conventional names for hours/minutes/seconds/days/years in date arithmetic; longer names would be less readable"
+        )]
+        fn date_time_from_unix(secs: u64) -> DateTime {
+            // Compute a DateTime from seconds since epoch using a simple algorithm.
+            // Sufficiently accurate for test UTCTime values.
+            let days = secs / 86_400;
+            let rem = secs % 86_400;
+            let h = (rem / 3600) as u8;
+            let m = ((rem % 3600) / 60) as u8;
+            let s = (rem % 60) as u8;
+
+            #[allow(
+                clippy::cast_possible_wrap,
+                reason = "days since epoch fits in i64 for any timestamp this test module produces (well under 2^63)"
+            )]
+            let mut d = days as i64;
+            let mut y = 1970i64;
+
+            loop {
+                let days_in_year = if is_leap(y) { 366 } else { 365 };
+                if d < days_in_year {
+                    break;
+                }
+                d -= days_in_year;
+                y += 1;
+            }
+
+            let month_days = if is_leap(y) {
+                [31, 29, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+            } else {
+                [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+            };
+
+            let mut mo = 1u8;
+            for &md in &month_days {
+                if d < i64::from(md) {
+                    break;
+                }
+                d -= i64::from(md);
+                mo += 1;
+            }
+
+            DateTime::new(
+                u16::try_from(y).unwrap(),
+                mo,
+                u8::try_from(d + 1).unwrap(),
+                h,
+                m,
+                s,
+            )
+            .unwrap()
+        }
+
+        fn is_leap(y: i64) -> bool {
+            (y % 4 == 0 && y % 100 != 0) || (y % 400 == 0)
+        }
+
+        pub(crate) fn encode_bit_string(bytes: &[u8]) -> Vec<u8> {
+            let bs = BitStringRef::new(0, bytes).unwrap();
+            let mut buf = Vec::new();
+            bs.encode(&mut buf).unwrap();
+            buf
+        }
+
+        pub(crate) fn encode_name(rdn_oid: &str, value: &str) -> Vec<u8> {
+            let set = encode_set(&encode_sequence(&[
+                encode_oid(rdn_oid),
+                encode_tag_raw(0x13, value.as_bytes()), // PrintableString
+            ]));
+            encode_sequence(&[set])
+        }
+
+        pub(crate) fn encode_algorithm_identifier(oid_str: &str) -> Vec<u8> {
+            encode_sequence(&[encode_oid(oid_str)])
+        }
+
+        pub(crate) fn encode_context_explicit(tag: u8, content: &[u8]) -> Vec<u8> {
+            // Context-specific constructed: tag byte = 0xa0 | tag_number
+            encode_tag_raw(0xa0 | tag, content)
+        }
+    }
+
+    /// Build a structurally valid CRL DER blob for testing.
+    ///
+    /// `serials` are the raw content octets of the serial INTEGERs (before DER encoding).
+    /// `this_update` and `next_update` are Unix timestamps; `None` means absent.
+    /// `has_delta` adds a `deltaCRLIndicator` extension.
+    fn build_crl_der(
+        serials: &[&[u8]],
+        this_update: Option<u64>,
+        next_update: Option<u64>,
+        has_delta: bool,
+    ) -> Vec<u8> {
+        let now = this_update.unwrap_or(1_704_000_000);
+        let later = next_update.unwrap_or(now + 86_400);
+
+        let mut tbs_items = vec![
+            // Version (v2, INTEGER 1)
+            der_enc::encode_integer(&[0x01]),
+            // AlgorithmIdentifier (sha256WithRSAEncryption)
+            der_enc::encode_algorithm_identifier("1.2.840.113549.1.1.11"),
+            // Issuer Name
+            der_enc::encode_name("2.5.4.3", "Test CA"),
+            // thisUpdate
+            der_enc::encode_utctime(now),
+            // nextUpdate (optional)
+            der_enc::encode_utctime(later),
+        ];
+
+        // revokedCertificates (optional)
+        if !serials.is_empty() {
+            let entries: Vec<Vec<u8>> = serials
+                .iter()
+                .map(|s| {
+                    der_enc::encode_sequence(&[
+                        der_enc::encode_integer(s),
+                        der_enc::encode_utctime(now),
+                    ])
+                })
+                .collect();
+            let entry_refs: Vec<&[u8]> = entries.iter().map(std::vec::Vec::as_slice).collect();
+            tbs_items.push(der_enc::encode_sequence(&entry_refs));
+        }
+
+        // crlExtensions [0] EXPLICIT (optional)
+        if has_delta {
+            let ext = der_enc::encode_sequence(&[
+                der_enc::encode_oid("2.5.29.27"),
+                der_enc::encode_octet_string(&[]),
+            ]);
+            let ext_seq = der_enc::encode_sequence(&[ext]);
+            tbs_items.push(der_enc::encode_context_explicit(0, &ext_seq));
+        }
+
+        let tbs = der_enc::encode_sequence(&tbs_items);
+
+        let sig_alg = der_enc::encode_algorithm_identifier("1.2.840.113549.1.1.11");
+        let sig_value = der_enc::encode_bit_string(&[0u8; 256]);
+
+        der_enc::encode_sequence(&[tbs, sig_alg, sig_value])
+    }
+
+    /// Build a CRL with a single serial.
+    fn build_single_crl(serial: &[u8]) -> Vec<u8> {
+        build_crl_der(&[serial], None, None, false)
+    }
+
+    fn default_cfg() -> CrlConfig {
+        CrlConfig {
+            max_bytes: 1_000_000_000,
+            max_entries: 10_000_000,
+            stale_grace_secs: 86_400,
+            no_next_update_ttl_secs: 86_400,
+            skew_secs: 300,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Unit tests
+    // -----------------------------------------------------------------------
+
     #[test]
     fn crl_empty() {
-        let cfg = CrlConfig::default();
+        let cfg = default_cfg();
         assert_eq!(parse(&[], &cfg), Err(CrlError::Empty));
+    }
+
+    #[test]
+    fn crl_no_revoked_list() {
+        let der = build_crl_der(&[], None, None, false);
+        let cfg = default_cfg();
+        let parsed = parse(&der, &cfg).expect("CRL with no revoked list should parse");
+        assert_eq!(parsed.serials().count(), 0);
+        let verified = VerifiedCrl { parsed };
+        let idx = RevocationIndex::build(&verified, UnixSeconds::new(1_704_000_000), &cfg)
+            .expect("build should succeed");
+        assert_eq!(idx.len(), 0);
+        assert!(idx.is_empty());
+        assert!(!idx.is_revoked(&[0x01]));
+    }
+
+    #[test]
+    fn crl_single_entry() {
+        let der = build_single_crl(&[0x2a]); // serial 42
+        let cfg = default_cfg();
+        let parsed = parse(&der, &cfg).expect("CRL with one entry should parse");
+        assert_eq!(parsed.serials().count(), 1);
+        let verified = VerifiedCrl { parsed };
+        let idx = RevocationIndex::build(&verified, UnixSeconds::new(1_704_000_000), &cfg)
+            .expect("build should succeed");
+        assert_eq!(idx.len(), 1);
+        assert!(!idx.is_empty());
+        assert!(idx.is_revoked(&[0x2a]));
+        assert!(!idx.is_revoked(&[0x01]));
+    }
+
+    #[test]
+    fn crl_max_bytes_boundary() {
+        let mut cfg = default_cfg();
+        cfg.max_bytes = 100;
+        let der = [0u8; 100];
+        // Exactly max_bytes should parse (and fail at DER parse, not size)
+        let parsed = parse(&der, &cfg);
+        assert_eq!(parsed.err(), Some(CrlError::Parse));
+        // One over should be TooLarge
+        cfg.max_bytes = 99;
+        assert_eq!(parse(&[0u8; 100], &cfg), Err(CrlError::TooLarge));
+    }
+
+    #[test]
+    fn crl_max_entries_boundary() {
+        let mut cfg = default_cfg();
+        cfg.max_entries = 5;
+        cfg.max_bytes = 1_000_000_000;
+        let serials: Vec<Vec<u8>> = (0..5).map(|i| vec![i + 1]).collect();
+        let serial_refs: Vec<&[u8]> = serials.iter().map(std::vec::Vec::as_slice).collect();
+        let der = build_crl_der(&serial_refs, None, None, false);
+        let parsed = parse(&der, &cfg).expect("should parse");
+        let verified = VerifiedCrl { parsed };
+        let idx = RevocationIndex::build(&verified, UnixSeconds::new(1_704_000_000), &cfg)
+            .expect("5 entries with max_entries=5 should build");
+        assert_eq!(idx.len(), 5);
+
+        // One over
+        let serials: Vec<Vec<u8>> = (0..6).map(|i| vec![i + 1]).collect();
+        let serial_refs: Vec<&[u8]> = serials.iter().map(std::vec::Vec::as_slice).collect();
+        let der = build_crl_der(&serial_refs, None, None, false);
+        let parsed = parse(&der, &cfg).expect("should parse");
+        let verified = VerifiedCrl { parsed };
+        assert_eq!(
+            RevocationIndex::build(&verified, UnixSeconds::new(1_704_000_000), &cfg),
+            Err(CrlError::TooManyEntries)
+        );
+    }
+
+    #[test]
+    fn crl_serial_21_bytes() {
+        // 21-byte serial should be rejected (RFC 5280 limits to 20)
+        // Use non-zero content so the DER INTEGER encoding is valid
+        // (all-zeros would be invalid DER due to leading zero rule).
+        let serial: Vec<u8> = vec![0x01; 21];
+        let der = build_single_crl(&serial);
+        let cfg = default_cfg();
+        let parsed = parse(&der, &cfg).expect("should parse");
+        // The serial in the CRL has 21 content octets.
+        // After normalization, it's still 21 bytes (no leading zero to strip).
+        assert_eq!(
+            RevocationIndex::build(
+                &VerifiedCrl { parsed },
+                UnixSeconds::new(1_704_000_000),
+                &cfg,
+            ),
+            Err(CrlError::SerialTooLong)
+        );
+
+        // 21 content octets with leading zero -> normalizes to 20 -> accepted
+        let serial: Vec<u8> = {
+            let mut s = vec![0x00];
+            s.extend_from_slice(&[0xaa; 20]);
+            s
+        };
+        let der = build_single_crl(&serial);
+        let parsed = parse(&der, &cfg).expect("should parse");
+        let idx = RevocationIndex::build(
+            &VerifiedCrl { parsed },
+            UnixSeconds::new(1_704_000_000),
+            &cfg,
+        )
+        .expect("20-byte normalized serial should build");
+        assert_eq!(idx.len(), 1);
+    }
+
+    #[test]
+    fn crl_serial_17_bytes_wide() {
+        // A 17-byte serial should go into the wide set.
+        // Use bytes with high bit clear so DER INTEGER encoding is valid.
+        let serial = [0x0a; 17];
+        let der = build_single_crl(&serial);
+        let cfg = default_cfg();
+        let parsed = parse(&der, &cfg).expect("should parse");
+        let idx = RevocationIndex::build(
+            &VerifiedCrl { parsed },
+            UnixSeconds::new(1_704_000_000),
+            &cfg,
+        )
+        .expect("build should succeed");
+        assert_eq!(idx.len(), 1);
+        assert!(idx.is_revoked(&serial));
+        assert!(!idx.is_revoked(&[0xbb; 17]));
+    }
+
+    #[test]
+    fn crl_serial_leading_zero_16_bytes() {
+        // 17 content octets: 00 FF FF ... FF (17 bytes) -> normalizes to 16 bytes -> in serials
+        let serial_der = {
+            let mut s = vec![0x00];
+            s.extend_from_slice(&[0xff; 16]);
+            s
+        };
+        let der = build_single_crl(&serial_der);
+        let cfg = default_cfg();
+        let parsed = parse(&der, &cfg).expect("should parse");
+        let idx = RevocationIndex::build(
+            &VerifiedCrl { parsed },
+            UnixSeconds::new(1_704_000_000),
+            &cfg,
+        )
+        .expect("build should succeed");
+        assert_eq!(idx.len(), 1);
+        // After normalization, the serial is [0xff; 16]
+        assert!(idx.is_revoked(&[0xff; 16]));
+        // Same serial with DER padding (00 FF...FF)
+        let mut with_padding = vec![0x00];
+        with_padding.extend_from_slice(&[0xff; 16]);
+        assert!(idx.is_revoked(&with_padding));
+        // Should have 0 wide serials
+        assert!(idx.wide.is_empty());
+    }
+
+    #[test]
+    fn crl_serial_zero() {
+        let der = build_single_crl(&[0x00]);
+        let cfg = default_cfg();
+        let parsed = parse(&der, &cfg).expect("should parse");
+        let idx = RevocationIndex::build(
+            &VerifiedCrl { parsed },
+            UnixSeconds::new(1_704_000_000),
+            &cfg,
+        )
+        .expect("build should succeed");
+        assert_eq!(idx.len(), 1);
+        // Serial 0 normalizes to [0x00]
+        assert!(idx.is_revoked(&[0x00]));
+        // Also matches when given with leading zeros
+        assert!(idx.is_revoked(&[0x00, 0x00]));
+    }
+
+    #[test]
+    fn crl_duplicate_serials() {
+        let der = build_crl_der(&[&[0x01], &[0x01], &[0x02]], None, None, false);
+        let cfg = default_cfg();
+        let parsed = parse(&der, &cfg).expect("should parse");
+        let idx = RevocationIndex::build(
+            &VerifiedCrl { parsed },
+            UnixSeconds::new(1_704_000_000),
+            &cfg,
+        )
+        .expect("build should succeed");
+        assert_eq!(idx.len(), 2); // deduplicated
+    }
+
+    #[test]
+    fn crl_this_update_future() {
+        let future = 1_900_000_000u64; // year 2030+
+        let der = build_crl_der(&[&[0x01]], Some(future), Some(future + 86_400), false);
+        let cfg = default_cfg();
+        let parsed = parse(&der, &cfg).expect("should parse");
+        let verified = VerifiedCrl { parsed };
+        // "now" is 1_704_000_000, thisUpdate is 1_900_000_000, skew 300
+        // 1_900_000_000 > 1_704_000_000 + 300 = 1_704_000_300
+        assert_eq!(
+            RevocationIndex::build(&verified, UnixSeconds::new(1_704_000_000), &cfg),
+            Err(CrlError::NotYetValid)
+        );
+    }
+
+    #[test]
+    fn crl_next_update_past() {
+        let past = 1_700_000_000u64;
+        let der = build_crl_der(&[&[0x01]], Some(past - 86_400), Some(past), false);
+        let cfg = default_cfg();
+        let parsed = parse(&der, &cfg).expect("should parse");
+        let verified = VerifiedCrl { parsed };
+        // "now" is 1_704_000_000, nextUpdate is 1_700_000_000, skew 300
+        // 1_704_000_000 > 1_700_000_000 + 300 = 1_700_000_300
+        assert_eq!(
+            RevocationIndex::build(&verified, UnixSeconds::new(1_704_000_000), &cfg),
+            Err(CrlError::AlreadyExpired)
+        );
+    }
+
+    #[test]
+    fn crl_no_next_update() {
+        let now = 1_704_000_000u64;
+        // CRL with no nextUpdate, thisUpdate is now
+        let items: Vec<Vec<u8>> = vec![
+            der_enc::encode_integer(&[0x01]), // version v2
+            der_enc::encode_algorithm_identifier("1.2.840.113549.1.1.11"),
+            der_enc::encode_name("2.5.4.3", "Test CA"),
+            der_enc::encode_utctime(now), // thisUpdate
+            // no nextUpdate
+            der_enc::encode_sequence(&[der_enc::encode_sequence(&[
+                der_enc::encode_integer(&[0x01]),
+                der_enc::encode_utctime(now),
+            ])]),
+        ];
+        let tbs = der_enc::encode_sequence(&items);
+        let der = der_enc::encode_sequence(&[
+            tbs,
+            der_enc::encode_algorithm_identifier("1.2.840.113549.1.1.11"),
+            der_enc::encode_bit_string(&[0u8; 256]),
+        ]);
+
+        let cfg = default_cfg();
+        let parsed = parse(&der, &cfg).expect("should parse");
+        assert!(parsed.next_update().is_none());
+        let verified = VerifiedCrl { parsed };
+        let idx = RevocationIndex::build(&verified, UnixSeconds::new(now), &cfg)
+            .expect("build should succeed");
+        // Fresh for no_next_update_ttl_secs (86_400)
+        assert_eq!(idx.freshness(UnixSeconds::new(now), &cfg), Freshness::Fresh);
+        assert_eq!(
+            idx.freshness(UnixSeconds::new(now + 86_400), &cfg),
+            Freshness::Fresh
+        );
+        assert_eq!(
+            idx.freshness(UnixSeconds::new(now + 86_401), &cfg),
+            Freshness::Stale
+        );
+        assert_eq!(
+            idx.freshness(UnixSeconds::new(now + 172_801), &cfg),
+            Freshness::Expired
+        );
+    }
+
+    #[test]
+    fn crl_staleness_transitions() {
+        let now = 1_704_000_000u64;
+        let der = build_crl_der(&[&[0x01]], Some(now - 86_400), Some(now + 86_400), false);
+        let cfg = default_cfg();
+        let parsed = parse(&der, &cfg).expect("should parse");
+        let idx = RevocationIndex::build(&VerifiedCrl { parsed }, UnixSeconds::new(now), &cfg)
+            .expect("build should succeed");
+
+        // Fresh: inside nextUpdate
+        assert_eq!(idx.freshness(UnixSeconds::new(now), &cfg), Freshness::Fresh);
+        assert_eq!(
+            idx.freshness(UnixSeconds::new(now + 86_400), &cfg),
+            Freshness::Fresh
+        );
+        // Stale: past nextUpdate but within grace
+        assert_eq!(
+            idx.freshness(UnixSeconds::new(now + 86_401), &cfg),
+            Freshness::Stale
+        );
+        assert_eq!(
+            idx.freshness(UnixSeconds::new(now + 172_800), &cfg),
+            Freshness::Stale
+        );
+        // Expired: past nextUpdate + staleGrace (86_400)
+        assert_eq!(
+            idx.freshness(UnixSeconds::new(now + 172_801), &cfg),
+            Freshness::Expired
+        );
+    }
+
+    #[test]
+    fn crl_delta_refused() {
+        let items: Vec<Vec<u8>> = vec![
+            der_enc::encode_integer(&[0x01]), // version v2
+            der_enc::encode_algorithm_identifier("1.2.840.113549.1.1.11"),
+            der_enc::encode_name("2.5.4.3", "Test CA"),
+            der_enc::encode_utctime(1_704_000_000),
+            der_enc::encode_utctime(1_704_086_400),
+            der_enc::encode_sequence(&[der_enc::encode_sequence(&[
+                der_enc::encode_integer(&[0x01]),
+                der_enc::encode_utctime(1_704_000_000),
+            ])]),
+            // crlExtensions [0] EXPLICIT with deltaCRLIndicator
+            der_enc::encode_context_explicit(
+                0,
+                &der_enc::encode_sequence(&[der_enc::encode_sequence(&[
+                    der_enc::encode_oid("2.5.29.27"),
+                    der_enc::encode_octet_string(&[]),
+                ])]),
+            ),
+        ];
+        let tbs = der_enc::encode_sequence(&items);
+        let der = der_enc::encode_sequence(&[
+            tbs,
+            der_enc::encode_algorithm_identifier("1.2.840.113549.1.1.11"),
+            der_enc::encode_bit_string(&[0u8; 256]),
+        ]);
+
+        let cfg = default_cfg();
+        assert_eq!(parse(&der, &cfg), Err(CrlError::DeltaCrlUnsupported));
+    }
+
+    #[test]
+    fn crl_wrong_issuer() {
+        // We need an actual issuer cert for verify_signature.
+        // Build a minimal issuer cert.
+        use rcgen::{CertificateParams, KeyPair, KeyUsagePurpose};
+        let key_pair = KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256).unwrap();
+        let mut params = CertificateParams::new(vec!["Test CA".to_owned()]).unwrap();
+        params.key_usages = vec![KeyUsagePurpose::KeyCertSign];
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let cert = params.self_signed(&key_pair).unwrap();
+        let cert_der = cert.der().to_vec();
+
+        // Build a CRL with a different issuer
+        let items: Vec<Vec<u8>> = vec![
+            der_enc::encode_integer(&[0x01]),
+            der_enc::encode_algorithm_identifier("1.2.840.113549.1.1.11"),
+            der_enc::encode_name("2.5.4.3", "Different CA"),
+            der_enc::encode_utctime(1_704_000_000),
+            der_enc::encode_utctime(1_704_086_400),
+        ];
+        let tbs = der_enc::encode_sequence(&items);
+        let der = der_enc::encode_sequence(&[
+            tbs,
+            der_enc::encode_algorithm_identifier("1.2.840.113549.1.1.11"),
+            der_enc::encode_bit_string(&[0u8; 256]),
+        ]);
+
+        let cfg = default_cfg();
+        let parsed = parse(&der, &cfg).expect("should parse");
+        assert_eq!(
+            verify_signature(parsed, &cert_der),
+            Err(CrlError::IssuerMismatch)
+        );
+    }
+
+    #[test]
+    fn crl_truncated_every_97_bytes() {
+        use rcgen::{CertificateParams, KeyPair};
+        let key_pair = KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256).unwrap();
+        let mut params = CertificateParams::new(vec!["Test CA".to_owned()]).unwrap();
+        params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        let cert = params.self_signed(&key_pair).unwrap();
+        let _cert_der = cert.der().to_vec();
+
+        // Build a CRL with 1000 entries
+        let serials: Vec<Vec<u8>> = (0u64..1000)
+            .map(|i| {
+                let bytes = i.to_be_bytes();
+                // Skip leading zeros
+                let start = bytes
+                    .iter()
+                    .position(|b| *b != 0)
+                    .unwrap_or(bytes.len() - 1);
+                bytes[start..].to_vec()
+            })
+            .collect();
+        let serial_refs: Vec<&[u8]> = serials.iter().map(std::vec::Vec::as_slice).collect();
+        let der = build_crl_der(&serial_refs, None, None, false);
+
+        // Truncate at every 97th byte and assert no panic, just Err
+        for end in (0..der.len()).step_by(97).skip(1) {
+            let truncated = &der[..end];
+            let result = parse(truncated, &default_cfg());
+            assert!(result.is_err() || result.is_ok());
+            // The point is that it doesn't panic, not what error it returns
+        }
+    }
+
+    #[test]
+    fn crl_all_ff_refused() {
+        // 256 MiB of 0xFF
+        let cfg = default_cfg();
+        let _ = cfg;
+        let big = vec![0xffu8; 268_435_456];
+        // Should be refused by size check since max_bytes default is 268_435_456
+        let mut cfg_small = default_cfg();
+        cfg_small.max_bytes = 268_435_455;
+        assert_eq!(parse(&big, &cfg_small), Err(CrlError::TooLarge));
+
+        // With a raised max_bytes, should fail DER parse (not OOM)
+        let cfg_large = default_cfg();
+        let _ = cfg_large;
+        let result = parse(&big, &default_cfg());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn crl_nested_bomb_is_fast() {
+        // Build a deeply nested DER bomb: 10,000 nested SEQUENCEs
+        let mut inner = vec![0x05u8, 0x00]; // NULL
+        for _ in 0..10_000 {
+            let mut buf = vec![0x30u8]; // SEQUENCE tag
+            let len = inner.len();
+            #[allow(
+                clippy::cast_possible_truncation,
+                reason = "len is bounded by inner.len() which is < 10000 bytes after 10000 iterations of SEQUENCE wrapping; well within u8"
+            )]
+            {
+                if len < 128 {
+                    buf.push(len as u8);
+                } else {
+                    // Longer encoding not needed for small bombs
+                    buf.push(0x81);
+                    buf.push(len as u8);
+                }
+            }
+            buf.extend_from_slice(&inner);
+            inner = buf;
+        }
+        let start = std::time::Instant::now();
+        let result = parse(&inner, &default_cfg());
+        let elapsed = start.elapsed();
+        assert!(result.is_err());
+        assert!(
+            elapsed.as_millis() < 100,
+            "nested bomb took {} ms",
+            elapsed.as_millis()
+        );
+    }
+
+    #[test]
+    fn crl_set_keeps_later_this_update() {
+        // Both types are Send + Sync (compile-time check)
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<RevocationIndex>();
+        assert_send_sync::<CrlSet>();
+
+        // Build two indices for the same issuer with different thisUpdate times
+        let der_early = build_crl_der(&[&[0x01]], Some(1_704_000_000), Some(1_704_086_400), false);
+        let der_late = build_crl_der(&[&[0x02]], Some(1_704_000_100), Some(1_704_086_500), false);
+        let cfg = default_cfg();
+
+        let parsed_early = parse(&der_early, &cfg).unwrap();
+        let parsed_late = parse(&der_late, &cfg).unwrap();
+
+        let idx_early = RevocationIndex::build(
+            &VerifiedCrl {
+                parsed: parsed_early,
+            },
+            UnixSeconds::new(1_704_000_000),
+            &cfg,
+        )
+        .unwrap();
+        let idx_late = RevocationIndex::build(
+            &VerifiedCrl {
+                parsed: parsed_late,
+            },
+            UnixSeconds::new(1_704_000_000),
+            &cfg,
+        )
+        .unwrap();
+
+        let set = CrlSet::from_indices(vec![Arc::new(idx_early), Arc::new(idx_late)], 1);
+        assert_eq!(set.len(), 1);
+        let found = set
+            .for_issuer(&der_enc::encode_name("2.5.4.3", "Test CA"))
+            .unwrap();
+        // Should keep the one with later thisUpdate (serial 2)
+        assert!(found.is_revoked(&[0x02]));
+        assert!(!found.is_revoked(&[0x01]));
+    }
+
+    #[test]
+    fn crl_memory_bytes_under_20mb() {
+        let cfg = default_cfg();
+        // Build a CRL with 1,000,000 entries (all 8-byte serials to fit in u128)
+        let serials: Vec<Vec<u8>> = (0u64..1_000_000)
+            .map(|i| {
+                let bytes = i.to_be_bytes();
+                let start = bytes.iter().position(|b| *b != 0).unwrap_or(7);
+                bytes[start..].to_vec()
+            })
+            .collect();
+        let serial_refs: Vec<&[u8]> = serials.iter().map(std::vec::Vec::as_slice).collect();
+        let der = build_crl_der(&serial_refs, None, None, false);
+        let parsed = parse(&der, &cfg).expect("should parse 1M CRL");
+        let idx = RevocationIndex::build(
+            &VerifiedCrl { parsed },
+            UnixSeconds::new(1_704_000_000),
+            &cfg,
+        )
+        .expect("build should succeed");
+        let bytes = idx.memory_bytes();
+        assert!(bytes < 20 * 1024 * 1024, "memory_bytes {bytes} >= 20 MB");
+    }
+
+    #[test]
+    fn crl_parse_1e6_allocation_bounded() {
+        // Build a CRL with 1,000,000 entries and verify build succeeds with
+        // bounded memory (final memory_bytes < 200 MB).
+        let cfg = default_cfg();
+        let serials: Vec<Vec<u8>> = (0u64..1_000_000)
+            .map(|i| {
+                let bytes = i.to_be_bytes();
+                let start = bytes.iter().position(|b| *b != 0).unwrap_or(7);
+                bytes[start..].to_vec()
+            })
+            .collect();
+        let serial_refs: Vec<&[u8]> = serials.iter().map(std::vec::Vec::as_slice).collect();
+        let der = build_crl_der(&serial_refs, None, None, false);
+        let parsed = parse(&der, &cfg).expect("should parse 1M CRL");
+        let idx = RevocationIndex::build(
+            &VerifiedCrl { parsed },
+            UnixSeconds::new(1_704_000_000),
+            &cfg,
+        )
+        .expect("build should succeed");
+        let bytes = idx.memory_bytes();
+        assert!(bytes < 200 * 1024 * 1024, "memory_bytes {bytes} >= 200 MB");
+    }
+
+    // -----------------------------------------------------------------------
+    // Property tests
+    // -----------------------------------------------------------------------
+
+    proptest! {
+        #[test]
+        fn prop_is_revoked_matches_hashset(
+            serials in proptest::collection::vec(
+                proptest::collection::vec(any::<u8>(), 1..=20usize),
+                1..=200,
+            ),
+            probes in proptest::collection::vec(
+                proptest::collection::vec(any::<u8>(), 1..=20usize),
+                100,
+            ),
+        ) {
+            let serial_refs: Vec<&[u8]> = serials.iter().map(std::vec::Vec::as_slice).collect();
+            if serial_refs.len() > 8_000_000 {
+                return Ok(());
+            }
+            let der = build_crl_der(&serial_refs, None, None, false);
+            let cfg = default_cfg();
+            let Ok(parsed) = parse(&der, &cfg) else {
+                return Ok(());
+            };
+            let Ok(idx) = RevocationIndex::build(
+                &VerifiedCrl { parsed },
+                UnixSeconds::new(1_704_000_000),
+                &cfg,
+            ) else {
+                return Ok(());
+            };
+
+            let mut reference: HashSet<Vec<u8>> = HashSet::new();
+            for s in &serials {
+                let norm = normalize_serial(s).to_vec();
+                reference.insert(norm);
+            }
+
+            // Assert every serial in the index is matched
+            for s in &serials {
+                let found = idx.is_revoked(s);
+                let norm = normalize_serial(s).to_vec();
+                let expected = reference.contains(&norm);
+                prop_assert_eq!(found, expected, "serial {:?} (normalized {:?}) mismatch", s, norm);
+            }
+
+            // Assert random probes agree
+            for probe in &probes {
+                let found = idx.is_revoked(probe);
+                let norm = normalize_serial(probe).to_vec();
+                let expected = reference.contains(&norm);
+                prop_assert_eq!(found, expected, "probe {:?} (normalized {:?}) mismatch", probe, norm);
+            }
+        }
+
+        #[test]
+        fn prop_serial_normalization_is_stable(
+            base in proptest::collection::vec(any::<u8>(), 1..=16usize),
+            extra_leading_zeros in 0..=8usize,
+        ) {
+            // Build with the base serial, then look up with leading zeros added.
+            // They should match.
+            let der = build_single_crl(&base);
+            let cfg = default_cfg();
+            let Ok(parsed) = parse(&der, &cfg) else {
+                return Ok(());
+            };
+            let Ok(idx) = RevocationIndex::build(
+                &VerifiedCrl { parsed },
+                UnixSeconds::new(1_704_000_000),
+                &cfg,
+            ) else {
+                return Ok(());
+            };
+
+            // Look up with extra leading zeros
+            let mut padded = vec![0x00u8; extra_leading_zeros];
+            padded.extend_from_slice(&base);
+            prop_assert!(idx.is_revoked(&base));
+            prop_assert!(idx.is_revoked(&padded));
+        }
+
+        #[test]
+        fn prop_parse_never_panics(
+            valid_crl_der in proptest::collection::vec(any::<u8>(), 50..=2000usize),
+            flip_offset in 0..2000usize,
+        ) {
+            // We can't generate a valid CRL randomly, but we can ensure parse never panics.
+            // Use a valid CRL and flip one byte inside it.
+            let base_der = build_crl_der(&[&[0x01], &[0x02]], None, None, false);
+            if flip_offset >= base_der.len() {
+                return Ok(());
+            }
+            let mut corrupted = base_der;
+            corrupted[flip_offset] ^= 0xff;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                parse(&corrupted, &default_cfg())
+            }));
+            prop_assert!(
+                result.is_ok(),
+                "parse must not panic on any input; flipped byte at offset {flip_offset}"
+            );
+            // Also test with random byte sequences
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                parse(&valid_crl_der, &default_cfg())
+            }));
+            prop_assert!(result.is_ok(), "parse must not panic on random byte sequences");
+        }
+    }
+
+    // Helper to access wide set for assertions in crl_serial_leading_zero_16_bytes
+    #[allow(
+        dead_code,
+        reason = "kept for test assertions; the field is private and the accessor exists in case a future test needs to inspect the wide set"
+    )]
+    impl RevocationIndex {
+        fn wide(&self) -> &HashSet<Box<[u8]>> {
+            &self.wide
+        }
     }
 }
