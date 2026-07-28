@@ -19,6 +19,10 @@ fn bench_two_clause_predicate(c: &mut Criterion) {
     });
 }
 
+#[allow(
+    clippy::indexing_slicing,
+    reason = "take <= piece.len() by construction (piece.len().min(remaining))"
+)]
 fn bench_8kib_source(c: &mut Criterion) {
     let mut src = Vec::with_capacity(8192);
     // Fill 8 KiB with a dense token stream so lexing does real work.

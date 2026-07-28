@@ -316,9 +316,9 @@ mod tests {
     fn every_limit_field_has_a_cap() {
         let base = PolicyLimits::defaults();
         let fields = [
-            ("max_source_bytes", u32::from(base.max_source_bytes)),
-            ("max_tokens", u32::from(base.max_tokens)),
-            ("max_string_bytes", u32::from(base.max_string_bytes)),
+            ("max_source_bytes", base.max_source_bytes),
+            ("max_tokens", base.max_tokens),
+            ("max_string_bytes", base.max_string_bytes),
             ("max_depth", u32::from(base.max_depth)),
             ("max_ops", u32::from(base.max_ops)),
             ("max_consts", u32::from(base.max_consts)),
