@@ -114,6 +114,18 @@ x509-cert = "0.2"
 der = "0.7"
 # dev-only: builds certificate fixtures in tests so no key material is committed
 rcgen = "0.14.8"
+# RFC 6455 Section 4.2.2 Sec-WebSocket-Accept computation: SHA-1 over the
+# base64 Sec-WebSocket-Key string plus the RFC GUID. Not pinned by an earlier
+# milestone in this tree yet, so `ws-upgrade-handshake` (#203) pins it here.
+sha1 = "0.10"
+# `ConstantTimeEq` for comparing the recomputed Sec-WebSocket-Accept against
+# the value the upstream sent, per the workspace's `constant-time-secrets`
+# invariant lint. Not pinned by an earlier milestone in this tree yet, so
+# `ws-upgrade-handshake` (#203) pins it here.
+subtle = "2.6"
+# Constant-time, allocation-free base64 for the Sec-WebSocket-Key and
+# Sec-WebSocket-Accept wire values (`ws-upgrade-handshake`, #203).
+base64ct = "1.6"
 
 [workspace.lints.rust]
 # A proxy parses attacker-controlled bytes on every request. There is no

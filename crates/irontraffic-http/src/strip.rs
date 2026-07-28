@@ -367,6 +367,37 @@ pub const fn is_identity_field(k: KnownHeader) -> bool {
     )
 }
 
+/// True when any `Connection` field line in `section` lists `token`.
+///
+/// The ONE tokenizer over connection-options in the workspace. [`strip_ingress`] uses
+/// the same split on `,`, the same [`trim_ows`] and the same ASCII-case-insensitive
+/// comparison in its own step 1; this is the exported form so that a caller deciding
+/// whether an upgrade was authorised and the strip deciding which fields to delete
+/// cannot disagree about `Upgrade ` with a trailing space. `ws-upgrade-handshake`
+/// (#203) is what makes this true: it is the one caller outside this file, and it
+/// contains no tokenizer of its own.
+///
+/// Unlike [`strip_ingress`] step 1 this does not lowercase into a 64-byte buffer and
+/// has no `FieldLineTooLong` error: a token longer than 64 bytes cannot equal any
+/// token a caller asks about, so the cap cannot change the answer.
+///
+/// `strip_ingress` is NOT rewritten to call this: it keeps its own loop because it
+/// needs the lowercased token bytes for its own step 6 field-name comparison. What
+/// this function guarantees instead is that the two agree, which
+/// `crates/irontraffic-ws/tests/handshake.rs`'s `connection_token_table` test asserts
+/// over the whole `Connection` token table.
+#[must_use]
+pub fn connection_has_token(section: &FieldSection, token: &[u8]) -> bool {
+    for value in section.get_all_known(KnownHeader::Connection) {
+        for element in value.split(|&b| b == b',') {
+            if trim_ows(element).eq_ignore_ascii_case(token) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// True for exactly the six fields RFC 9113 Section 8.2.2 makes a
 /// multiplexed message malformed if present: `Connection`,
 /// `ProxyConnection`, `KeepAlive`, `TransferEncoding`, `Upgrade` and
@@ -725,6 +756,55 @@ mod tests {
         assert_eq!(report.connection_named, 0);
         assert_eq!(sec.get_unique(b"x-custom-b"), Ok(Some(&b"1"[..])));
         assert_eq!(sec.len(), 2);
+    }
+
+    /// Not one of the 16 named tests: a direct, focused unit test of
+    /// `connection_has_token`, added by `ws-upgrade-handshake` (#203). The
+    /// cross-crate test (`crates/irontraffic-ws/tests/handshake.rs`'s
+    /// `connection_token_table`) proves this function agrees with `strip_ingress`'s
+    /// own token matching; this one exercises the function directly so a mutation
+    /// to it is caught without depending on that other crate's suite.
+    #[test]
+    fn connection_has_token_matches_the_upgrade_token() {
+        let cases: &[(&[&[u8]], bool)] = &[
+            (&[b"Upgrade"], true),
+            (&[b"upgrade"], true),
+            (&[b"keep-alive, Upgrade"], true),
+            (&[b"Upgrade, keep-alive"], true),
+            (&[b"Upgraded"], false),
+            (&[b"upgrad"], false),
+            (&[b""], false),
+            (&[], false),
+            // Two field lines are combined, exactly as `strip_ingress` step 1 does.
+            (&[b"keep-alive", b"Upgrade"], true),
+            (&[b"keep-alive", b"close"], false),
+        ];
+        for (values, expected) in cases {
+            let fields: Vec<(&[u8], &[u8])> =
+                values.iter().map(|v| (&b"connection"[..], *v)).collect();
+            let sec = section(&fields);
+            assert_eq!(
+                connection_has_token(&sec, b"upgrade"),
+                *expected,
+                "{values:?}"
+            );
+        }
+    }
+
+    /// Not one of the 16 named tests: a token longer than the 64-byte buffer
+    /// `strip_ingress` caps its own lowercase scratch space at must still compare
+    /// correctly, because `connection_has_token` has no such cap (its own doc
+    /// comment states this: a token over 64 bytes cannot equal `upgrade` either, so
+    /// the cap cannot change the answer, but this pins that the function does not
+    /// itself introduce a truncation that would make an over-length token spuriously
+    /// equal a short one).
+    #[test]
+    fn connection_has_token_handles_long_values() {
+        let mut long = BytesMut::new();
+        long.extend_from_slice(&[b'a'; 100]);
+        let sec = section(&[(b"connection", &long[..])]);
+        assert!(!connection_has_token(&sec, b"upgrade"));
+        assert!(connection_has_token(&sec, &long[..]));
     }
 
     /// Not one of the 16 named tests: caught two real `cargo mutants` misses

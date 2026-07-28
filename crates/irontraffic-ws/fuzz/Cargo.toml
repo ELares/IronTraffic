@@ -22,10 +22,25 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 irontraffic-ws = { path = ".." }
+# fuzz_ws_handshake drives the real H1Parser + canonicalize_request pipeline (the
+# same one the handshake tests use) and builds FieldSection values directly with
+# FieldSectionBuilder, both of which live in irontraffic-http rather than
+# irontraffic-ws. Added by ws-upgrade-handshake (#203).
+irontraffic-http = { path = "../../irontraffic-http" }
+# fuzz_ws_handshake builds the caller-supplied BytesMut arena FieldSectionBuilder and
+# canonicalize_request write into; version matches the workspace's bytes = "1.10" pin.
+bytes = "1.10"
 
 [[bin]]
 name = "fuzz_ws_frame"
 path = "fuzz_targets/fuzz_ws_frame.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_ws_handshake"
+path = "fuzz_targets/fuzz_ws_handshake.rs"
 test = false
 doc = false
 bench = false
