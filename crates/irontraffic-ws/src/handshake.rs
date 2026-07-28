@@ -138,6 +138,22 @@ pub struct UpgradeRequest {
     subprotocol_len: u8,
     /// True when the client offered any extension. We negotiate none, so this exists
     /// only so the response check can refuse an extension nobody could have accepted.
+    ///
+    /// Unread within this issue: `verify`'s own extension check (step 4) is
+    /// unconditional (we offer the upstream no extensions regardless of what the
+    /// downstream client offered, so any extension in a `101` is unrequested either
+    /// way), matching `ws-extended-connect-bridge` (#204)'s not-yet-landed use of the
+    /// same bookkeeping. There is deliberately no public accessor for it, matching the
+    /// issue's own `Public API` listing for `UpgradeRequest`, which names none; the
+    /// same precedent as `irontraffic_http::h1::parser::RawHead::target` (kept
+    /// `pub(crate)` with no reader yet, so the invariant it stores for is true from
+    /// the moment this type exists rather than only once a later issue lands).
+    #[allow(
+        dead_code,
+        reason = "stored per the issue's own struct definition, read only by a future \
+                  ws-extended-connect-bridge (#204) consumer that has not landed yet; see \
+                  the field's own doc comment"
+    )]
     offered_extensions: bool,
 }
 
@@ -590,14 +606,6 @@ impl UpgradeRequest {
         self.subprotocols().any(|s| s == name)
     }
 
-    /// True when the client offered any `Sec-WebSocket-Extensions` value. We negotiate
-    /// none, so [`UpgradeResponse::verify`] uses this only to know whether a response
-    /// echoing one back was even representable as an offer, not to accept it.
-    #[must_use]
-    pub const fn offered_extensions(&self) -> bool {
-        self.offered_extensions
-    }
-
     /// Builds the request value for a handshake WE synthesised: `nonce` is the 16 key
     /// bytes we drew ourselves, and the three subprotocol arguments are copied verbatim
     /// out of an `extended::ExtendedConnect`, whose buffers are declared with these same
@@ -754,5 +762,215 @@ mod tests {
         // narrowest possible scope.
         let key_b64 = *b"dGhlIHNhbXBsZSBub25jZQ==";
         assert_eq!(&accept_key(&key_b64), b"s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+    }
+
+    /// One concrete value per `HandshakeError` variant, with its expected metric
+    /// label and its expected status on each `HandshakeSide`. Neither
+    /// `HandshakeError::metric_label` nor its `Display` impl is exercised by any
+    /// test named in the module's own issue, which is exactly the gap a
+    /// `replace metric_label -> "" ` or `replace fmt -> Ok(Default::default())`
+    /// mutation exploits; this closes it, mirroring
+    /// `irontraffic_http::error::RejectReason`'s own `full_status_table` /
+    /// `metric_labels_are_unique` / `metric_labels_are_snake_case` convention.
+    ///
+    /// Exhaustive match, no wildcard arm: adding a variant to `HandshakeError`
+    /// without adding a case to `handshake_error_mappings_are_exhaustive_and_pinned`'s
+    /// own `cases` array is still something the compiler permits, since the array
+    /// length is not tied to the enum by the type system; this ordinal function is
+    /// what actually enforces completeness, the same way `RejectReason::tests::seen`
+    /// does for its own enum.
+    fn handshake_error_ordinal(e: &HandshakeError) -> usize {
+        match e {
+            HandshakeError::UpgradeTokenNotWebsocket => 0,
+            HandshakeError::ConnectionTokenMissing => 1,
+            HandshakeError::MethodNotGet { .. } => 2,
+            HandshakeError::UpgradeWithBody => 3,
+            HandshakeError::VersionMissing => 4,
+            HandshakeError::UnsupportedVersion { .. } => 5,
+            HandshakeError::KeyMissing => 6,
+            HandshakeError::KeyWrongLength { .. } => 7,
+            HandshakeError::KeyNotBase64 => 8,
+            HandshakeError::TooManySubprotocols => 9,
+            HandshakeError::SubprotocolListTooLong { .. } => 10,
+            HandshakeError::NotSwitchingProtocols { .. } => 11,
+            HandshakeError::AcceptMissing => 12,
+            HandshakeError::AcceptMismatch => 13,
+            HandshakeError::UnrequestedExtension => 14,
+            HandshakeError::UnofferedSubprotocol => 15,
+            HandshakeError::DuplicateUpgrade => 16,
+            HandshakeError::Duplicate(_) => 17,
+            HandshakeError::Field(_) => 18,
+        }
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one table of 19 HandshakeError variants, each with its expected metric \
+                  label and status; splitting it would break the 1:1 mapping to the enum \
+                  the ordinal function above enforces"
+    )]
+    #[test]
+    fn handshake_error_mappings_are_exhaustive_and_pinned() {
+        let cases: [(HandshakeError, &str, u16); 19] = [
+            (
+                HandshakeError::UpgradeTokenNotWebsocket,
+                "ws_upgrade_token_not_websocket",
+                400,
+            ),
+            (
+                HandshakeError::ConnectionTokenMissing,
+                "ws_connection_token_missing",
+                400,
+            ),
+            (
+                HandshakeError::MethodNotGet {
+                    method: Method::Post,
+                },
+                "ws_method_not_get",
+                400,
+            ),
+            (HandshakeError::UpgradeWithBody, "ws_upgrade_with_body", 400),
+            (HandshakeError::VersionMissing, "ws_version_missing", 400),
+            (
+                HandshakeError::UnsupportedVersion { found: 8 },
+                "ws_unsupported_version",
+                426,
+            ),
+            (HandshakeError::KeyMissing, "ws_key_missing", 400),
+            (
+                HandshakeError::KeyWrongLength { len: 23 },
+                "ws_key_wrong_length",
+                400,
+            ),
+            (HandshakeError::KeyNotBase64, "ws_key_not_base64", 400),
+            (
+                HandshakeError::TooManySubprotocols,
+                "ws_too_many_subprotocols",
+                400,
+            ),
+            (
+                HandshakeError::SubprotocolListTooLong { len: 257 },
+                "ws_subprotocol_list_too_long",
+                400,
+            ),
+            (
+                HandshakeError::NotSwitchingProtocols { status: 200 },
+                "ws_not_switching_protocols",
+                400,
+            ),
+            (HandshakeError::AcceptMissing, "ws_accept_missing", 400),
+            (HandshakeError::AcceptMismatch, "ws_accept_mismatch", 400),
+            (
+                HandshakeError::UnrequestedExtension,
+                "ws_unrequested_extension",
+                400,
+            ),
+            (
+                HandshakeError::UnofferedSubprotocol,
+                "ws_unoffered_subprotocol",
+                400,
+            ),
+            (
+                HandshakeError::DuplicateUpgrade,
+                "ws_duplicate_upgrade",
+                400,
+            ),
+            (
+                HandshakeError::Duplicate(DuplicateField { name_len: 6 }),
+                "ws_duplicate_field",
+                400,
+            ),
+            (
+                HandshakeError::Field(RejectReason::FieldNameEmpty),
+                RejectReason::FieldNameEmpty.metric_label(),
+                400,
+            ),
+        ];
+
+        let mut labels: Vec<&str> = Vec::with_capacity(cases.len());
+        for (i, (err, label, req_status)) in cases.iter().enumerate() {
+            assert_eq!(
+                handshake_error_ordinal(err),
+                i,
+                "case {i} ({err:?}) is out of order or a variant is missing from `cases`"
+            );
+            assert_eq!(err.metric_label(), *label, "{err:?} metric label");
+            assert_eq!(
+                err.status(HandshakeSide::Request),
+                *req_status,
+                "{err:?} status on HandshakeSide::Request"
+            );
+            // Every variant answers 502 on the response side, unconditionally: the
+            // client's request may have been perfect and the upstream is what
+            // misbehaved.
+            assert_eq!(
+                err.status(HandshakeSide::Response),
+                502,
+                "{err:?} status on HandshakeSide::Response must always be 502"
+            );
+            // `Display` must actually render something: the empty string is exactly
+            // what `replace fmt -> Ok(Default::default())` leaves behind.
+            let rendered = err.to_string();
+            assert!(
+                !rendered.is_empty(),
+                "{err:?} rendered an empty Display string"
+            );
+            labels.push(label);
+        }
+
+        labels.sort_unstable();
+        for pair in labels.windows(2) {
+            assert_ne!(pair[0], pair[1], "duplicate metric label: {}", pair[0]);
+        }
+        for label in &labels {
+            assert!(
+                label
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_'),
+                "{label:?} is not snake_case"
+            );
+        }
+    }
+
+    /// A handful of exact `Display` strings, spot-checked verbatim rather than only
+    /// asserted non-empty: proves the message TEXT itself, not merely that some
+    /// text exists.
+    #[test]
+    fn handshake_error_display_text_is_exact() {
+        assert_eq!(
+            HandshakeError::UpgradeTokenNotWebsocket.to_string(),
+            "upgrade token is not websocket"
+        );
+        assert_eq!(
+            HandshakeError::ConnectionTokenMissing.to_string(),
+            "connection header does not contain the upgrade token"
+        );
+        assert_eq!(
+            HandshakeError::MethodNotGet {
+                method: Method::Post
+            }
+            .to_string(),
+            "websocket upgrade method is Post, expected GET"
+        );
+        assert_eq!(
+            HandshakeError::UnsupportedVersion { found: 8 }.to_string(),
+            "sec-websocket-version is 8, only 13 is supported"
+        );
+        assert_eq!(
+            HandshakeError::KeyWrongLength { len: 23 }.to_string(),
+            "sec-websocket-key is 23 characters, expected 24"
+        );
+        assert_eq!(
+            HandshakeError::NotSwitchingProtocols { status: 200 }.to_string(),
+            "upstream answered 200, expected 101"
+        );
+        assert_eq!(
+            HandshakeError::TooManySubprotocols.to_string(),
+            "more than 8 subprotocols offered"
+        );
+        assert_eq!(
+            HandshakeError::SubprotocolListTooLong { len: 257 }.to_string(),
+            "subprotocol list is 257 bytes, above 256"
+        );
     }
 }

@@ -504,6 +504,26 @@ fn too_many_subprotocols() {
         ]
     );
 
+    // Exactly 256 bytes (eight names of 32 bytes each): the boundary itself, which
+    // MUST be accepted. Asserted separately from the 257-byte case below because a
+    // mutation of the `end > MAX_SUBPROTOCOL_BYTES` guard to `==` or `>=` would
+    // WRONGLY reject this exact-256 case while still rejecting every over-256 case
+    // the same way (via the redundant `subprotocol_bytes.get_mut(cursor..end)`
+    // bounds check), so the 257-byte case alone cannot tell the correct `>` apart
+    // from either mutant.
+    let eight_32 = std::iter::repeat_n("a".repeat(32), 8)
+        .collect::<Vec<_>>()
+        .join(", ");
+    let head_256 = format!(
+        "GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: {eight_32}\r\n\r\n"
+    );
+    let (req, tokens) =
+        upgrade(head_256.as_bytes()).expect("test fixture must parse and canonicalize");
+    assert!(
+        UpgradeRequest::parse(&req, tokens).unwrap().is_some(),
+        "exactly 256 total subprotocol bytes must be accepted"
+    );
+
     // Eight names totalling 257 bytes: seven of 32 bytes plus one of 33.
     let mut names: Vec<String> = (0..7).map(|_| "a".repeat(32)).collect();
     names.push("a".repeat(33));
