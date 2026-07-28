@@ -48,3 +48,9 @@ name = "fuzz_pushback_headers"
 path = "fuzz_targets/fuzz_pushback_headers.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fuzz_health_response_parser"
+path = "fuzz_targets/fuzz_health_response_parser.rs"
+test = false
+doc = false
