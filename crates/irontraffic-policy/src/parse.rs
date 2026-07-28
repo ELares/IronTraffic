@@ -800,6 +800,35 @@ mod tests {
     }
 
     #[test]
+    fn trailing_comma_is_rejected() {
+        // #738's M49: a trailing comma in an element list is correctly
+        // rejected (elem_list's loop always expects another expr after a
+        // comma, `]`/`)` is not one) but was pinned by nothing. Covers both
+        // callers of elem_list: a list literal and a call's argument list.
+        let src = b"[1, 2,]";
+        let toks = lex(src, &default_limits()).unwrap();
+        let err = parse(&toks, src, &default_limits()).unwrap_err();
+        assert_eq!(
+            err,
+            ParseError::Unexpected {
+                at: 6,
+                found: Tok::RBracket
+            }
+        );
+
+        let src = b"a.startsWith(1,)";
+        let toks = lex(src, &default_limits()).unwrap();
+        let err = parse(&toks, src, &default_limits()).unwrap_err();
+        assert_eq!(
+            err,
+            ParseError::Unexpected {
+                at: 15,
+                found: Tok::RParen
+            }
+        );
+    }
+
+    #[test]
     fn list_at_exactly_the_cap_is_accepted() {
         // The reject side alone cannot tell a per-item cap from an
         // off-by-one: pin the accept side at exactly the limit too.
