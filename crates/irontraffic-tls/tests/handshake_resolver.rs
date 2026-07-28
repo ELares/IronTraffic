@@ -394,13 +394,23 @@ fn handshake_normal_client_gets_real_cert_when_challenge_live() {
 
     // The other half of the same isolation property: a normal-ALPN client asking for a name that
     // has ONLY a live challenge entry (no real certificate anywhere in CertIndex) must get NO
-    // certificate at all, never the challenge certificate as a fallback.
+    // certificate at all, never the challenge certificate as a fallback. The client trusts
+    // `challenge_only_der` directly: if it did not, this assertion would pass even for a resolver
+    // that incorrectly falls back to the challenge map, because the client would then simply
+    // reject the (wrongly) served challenge certificate as untrusted rather than because the
+    // server sent nothing. Trusting it makes the two failure causes distinguishable, and a
+    // correct resolver still fails this handshake regardless of what the client trusts, because
+    // it never sends a Certificate message at all.
     let mut miss_server = rustls::ServerConnection::new(server_cfg).expect("server conn");
-    let mut miss_client = build_client("challenge-only.example.com", &[], &[b"h2"]);
+    let mut miss_client = build_client(
+        "challenge-only.example.com",
+        &[&challenge_only_der],
+        &[b"h2"],
+    );
     assert!(
         pump_handshake(&mut miss_client, &mut miss_server).is_some(),
         "a normal ALPN client for a name with only a live challenge entry must fail, not fall \
-         back to the challenge certificate"
+         back to serving the (here, trusted) challenge certificate"
     );
     assert!(
         miss_client.peer_certificates().is_none(),
