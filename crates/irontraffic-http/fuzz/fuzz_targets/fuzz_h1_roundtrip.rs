@@ -1,27 +1,38 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
-//! Fuzz target for the HTTP/1 serialise-then-parse round-trip: serialise `body`
-//! bytes as a chunked or content-length framed message, serialise a matching
-//! head with `h1::serialize`, feed the result into `H1Parser`, and assert the
-//! round-trip produces the same body the fuzzer supplied.
+//! Fuzz target for the HTTP/1 serialise-then-parse round-trip: serialise
+//! `body_payload` bytes as a content-length or chunked framed message,
+//! serialise a matching head with `h1::serialize`, feed the result into
+//! `H1Parser`, and assert the round-trip produces the same body the fuzzer
+//! supplied.
 //!
 //! This is the fuzz target that proves the serialiser and the parser agree
 //! about framing, because the only way they disagree is a smuggling gadget.
 //! Run with `cargo fuzz run fuzz_h1_roundtrip` from
 //! `crates/irontraffic-http/fuzz/`.
+//!
+//! The first byte of the fuzzer's input selects `Content-Length` or
+//! `Transfer-Encoding: chunked` framing for the OUTBOUND body; the rest of
+//! the input is the body payload. Both framing paths are exercised roughly
+//! evenly, which matters because the chunked path is the one that reaches
+//! `ChunkedEncoder` on the way out and `ChunkedDecoder` on the way back:
+//! a target that always chose `Content-Length` would never touch either and
+//! would be vacuous for exactly the smuggling-relevant half of this issue's
+//! thesis (#37).
 
 #![no_main]
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use bytes::BytesMut;
 use irontraffic_http::authority::Authority;
-use irontraffic_http::canonical::{CanonicalRequest, CanonicalRequestBuilder};
+use irontraffic_http::canonical::CanonicalRequestBuilder;
 use irontraffic_http::field::UnderscorePolicy;
-use irontraffic_http::framing::{OtherCodings, RequestFraming, resolve_request_framing};
+use irontraffic_http::framing::RequestFraming;
 use irontraffic_http::h1::H1Parser;
-use irontraffic_http::h1::chunked::ChunkedDecoder;
+use irontraffic_http::h1::chunked::{ChunkedDecoder, ChunkedEvent};
 use irontraffic_http::h1::serialize::{
-    BodySource, ConnectionMode, ChunkedEncoder, serialize_request_head,
+    BodySource, ChunkedEncoder, ConnectionMode, serialize_request_head,
 };
 use irontraffic_http::limits::Limits;
 use irontraffic_http::path::PathPolicy;
@@ -65,14 +76,50 @@ fn build_fields() -> FieldSection {
     builder.finish(&mut arena)
 }
 
+/// An empty trailer section, for `ChunkedEncoder::finish` when the body
+/// carries no trailers. Trailer-field parsing itself is `fuzz_chunked`'s job,
+/// not this target's.
+fn empty_fields() -> FieldSection {
+    let limits = clamped();
+    let mut arena = BytesMut::new();
+    let builder = FieldSectionBuilder::new(&arena, &limits);
+    builder.finish(&mut arena)
+}
+
 fn local_addr() -> SocketAddr {
     SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, 1)), 8080)
 }
 
+/// Cheap run counters, printed periodically to stderr so a `cargo fuzz run`
+/// session gives direct evidence that both framing paths are actually
+/// reached, not just selected and then abandoned at an early `return`. See
+/// the module doc comment: a target that never reaches the chunked branch
+/// would be the vacuous shape this project rejects.
+static REACHED: AtomicU64 = AtomicU64::new(0);
+static EXACT_HIT: AtomicU64 = AtomicU64::new(0);
+static CHUNKED_HIT: AtomicU64 = AtomicU64::new(0);
+
+fn report(n: u64) {
+    if n.is_multiple_of(20_000) {
+        eprintln!(
+            "fuzz_h1_roundtrip: {n} reached, {} exact round-trips, {} chunked round-trips",
+            EXACT_HIT.load(Ordering::Relaxed),
+            CHUNKED_HIT.load(Ordering::Relaxed)
+        );
+    }
+}
+
 fuzz_target!(|data: &[u8]| {
-    if data.len() > 65536 {
+    if data.is_empty() || data.len() > 65536 {
         return;
     }
+
+    // First byte selects the OUTBOUND framing; the rest is the body.
+    let use_chunked = data[0] & 1 == 1;
+    let body_payload = data.get(1..).unwrap_or(&[]);
+
+    let n = REACHED.fetch_add(1, Ordering::Relaxed) + 1;
+    report(n);
 
     let limits = Limits::DEFAULT.clamped();
     let parser = H1Parser::new(&limits, UnderscorePolicy::Reject);
@@ -91,13 +138,16 @@ fuzz_target!(|data: &[u8]| {
         }
     };
 
-    let framing = if data.len() == 0 {
+    // The request's own INBOUND framing (metadata on `CanonicalRequest`,
+    // never read by the serializer, which frames only from the `BodySource`
+    // passed to `serialize_request_head`). Kept consistent with
+    // `body_payload` purely so `CanonicalRequestBuilder::build` sees a
+    // coherent request.
+    let framing = if body_payload.is_empty() {
         RequestFraming::Empty
-    } else if data.len() == 1 {
-        RequestFraming::Exact { len: 0 }
     } else {
         RequestFraming::Exact {
-            len: data.len() as u64,
+            len: body_payload.len() as u64,
         }
     };
 
@@ -116,9 +166,18 @@ fuzz_target!(|data: &[u8]| {
         Err(_) => return,
     };
 
-    let body = BodySource::Exact { len: data.len() as u64 };
+    // The OUTBOUND framing: chosen by the fuzzer's first byte, independent
+    // of the inbound framing above. This is the thing under test: does the
+    // serializer regenerate a framing that the parser can recover exactly?
+    let body = if use_chunked {
+        BodySource::Streaming
+    } else {
+        BodySource::Exact {
+            len: body_payload.len() as u64,
+        }
+    };
 
-    // Serialize.
+    // Serialize the head.
     let mut head_buf = BytesMut::new();
     head_buf.reserve(4096);
     if serialize_request_head(
@@ -137,63 +196,93 @@ fuzz_target!(|data: &[u8]| {
         return;
     }
 
-    // Build the full wire image: head + body.
+    // Build the full wire image: head + body, framed the way `body` said.
     let mut wire = BytesMut::new();
     wire.extend_from_slice(&head_buf);
-    wire.extend_from_slice(data);
+    if use_chunked {
+        let mut encoder = ChunkedEncoder::new();
+        // An empty chunk would terminate the body (see `ChunkedEncoder`'s
+        // own doc comment), so a genuinely empty payload writes none and
+        // relies on `finish` alone for the terminal `0\r\n\r\n`.
+        if !body_payload.is_empty() {
+            encoder.write_chunk(body_payload, &mut wire);
+        }
+        if encoder.finish(&empty_fields(), &mut wire).is_err() {
+            return;
+        }
+    } else {
+        wire.extend_from_slice(body_payload);
+    }
 
-    // Parse it back.
+    // Parse the head back.
     let parsed = match parser.parse_request_head(&wire) {
         Ok(irontraffic_http::scalar::ParseStatus::Complete {
-            value: head,
+            value: _head,
             consumed,
-        }) => (head, consumed),
-        _ => return,
+        }) => consumed,
+        _ => {
+            panic!( // it-allow: no-panic reason: fuzz target reports a finding by panicking; a head this same call just serialized failing to reparse is the P-ROUNDTRIP violation this target exists to catch, never a normal outcome
+                "reparse of our own serialized head failed (use_chunked={use_chunked}, \
+                 body_payload.len()={})",
+                body_payload.len()
+            );
+        }
     };
 
-    let (_head, consumed) = parsed;
+    let body_bytes = wire.get(parsed..).unwrap_or(&[]);
 
-    // Verify the body matches.
-    let body_bytes = wire.get(consumed..).unwrap_or(&[]);
-    let parsed_framing = resolve_request_framing(
-        &Method::Post,
-        WireVersion::Http11,
-        &req.headers,
-        OtherCodings::Reject,
-    );
-
-    match parsed_framing {
-        Ok(RequestFraming::Exact { len }) if len as usize <= body_bytes.len() => {
-            let expected_body = &body_bytes[..len as usize];
-            assert_eq!(expected_body, data, "round-trip body mismatch");
-        }
-        Ok(RequestFraming::Exact { len }) => {
-            // Body shorter than declared: not a round-trip failure, just
-            // incomplete data. Accept.
-            let _ = len;
-        }
-        Ok(RequestFraming::Empty) => {
-            assert!(data.is_empty(), "empty framing but non-empty body");
-        }
-        Ok(RequestFraming::Streamed) => {
-            // For chunked, decode the body.
-            let mut decoder = ChunkedDecoder::new();
-            let mut decoded = BytesMut::new();
-            let mut remaining = body_bytes;
-            loop {
-                match decoder.decode(remaining) {
-                    Ok(irontraffic_http::h1::chunked::ChunkedEvent::Data { offset, len }) => {
-                        let chunk = remaining.get(offset..offset + len).unwrap_or(&[]);
-                        decoded.extend_from_slice(chunk);
-                        remaining = remaining.get(offset + len..).unwrap_or(&[]);
+    if use_chunked {
+        // Decode the chunked body with the real, stateful decoder,
+        // resuming across NeedMore exactly as a live read loop would.
+        let dec_limits = clamped();
+        let mut decoder = ChunkedDecoder::new(&dec_limits, UnderscorePolicy::Reject);
+        let mut arena = BytesMut::new();
+        let mut decoded = BytesMut::new();
+        let mut pos = 0usize;
+        loop {
+            let buf = body_bytes.get(pos..).unwrap_or(&[]);
+            match decoder.decode(buf, &mut arena) {
+                Ok(ChunkedEvent::Data { offset, len }) => {
+                    let chunk = buf.get(offset..offset.saturating_add(len)).unwrap_or(&[]);
+                    decoded.extend_from_slice(chunk);
+                    pos = pos.saturating_add(decoder.consumed_this_call());
+                }
+                Ok(ChunkedEvent::NeedMore) => {
+                    let consumed = decoder.consumed_this_call();
+                    if consumed == 0 {
+                        // Our own encoder just wrote a complete, correctly
+                        // terminated chunked body onto `wire`, all of which
+                        // is in `body_bytes`. Stalling here means the
+                        // encoder and the decoder disagree about framing,
+                        // which is exactly the smuggling-shaped bug this
+                        // target exists to catch, so this is a real finding
+                        // and not a "feed more input" situation.
+                        panic!( // it-allow: no-panic reason: fuzz target reports a finding by panicking; a stall on a body this same call's ChunkedEncoder just wrote and terminated is an encoder/decoder framing disagreement, the smuggling-shaped bug this target exists to catch
+                            "ChunkedDecoder needed more input than our own ChunkedEncoder \
+                             wrote (body_payload.len()={})",
+                            body_payload.len()
+                        );
                     }
-                    Ok(irontraffic_http::h1::chunked::ChunkedEvent::Finished { .. }) => break,
-                    Err(_) => return,
-                    _ => return,
+                    pos = pos.saturating_add(consumed);
+                }
+                Ok(ChunkedEvent::Done { consumed: _ }) => {
+                    // The message is complete; nothing after this point in
+                    // `body_bytes` is read, so `pos` need not advance again.
+                    break;
+                }
+                Err(reason) => {
+                    panic!( // it-allow: no-panic reason: fuzz target reports a finding by panicking; the decoder rejecting a body this same call's ChunkedEncoder just wrote is a real encoder/decoder disagreement, never a normal outcome
+                        "chunked round-trip decode failed: {reason:?} \
+                         (body_payload.len()={})",
+                        body_payload.len()
+                    );
                 }
             }
-            assert_eq!(&decoded[..], data, "chunked round-trip body mismatch");
         }
-        Err(_) => {}
+        CHUNKED_HIT.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(&decoded[..], body_payload, "chunked round-trip body mismatch");
+    } else {
+        EXACT_HIT.fetch_add(1, Ordering::Relaxed);
+        assert_eq!(body_bytes, body_payload, "content-length round-trip body mismatch");
     }
 });
