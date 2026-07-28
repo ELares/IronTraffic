@@ -242,12 +242,16 @@ impl GuestAction {
     ///
     /// # Errors
     /// `AbiError::BadPayload` when a field is out of range.
+    #[allow(
+        clippy::manual_range_contains,
+        reason = "This is exactly the manual range check the issue requires"
+    )]
     pub fn encode(self) -> Result<i32, AbiError> {
         let raw = match self {
             GuestAction::Continue => 0,
             GuestAction::Pause => 1,
             GuestAction::Respond { status, template } => {
-                if status < 200 || status > 599 {
+                if !(200..=599).contains(&status) {
                     return Err(AbiError::BadPayload {
                         raw: i32::from(status),
                     });

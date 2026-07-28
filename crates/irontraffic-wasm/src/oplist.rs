@@ -226,10 +226,10 @@ mod tests {
         let record = encode_op(0, 0, 1, 0, 0, 0, 0);
         mem[..20].copy_from_slice(&record);
         let mut iter = decode_op_list(&mem, 0, 20, 10).expect("header ok");
-        assert_eq!(
-            iter.next().expect("item"),
-            Err(AbiError::ReservedNonZero { at: 0 })
-        );
+        match iter.next().expect("item") {
+            Err(e) => assert_eq!(e, AbiError::ReservedNonZero { at: 0 }),
+            Ok(_) => panic!("expected ReservedNonZero error"),
+        }
     }
 
     #[test]
@@ -238,10 +238,10 @@ mod tests {
         let record = encode_op(0, 1, 0, 0, 0, 0, 0);
         mem[..20].copy_from_slice(&record);
         let mut iter = decode_op_list(&mem, 0, 20, 10).expect("header ok");
-        assert_eq!(
-            iter.next().expect("item"),
-            Err(AbiError::BadOpRecord { at: 0 })
-        );
+        match iter.next().expect("item") {
+            Err(e) => assert_eq!(e, AbiError::BadOpRecord { at: 0 }),
+            Ok(_) => panic!("expected BadOpRecord error"),
+        }
     }
 
     #[test]
@@ -250,10 +250,10 @@ mod tests {
         let record = encode_op(3, 0, 0, 0, 0, 0, 0);
         mem[..20].copy_from_slice(&record);
         let mut iter = decode_op_list(&mem, 0, 20, 10).expect("header ok");
-        assert_eq!(
-            iter.next().expect("item"),
-            Err(AbiError::BadOpRecord { at: 0 })
-        );
+        match iter.next().expect("item") {
+            Err(e) => assert_eq!(e, AbiError::BadOpRecord { at: 0 }),
+            Ok(_) => panic!("expected BadOpRecord error"),
+        }
     }
 
     #[test]
@@ -326,14 +326,17 @@ mod tests {
         let record = encode_op(0, 0, 0, 100, 5, 0, 0);
         mem[..20].copy_from_slice(&record);
         let mut iter = decode_op_list(&mem, 0, 20, 10).expect("header ok");
-        assert_eq!(
-            iter.next().expect("item"),
-            Err(AbiError::OutOfBounds {
-                ptr: 100,
-                len: 5,
-                mem_len: 20,
-            })
-        );
+        match iter.next().expect("item") {
+            Err(e) => assert_eq!(
+                e,
+                AbiError::OutOfBounds {
+                    ptr: 100,
+                    len: 5,
+                    mem_len: 20,
+                }
+            ),
+            Ok(_) => panic!("expected OutOfBounds error"),
+        }
     }
 
     #[test]
@@ -343,14 +346,17 @@ mod tests {
         let record = encode_op(1, 0, 0, 20, 3, 100, 5);
         mem[..20].copy_from_slice(&record);
         let mut iter = decode_op_list(&mem, 0, 20, 10).expect("header ok");
-        assert_eq!(
-            iter.next().expect("item"),
-            Err(AbiError::OutOfBounds {
-                ptr: 100,
-                len: 5,
-                mem_len: 24,
-            })
-        );
+        match iter.next().expect("item") {
+            Err(e) => assert_eq!(
+                e,
+                AbiError::OutOfBounds {
+                    ptr: 100,
+                    len: 5,
+                    mem_len: 24,
+                }
+            ),
+            Ok(_) => panic!("expected OutOfBounds error"),
+        }
     }
 
     #[test]
@@ -397,51 +403,64 @@ mod tests {
     #[test]
     fn oversized_field_rejected() {
         let mem_len = 16 * 1024 * 1024;
-        let mut mem = vec![0u8; mem_len];
         let big = MAX_OP_FIELD_BYTES + 1;
 
         // Name too large.
+        let mut mem = vec![0u8; mem_len];
         let record = encode_op(0, 0, 0, 0, big, 0, 0);
         mem[..20].copy_from_slice(&record);
-        match decode_op_list(&mem, 0, 20, 10) {
-            Err(e) => assert_eq!(
+        let mut iter = decode_op_list(&mem, 0, 20, 10).expect("should return Ok with error");
+        if let Some(Err(e)) = iter.next() {
+            assert_eq!(
                 e,
                 AbiError::FieldTooLarge {
                     at: 0,
                     len: big,
                     max: MAX_OP_FIELD_BYTES,
                 }
-            ),
-            Ok(_) => panic!("expected FieldTooLarge"),
+            );
+        } else {
+            panic!("expected FieldTooLarge, got Ok or different error");
         }
+        assert!(
+            iter.next().is_none(),
+            "iterator should be exhausted after one error"
+        );
 
         // Name exactly at the limit is accepted (the value here is empty).
+        let mut mem = vec![0u8; mem_len];
         let record = encode_op(0, 0, 0, 0, MAX_OP_FIELD_BYTES, 0, 0);
         mem[..20].copy_from_slice(&record);
-        {
-            let mut iter = decode_op_list(&mem, 0, 20, 10).expect("at limit");
-            let (op, name, value) = iter.next().expect("one op").expect("valid record");
-            assert_eq!(op, 0);
-            assert_eq!(name.len(), MAX_OP_FIELD_BYTES as usize);
-            assert!(value.expect("value").is_empty());
-        }
+        let mut iter = decode_op_list(&mem, 0, 20, 10).expect("at limit");
+        let (op, name, value) = iter.next().expect("one op").expect("valid record");
+        assert_eq!(op, 0);
+        assert_eq!(name.len(), MAX_OP_FIELD_BYTES as usize);
+        assert!(value.expect("value").is_empty());
 
         // Value too large on a Set.
+        let mut mem = vec![0u8; mem_len];
         let record = encode_op(1, 0, 0, 0, 0, 0, MAX_OP_FIELD_BYTES + 1);
         mem[..20].copy_from_slice(&record);
-        match decode_op_list(&mem, 0, 20, 10) {
-            Err(e) => assert_eq!(
+        let mut iter = decode_op_list(&mem, 0, 20, 10).expect("should return Ok with error");
+        if let Some(Err(e)) = iter.next() {
+            assert_eq!(
                 e,
                 AbiError::FieldTooLarge {
                     at: 0,
                     len: MAX_OP_FIELD_BYTES + 1,
                     max: MAX_OP_FIELD_BYTES,
                 }
-            ),
-            Ok(_) => panic!("expected FieldTooLarge"),
+            );
+        } else {
+            panic!("expected FieldTooLarge, got Ok or different error");
         }
+        assert!(
+            iter.next().is_none(),
+            "iterator should be exhausted after one error"
+        );
 
         // Remove ignores an oversized value_len.
+        let mut mem = vec![0u8; mem_len];
         let record = encode_op(2, 0, 0, 0, 0, 0, big);
         mem[..20].copy_from_slice(&record);
         let mut iter = decode_op_list(&mem, 0, 20, 10).expect("valid remove");
@@ -454,43 +473,55 @@ mod tests {
     #[test]
     fn name_too_large_with_one_extra_byte_is_rejected() {
         let mem_len = 16 * 1024 * 1024;
-        let mut mem = vec![0u8; mem_len];
 
         // First record: Name too large with length one byte larger than max.
+        let mut mem = vec![0u8; mem_len];
         let record = encode_op(0, 0, 0, 0, MAX_OP_FIELD_BYTES + 1, 0, 0);
         mem[..20].copy_from_slice(&record);
-        match decode_op_list(&mem, 0, 20, 10) {
-            Err(e) => assert_eq!(
+        let mut iter = decode_op_list(&mem, 0, 20, 10).expect("should return Ok with error");
+        if let Some(Err(e)) = iter.next() {
+            assert_eq!(
                 e,
                 AbiError::FieldTooLarge {
                     at: 0,
                     len: MAX_OP_FIELD_BYTES + 1,
                     max: MAX_OP_FIELD_BYTES,
                 }
-            ),
-            Ok(_) => panic!("expected FieldTooLarge"),
+            );
+        } else {
+            panic!("expected FieldTooLarge, got Ok or different error");
         }
+        assert!(
+            iter.next().is_none(),
+            "iterator should be exhausted after one error"
+        );
     }
 
     #[test]
     fn oversized_value_is_rejected() {
         let mem_len = 16 * 1024 * 1024;
-        let mut mem = vec![0u8; mem_len];
 
         // Value too large on a Set.
+        let mut mem = vec![0u8; mem_len];
         let record = encode_op(1, 0, 0, 0, 0, 0, MAX_OP_FIELD_BYTES + 1);
         mem[..20].copy_from_slice(&record);
-        match decode_op_list(&mem, 0, 20, 10) {
-            Err(e) => assert_eq!(
+        let mut iter = decode_op_list(&mem, 0, 20, 10).expect("should return Ok with error");
+        if let Some(Err(e)) = iter.next() {
+            assert_eq!(
                 e,
                 AbiError::FieldTooLarge {
                     at: 0,
                     len: MAX_OP_FIELD_BYTES + 1,
                     max: MAX_OP_FIELD_BYTES,
                 }
-            ),
-            Ok(_) => panic!("expected FieldTooLarge"),
+            );
+        } else {
+            panic!("expected FieldTooLarge, got Ok or different error");
         }
+        assert!(
+            iter.next().is_none(),
+            "iterator should be exhausted after one error"
+        );
     }
 
     #[test]
