@@ -695,6 +695,38 @@ mod tests {
     }
 
     #[test]
+    fn every_relational_operator_maps_to_its_own_binop() {
+        // #738 SHOULD_FIX 3: only `Eq` was asserted anywhere, and `In` was
+        // pinned incidentally by a test that needs `in` to parse at all, not
+        // by anything checking what it maps to. `Ne`, `Lt`, `Le`, `Gt`, `Ge`
+        // were pinned by nothing: a one-character `relop_of` regression
+        // (`Lt` mapping to `Le`, say) could turn `x < 10` into `x <= 10` in
+        // a security predicate with the whole suite green. One table over
+        // all seven closes every one of those gaps at once.
+        let cases: [(&[u8], BinOp); 7] = [
+            (b"a == b", BinOp::Eq),
+            (b"a != b", BinOp::Ne),
+            (b"a < b", BinOp::Lt),
+            (b"a <= b", BinOp::Le),
+            (b"a > b", BinOp::Gt),
+            (b"a >= b", BinOp::Ge),
+            (b"a in b", BinOp::In),
+        ];
+        for (src, expected_op) in cases {
+            let ast = parse_src(src, default_limits()).unwrap();
+            let Node::Bin { op, .. } = ast.nodes[ast.root.index()] else {
+                panic!("{src:?} did not parse to a Bin node: {:?}", ast.nodes);
+            };
+            assert_eq!(
+                op,
+                expected_op,
+                "{} did not map to {expected_op:?}",
+                String::from_utf8_lossy(src)
+            );
+        }
+    }
+
+    #[test]
     fn parens_produce_no_node() {
         let ast = parse_src(b"(true)", default_limits()).unwrap();
         assert_eq!(ast.nodes, vec![Node::Bool(true)]);
