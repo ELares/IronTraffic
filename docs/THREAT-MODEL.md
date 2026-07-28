@@ -1234,4 +1234,14 @@ boundaries, against a spec whose method, status ranges, `receive` patterns, and 
 mapped into the valid range rather than passed through unmodified, so every generated input reaches
 `on_bytes`/`on_eof` instead of being rejected by `HttpCheckSpec::validate` before the parser runs.
 It asserts the retained body never exceeds `response_buffer_size`, the buffer never reallocates
-after construction, and both codecs always reach `Done` once `on_eof` is called.
+after construction, and both codecs always reach `Done` once `on_eof` is called. Reaching
+`on_bytes`/`on_eof` is not the same claim as reaching the parser: an earlier version of this target
+fed `HttpCheckCodec` an unconstrained arbitrary byte stream, which almost never begins with the
+5-byte `HTTP/` magic, so 500,000 runs completed with the HTTP half never getting past byte 12 while
+every one of those runs still technically satisfied "reaches on_bytes/on_eof". `build_http_response`
+now gives each generated response an `Arbitrary`-chosen shape (unmodified, a partial `HTTP/1.1 `
+prefix, or a full well-formed head with an arbitrary status), so both a bare stream and a real head
+are explored in the same corpus, and a process-lifetime counter fails the run outright if the HTTP
+half ever again goes back to parsing zero status lines after a meaningful number of executions. The
+TCP half is intentionally left driven by the unmodified byte stream: `TcpCheckCodec` has no phase
+machine to gate on an HTTP-shaped prefix, so reshaping its input would only cost it entropy.

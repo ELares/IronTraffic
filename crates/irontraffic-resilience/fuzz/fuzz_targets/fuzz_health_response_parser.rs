@@ -14,16 +14,33 @@
 //! modulus, so `compile()` succeeds on every input this target generates; `path`
 //! and `host` are fixed valid constants, since the codec's own outbound request
 //! bytes are not the surface under fuzzing here (the untrusted input is the
-//! response, per `docs/THREAT-MODEL.md`, "Health check response parsing"). `response`
-//! and `chunk_sizes` are the actual fuzzed surface: an arbitrary byte stream fed to
-//! both codecs through arbitrary chunk boundaries.
+//! response, per `docs/THREAT-MODEL.md`, "Health check response parsing").
+//!
+//! `response` and `chunk_sizes` are the actual fuzzed surface, but `response` alone
+//! is not enough for the HTTP half: #739 BLOCKING 2 found that 500,000 runs of an
+//! earlier version of this target never got the HTTP codec past byte 12, because a
+//! uniformly random byte string essentially never starts with `HTTP/`. The same
+//! bounding reasoning this doc comment already applies to the spec seed applies to
+//! the response too. `response_shape` (via `build_http_response`) picks, per input,
+//! among an unmodified arbitrary stream (keeping `Phase::StatusLine` rejection
+//! coverage alive), a partial `HTTP/1.1 ` prefix, and a full well-formed head with
+//! an `Arbitrary`-chosen status (`status_seed`), so both shapes described in #739
+//! are explored within one corpus rather than by three separate hardcoded runs.
+//! This reshaping is applied ONLY to the bytes handed to `drive_http`: `drive_tcp`
+//! keeps consuming `input.response` unmodified, because `TcpCheckCodec` has no
+//! phase machine to gate on an HTTP-shaped prefix and the reviewer's own counters
+//! showed the TCP half was already meaningfully fuzzed; reshaping its input too
+//! would only shrink the per-input entropy it explores for no coverage gain.
 //!
 //! Contract: neither codec's `on_bytes` or `on_eof` may panic or hang, neither may
 //! allocate after construction (captured as `Vec::capacity` immediately after `new`
 //! and compared again after driving the whole response through), and the retained
 //! body length may never exceed `response_buffer_size`. Driving to completion means
 //! either `on_bytes` returns `Done` directly, or every response byte was offered and
-//! `on_eof` is then called and asserted to return `Done` (never `NeedMore`).
+//! `on_eof` is then called and asserted to return `Done` (never `NeedMore`). A
+//! process-lifetime self-check (`assert_http_half_is_reached`, below) additionally
+//! fails the run outright if the HTTP half goes back to never parsing a status line,
+//! which is what let the #739 regression run to completion 500,000 times unnoticed.
 
 use arbitrary::Arbitrary;
 use irontraffic_resilience::health::{
@@ -31,6 +48,7 @@ use irontraffic_resilience::health::{
     HttpCheckSpec, StatusRange, TcpCheckCodec, TcpCheckSpec,
 };
 use libfuzzer_sys::fuzz_target;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Arbitrary)]
 struct FuzzInput {
@@ -39,6 +57,11 @@ struct FuzzInput {
     pattern_seed: Vec<u8>,
     response_buffer_size_raw: u16,
     max_head_bytes_raw: u16,
+    /// Selects which of the three head shapes `build_http_response` glues onto
+    /// `response` before it is handed to `drive_http`. See the module doc.
+    response_shape: u8,
+    /// The status code used when `response_shape` selects the full-head shape.
+    status_seed: u8,
     response: Vec<u8>,
     chunk_sizes: Vec<u8>,
 }
@@ -52,6 +75,54 @@ fn clamp_patterns(seed: &[u8]) -> Vec<Vec<u8>> {
         .filter(|chunk| !chunk.is_empty())
         .map(<[u8]>::to_vec)
         .collect()
+}
+
+/// Build the bytes handed to `drive_http`: `tail` unmodified, `tail` behind a
+/// partial `HTTP/1.1 ` status-line prefix, or `tail` behind a full well-formed
+/// head with an `Arbitrary`-chosen 3-digit status. #739 BLOCKING 2's fix: without
+/// some shape carrying a real head, the HTTP codec never leaves
+/// `consume_status_line_byte`.
+fn build_http_response(shape: u8, status_seed: u8, tail: &[u8]) -> Vec<u8> {
+    match shape % 3 {
+        0 => tail.to_vec(),
+        1 => {
+            let mut v = b"HTTP/1.1 ".to_vec();
+            v.extend_from_slice(tail);
+            v
+        }
+        _ => {
+            let status = u16::from(status_seed) % 1000;
+            let mut v = format!("HTTP/1.1 {status:03} OK\r\n\r\n").into_bytes();
+            v.extend_from_slice(tail);
+            v
+        }
+    }
+}
+
+/// Process-lifetime counters for `assert_http_half_is_reached`'s self-check.
+static HTTP_RUNS: AtomicU64 = AtomicU64::new(0);
+static HTTP_PARSED_STATUS_LINE: AtomicU64 = AtomicU64::new(0);
+
+/// Fails the fuzz run outright if the HTTP half has gone back to never parsing a
+/// status line. #739 BLOCKING 2's actual defect was that 500,000 executions of
+/// `drive_http` completed with `parsed_status_line=0` and nothing noticed, because
+/// the only thing asserted was that `drive_http` was CALLED, not that it ever got
+/// anywhere. This is the same "assert reachability, not just invocation" guard
+/// `prop_never_exceeds_caps` now applies in-crate, applied here at the fuzz-target
+/// level: it panics (which `cargo fuzz` treats as a crash) once enough executions
+/// have accumulated that a zero count can no longer be attributed to bad luck on a
+/// tiny run.
+fn assert_http_half_is_reached(codec: &HttpCheckCodec) {
+    let total = HTTP_RUNS.fetch_add(1, Ordering::Relaxed) + 1;
+    if codec.status().is_some() {
+        HTTP_PARSED_STATUS_LINE.fetch_add(1, Ordering::Relaxed);
+    }
+    let parsed = HTTP_PARSED_STATUS_LINE.load(Ordering::Relaxed);
+    assert!(
+        total < 20_000 || parsed > 0,
+        "parsed_status_line stayed at 0 after {total} executions: the HTTP half \
+         of this fuzz target has gone unseeded again, see #739 BLOCKING 2"
+    );
 }
 
 /// Feed `response` to `codec` through `chunk_sizes`-shaped chunks until it
@@ -170,8 +241,10 @@ fuzz_target!(|input: FuzzInput| {
         // this should not happen; fail closed rather than panic if it ever does.
         return;
     };
+    let http_response = build_http_response(input.response_shape, input.status_seed, &input.response);
     let mut http_codec = HttpCheckCodec::new(&http_compiled);
-    drive_http(&mut http_codec, &http_compiled, &input.response, &input.chunk_sizes);
+    drive_http(&mut http_codec, &http_compiled, &http_response, &input.chunk_sizes);
+    assert_http_half_is_reached(&http_codec);
 
     let tcp_receive = if receive.is_empty() {
         vec![vec![b'o', b'k']]
