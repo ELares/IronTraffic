@@ -90,7 +90,13 @@ fn upgrade(head_bytes: &[u8]) -> Option<(CanonicalRequest, UpgradeTokens<'static
         let name = head.field_name(i)?;
         let value = head.field_value(i)?;
         pre_builder
-            .push_normalized(&mut pre_arena, name, UnderscorePolicy::Reject, value, head.version)
+            .push_normalized(
+                &mut pre_arena,
+                name,
+                UnderscorePolicy::Reject,
+                value,
+                head.version,
+            )
             .ok()?;
     }
     let pre = pre_builder.finish(&mut pre_arena);
@@ -131,9 +137,11 @@ fn build_section(fields: &[(&[u8], &[u8])]) -> Option<FieldSection> {
 /// is already in scope rather than one built from wire bytes.
 fn response_tokens(headers: &FieldSection) -> UpgradeTokens<'_> {
     let duplicate_upgrade = headers.get_unique_known(KnownHeader::Upgrade).is_err();
-    let upgrade_value = headers.get_unique_known(KnownHeader::Upgrade).ok().flatten();
-    let connection_has_upgrade =
-        irontraffic_http::strip::connection_has_token(headers, b"upgrade");
+    let upgrade_value = headers
+        .get_unique_known(KnownHeader::Upgrade)
+        .ok()
+        .flatten();
+    let connection_has_upgrade = irontraffic_http::strip::connection_has_token(headers, b"upgrade");
     UpgradeTokens {
         upgrade: upgrade_value,
         connection_has_upgrade,
@@ -191,7 +199,8 @@ fn valid_upgrade_parses() {
 
 #[test]
 fn non_upgrade_is_none() {
-    let (req, tokens) = upgrade(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n").expect("test fixture must parse and canonicalize");
+    let (req, tokens) = upgrade(b"GET / HTTP/1.1\r\nHost: example.com\r\n\r\n")
+        .expect("test fixture must parse and canonicalize");
     assert_eq!(UpgradeRequest::parse(&req, tokens), Ok(None));
 }
 
@@ -209,14 +218,18 @@ fn connection_token_table() {
         (None, false),
     ];
     for (value, accepted) in rows {
-        let mut head = String::from("GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\n");
+        let mut head =
+            String::from("GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\n");
         if let Some(v) = value {
             head.push_str("Connection: ");
             head.push_str(v);
             head.push_str("\r\n");
         }
-        head.push_str("Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n");
-        let (req, tokens) = upgrade(head.as_bytes()).expect("test fixture must parse and canonicalize");
+        head.push_str(
+            "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n",
+        );
+        let (req, tokens) =
+            upgrade(head.as_bytes()).expect("test fixture must parse and canonicalize");
         if *accepted {
             assert!(
                 UpgradeRequest::parse(&req, tokens).unwrap().is_some(),
@@ -262,7 +275,10 @@ fn connection_token_table() {
         };
         let mut sec = build_section(&fields).expect("test fixture fields must be valid");
         let has_token = irontraffic_http::strip::connection_has_token(&sec, b"x-custom-marker");
-        assert_eq!(has_token, *names_it, "connection_has_token disagrees for {value:?}");
+        assert_eq!(
+            has_token, *names_it,
+            "connection_has_token disagrees for {value:?}"
+        );
 
         let report = irontraffic_http::strip::strip_ingress(&mut sec, &limits)
             .expect("test fixture connection value must be well formed");
@@ -284,7 +300,8 @@ fn upgrade_value_table() {
     };
 
     for value in ["websocket", "WebSocket", "WEBSOCKET", "websocket "] {
-        let (req, tokens) = upgrade(&head(value)).expect("test fixture must parse and canonicalize");
+        let (req, tokens) =
+            upgrade(&head(value)).expect("test fixture must parse and canonicalize");
         assert!(
             UpgradeRequest::parse(&req, tokens).unwrap().is_some(),
             "{value:?} must be accepted"
@@ -292,7 +309,8 @@ fn upgrade_value_table() {
     }
 
     for value in ["websocket, h2c", "h2c", "web socket"] {
-        let (req, tokens) = upgrade(&head(value)).expect("test fixture must parse and canonicalize");
+        let (req, tokens) =
+            upgrade(&head(value)).expect("test fixture must parse and canonicalize");
         assert_eq!(
             UpgradeRequest::parse(&req, tokens).unwrap_err(),
             HandshakeError::UpgradeTokenNotWebsocket,
@@ -310,7 +328,8 @@ fn method_and_body_table() {
         .into_bytes()
     };
 
-    let (req, tokens) = upgrade(&head("POST", "")).expect("test fixture must parse and canonicalize");
+    let (req, tokens) =
+        upgrade(&head("POST", "")).expect("test fixture must parse and canonicalize");
     assert_eq!(
         UpgradeRequest::parse(&req, tokens).unwrap_err(),
         HandshakeError::MethodNotGet {
@@ -318,19 +337,24 @@ fn method_and_body_table() {
         }
     );
 
-    let (req, tokens) = upgrade(&head("GET", "Content-Length: 5\r\n")).expect("test fixture must parse and canonicalize");
+    let (req, tokens) = upgrade(&head("GET", "Content-Length: 5\r\n"))
+        .expect("test fixture must parse and canonicalize");
     assert_eq!(
         UpgradeRequest::parse(&req, tokens).unwrap_err(),
         HandshakeError::UpgradeWithBody
     );
 
-    let (req, tokens) = upgrade(&head("GET", "Content-Length: 0\r\n")).expect("test fixture must parse and canonicalize");
+    let (req, tokens) = upgrade(&head("GET", "Content-Length: 0\r\n"))
+        .expect("test fixture must parse and canonicalize");
     assert!(UpgradeRequest::parse(&req, tokens).unwrap().is_some());
 
-    let (req, tokens) = upgrade(&head("PUT", "")).expect("test fixture must parse and canonicalize");
+    let (req, tokens) =
+        upgrade(&head("PUT", "")).expect("test fixture must parse and canonicalize");
     assert_eq!(
         UpgradeRequest::parse(&req, tokens).unwrap_err(),
-        HandshakeError::MethodNotGet { method: Method::Put }
+        HandshakeError::MethodNotGet {
+            method: Method::Put
+        }
     );
 }
 
@@ -349,11 +373,13 @@ fn version_table() {
         h.into_bytes()
     };
 
-    let (req, tokens) = upgrade(&head(Some("13"))).expect("test fixture must parse and canonicalize");
+    let (req, tokens) =
+        upgrade(&head(Some("13"))).expect("test fixture must parse and canonicalize");
     assert!(UpgradeRequest::parse(&req, tokens).unwrap().is_some());
 
     for (v, found) in [("8", 8_u32), ("0", 0), ("14", 14)] {
-        let (req, tokens) = upgrade(&head(Some(v))).expect("test fixture must parse and canonicalize");
+        let (req, tokens) =
+            upgrade(&head(Some(v))).expect("test fixture must parse and canonicalize");
         assert_eq!(
             UpgradeRequest::parse(&req, tokens).unwrap_err(),
             HandshakeError::UnsupportedVersion { found },
@@ -367,7 +393,8 @@ fn version_table() {
         HandshakeError::VersionMissing
     );
 
-    let (req, tokens) = upgrade(&head(Some("13abc"))).expect("test fixture must parse and canonicalize");
+    let (req, tokens) =
+        upgrade(&head(Some("13abc"))).expect("test fixture must parse and canonicalize");
     assert!(matches!(
         UpgradeRequest::parse(&req, tokens).unwrap_err(),
         HandshakeError::Field(_)
@@ -397,25 +424,29 @@ fn key_table() {
     };
 
     // A valid 24-character key.
-    let (req, tokens) = upgrade(&head(Some("dGhlIHNhbXBsZSBub25jZQ=="))).expect("test fixture must parse and canonicalize");
+    let (req, tokens) = upgrade(&head(Some("dGhlIHNhbXBsZSBub25jZQ==")))
+        .expect("test fixture must parse and canonicalize");
     assert!(UpgradeRequest::parse(&req, tokens).unwrap().is_some());
 
     // 23 characters (one short of the trailing `=`).
-    let (req, tokens) = upgrade(&head(Some("dGhlIHNhbXBsZSBub25jZQ="))).expect("test fixture must parse and canonicalize");
+    let (req, tokens) = upgrade(&head(Some("dGhlIHNhbXBsZSBub25jZQ=")))
+        .expect("test fixture must parse and canonicalize");
     assert_eq!(
         UpgradeRequest::parse(&req, tokens).unwrap_err(),
         HandshakeError::KeyWrongLength { len: 23 }
     );
 
     // 25 characters (one past the valid key).
-    let (req, tokens) = upgrade(&head(Some("dGhlIHNhbXBsZSBub25jZQ==A"))).expect("test fixture must parse and canonicalize");
+    let (req, tokens) = upgrade(&head(Some("dGhlIHNhbXBsZSBub25jZQ==A")))
+        .expect("test fixture must parse and canonicalize");
     assert_eq!(
         UpgradeRequest::parse(&req, tokens).unwrap_err(),
         HandshakeError::KeyWrongLength { len: 25 }
     );
 
     // 24 characters with a `!`, not in the base64 alphabet.
-    let (req, tokens) = upgrade(&head(Some("!GhlIHNhbXBsZSBub25jZQ=="))).expect("test fixture must parse and canonicalize");
+    let (req, tokens) = upgrade(&head(Some("!GhlIHNhbXBsZSBub25jZQ==")))
+        .expect("test fixture must parse and canonicalize");
     assert_eq!(
         UpgradeRequest::parse(&req, tokens).unwrap_err(),
         HandshakeError::KeyNotBase64
@@ -439,8 +470,7 @@ fn key_table() {
 #[test]
 fn too_many_subprotocols() {
     // Nine offered.
-    let nine =
-        "GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: p0, p1, p2, p3, p4, p5, p6, p7, p8\r\n\r\n";
+    let nine = "GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Protocol: p0, p1, p2, p3, p4, p5, p6, p7, p8\r\n\r\n";
     let (req, tokens) = upgrade(nine.as_bytes()).expect("test fixture must parse and canonicalize");
     assert_eq!(
         UpgradeRequest::parse(&req, tokens).unwrap_err(),
@@ -498,7 +528,8 @@ fn response_accept_mismatch() {
         (b"upgrade", b"websocket"),
         (b"connection", b"Upgrade"),
         (b"sec-websocket-accept", &accept[..]),
-    ]).expect("test fixture fields must be valid");
+    ])
+    .expect("test fixture fields must be valid");
     let htokens = response_tokens(&headers);
     let err = UpgradeResponse::verify(&upgrade_req, 101, &headers, htokens).unwrap_err();
     assert_eq!(err, HandshakeError::AcceptMismatch);
@@ -527,7 +558,8 @@ fn response_unrequested_extension() {
         (b"connection", b"Upgrade"),
         (b"sec-websocket-accept", &accept[..]),
         (b"sec-websocket-extensions", b"permessage-deflate"),
-    ]).expect("test fixture fields must be valid");
+    ])
+    .expect("test fixture fields must be valid");
     let htokens = response_tokens(&headers);
     let err = UpgradeResponse::verify(&upgrade_req, 101, &headers, htokens).unwrap_err();
     assert_eq!(err, HandshakeError::UnrequestedExtension);
@@ -546,7 +578,8 @@ fn response_unoffered_subprotocol() {
         (b"connection", b"Upgrade"),
         (b"sec-websocket-accept", &accept[..]),
         (b"sec-websocket-protocol", b"chat"),
-    ]).expect("test fixture fields must be valid");
+    ])
+    .expect("test fixture fields must be valid");
     let bad_tokens = response_tokens(&bad);
     assert_eq!(
         UpgradeResponse::verify(&upgrade_req, 101, &bad, bad_tokens).unwrap_err(),
@@ -562,7 +595,8 @@ fn response_unoffered_subprotocol() {
         (b"connection", b"Upgrade"),
         (b"sec-websocket-accept", &accept[..]),
         (b"sec-websocket-protocol", b"superchat"),
-    ]).expect("test fixture fields must be valid");
+    ])
+    .expect("test fixture fields must be valid");
     let good_tokens = response_tokens(&good);
     let ok = UpgradeResponse::verify(&upgrade_req, 101, &good, good_tokens).unwrap();
     let slot = good
@@ -575,14 +609,18 @@ fn response_unoffered_subprotocol() {
     let expected_start = u16::try_from(slot.value_off).unwrap();
     let expected_end =
         u16::try_from(u64::from(slot.value_off).saturating_add(u64::from(slot.value_len))).unwrap();
-    assert_eq!(ok.selected_subprotocol, Some((expected_start, expected_end)));
+    assert_eq!(
+        ok.selected_subprotocol,
+        Some((expected_start, expected_end))
+    );
 
     // Selecting none is legal.
     let none = build_section(&[
         (b"upgrade", b"websocket"),
         (b"connection", b"Upgrade"),
         (b"sec-websocket-accept", &accept[..]),
-    ]).expect("test fixture fields must be valid");
+    ])
+    .expect("test fixture fields must be valid");
     let none_tokens = response_tokens(&none);
     let ok_none = UpgradeResponse::verify(&upgrade_req, 101, &none, none_tokens).unwrap();
     assert_eq!(ok_none.selected_subprotocol, None);
@@ -592,7 +630,10 @@ fn response_unoffered_subprotocol() {
 fn h2c_upgrade_is_refused() {
     let head = b"GET / HTTP/1.1\r\nHost: example.com\r\nUpgrade: h2c\r\nConnection: Upgrade, HTTP2-Settings\r\nHTTP2-Settings: AAA\r\n\r\n";
     let (req, tokens) = upgrade(head).expect("test fixture must parse and canonicalize");
-    assert!(matches!(req.headers.get_unique(b"http2-settings"), Ok(None)));
+    assert!(matches!(
+        req.headers.get_unique(b"http2-settings"),
+        Ok(None)
+    ));
     assert_eq!(
         UpgradeRequest::parse(&req, tokens).unwrap_err(),
         HandshakeError::UpgradeTokenNotWebsocket
@@ -666,7 +707,10 @@ fn canonical_request_carries_no_upgrade_evidence() {
     let (req, tokens) = upgrade(BROWSER_UPGRADE).expect("test fixture must parse and canonicalize");
     assert!(matches!(req.headers.get_unique(b"upgrade"), Ok(None)));
     assert!(matches!(req.headers.get_unique(b"connection"), Ok(None)));
-    assert_eq!(UpgradeRequest::parse(&req, UpgradeTokens::default()), Ok(None));
+    assert_eq!(
+        UpgradeRequest::parse(&req, UpgradeTokens::default()),
+        Ok(None)
+    );
     assert!(matches!(UpgradeRequest::parse(&req, tokens), Ok(Some(_))));
 }
 

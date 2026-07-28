@@ -262,7 +262,9 @@ impl core::fmt::Display for HandshakeError {
                 f,
                 "sec-websocket-key is {len} characters, expected {KEY_B64_LEN}"
             ),
-            HandshakeError::KeyNotBase64 => write!(f, "sec-websocket-key is not base64 of 16 bytes"),
+            HandshakeError::KeyNotBase64 => {
+                write!(f, "sec-websocket-key is not base64 of 16 bytes")
+            }
             HandshakeError::TooManySubprotocols => {
                 write!(f, "more than {MAX_SUBPROTOCOLS} subprotocols offered")
             }
@@ -273,7 +275,9 @@ impl core::fmt::Display for HandshakeError {
             HandshakeError::NotSwitchingProtocols { status } => {
                 write!(f, "upstream answered {status}, expected 101")
             }
-            HandshakeError::AcceptMissing => write!(f, "sec-websocket-accept is missing from the 101"),
+            HandshakeError::AcceptMissing => {
+                write!(f, "sec-websocket-accept is missing from the 101")
+            }
             HandshakeError::AcceptMismatch => {
                 write!(f, "sec-websocket-accept does not match the key")
             }
@@ -540,7 +544,11 @@ impl UpgradeRequest {
         }
 
         // Step 9.
-        let offered_extensions = req.headers.get_all(SEC_WEBSOCKET_EXTENSIONS).next().is_some();
+        let offered_extensions = req
+            .headers
+            .get_all(SEC_WEBSOCKET_EXTENSIONS)
+            .next()
+            .is_some();
 
         // Step 10.
         Ok(Some(UpgradeRequest {
