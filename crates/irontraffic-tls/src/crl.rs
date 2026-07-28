@@ -531,14 +531,27 @@ pub fn verify_signature<'a>(
         x509_cert::der::Encode::to_der(&spki.algorithm).map_err(|_| CrlError::Parse)?;
     let public_key_bytes = spki.subject_public_key.raw_bytes();
 
+    // `rustls_pki_types::AlgorithmIdentifier` holds the SEQUENCE CONTENTS of an
+    // AlgorithmIdentifier, not the full TLV: see its own doc example, which builds
+    // `RSA_ENCRYPTION` from bytes starting at 0x06 (OBJECT IDENTIFIER) with no leading
+    // `0x30 <len>` SEQUENCE header. `parsed.sig_alg_der` and `spki_alg_der` are both full
+    // TLVs (one captured via `der::Reader::tlv_bytes`, the other emitted by `Encode::to_der`),
+    // so comparing them directly against the constants can never match. Strip the outer
+    // SEQUENCE header from each with a real DER parser before comparing contents to contents;
+    // a SEQUENCE header is not a fixed-width prefix, so this cannot be a hardcoded byte
+    // offset. The parameters field (for example RSA's `NULL {}`) stays part of the compared
+    // content on both sides, since it is part of the algorithm's identity.
+    let sig_alg_content = read_sequence_content(parsed.sig_alg_der)?;
+    let spki_alg_content = read_sequence_content(spki_alg_der.as_slice())?;
+
     let provider = crate::provider::provider().ok_or(CrlError::ProviderNotInstalled)?;
     let alg = provider
         .signature_verification_algorithms
         .all
         .iter()
         .find(|a| {
-            a.signature_alg_id().as_ref() == parsed.sig_alg_der
-                && a.public_key_alg_id().as_ref() == spki_alg_der.as_slice()
+            a.signature_alg_id().as_ref() == sig_alg_content
+                && a.public_key_alg_id().as_ref() == spki_alg_content
         })
         .ok_or(CrlError::UnsupportedSignatureAlgorithm)?;
 
@@ -1135,9 +1148,125 @@ mod tests {
         der_enc::encode_sequence(&[tbs, sig_alg, sig_value])
     }
 
-    /// Build a CRL with a single serial.
-    fn build_single_crl(serial: &[u8]) -> Vec<u8> {
-        build_crl_der(&[serial], None, None, false)
+    // -----------------------------------------------------------------------
+    // Real signing fixture for `verify_signature`.
+    //
+    // `verify_signature` performs a genuine cryptographic check (that is the entire point of
+    // #726), so any test that needs a `VerifiedCrl` must obtain one from a CRL that is
+    // actually, validly signed against a real issuing certificate. `CaFixture` is a real
+    // self-signed RSA-2048 CA, generated once and shared by every test below: RSA-2048 key
+    // generation is the expensive part, not the per-call sign, so one process-wide fixture
+    // (mirroring the fuzz target's own `Fixture` in fuzz_targets/fuzz_crl_parse.rs) keeps the
+    // whole suite fast.
+    // -----------------------------------------------------------------------
+
+    /// `verify_signature` needs a process-wide crypto provider installed to find a matching
+    /// signature-verification algorithm; without one it fails closed with
+    /// `CrlError::ProviderNotInstalled` before it ever reaches the comparison this module
+    /// exists to fix. Installation is process-global and idempotent (`Ok` and
+    /// `AlreadyInstalled` both leave a provider installed), so one `Once` shared by every test
+    /// in this module is enough; mirrors `store::index::tests::ensure_provider_installed` and
+    /// `store::cred::tests::ensure_provider_installed`.
+    fn ensure_provider_installed() {
+        static INIT: std::sync::Once = std::sync::Once::new();
+        INIT.call_once(|| {
+            let _ = crate::install_process_provider(); // it-allow: no-swallowed-error reason: either this call or another test module's own ensure_provider_installed() installs the process-wide provider; either outcome (Ok or AlreadyInstalled) leaves a provider installed, which is all this helper promises.
+        });
+    }
+
+    struct CaFixture {
+        key_pair: rcgen::KeyPair,
+        issuer_der: Vec<u8>,
+        /// The fixture certificate's own subject, DER-encoded exactly the way
+        /// `verify_signature` encodes it (`x509_cert::der::Encode::to_der` on the parsed
+        /// certificate's `subject`), so a CRL built with this as its issuer field is byte-for-
+        /// byte accepted by the issuer check.
+        subject_dn: Vec<u8>,
+    }
+
+    fn ca_fixture() -> &'static CaFixture {
+        static FIXTURE: std::sync::OnceLock<CaFixture> = std::sync::OnceLock::new();
+        FIXTURE.get_or_init(|| {
+            use rcgen::{CertificateParams, KeyPair, KeyUsagePurpose};
+            ensure_provider_installed();
+            let key_pair = KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256)
+                .expect("RSA-2048 key generation for a fixed algorithm must not fail in a test");
+            let mut params = CertificateParams::new(vec!["cafixture.test".to_owned()])
+                .expect("a single ASCII SAN must always build valid CertificateParams");
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+            let cert = params
+                .self_signed(&key_pair)
+                .expect("self-signing a fixed CA template must not fail in a test");
+            let issuer_der = cert.der().to_vec();
+
+            let parsed_cert = x509_cert::Certificate::from_der(&issuer_der)
+                .expect("rcgen must emit a certificate that x509_cert can parse back");
+            let subject_dn = x509_cert::der::Encode::to_der(&parsed_cert.tbs_certificate.subject)
+                .expect("a parsed Name must re-encode to DER");
+
+            CaFixture {
+                key_pair,
+                issuer_der,
+                subject_dn,
+            }
+        })
+    }
+
+    /// Encode `tbs_items` as a `TBSCertList` SEQUENCE, sign it with `fx`'s real key, and wrap
+    /// the result as a complete `CertificateList` DER blob: a real RSA-PKCS1-SHA256 signature
+    /// over the exact bytes `verify_signature` will re-hash, in place of the placeholder
+    /// `[0u8; 256]` the unsigned `build_crl_der` above writes.
+    fn sign_tbs_into_crl(tbs_items: &[Vec<u8>], fx: &CaFixture) -> Vec<u8> {
+        let tbs = der_enc::encode_sequence(tbs_items);
+        let sig_alg = der_enc::encode_algorithm_identifier("1.2.840.113549.1.1.11");
+        let signature = rcgen::SigningKey::sign(&fx.key_pair, &tbs)
+            .expect("RSA signing must not fail for a well-formed TBS in a test fixture");
+        let sig_value = der_enc::encode_bit_string(&signature);
+        der_enc::encode_sequence(&[tbs, sig_alg, sig_value])
+    }
+
+    /// Same shape and parameters as `build_crl_der` (fine-grained control over serials and
+    /// timestamps for edge cases), but the issuer field is `ca_fixture()`'s own real subject
+    /// and the signature is real, so the result is accepted by `verify_signature`, not just
+    /// by `parse`.
+    fn build_signed_crl_der(
+        serials: &[&[u8]],
+        this_update: Option<u64>,
+        next_update: Option<u64>,
+    ) -> Vec<u8> {
+        let fx = ca_fixture();
+        let now = this_update.unwrap_or(1_704_000_000);
+        let later = next_update.unwrap_or(now + 86_400);
+
+        let mut tbs_items = vec![
+            der_enc::encode_integer(&[0x01]),
+            der_enc::encode_algorithm_identifier("1.2.840.113549.1.1.11"),
+            fx.subject_dn.clone(),
+            der_enc::encode_utctime(now),
+            der_enc::encode_utctime(later),
+        ];
+
+        if !serials.is_empty() {
+            let entries: Vec<Vec<u8>> = serials
+                .iter()
+                .map(|s| {
+                    der_enc::encode_sequence(&[
+                        der_enc::encode_integer(s),
+                        der_enc::encode_utctime(now),
+                    ])
+                })
+                .collect();
+            let entry_refs: Vec<&[u8]> = entries.iter().map(std::vec::Vec::as_slice).collect();
+            tbs_items.push(der_enc::encode_sequence(&entry_refs));
+        }
+
+        sign_tbs_into_crl(&tbs_items, fx)
+    }
+
+    /// Build a validly signed CRL with a single serial.
+    fn build_single_signed_crl(serial: &[u8]) -> Vec<u8> {
+        build_signed_crl_der(&[serial], None, None)
     }
 
     fn default_cfg() -> CrlConfig {
@@ -1162,11 +1291,12 @@ mod tests {
 
     #[test]
     fn crl_no_revoked_list() {
-        let der = build_crl_der(&[], None, None, false);
+        let der = build_signed_crl_der(&[], None, None);
         let cfg = default_cfg();
         let parsed = parse(&der, &cfg).expect("CRL with no revoked list should parse");
         assert_eq!(parsed.serials().count(), 0);
-        let verified = VerifiedCrl { parsed };
+        let verified =
+            verify_signature(parsed, &ca_fixture().issuer_der).expect("fixture CRL must verify");
         let idx = RevocationIndex::build(&verified, UnixSeconds::new(1_704_000_000), &cfg)
             .expect("build should succeed");
         assert_eq!(idx.len(), 0);
@@ -1176,11 +1306,12 @@ mod tests {
 
     #[test]
     fn crl_single_entry() {
-        let der = build_single_crl(&[0x2a]); // serial 42
+        let der = build_single_signed_crl(&[0x2a]); // serial 42
         let cfg = default_cfg();
         let parsed = parse(&der, &cfg).expect("CRL with one entry should parse");
         assert_eq!(parsed.serials().count(), 1);
-        let verified = VerifiedCrl { parsed };
+        let verified =
+            verify_signature(parsed, &ca_fixture().issuer_der).expect("fixture CRL must verify");
         let idx = RevocationIndex::build(&verified, UnixSeconds::new(1_704_000_000), &cfg)
             .expect("build should succeed");
         assert_eq!(idx.len(), 1);
@@ -1209,9 +1340,10 @@ mod tests {
         cfg.max_bytes = 1_000_000_000;
         let serials: Vec<Vec<u8>> = (0..5).map(|i| vec![i + 1]).collect();
         let serial_refs: Vec<&[u8]> = serials.iter().map(std::vec::Vec::as_slice).collect();
-        let der = build_crl_der(&serial_refs, None, None, false);
+        let der = build_signed_crl_der(&serial_refs, None, None);
         let parsed = parse(&der, &cfg).expect("should parse");
-        let verified = VerifiedCrl { parsed };
+        let verified =
+            verify_signature(parsed, &ca_fixture().issuer_der).expect("fixture CRL must verify");
         let idx = RevocationIndex::build(&verified, UnixSeconds::new(1_704_000_000), &cfg)
             .expect("5 entries with max_entries=5 should build");
         assert_eq!(idx.len(), 5);
@@ -1219,9 +1351,10 @@ mod tests {
         // One over
         let serials: Vec<Vec<u8>> = (0..6).map(|i| vec![i + 1]).collect();
         let serial_refs: Vec<&[u8]> = serials.iter().map(std::vec::Vec::as_slice).collect();
-        let der = build_crl_der(&serial_refs, None, None, false);
+        let der = build_signed_crl_der(&serial_refs, None, None);
         let parsed = parse(&der, &cfg).expect("should parse");
-        let verified = VerifiedCrl { parsed };
+        let verified =
+            verify_signature(parsed, &ca_fixture().issuer_der).expect("fixture CRL must verify");
         assert_eq!(
             RevocationIndex::build(&verified, UnixSeconds::new(1_704_000_000), &cfg),
             Err(CrlError::TooManyEntries)
@@ -1234,17 +1367,15 @@ mod tests {
         // Use non-zero content so the DER INTEGER encoding is valid
         // (all-zeros would be invalid DER due to leading zero rule).
         let serial: Vec<u8> = vec![0x01; 21];
-        let der = build_single_crl(&serial);
+        let der = build_single_signed_crl(&serial);
         let cfg = default_cfg();
         let parsed = parse(&der, &cfg).expect("should parse");
+        let verified =
+            verify_signature(parsed, &ca_fixture().issuer_der).expect("fixture CRL must verify");
         // The serial in the CRL has 21 content octets.
         // After normalization, it's still 21 bytes (no leading zero to strip).
         assert_eq!(
-            RevocationIndex::build(
-                &VerifiedCrl { parsed },
-                UnixSeconds::new(1_704_000_000),
-                &cfg,
-            ),
+            RevocationIndex::build(&verified, UnixSeconds::new(1_704_000_000), &cfg),
             Err(CrlError::SerialTooLong)
         );
 
@@ -1254,14 +1385,12 @@ mod tests {
             s.extend_from_slice(&[0xaa; 20]);
             s
         };
-        let der = build_single_crl(&serial);
+        let der = build_single_signed_crl(&serial);
         let parsed = parse(&der, &cfg).expect("should parse");
-        let idx = RevocationIndex::build(
-            &VerifiedCrl { parsed },
-            UnixSeconds::new(1_704_000_000),
-            &cfg,
-        )
-        .expect("20-byte normalized serial should build");
+        let verified =
+            verify_signature(parsed, &ca_fixture().issuer_der).expect("fixture CRL must verify");
+        let idx = RevocationIndex::build(&verified, UnixSeconds::new(1_704_000_000), &cfg)
+            .expect("20-byte normalized serial should build");
         assert_eq!(idx.len(), 1);
     }
 
@@ -1270,15 +1399,13 @@ mod tests {
         // A 17-byte serial should go into the wide set.
         // Use bytes with high bit clear so DER INTEGER encoding is valid.
         let serial = [0x0a; 17];
-        let der = build_single_crl(&serial);
+        let der = build_single_signed_crl(&serial);
         let cfg = default_cfg();
         let parsed = parse(&der, &cfg).expect("should parse");
-        let idx = RevocationIndex::build(
-            &VerifiedCrl { parsed },
-            UnixSeconds::new(1_704_000_000),
-            &cfg,
-        )
-        .expect("build should succeed");
+        let verified =
+            verify_signature(parsed, &ca_fixture().issuer_der).expect("fixture CRL must verify");
+        let idx = RevocationIndex::build(&verified, UnixSeconds::new(1_704_000_000), &cfg)
+            .expect("build should succeed");
         assert_eq!(idx.len(), 1);
         assert!(idx.is_revoked(&serial));
         assert!(!idx.is_revoked(&[0xbb; 17]));
@@ -1292,15 +1419,13 @@ mod tests {
             s.extend_from_slice(&[0xff; 16]);
             s
         };
-        let der = build_single_crl(&serial_der);
+        let der = build_single_signed_crl(&serial_der);
         let cfg = default_cfg();
         let parsed = parse(&der, &cfg).expect("should parse");
-        let idx = RevocationIndex::build(
-            &VerifiedCrl { parsed },
-            UnixSeconds::new(1_704_000_000),
-            &cfg,
-        )
-        .expect("build should succeed");
+        let verified =
+            verify_signature(parsed, &ca_fixture().issuer_der).expect("fixture CRL must verify");
+        let idx = RevocationIndex::build(&verified, UnixSeconds::new(1_704_000_000), &cfg)
+            .expect("build should succeed");
         assert_eq!(idx.len(), 1);
         // After normalization, the serial is [0xff; 16]
         assert!(idx.is_revoked(&[0xff; 16]));
@@ -1314,15 +1439,13 @@ mod tests {
 
     #[test]
     fn crl_serial_zero() {
-        let der = build_single_crl(&[0x00]);
+        let der = build_single_signed_crl(&[0x00]);
         let cfg = default_cfg();
         let parsed = parse(&der, &cfg).expect("should parse");
-        let idx = RevocationIndex::build(
-            &VerifiedCrl { parsed },
-            UnixSeconds::new(1_704_000_000),
-            &cfg,
-        )
-        .expect("build should succeed");
+        let verified =
+            verify_signature(parsed, &ca_fixture().issuer_der).expect("fixture CRL must verify");
+        let idx = RevocationIndex::build(&verified, UnixSeconds::new(1_704_000_000), &cfg)
+            .expect("build should succeed");
         assert_eq!(idx.len(), 1);
         // Serial 0 normalizes to [0x00]
         assert!(idx.is_revoked(&[0x00]));
@@ -1332,25 +1455,24 @@ mod tests {
 
     #[test]
     fn crl_duplicate_serials() {
-        let der = build_crl_der(&[&[0x01], &[0x01], &[0x02]], None, None, false);
+        let der = build_signed_crl_der(&[&[0x01], &[0x01], &[0x02]], None, None);
         let cfg = default_cfg();
         let parsed = parse(&der, &cfg).expect("should parse");
-        let idx = RevocationIndex::build(
-            &VerifiedCrl { parsed },
-            UnixSeconds::new(1_704_000_000),
-            &cfg,
-        )
-        .expect("build should succeed");
+        let verified =
+            verify_signature(parsed, &ca_fixture().issuer_der).expect("fixture CRL must verify");
+        let idx = RevocationIndex::build(&verified, UnixSeconds::new(1_704_000_000), &cfg)
+            .expect("build should succeed");
         assert_eq!(idx.len(), 2); // deduplicated
     }
 
     #[test]
     fn crl_this_update_future() {
         let future = 1_900_000_000u64; // year 2030+
-        let der = build_crl_der(&[&[0x01]], Some(future), Some(future + 86_400), false);
+        let der = build_signed_crl_der(&[&[0x01]], Some(future), Some(future + 86_400));
         let cfg = default_cfg();
         let parsed = parse(&der, &cfg).expect("should parse");
-        let verified = VerifiedCrl { parsed };
+        let verified =
+            verify_signature(parsed, &ca_fixture().issuer_der).expect("fixture CRL must verify");
         // "now" is 1_704_000_000, thisUpdate is 1_900_000_000, skew 300
         // 1_900_000_000 > 1_704_000_000 + 300 = 1_704_000_300
         assert_eq!(
@@ -1362,10 +1484,11 @@ mod tests {
     #[test]
     fn crl_next_update_past() {
         let past = 1_700_000_000u64;
-        let der = build_crl_der(&[&[0x01]], Some(past - 86_400), Some(past), false);
+        let der = build_signed_crl_der(&[&[0x01]], Some(past - 86_400), Some(past));
         let cfg = default_cfg();
         let parsed = parse(&der, &cfg).expect("should parse");
-        let verified = VerifiedCrl { parsed };
+        let verified =
+            verify_signature(parsed, &ca_fixture().issuer_der).expect("fixture CRL must verify");
         // "now" is 1_704_000_000, nextUpdate is 1_700_000_000, skew 300
         // 1_704_000_000 > 1_700_000_000 + 300 = 1_700_000_300
         assert_eq!(
@@ -1377,11 +1500,14 @@ mod tests {
     #[test]
     fn crl_no_next_update() {
         let now = 1_704_000_000u64;
-        // CRL with no nextUpdate, thisUpdate is now
-        let items: Vec<Vec<u8>> = vec![
+        let fx = ca_fixture();
+        // CRL with no nextUpdate, thisUpdate is now. Built by hand (not via
+        // build_signed_crl_der, which always writes nextUpdate) and signed with the fixture's
+        // real key so it still verifies.
+        let tbs_items: Vec<Vec<u8>> = vec![
             der_enc::encode_integer(&[0x01]), // version v2
             der_enc::encode_algorithm_identifier("1.2.840.113549.1.1.11"),
-            der_enc::encode_name("2.5.4.3", "Test CA"),
+            fx.subject_dn.clone(),
             der_enc::encode_utctime(now), // thisUpdate
             // no nextUpdate
             der_enc::encode_sequence(&[der_enc::encode_sequence(&[
@@ -1389,17 +1515,12 @@ mod tests {
                 der_enc::encode_utctime(now),
             ])]),
         ];
-        let tbs = der_enc::encode_sequence(&items);
-        let der = der_enc::encode_sequence(&[
-            tbs,
-            der_enc::encode_algorithm_identifier("1.2.840.113549.1.1.11"),
-            der_enc::encode_bit_string(&[0u8; 256]),
-        ]);
+        let der = sign_tbs_into_crl(&tbs_items, fx);
 
         let cfg = default_cfg();
         let parsed = parse(&der, &cfg).expect("should parse");
         assert!(parsed.next_update().is_none());
-        let verified = VerifiedCrl { parsed };
+        let verified = verify_signature(parsed, &fx.issuer_der).expect("fixture CRL must verify");
         let idx = RevocationIndex::build(&verified, UnixSeconds::new(now), &cfg)
             .expect("build should succeed");
         // Fresh for no_next_update_ttl_secs (86_400)
@@ -1421,10 +1542,12 @@ mod tests {
     #[test]
     fn crl_staleness_transitions() {
         let now = 1_704_000_000u64;
-        let der = build_crl_der(&[&[0x01]], Some(now - 86_400), Some(now + 86_400), false);
+        let der = build_signed_crl_der(&[&[0x01]], Some(now - 86_400), Some(now + 86_400));
         let cfg = default_cfg();
         let parsed = parse(&der, &cfg).expect("should parse");
-        let idx = RevocationIndex::build(&VerifiedCrl { parsed }, UnixSeconds::new(now), &cfg)
+        let verified =
+            verify_signature(parsed, &ca_fixture().issuer_der).expect("fixture CRL must verify");
+        let idx = RevocationIndex::build(&verified, UnixSeconds::new(now), &cfg)
             .expect("build should succeed");
 
         // Fresh: inside nextUpdate
@@ -1513,6 +1636,118 @@ mod tests {
         assert_eq!(
             verify_signature(parsed, &cert_der),
             Err(CrlError::IssuerMismatch)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // #726 acceptance: verify_signature must accept a genuinely valid signature and reject
+    // an invalid one. Every other test in this module reaches RevocationIndex::build through
+    // a real verify_signature call now, but these three are the ones #726 calls out by name:
+    // before the fix, verify_signature rejected every input including a real signature, so
+    // "always Err" would have passed every test in this file that only ever checked an error
+    // variant, and only a test that requires Ok can catch that.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn crl_verify_signature_accepts_a_genuinely_signed_crl() {
+        // Mirrors fuzz_targets/fuzz_crl_parse.rs's own construction: a real RSA-2048 CA key
+        // pair and a CRL built and signed through rcgen's CertificateRevocationListParams::
+        // signed_by, the same mechanism the fuzz target already uses to reach this code path,
+        // rather than a second hand-rolled signer. This is the test #726 says the fix is
+        // unverifiable without: this module's other pre-existing tests all reached
+        // RevocationIndex::build by constructing VerifiedCrl directly, so none of them would
+        // ever have caught a comparison that can never match.
+        use rcgen::{
+            CertificateParams, CertificateRevocationListParams, Issuer, KeyIdMethod, KeyPair,
+            KeyUsagePurpose, RevokedCertParams, SerialNumber,
+        };
+        ensure_provider_installed();
+
+        let key_pair = KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256).unwrap();
+        let mut ca_params = CertificateParams::new(vec!["cafixture.test".to_owned()]).unwrap();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let cert = ca_params.self_signed(&key_pair).unwrap();
+        let issuer_der = cert.der().to_vec();
+
+        let issuer = Issuer::from_params(&ca_params, &key_pair);
+        let crl_params = CertificateRevocationListParams {
+            this_update: rcgen::date_time_ymd(2024, 1, 1),
+            next_update: rcgen::date_time_ymd(2030, 1, 1),
+            crl_number: SerialNumber::from(1u64),
+            issuing_distribution_point: None,
+            revoked_certs: vec![RevokedCertParams {
+                serial_number: SerialNumber::from_slice(&[0x2a]),
+                revocation_time: rcgen::date_time_ymd(2024, 6, 1),
+                reason_code: None,
+                invalidity_date: None,
+            }],
+            key_identifier_method: KeyIdMethod::Sha256,
+        };
+        let der = crl_params.signed_by(&issuer).unwrap().der().to_vec();
+
+        let cfg = default_cfg();
+        let parsed = parse(&der, &cfg).expect("a genuinely valid CRL must parse");
+        let verified = verify_signature(parsed, &issuer_der)
+            .expect("a CRL signed by its own stated issuer must verify");
+
+        // 2025-01-01, inside the fixture's 2024..2030 validity window.
+        let now = UnixSeconds::new(1_735_689_600);
+        let idx = RevocationIndex::build(&verified, now, &cfg).expect("build should succeed");
+        assert!(idx.is_revoked(&[0x2a]));
+        assert!(!idx.is_revoked(&[0x2b]));
+    }
+
+    #[test]
+    fn crl_verify_signature_rejects_a_different_key() {
+        // The correctly signed fixture CRL, verified against a DIFFERENT CA that happens to
+        // share the same subject DN (rcgen's own default: CertificateParams::new only sets
+        // subject_alt_names, never distinguished_name, so every CA built this way gets the
+        // same "CN=rcgen self signed cert" subject regardless of key). The issuer-name check
+        // in verify_signature therefore passes, so this exercises the signature check itself,
+        // not IssuerMismatch: it is what stops the fix from degenerating into "make
+        // verify_signature always return Ok", which would otherwise pass every other test in
+        // this module.
+        use rcgen::{CertificateParams, KeyPair, KeyUsagePurpose};
+
+        let der = build_single_signed_crl(&[0x2a]);
+        let cfg = default_cfg();
+        let parsed = parse(&der, &cfg).expect("should parse");
+
+        let other_key = KeyPair::generate_for(&rcgen::PKCS_RSA_SHA256).unwrap();
+        let mut other_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        other_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        other_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+        let other_cert = other_params.self_signed(&other_key).unwrap();
+
+        assert_eq!(
+            verify_signature(parsed, other_cert.der()),
+            Err(CrlError::BadSignature)
+        );
+    }
+
+    #[test]
+    fn crl_verify_signature_rejects_a_flipped_signature_bit() {
+        // Same fixture as the rest of this module. One bit of the (real, valid) signature is
+        // flipped after signing, located via parse's own borrow into the buffer (parsed.
+        // signature is a subslice of the bytes we hand it) rather than a hardcoded byte
+        // offset, so this does not depend on knowing the encoder's exact layout.
+        let der = build_single_signed_crl(&[0x2a]);
+        let cfg = default_cfg();
+        let offset = {
+            let parsed = parse(&der, &cfg).expect("should parse");
+            parsed.signature.as_ptr() as usize - der.as_ptr() as usize
+        };
+        let mut mutated = der.clone();
+        if let Some(byte) = mutated.get_mut(offset) {
+            *byte ^= 0x01;
+        }
+
+        let parsed = parse(&mutated, &cfg)
+            .expect("flipping one bit inside the signature content must not change the DER shape");
+        assert_eq!(
+            verify_signature(parsed, &ca_fixture().issuer_der),
+            Err(CrlError::BadSignature)
         );
     }
 
@@ -1609,35 +1844,24 @@ mod tests {
         assert_send_sync::<CrlSet>();
 
         // Build two indices for the same issuer with different thisUpdate times
-        let der_early = build_crl_der(&[&[0x01]], Some(1_704_000_000), Some(1_704_086_400), false);
-        let der_late = build_crl_der(&[&[0x02]], Some(1_704_000_100), Some(1_704_086_500), false);
+        let der_early = build_signed_crl_der(&[&[0x01]], Some(1_704_000_000), Some(1_704_086_400));
+        let der_late = build_signed_crl_der(&[&[0x02]], Some(1_704_000_100), Some(1_704_086_500));
         let cfg = default_cfg();
 
         let parsed_early = parse(&der_early, &cfg).unwrap();
         let parsed_late = parse(&der_late, &cfg).unwrap();
 
-        let idx_early = RevocationIndex::build(
-            &VerifiedCrl {
-                parsed: parsed_early,
-            },
-            UnixSeconds::new(1_704_000_000),
-            &cfg,
-        )
-        .unwrap();
-        let idx_late = RevocationIndex::build(
-            &VerifiedCrl {
-                parsed: parsed_late,
-            },
-            UnixSeconds::new(1_704_000_000),
-            &cfg,
-        )
-        .unwrap();
+        let verified_early = verify_signature(parsed_early, &ca_fixture().issuer_der).unwrap();
+        let verified_late = verify_signature(parsed_late, &ca_fixture().issuer_der).unwrap();
+
+        let idx_early =
+            RevocationIndex::build(&verified_early, UnixSeconds::new(1_704_000_000), &cfg).unwrap();
+        let idx_late =
+            RevocationIndex::build(&verified_late, UnixSeconds::new(1_704_000_000), &cfg).unwrap();
 
         let set = CrlSet::from_indices(vec![Arc::new(idx_early), Arc::new(idx_late)], 1);
         assert_eq!(set.len(), 1);
-        let found = set
-            .for_issuer(&der_enc::encode_name("2.5.4.3", "Test CA"))
-            .unwrap();
+        let found = set.for_issuer(&ca_fixture().subject_dn).unwrap();
         // Should keep the one with later thisUpdate (serial 2)
         assert!(found.is_revoked(&[0x02]));
         assert!(!found.is_revoked(&[0x01]));
@@ -1655,14 +1879,12 @@ mod tests {
             })
             .collect();
         let serial_refs: Vec<&[u8]> = serials.iter().map(std::vec::Vec::as_slice).collect();
-        let der = build_crl_der(&serial_refs, None, None, false);
+        let der = build_signed_crl_der(&serial_refs, None, None);
         let parsed = parse(&der, &cfg).expect("should parse 1M CRL");
-        let idx = RevocationIndex::build(
-            &VerifiedCrl { parsed },
-            UnixSeconds::new(1_704_000_000),
-            &cfg,
-        )
-        .expect("build should succeed");
+        let verified =
+            verify_signature(parsed, &ca_fixture().issuer_der).expect("fixture CRL must verify");
+        let idx = RevocationIndex::build(&verified, UnixSeconds::new(1_704_000_000), &cfg)
+            .expect("build should succeed");
         let bytes = idx.memory_bytes();
         assert!(bytes < 20 * 1024 * 1024, "memory_bytes {bytes} >= 20 MB");
     }
@@ -1680,14 +1902,12 @@ mod tests {
             })
             .collect();
         let serial_refs: Vec<&[u8]> = serials.iter().map(std::vec::Vec::as_slice).collect();
-        let der = build_crl_der(&serial_refs, None, None, false);
+        let der = build_signed_crl_der(&serial_refs, None, None);
         let parsed = parse(&der, &cfg).expect("should parse 1M CRL");
-        let idx = RevocationIndex::build(
-            &VerifiedCrl { parsed },
-            UnixSeconds::new(1_704_000_000),
-            &cfg,
-        )
-        .expect("build should succeed");
+        let verified =
+            verify_signature(parsed, &ca_fixture().issuer_der).expect("fixture CRL must verify");
+        let idx = RevocationIndex::build(&verified, UnixSeconds::new(1_704_000_000), &cfg)
+            .expect("build should succeed");
         let bytes = idx.memory_bytes();
         assert!(bytes < 200 * 1024 * 1024, "memory_bytes {bytes} >= 200 MB");
     }
@@ -1712,13 +1932,15 @@ mod tests {
             if serial_refs.len() > 8_000_000 {
                 return Ok(());
             }
-            let der = build_crl_der(&serial_refs, None, None, false);
+            let der = build_signed_crl_der(&serial_refs, None, None);
             let cfg = default_cfg();
             let Ok(parsed) = parse(&der, &cfg) else {
                 return Ok(());
             };
+            let verified = verify_signature(parsed, &ca_fixture().issuer_der)
+                .expect("a CRL signed by ca_fixture's own key must always verify");
             let Ok(idx) = RevocationIndex::build(
-                &VerifiedCrl { parsed },
+                &verified,
                 UnixSeconds::new(1_704_000_000),
                 &cfg,
             ) else {
@@ -1755,13 +1977,15 @@ mod tests {
         ) {
             // Build with the base serial, then look up with leading zeros added.
             // They should match.
-            let der = build_single_crl(&base);
+            let der = build_single_signed_crl(&base);
             let cfg = default_cfg();
             let Ok(parsed) = parse(&der, &cfg) else {
                 return Ok(());
             };
+            let verified = verify_signature(parsed, &ca_fixture().issuer_der)
+                .expect("a CRL signed by ca_fixture's own key must always verify");
             let Ok(idx) = RevocationIndex::build(
-                &VerifiedCrl { parsed },
+                &verified,
                 UnixSeconds::new(1_704_000_000),
                 &cfg,
             ) else {
