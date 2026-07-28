@@ -1838,20 +1838,48 @@ mod tests {
     }
 
     #[test]
-    fn crl_outer_sequence_tag_is_checked() {
-        // #729 SURVIVED M1: read_sequence_content dropping its SEQUENCE tag assertion. DER's
-        // length encoding does not depend on the tag, so a reader that skipped this assertion
-        // would happily treat any constructed universal tag's content as if it were a
-        // SEQUENCE's; this assertion is the structural half of the #726 fix, not the
-        // length-based slicing that follows it. Flip only the outer tag byte, SEQUENCE (0x30)
-        // to SET (0x31), leaving the length and every nested byte untouched: without the tag
-        // check this would parse identically to the unmutated CRL.
+    fn crl_outer_certificate_list_tag_is_checked() {
+        // The outer CertificateList wrapper's SEQUENCE tag assertion, in
+        // read_sequence_content_from_reader. DER's length encoding does not depend on the tag,
+        // so a reader that skipped this assertion would happily treat any constructed universal
+        // tag's content as if it were a SEQUENCE's. Flip only the outer tag byte, SEQUENCE
+        // (0x30) to SET (0x31), leaving the length and every nested byte untouched: without the
+        // tag check this would parse identically to the unmutated CRL.
         let der = build_single_signed_crl(&[0x2a]);
         let mut mutated = der.clone();
         if let Some(byte) = mutated.get_mut(0) {
             assert_eq!(
                 *byte, 0x30,
                 "test fixture's outer tag is not SEQUENCE as expected"
+            );
+            *byte = 0x31;
+        }
+        assert_eq!(parse(&mutated, &default_cfg()), Err(CrlError::Parse));
+    }
+
+    #[test]
+    fn crl_tbs_cert_list_tag_is_checked() {
+        // #729 SURVIVED M1: read_sequence_content dropping its SEQUENCE tag assertion.
+        // read_sequence_content (not the outer-only read_sequence_content_from_reader above) is
+        // the function used at every OTHER structural boundary in this module: TBSCertList's
+        // own content in parse_tbs_cert_list, each revoked entry's content, revokedCertificates'
+        // content, crlExtensions' content, and both AlgorithmIdentifier comparisons inside
+        // verify_signature. This is the structural half of the #726 fix, not the length-based
+        // slicing that follows it. Flip TBSCertList's own tag byte, located via tbs_span()
+        // rather than a hardcoded offset, SEQUENCE (0x30) to SET (0x31), leaving the length and
+        // every nested byte untouched: without the tag check parse_tbs_cert_list would read the
+        // identical content and this would parse exactly like the unmutated CRL.
+        let der = build_single_signed_crl(&[0x2a]);
+        let tbs_start = {
+            let parsed = parse(&der, &default_cfg()).expect("should parse");
+            let tbs = parsed.tbs_span();
+            tbs.as_ptr() as usize - der.as_ptr() as usize
+        };
+        let mut mutated = der.clone();
+        if let Some(byte) = mutated.get_mut(tbs_start) {
+            assert_eq!(
+                *byte, 0x30,
+                "test fixture's TBSCertList tag is not SEQUENCE as expected"
             );
             *byte = 0x31;
         }
