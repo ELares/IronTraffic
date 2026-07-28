@@ -6,6 +6,24 @@
 //! enforcement once its budget file exists. The flatness assertion (max/min ratio under 1.35
 //! across n) is the important property and is enforced by the unit test
 //! `store::index::tests::resolve_flat_across_n`.
+//!
+//! **`resolver/resolve_parts`, `resolver/challenge_branch`, and `resolver/alpn_verdict_100`,
+//! named in `cert-resolver-and-acme-challenge-map` (#117)'s Benchmarks section, are not present
+//! in this file.** `IronResolver::resolve_parts` and `alpn_verdict` are `pub(crate)` (the same
+//! issue's own Design section requires this: "Do NOT make ... `IronResolver::resolve_parts`
+//! `pub`", and `alpn_verdict`'s own signature is `pub(crate) fn alpn_verdict(...) -> AlpnVerdict`
+//! where `AlpnVerdict` itself is a `pub(crate)` enum). A `[[bench]]` target, like every file under
+//! `tests/`, compiles as a separate crate linked against `irontraffic_tls` only through its public
+//! API, so `resolve_parts` and `alpn_verdict` are structurally unreachable from here regardless of
+//! how this file is written; even granting `resolve_parts` itself `pub` would not fix it, because
+//! one of its parameters (`AlpnVerdict`) is a `pub(crate)` type an external crate cannot construct
+//! a value of at all. This is the identical contradiction documented at length in
+//! `tests/handshake_resolver.rs`'s module doc for `handshake_no_allocations_in_resolver`, which
+//! faces the same "10,000 `resolve_parts` calls from a file that cannot see `resolve_parts`"
+//! problem; see that comment for the full reasoning, and this crate's #117 implementation report
+//! for the finding. No substitute benchmark is added in their place: a benchmark that measures
+//! something else while claiming to measure `resolve_parts` would be exactly the kind of
+//! decorative, meaning-nothing verification this project's own review process exists to catch.
 
 #![allow(
     missing_docs,
