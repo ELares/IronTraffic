@@ -101,6 +101,15 @@ pub struct CertIndex {
     default_cred: Option<Arc<Credentials>>,
     generation: u64,
     stats: CertStats,
+    /// Test-only instrumentation (issue #719's `SHOULD_FIX`): counts how many times `resolve`
+    /// probes the `wild` map. #115's thesis is "exactly two hash probes ... exactly one
+    /// wildcard probe", and its Do NOT list says "Do NOT walk every suffix of the SNI." Nothing
+    /// else in this suite discriminates that claim from an Envoy style O(k) suffix walk that
+    /// still returns the correct credential: such a walk passes every functional assertion here
+    /// and only probes `wild` a different number of times. See
+    /// `resolve_wildcard_branch_probes_wild_map_exactly_once` below, which reads this counter.
+    #[cfg(test)]
+    wild_probe_count: AtomicU64,
 }
 
 /// Counters for the certificate path. Monotone, relaxed, may lose an increment; never a balance.
@@ -542,6 +551,8 @@ impl CertIndexBuilder {
             default_cred,
             generation,
             stats: CertStats::default(),
+            #[cfg(test)]
+            wild_probe_count: AtomicU64::new(0),
         })
     }
 
@@ -607,6 +618,10 @@ impl CertIndex {
             return self.default_path();
         };
         let wkey = self.hasher.hash(parent);
+        // Test-only probe counter (issue #719's SHOULD_FIX); see the field doc on
+        // `wild_probe_count`. This is the ONE place `resolve` probes `wild`.
+        #[cfg(test)]
+        self.wild_probe_count.fetch_add(1, Ordering::Relaxed);
         if let Some(&i) = self.wild.get(&wkey)
             && self.name_at(i) == parent.as_bytes()
         {
@@ -730,6 +745,14 @@ impl CertIndex {
     #[must_use]
     pub fn stats(&self) -> &CertStats {
         &self.stats
+    }
+
+    /// Test-only: number of times `resolve` has probed the `wild` map on `self`. See the
+    /// `wild_probe_count` field doc for why this exists.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn wild_probe_count_for_test(&self) -> u64 {
+        self.wild_probe_count.load(Ordering::Relaxed)
     }
 
     /// The stored name bytes for a group. `i` came out of one of the two maps, so it is in range
@@ -1101,6 +1124,37 @@ mod tests {
             upper.map(|c| c.fingerprint())
         );
         assert_eq!(lower.map(|c| c.fingerprint()), Some(cred.fingerprint()));
+    }
+
+    #[test]
+    fn resolve_wildcard_branch_probes_wild_map_exactly_once() {
+        // #115's thesis is "exactly two hash probes ... exactly one wildcard probe", and its Do
+        // NOT list is explicit: "Do NOT walk every suffix of the SNI." Issue #719 found that
+        // nothing in this suite discriminates that claim from an Envoy style O(k) suffix walk:
+        // a walk that probes `wild` once per label, and only accepts a hit at the immediate
+        // parent, returns the exact same credential for every case above and leaves the whole
+        // suite green. This test counts `wild` probes directly instead of inferring them from
+        // the answer, over a deep name (8 labels) so a per-label walk would need several probes
+        // where the two-probe design needs exactly one.
+        let cred = cred_ecdsa_p256(&["*.b.c.d.e.f.g.h"]);
+        let index = build_index(&[("*.b.c.d.e.f.g.h", true, Arc::clone(&cred))]);
+
+        assert_eq!(index.wild_probe_count_for_test(), 0);
+        let got = index.resolve("a.b.c.d.e.f.g.h", ClientCaps::all());
+        assert_eq!(got.map(|c| c.fingerprint()), Some(cred.fingerprint()));
+        assert_eq!(
+            index.wild_probe_count_for_test(),
+            1,
+            "resolve must perform exactly one wild-map probe per call, independent of how many \
+             labels the SNI carries; a suffix walk would probe once per label instead"
+        );
+
+        let _ = index.resolve("a.b.c.d.e.f.g.h", ClientCaps::all());
+        assert_eq!(
+            index.wild_probe_count_for_test(),
+            2,
+            "a second resolve call must add exactly one more probe, not accumulate walk cost"
+        );
     }
 
     #[test]
