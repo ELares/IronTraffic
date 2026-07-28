@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "irontraffic-policy"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Compiles the ITPL token definition into a DFA at build time. Lexing is the one part
+# of the front end where a generator is clearly better than hand-written code, and
+# `logos` has no transitive dependencies of its own beyond its proc-macro.
+logos = "0.15"
+
+[dev-dependencies]
+criterion = { workspace = true }
+proptest = { workspace = true }
+
+[[bench]]
+name = "policy"
+harness = false
