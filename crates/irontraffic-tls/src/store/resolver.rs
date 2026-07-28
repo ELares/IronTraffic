@@ -364,6 +364,16 @@ mod tests {
         blake3::hash(cred.leaf_der())
     }
 
+    /// `alpn_verdict` over a real single-entry `["acme-tls/1"]` list. Used by every test that
+    /// exercises the challenge branch, so that branch is reached the same way `IronResolver::resolve`
+    /// reaches it (by classifying a real ALPN list) rather than by a test handing `resolve_parts`
+    /// a pre-decided `AlpnVerdict::Challenge` value, which would leave `alpn_verdict`'s own
+    /// single-entry ACME detection unexercised by these tests.
+    fn acme_only_verdict() -> AlpnVerdict {
+        let entries: [&[u8]; 1] = [b"acme-tls/1"];
+        alpn_verdict(Some(entries.iter().copied()))
+    }
+
     #[test]
     fn alpn_absent_uses_normal_branch() {
         let verdict = alpn_verdict(None::<std::iter::Empty<&[u8]>>);
@@ -392,11 +402,14 @@ mod tests {
         let certs = CertIndexBuilder::new([1u8; 16]).build().expect("build");
         let resolver = test_resolver(certs, challenge, false, UnixSeconds::new(1_000));
 
-        let got = resolver.resolve_parts(
-            AlpnVerdict::Challenge,
-            Some("a.example.com"),
-            ClientCaps::all(),
-        );
+        // Goes through alpn_verdict on a real single-entry `["acme-tls/1"]` list, not a
+        // hand-fed AlpnVerdict::Challenge: a resolve_parts call fed the verdict directly cannot
+        // catch a mutant that breaks alpn_verdict's own single-entry ACME detection, which is
+        // exactly what a plain `resolve_parts(AlpnVerdict::Challenge, ...)` call here missed on a
+        // first pass of this test.
+        let verdict = acme_only_verdict();
+        assert_eq!(verdict, AlpnVerdict::Challenge);
+        let got = resolver.resolve_parts(verdict, Some("a.example.com"), ClientCaps::all());
         let key = got.expect("live challenge must be served");
         assert_eq!(leaf_hash(&key), blake3::hash(&cert_der));
         assert_eq!(resolver.stats().challenge_hits.load(Ordering::Relaxed), 1);
@@ -416,11 +429,9 @@ mod tests {
         let challenge = ChallengeCerts::empty([9u8; 16]);
         let resolver = test_resolver(certs, challenge, false, UnixSeconds::new(1_000));
 
-        let got = resolver.resolve_parts(
-            AlpnVerdict::Challenge,
-            Some("a.example.com"),
-            ClientCaps::all(),
-        );
+        let verdict = acme_only_verdict();
+        assert_eq!(verdict, AlpnVerdict::Challenge);
+        let got = resolver.resolve_parts(verdict, Some("a.example.com"), ClientCaps::all());
         assert!(got.is_none());
         assert_eq!(resolver.stats().challenge_misses.load(Ordering::Relaxed), 1);
         assert_eq!(resolver.stats().challenge_hits.load(Ordering::Relaxed), 0);
@@ -442,11 +453,9 @@ mod tests {
         // now == expires: the boundary itself must already be treated as expired ("<=", not "<").
         let resolver = test_resolver(certs, challenge, false, UnixSeconds::new(1_000));
 
-        let got = resolver.resolve_parts(
-            AlpnVerdict::Challenge,
-            Some("a.example.com"),
-            ClientCaps::all(),
-        );
+        let verdict = acme_only_verdict();
+        assert_eq!(verdict, AlpnVerdict::Challenge);
+        let got = resolver.resolve_parts(verdict, Some("a.example.com"), ClientCaps::all());
         assert!(got.is_none());
         assert_eq!(resolver.stats().challenge_misses.load(Ordering::Relaxed), 1);
     }
