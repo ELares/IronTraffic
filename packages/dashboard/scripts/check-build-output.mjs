@@ -129,6 +129,45 @@ function readIndexHtml() {
   return readFileSync(indexPath, "utf8");
 }
 
+// Not one of the numbered tests, but the enumerate-and-reject counterpart to all of
+// them: every other assertion here checks a PROPERTY of files it already expects to
+// find, so a file it never goes looking for (an extra entry sitting at the root of
+// embedded/, or a stray directory beside assets/) would otherwise pass silently. This
+// walks the top level of embedded/ and fails on anything other than the exact
+// index.html (plus its .br/.gz siblings) and the assets/ directory. Everything under
+// assets/ is still checked by testAssetsAreContentHashed's pattern match, which
+// applies to every file there regardless of extension, so a stray non-hashed file
+// nested under assets/ is already rejected without a second walk here.
+function testNoUnexpectedFiles() {
+  const allowedRootFiles = new Set([
+    "index.html",
+    "index.html.br",
+    "index.html.gz",
+  ]);
+  const allowedRootDirs = new Set(["assets"]);
+  for (const entry of readdirSync(EMBEDDED_DIR, { withFileTypes: true })) {
+    if (entry.isDirectory()) {
+      if (!allowedRootDirs.has(entry.name)) {
+        fail(
+          "no_unexpected_files",
+          `unexpected directory at embedded/${entry.name}/`,
+        );
+      }
+      continue;
+    }
+    if (!entry.isFile()) {
+      fail(
+        "no_unexpected_files",
+        `unexpected non-regular entry at embedded/${entry.name}`,
+      );
+      continue;
+    }
+    if (!allowedRootFiles.has(entry.name)) {
+      fail("no_unexpected_files", `unexpected file at embedded/${entry.name}`);
+    }
+  }
+}
+
 // 4. no_inline_script_or_style
 function testNoInlineScriptOrStyle(html) {
   if (/<script(?![^>]*\bsrc=)/.test(html)) {
@@ -154,14 +193,46 @@ function testAssetsAreContentHashed() {
   const names = walk(assetsDir).map((f) => path.basename(f));
   const pattern =
     /^[A-Za-z0-9_.-]+-[A-Za-z0-9_-]{8,}\.(js|css|svg|woff2)(\.br|\.gz)?$/;
-  if (names.length === 0) {
-    fail("assets_are_content_hashed", "embedded/assets/ is empty");
+  // A .br/.gz sibling counts as a hashed name under the pattern above, so checking
+  // `names.length === 0` alone would pass on an assets/ directory that holds only
+  // compressed siblings with their uncompressed source deleted. Require at least one
+  // PRIMARY (uncompressed) asset; testNoOrphanedCompressedSiblings separately catches
+  // a compressed file whose source went missing while other primaries remain.
+  const primaryNames = names.filter(
+    (n) => !n.endsWith(".br") && !n.endsWith(".gz"),
+  );
+  if (primaryNames.length === 0) {
+    fail(
+      "assets_are_content_hashed",
+      "embedded/assets/ has no primary (uncompressed) hashed asset",
+    );
   }
   for (const name of names) {
     if (!pattern.test(name)) {
       fail(
         "assets_are_content_hashed",
         `embedded/assets/${name} does not match ${pattern}`,
+      );
+    }
+  }
+}
+
+// The counterpart to writePrecompressedSiblings: every .br or .gz file anywhere under
+// embedded/ must have a live uncompressed sibling. Without this, deleting an
+// uncompressed asset while leaving its compressed siblings behind is invisible to
+// every other check here, because each of them locates its inputs by walking for a
+// specific extension and iterates zero times, which looks identical to "nothing was
+// ever wrong" rather than "the thing this depends on is gone."
+function testNoOrphanedCompressedSiblings() {
+  for (const file of walk(EMBEDDED_DIR)) {
+    if (!file.endsWith(".br") && !file.endsWith(".gz")) {
+      continue;
+    }
+    const source = file.slice(0, -3);
+    if (!existsSync(source)) {
+      fail(
+        "no_orphaned_compressed_siblings",
+        `${path.relative(EMBEDDED_DIR, file)} has no matching uncompressed file at ${path.relative(EMBEDDED_DIR, source)}`,
       );
     }
   }
@@ -192,6 +263,21 @@ function testNoEvalInOutput() {
   }
 }
 
+// Shared by the writer and the checker so the two can never drift apart, and so the
+// checker can recompute the expected bytes from scratch rather than trust what is on
+// disk (see testPrecompressedSiblingsExistAndDecompress below).
+function compressBrotli(input) {
+  return brotliCompressSync(input, {
+    params: {
+      [zlibConstants.BROTLI_PARAM_QUALITY]: zlibConstants.BROTLI_MAX_QUALITY,
+      [zlibConstants.BROTLI_PARAM_SIZE_HINT]: input.length,
+    },
+  });
+}
+function compressGzip(input) {
+  return gzipSync(input, { level: 9 });
+}
+
 // Precompression: brotli quality 11 (size hint set) and gzip level 9, sibling written
 // only when smaller than the input. Runs over every emitted .js, .css, .svg and .html
 // file, which is a superset of what test 7b checks (.js and .css under assets/).
@@ -201,16 +287,11 @@ function writePrecompressedSiblings() {
   );
   for (const file of targets) {
     const input = readFileSync(file);
-    const br = brotliCompressSync(input, {
-      params: {
-        [zlibConstants.BROTLI_PARAM_QUALITY]: zlibConstants.BROTLI_MAX_QUALITY,
-        [zlibConstants.BROTLI_PARAM_SIZE_HINT]: input.length,
-      },
-    });
+    const br = compressBrotli(input);
     if (br.length < input.length) {
       writeFileSync(`${file}.br`, br);
     }
-    const gz = gzipSync(input, { level: 9 });
+    const gz = compressGzip(input);
     if (gz.length < input.length) {
       writeFileSync(`${file}.gz`, gz);
     }
@@ -253,18 +334,57 @@ function testPrecompressedSiblingsExistAndDecompress() {
         `${path.relative(EMBEDDED_DIR, gzPath)} (${gzBytes.length} bytes) is not smaller than its input (${input.length} bytes)`,
       );
     }
-    const brDecoded = brotliDecompressSync(brBytes);
+    // Decompression alone is not a sufficient integrity check: Node's brotli decoder
+    // silently ignores trailing bytes appended after a complete, valid stream and
+    // still returns the correct content (verified directly; corrupting a .br file by
+    // appending garbage decompresses cleanly with no error and no mismatch). Wrap the
+    // decode in try/catch, since a genuinely malformed stream (mid-stream corruption,
+    // which both codecs do detect) throws rather than returning wrong bytes, and
+    // additionally recompute the expected compressed bytes from the live input with
+    // the exact same parameters the writer used and require an exact match. That
+    // catches trailing-byte corruption, truncation and any other tamper that
+    // decompress-and-compare alone would miss, the same way a hash comparison would if
+    // this format carried one.
+    let brDecoded;
+    try {
+      brDecoded = brotliDecompressSync(brBytes);
+    } catch (err) {
+      fail(
+        "precompressed_siblings_exist_and_decompress",
+        `${path.relative(EMBEDDED_DIR, brPath)} failed to decompress: ${err.message}`,
+      );
+    }
     if (!brDecoded.equals(input)) {
       fail(
         "precompressed_siblings_exist_and_decompress",
         `${path.relative(EMBEDDED_DIR, brPath)} does not decompress to its input byte for byte`,
       );
     }
-    const gzDecoded = gunzipSync(gzBytes);
+    if (!compressBrotli(input).equals(brBytes)) {
+      fail(
+        "precompressed_siblings_exist_and_decompress",
+        `${path.relative(EMBEDDED_DIR, brPath)} does not match a fresh brotli compression of its input; the stored file is stale or corrupted`,
+      );
+    }
+    let gzDecoded;
+    try {
+      gzDecoded = gunzipSync(gzBytes);
+    } catch (err) {
+      fail(
+        "precompressed_siblings_exist_and_decompress",
+        `${path.relative(EMBEDDED_DIR, gzPath)} failed to decompress: ${err.message}`,
+      );
+    }
     if (!gzDecoded.equals(input)) {
       fail(
         "precompressed_siblings_exist_and_decompress",
         `${path.relative(EMBEDDED_DIR, gzPath)} does not decompress to its input byte for byte`,
+      );
+    }
+    if (!compressGzip(input).equals(gzBytes)) {
+      fail(
+        "precompressed_siblings_exist_and_decompress",
+        `${path.relative(EMBEDDED_DIR, gzPath)} does not match a fresh gzip compression of its input; the stored file is stale or corrupted`,
       );
     }
   }
@@ -432,6 +552,8 @@ async function testBuildIdIsValidated() {
 
 async function postBuild() {
   const html = readIndexHtml();
+  testNoUnexpectedFiles();
+  testNoOrphanedCompressedSiblings();
   testNoInlineScriptOrStyle(html);
   testAssetsAreContentHashed();
   testNoSourcemapsEmitted();
