@@ -78,3 +78,10 @@ bench = false
 name = "fuzz_path"
 path = "fuzz_targets/fuzz_path.rs"
 test = false
+
+[[bin]]
+name = "fuzz_h1_roundtrip"
+path = "fuzz_targets/fuzz_h1_roundtrip.rs"
+test = false
+doc = false
+bench = false

@@ -98,3 +98,7 @@ harness = false
 name = "http_strip"
 harness = false
 
+[[bench]]
+name = "http_h1_serialize"
+harness = false
+
