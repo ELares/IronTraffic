@@ -119,7 +119,7 @@ fn local_addr() -> SocketAddr {
     clippy::too_many_arguments,
     reason = "bench helper mirroring the full serialize_request_head call site"
 )]
-fn bench_one(
+fn measure_one(
     group: &mut criterion::BenchmarkGroup<'_, criterion::measurement::WallTime>,
     name: &str,
     req: &CanonicalRequest,
@@ -170,7 +170,7 @@ fn bench_h1_serialize(c: &mut Criterion) {
 
     let mut group = c.benchmark_group("bench_h1_serialize");
 
-    bench_one(
+    measure_one(
         &mut group,
         "typical_10_fields_exact",
         &typical,
@@ -179,7 +179,7 @@ fn bench_h1_serialize(c: &mut Criterion) {
         local,
         4096,
     );
-    bench_one(
+    measure_one(
         &mut group,
         "typical_10_fields_streaming",
         &typical,
@@ -188,7 +188,7 @@ fn bench_h1_serialize(c: &mut Criterion) {
         local,
         4096,
     );
-    bench_one(
+    measure_one(
         &mut group,
         "adversarial_100_fields",
         &adversarial,
