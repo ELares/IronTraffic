@@ -1,0 +1,3477 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "IronTraffic admin API",
+    "version": "1.0.0"
+  },
+  "servers": [
+    {
+      "url": "/v1"
+    }
+  ],
+  "x-it-non-api-allowlist": [
+    "GET /ui/{*path}",
+    "GET /healthz",
+    "GET /readyz",
+    "GET /metrics"
+  ],
+  "x-it-permissions": [
+    "none",
+    "overview:read",
+    "stats:read",
+    "config:read",
+    "config:write",
+    "config:freeze",
+    "runtime:read",
+    "explain:run",
+    "logs:read",
+    "events:read",
+    "traces:read",
+    "certs:read",
+    "limits:read",
+    "cluster:read",
+    "audit:read",
+    "rbac:read",
+    "sessions:read",
+    "sessions:manage",
+    "tokens:read",
+    "tokens:manage",
+    "apim:read",
+    "apim:write",
+    "support:read"
+  ],
+  "x-it-vocabulary-schemas": [
+    "ResourceRef",
+    "Provenance",
+    "HealthState"
+  ],
+  "x-it-operation-count": 62,
+  "x-it-expensive-operations": [
+    "dryrunConfig",
+    "adaptConfig",
+    "loadConfig",
+    "rollbackConfig",
+    "explainRequest",
+    "diffConfigVersions",
+    "getStatsTimeseries",
+    "queryLogs",
+    "queryAudit",
+    "verifyAuditChain",
+    "getSupportBundle",
+    "getApimAnalytics"
+  ],
+  "paths": {
+    "/overview": {
+      "get": {
+        "operationId": "getOverview",
+        "summary": "Return the composite overview of golden signals, config status and certificate expiry.",
+        "x-it-permission": "overview:read",
+        "x-it-cli": "irtctl overview",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/From"
+          },
+          {
+            "$ref": "#/components/parameters/To"
+          },
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/whoami": {
+      "get": {
+        "operationId": "getWhoami",
+        "summary": "Return the calling principal's effective permissions.",
+        "description": "Requires an authenticated principal like every operation in this document. none means the caller may hold no operator permission at all, not that the request goes unauthenticated; an unauthenticated request is 401.",
+        "x-it-permission": "none",
+        "x-it-cli": "irtctl whoami",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/stats/timeseries": {
+      "get": {
+        "operationId": "getStatsTimeseries",
+        "summary": "Return one or more metric series bucketed over a time window.",
+        "x-it-permission": "stats:read",
+        "x-it-cli": "irtctl stats timeseries",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/From"
+          },
+          {
+            "$ref": "#/components/parameters/To"
+          },
+          {
+            "$ref": "#/components/parameters/Step"
+          },
+          {
+            "name": "series",
+            "in": "query",
+            "required": true,
+            "description": "A comma separated list of series names. series x buckets is capped at 20000; an over cap request is 400 naming the cap and the requested product.",
+            "schema": {
+              "type": "string",
+              "maxLength": 2048,
+              "pattern": "^[A-Za-z][A-Za-z0-9_.]{0,127}(,[A-Za-z][A-Za-z0-9_.]{0,127}){0,63}$"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/stats/topn": {
+      "get": {
+        "operationId": "getStatsTopN",
+        "summary": "Return the top N values of a dimension over a time window.",
+        "x-it-permission": "stats:read",
+        "x-it-cli": "irtctl stats topn",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/From"
+          },
+          {
+            "$ref": "#/components/parameters/To"
+          },
+          {
+            "name": "dim",
+            "in": "query",
+            "required": true,
+            "description": "The dimension to rank, for example route or upstream.",
+            "schema": {
+              "type": "string",
+              "maxLength": 64,
+              "pattern": "^[a-z][a-z0-9_]{0,63}$"
+            }
+          },
+          {
+            "name": "k",
+            "in": "query",
+            "required": false,
+            "description": "The number of top entries to return.",
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 10
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/config": {
+      "get": {
+        "operationId": "getConfig",
+        "summary": "Return the whole current configuration document with its ETag.",
+        "x-it-permission": "config:read",
+        "x-it-cli": "irtctl config dump",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/config/{kind}": {
+      "get": {
+        "operationId": "listConfigKind",
+        "summary": "List every resource of one configuration kind.",
+        "x-it-permission": "config:read",
+        "x-it-cli": "irtctl config list {kind}",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Cursor"
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "parameters": [
+        {
+          "name": "kind",
+          "in": "path",
+          "required": true,
+          "description": "The configuration resource kind. freeze and versions are reserved and never resource kinds.",
+          "schema": {
+            "type": "string",
+            "maxLength": 64,
+            "pattern": "^[a-z][a-z0-9-]{0,63}$"
+          }
+        }
+      ]
+    },
+    "/config/{kind}/{ns}/{name}": {
+      "get": {
+        "operationId": "getConfigResource",
+        "summary": "Return one namespaced configuration resource with its ETag.",
+        "x-it-permission": "config:read",
+        "x-it-cli": "irtctl config get {kind} {ns}/{name}",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "put": {
+        "operationId": "putConfigResource",
+        "summary": "Replace one namespaced configuration resource, guarded by If-Match.",
+        "x-it-permission": "config:write",
+        "x-it-cli": "irtctl config apply -f -",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          },
+          {
+            "$ref": "#/components/parameters/Reason"
+          },
+          {
+            "$ref": "#/components/parameters/Csrf"
+          },
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "patch": {
+        "operationId": "patchConfigResource",
+        "summary": "Apply an RFC 6902 JSON Patch to one configuration resource, guarded by If-Match.",
+        "x-it-permission": "config:write",
+        "x-it-cli": "irtctl config patch",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          },
+          {
+            "$ref": "#/components/parameters/Reason"
+          },
+          {
+            "$ref": "#/components/parameters/Csrf"
+          },
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "deleteConfigResource",
+        "summary": "Delete one namespaced configuration resource, guarded by If-Match.",
+        "x-it-permission": "config:write",
+        "x-it-cli": "irtctl config delete",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          },
+          {
+            "$ref": "#/components/parameters/Reason"
+          },
+          {
+            "$ref": "#/components/parameters/Csrf"
+          },
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          }
+        ],
+        "responses": {
+          "204": {
+            "$ref": "#/components/responses/NoContent"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "parameters": [
+        {
+          "name": "kind",
+          "in": "path",
+          "required": true,
+          "description": "The configuration resource kind. freeze and versions are reserved and never resource kinds.",
+          "schema": {
+            "type": "string",
+            "maxLength": 64,
+            "pattern": "^[a-z][a-z0-9-]{0,63}$"
+          }
+        },
+        {
+          "name": "ns",
+          "in": "path",
+          "required": true,
+          "description": "The resource namespace. The literal default addresses a cluster scoped resource.",
+          "schema": {
+            "type": "string",
+            "maxLength": 63,
+            "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$"
+          }
+        },
+        {
+          "name": "name",
+          "in": "path",
+          "required": true,
+          "description": "The resource name, a DNS subdomain.",
+          "schema": {
+            "type": "string",
+            "maxLength": 253,
+            "pattern": "^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$"
+          }
+        }
+      ]
+    },
+    "/config:load": {
+      "post": {
+        "operationId": "loadConfig",
+        "summary": "Replace the whole configuration document in one atomic operation.",
+        "x-it-permission": "config:write",
+        "x-it-cli": "irtctl config load -f",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          },
+          {
+            "$ref": "#/components/parameters/Reason"
+          },
+          {
+            "$ref": "#/components/parameters/Csrf"
+          },
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/config:dryrun": {
+      "post": {
+        "operationId": "dryrunConfig",
+        "summary": "Compile a candidate configuration document without applying it.",
+        "x-it-permission": "config:read",
+        "x-it-cli": "irtctl config dryrun -f",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          },
+          {
+            "$ref": "#/components/parameters/Reason"
+          },
+          {
+            "$ref": "#/components/parameters/Csrf"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/config:adapt": {
+      "post": {
+        "operationId": "adaptConfig",
+        "summary": "Translate a foreign format document into the native configuration shape.",
+        "x-it-permission": "config:read",
+        "x-it-cli": "irtctl config adapt -f",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          },
+          {
+            "$ref": "#/components/parameters/Reason"
+          },
+          {
+            "$ref": "#/components/parameters/Csrf"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/config:rollback": {
+      "post": {
+        "operationId": "rollbackConfig",
+        "summary": "Recompile and activate a previously committed configuration version.",
+        "x-it-permission": "config:write",
+        "x-it-cli": "irtctl config rollback --to",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          },
+          {
+            "$ref": "#/components/parameters/Reason"
+          },
+          {
+            "$ref": "#/components/parameters/Csrf"
+          },
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/config/freeze": {
+      "get": {
+        "operationId": "getFreeze",
+        "summary": "Return whether configuration writes are currently frozen and why.",
+        "x-it-permission": "config:read",
+        "x-it-cli": "irtctl config freeze status",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "unfreezeConfig",
+        "summary": "Lift an active configuration write freeze, guarded by If-Match.",
+        "x-it-permission": "config:freeze",
+        "x-it-cli": "irtctl config unfreeze",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          },
+          {
+            "$ref": "#/components/parameters/Reason"
+          },
+          {
+            "$ref": "#/components/parameters/Csrf"
+          },
+          {
+            "$ref": "#/components/parameters/IfMatch"
+          }
+        ],
+        "responses": {
+          "204": {
+            "$ref": "#/components/responses/NoContent"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/config:freeze": {
+      "post": {
+        "operationId": "freezeConfig",
+        "summary": "Freeze configuration writes for a bounded time to live.",
+        "x-it-permission": "config:freeze",
+        "x-it-cli": "irtctl config freeze --reason --ttl",
+        "parameters": [
+          {
+            "name": "ttl",
+            "in": "query",
+            "required": true,
+            "description": "How long the freeze lasts before it expires on its own.",
+            "schema": {
+              "type": "string",
+              "maxLength": 16,
+              "pattern": "^[0-9]{1,6}[smhd]$"
+            }
+          },
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          },
+          {
+            "$ref": "#/components/parameters/Reason"
+          },
+          {
+            "$ref": "#/components/parameters/Csrf"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/config/versions": {
+      "get": {
+        "operationId": "listConfigVersions",
+        "summary": "List the commit log of configuration versions.",
+        "x-it-permission": "config:read",
+        "x-it-cli": "irtctl config history",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Cursor"
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/config/versions/{version}": {
+      "get": {
+        "operationId": "getConfigVersion",
+        "summary": "Return one committed configuration version by its epoch-index identifier.",
+        "x-it-permission": "config:read",
+        "x-it-cli": "irtctl config show --version",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "parameters": [
+        {
+          "name": "version",
+          "in": "path",
+          "required": true,
+          "description": "A bundle version rendered as epoch-index, for example 3-417.",
+          "schema": {
+            "type": "string",
+            "maxLength": 41,
+            "pattern": "^[0-9]{1,20}-[0-9]{1,20}$"
+          }
+        }
+      ]
+    },
+    "/config/versions/{from}/diff/{to}": {
+      "get": {
+        "operationId": "diffConfigVersions",
+        "summary": "Return the bounded diff between two committed configuration versions.",
+        "x-it-permission": "config:read",
+        "x-it-cli": "irtctl config diff",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "parameters": [
+        {
+          "name": "from",
+          "in": "path",
+          "required": true,
+          "description": "A bundle version rendered as epoch-index, the diff range start.",
+          "schema": {
+            "type": "string",
+            "maxLength": 41,
+            "pattern": "^[0-9]{1,20}-[0-9]{1,20}$"
+          }
+        },
+        {
+          "name": "to",
+          "in": "path",
+          "required": true,
+          "description": "A bundle version rendered as epoch-index, the diff range end.",
+          "schema": {
+            "type": "string",
+            "maxLength": 41,
+            "pattern": "^[0-9]{1,20}-[0-9]{1,20}$"
+          }
+        }
+      ]
+    },
+    "/transactions": {
+      "post": {
+        "operationId": "createTransaction",
+        "summary": "Begin a server side staged transaction and return its identifier.",
+        "x-it-permission": "config:write",
+        "x-it-cli": "irtctl tx begin",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          },
+          {
+            "$ref": "#/components/parameters/Reason"
+          },
+          {
+            "$ref": "#/components/parameters/Csrf"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/transactions/{id}": {
+      "get": {
+        "operationId": "getTransaction",
+        "summary": "Return a staged transaction's contents and its remaining time to live.",
+        "x-it-permission": "config:read",
+        "x-it-cli": "irtctl tx show",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "delete": {
+        "operationId": "abortTransaction",
+        "summary": "Discard a staged transaction without applying any of it.",
+        "x-it-permission": "config:write",
+        "x-it-cli": "irtctl tx abort",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          },
+          {
+            "$ref": "#/components/parameters/Reason"
+          },
+          {
+            "$ref": "#/components/parameters/Csrf"
+          }
+        ],
+        "responses": {
+          "204": {
+            "$ref": "#/components/responses/NoContent"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "An opaque identifier issued by the server for this resource type.",
+          "schema": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9._-]{1,128}$"
+          }
+        }
+      ]
+    },
+    "/transactions/{id}:commit": {
+      "post": {
+        "operationId": "commitTransaction",
+        "summary": "Atomically commit every change staged in a transaction.",
+        "x-it-permission": "config:write",
+        "x-it-cli": "irtctl tx commit",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          },
+          {
+            "$ref": "#/components/parameters/Reason"
+          },
+          {
+            "$ref": "#/components/parameters/Csrf"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "An opaque identifier issued by the server for this resource type.",
+          "schema": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9._-]{1,128}$"
+          }
+        }
+      ]
+    },
+    "/status": {
+      "get": {
+        "operationId": "getStatus",
+        "summary": "Return the per resource readiness conditions of the running configuration.",
+        "x-it-permission": "config:read",
+        "x-it-cli": "irtctl status",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/routes/{id}/effective": {
+      "get": {
+        "operationId": "getRouteEffective",
+        "summary": "Return one route's effective compiled configuration with its provenance.",
+        "x-it-permission": "config:read",
+        "x-it-cli": "irtctl routes effective",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "An opaque identifier issued by the server for this resource type.",
+          "schema": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9._-]{1,128}$"
+          }
+        }
+      ]
+    },
+    "/explain": {
+      "post": {
+        "operationId": "explainRequest",
+        "summary": "Run a synthetic request through the compiled configuration and explain its routing.",
+        "x-it-permission": "explain:run",
+        "x-it-cli": "irtctl explain",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          },
+          {
+            "$ref": "#/components/parameters/Reason"
+          },
+          {
+            "$ref": "#/components/parameters/Csrf"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/explain/requests/{request_id}": {
+      "get": {
+        "operationId": "getRecordedExplain",
+        "summary": "Return a previously recorded explain run by its request identifier.",
+        "x-it-permission": "explain:run",
+        "x-it-cli": "irtctl explain recorded",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "parameters": [
+        {
+          "name": "request_id",
+          "in": "path",
+          "required": true,
+          "description": "The request id of a previously recorded explain run.",
+          "schema": {
+            "type": "string",
+            "maxLength": 64,
+            "pattern": "^[A-Za-z0-9._-]{1,64}$"
+          }
+        }
+      ]
+    },
+    "/runtime/upstreams": {
+      "get": {
+        "operationId": "listRuntimeUpstreams",
+        "summary": "List every upstream known to the running configuration.",
+        "x-it-permission": "runtime:read",
+        "x-it-cli": "irtctl upstreams",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Cursor"
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/runtime/upstreams/{id}/endpoints": {
+      "get": {
+        "operationId": "getUpstreamEndpoints",
+        "summary": "Return the whole endpoint set of one upstream, never paginated.",
+        "x-it-permission": "runtime:read",
+        "x-it-cli": "irtctl upstreams endpoints",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "An opaque identifier issued by the server for this resource type.",
+          "schema": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9._-]{1,128}$"
+          }
+        }
+      ]
+    },
+    "/runtime/upstreams/{id}/events": {
+      "get": {
+        "operationId": "getUpstreamEvents",
+        "summary": "Return the paginated health event log of one upstream over a time window.",
+        "x-it-permission": "runtime:read",
+        "x-it-cli": "irtctl upstreams events",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Cursor"
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "$ref": "#/components/parameters/From"
+          },
+          {
+            "$ref": "#/components/parameters/To"
+          },
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "An opaque identifier issued by the server for this resource type.",
+          "schema": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9._-]{1,128}$"
+          }
+        }
+      ]
+    },
+    "/logs/query": {
+      "get": {
+        "operationId": "queryLogs",
+        "summary": "Query the retained request log over a time window, paginated.",
+        "x-it-permission": "logs:read",
+        "x-it-cli": "irtctl logs query",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Cursor"
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "$ref": "#/components/parameters/From"
+          },
+          {
+            "$ref": "#/components/parameters/To"
+          },
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/logs/stream": {
+      "get": {
+        "operationId": "streamLogs",
+        "summary": "Stream matching log lines as they are written.",
+        "x-it-permission": "logs:read",
+        "x-it-cli": "irtctl logs tail",
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/EventStream"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/events/stream": {
+      "get": {
+        "operationId": "streamEvents",
+        "summary": "Stream a multiplexed feed of configuration and runtime events.",
+        "x-it-permission": "events:read",
+        "x-it-cli": "irtctl events tail",
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/EventStream"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/traces/{trace_id}": {
+      "get": {
+        "operationId": "getTrace",
+        "summary": "Return one recorded request trace by its W3C trace identifier.",
+        "x-it-permission": "traces:read",
+        "x-it-cli": "irtctl trace",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "parameters": [
+        {
+          "name": "trace_id",
+          "in": "path",
+          "required": true,
+          "description": "A W3C trace id, 32 lowercase hex characters.",
+          "schema": {
+            "type": "string",
+            "maxLength": 32,
+            "pattern": "^[0-9a-f]{32}$"
+          }
+        }
+      ]
+    },
+    "/certs": {
+      "get": {
+        "operationId": "listCerts",
+        "summary": "List every certificate known to the running configuration, fingerprints only.",
+        "x-it-permission": "certs:read",
+        "x-it-cli": "irtctl certs",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Cursor"
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/certs/{id}": {
+      "get": {
+        "operationId": "getCert",
+        "summary": "Return one certificate's fingerprints and validity, never its key material.",
+        "x-it-permission": "certs:read",
+        "x-it-cli": "irtctl certs show",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "An opaque identifier issued by the server for this resource type.",
+          "schema": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9._-]{1,128}$"
+          }
+        }
+      ]
+    },
+    "/acme/orders": {
+      "get": {
+        "operationId": "listAcmeOrders",
+        "summary": "List the in flight and recent ACME certificate orders.",
+        "x-it-permission": "certs:read",
+        "x-it-cli": "irtctl acme orders",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/limits": {
+      "get": {
+        "operationId": "listLimits",
+        "summary": "List every configured rate and connection limit policy.",
+        "x-it-permission": "limits:read",
+        "x-it-cli": "irtctl limits",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/limits/topk": {
+      "get": {
+        "operationId": "getLimitTopK",
+        "summary": "Return the top-K heaviest rate limit keys over a time window, by sketch.",
+        "x-it-permission": "limits:read",
+        "x-it-cli": "irtctl limits topk",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/From"
+          },
+          {
+            "$ref": "#/components/parameters/To"
+          },
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/limits/keys/{key}": {
+      "get": {
+        "operationId": "getLimitKey",
+        "summary": "Return the exact current state of one rate limit key issued by getLimitTopK.",
+        "x-it-permission": "limits:read",
+        "x-it-cli": "irtctl limits key",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "parameters": [
+        {
+          "name": "key",
+          "in": "path",
+          "required": true,
+          "description": "A rate limit key identifier exactly as issued by getLimitTopK. Never an arbitrary request derived value.",
+          "schema": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9._:~-]{1,128}$"
+          }
+        }
+      ]
+    },
+    "/cluster/nodes": {
+      "get": {
+        "operationId": "listClusterNodes",
+        "summary": "List every node in the cluster with its generation.",
+        "x-it-permission": "cluster:read",
+        "x-it-cli": "irtctl cluster nodes",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/audit": {
+      "get": {
+        "operationId": "queryAudit",
+        "summary": "Query the append only audit and commit log, paginated over a time window.",
+        "x-it-permission": "audit:read",
+        "x-it-cli": "irtctl audit",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Cursor"
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "$ref": "#/components/parameters/From"
+          },
+          {
+            "$ref": "#/components/parameters/To"
+          },
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/audit/verify": {
+      "get": {
+        "operationId": "verifyAuditChain",
+        "summary": "Verify the audit log's hash chain and report the first break, if any.",
+        "x-it-permission": "audit:read",
+        "x-it-cli": "irtctl audit verify",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/sessions": {
+      "get": {
+        "operationId": "listSessions",
+        "summary": "List every active authenticated session.",
+        "x-it-permission": "sessions:read",
+        "x-it-cli": "irtctl sessions",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/sessions/{id}": {
+      "delete": {
+        "operationId": "revokeSession",
+        "summary": "Revoke one session immediately.",
+        "description": "Requires sessions:manage to revoke another principal's session. Revoking the session the request itself is authenticated with always succeeds for any authenticated caller, because that is the log out path; this is the only operation in this document where the effective permission depends on the object, and it only ever destroys the caller's own authority.",
+        "x-it-permission": "sessions:manage",
+        "x-it-cli": "irtctl sessions revoke",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          },
+          {
+            "$ref": "#/components/parameters/Reason"
+          },
+          {
+            "$ref": "#/components/parameters/Csrf"
+          }
+        ],
+        "responses": {
+          "204": {
+            "$ref": "#/components/responses/NoContent"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "An opaque identifier issued by the server for this resource type.",
+          "schema": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9._-]{1,128}$"
+          }
+        }
+      ]
+    },
+    "/tokens": {
+      "get": {
+        "operationId": "listTokens",
+        "summary": "List every API token by its prefix, never its value.",
+        "x-it-permission": "tokens:read",
+        "x-it-cli": "irtctl tokens",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "post": {
+        "operationId": "createToken",
+        "summary": "Create a new API token, revealed once in the response only.",
+        "x-it-permission": "tokens:manage",
+        "x-it-cli": "irtctl tokens create",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          },
+          {
+            "$ref": "#/components/parameters/Reason"
+          },
+          {
+            "$ref": "#/components/parameters/Csrf"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/tokens/{id}": {
+      "delete": {
+        "operationId": "revokeToken",
+        "summary": "Revoke one API token immediately.",
+        "x-it-permission": "tokens:manage",
+        "x-it-cli": "irtctl tokens revoke",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          },
+          {
+            "$ref": "#/components/parameters/Reason"
+          },
+          {
+            "$ref": "#/components/parameters/Csrf"
+          }
+        ],
+        "responses": {
+          "204": {
+            "$ref": "#/components/responses/NoContent"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "An opaque identifier issued by the server for this resource type.",
+          "schema": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9._-]{1,128}$"
+          }
+        }
+      ]
+    },
+    "/roles": {
+      "get": {
+        "operationId": "listRoles",
+        "summary": "List every role and the permissions it grants.",
+        "x-it-permission": "rbac:read",
+        "x-it-cli": "irtctl roles",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/apim/products": {
+      "get": {
+        "operationId": "listApimProducts",
+        "summary": "List every API management product.",
+        "x-it-permission": "apim:read",
+        "x-it-cli": "irtctl apim products",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/apim/products/{id}": {
+      "get": {
+        "operationId": "getApimProduct",
+        "summary": "Return one API management product.",
+        "x-it-permission": "apim:read",
+        "x-it-cli": "irtctl apim products show",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "An opaque identifier issued by the server for this resource type.",
+          "schema": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9._-]{1,128}$"
+          }
+        }
+      ]
+    },
+    "/apim/plans": {
+      "get": {
+        "operationId": "listApimPlans",
+        "summary": "List every API management plan.",
+        "x-it-permission": "apim:read",
+        "x-it-cli": "irtctl apim plans",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/apim/consumers": {
+      "get": {
+        "operationId": "listApimConsumers",
+        "summary": "List every API management consumer.",
+        "x-it-permission": "apim:read",
+        "x-it-cli": "irtctl apim consumers",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/Cursor"
+          },
+          {
+            "$ref": "#/components/parameters/Limit"
+          },
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/apim/consumers/{id}": {
+      "get": {
+        "operationId": "getApimConsumer",
+        "summary": "Return one API management consumer.",
+        "x-it-permission": "apim:read",
+        "x-it-cli": "irtctl apim consumers show",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "An opaque identifier issued by the server for this resource type.",
+          "schema": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9._-]{1,128}$"
+          }
+        }
+      ]
+    },
+    "/apim/consumers/{id}/credentials": {
+      "get": {
+        "operationId": "listApimCredentials",
+        "summary": "List one consumer's API credentials by prefix, never their value.",
+        "x-it-permission": "apim:read",
+        "x-it-cli": "irtctl apim credentials",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "post": {
+        "operationId": "createApimCredential",
+        "summary": "Create a new API credential for one consumer, revealed once.",
+        "x-it-permission": "apim:write",
+        "x-it-cli": "irtctl apim credentials create",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          },
+          {
+            "$ref": "#/components/parameters/Reason"
+          },
+          {
+            "$ref": "#/components/parameters/Csrf"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "An opaque identifier issued by the server for this resource type.",
+          "schema": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9._-]{1,128}$"
+          }
+        }
+      ]
+    },
+    "/apim/consumers/{id}/credentials/{credential_id}": {
+      "delete": {
+        "operationId": "deleteApimCredential",
+        "summary": "Revoke one API credential belonging to one consumer.",
+        "x-it-permission": "apim:write",
+        "x-it-cli": "irtctl apim credentials revoke",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IdempotencyKey"
+          },
+          {
+            "$ref": "#/components/parameters/Reason"
+          },
+          {
+            "$ref": "#/components/parameters/Csrf"
+          }
+        ],
+        "responses": {
+          "204": {
+            "$ref": "#/components/responses/NoContent"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "404": {
+            "$ref": "#/components/responses/NotFound"
+          },
+          "409": {
+            "$ref": "#/components/responses/Conflict"
+          },
+          "412": {
+            "$ref": "#/components/responses/PreconditionFailed"
+          },
+          "413": {
+            "$ref": "#/components/responses/PayloadTooLarge"
+          },
+          "422": {
+            "$ref": "#/components/responses/Unprocessable"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      },
+      "parameters": [
+        {
+          "name": "id",
+          "in": "path",
+          "required": true,
+          "description": "An opaque identifier issued by the server for this resource type.",
+          "schema": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9._-]{1,128}$"
+          }
+        },
+        {
+          "name": "credential_id",
+          "in": "path",
+          "required": true,
+          "description": "An opaque identifier for a single API credential belonging to a consumer.",
+          "schema": {
+            "type": "string",
+            "maxLength": 128,
+            "pattern": "^[A-Za-z0-9._-]{1,128}$"
+          }
+        }
+      ]
+    },
+    "/apim/analytics": {
+      "get": {
+        "operationId": "getApimAnalytics",
+        "summary": "Return API management usage analytics over a time window.",
+        "x-it-permission": "apim:read",
+        "x-it-cli": "irtctl apim analytics",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/From"
+          },
+          {
+            "$ref": "#/components/parameters/To"
+          },
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "400": {
+            "$ref": "#/components/responses/BadRequest"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/support-bundle": {
+      "get": {
+        "operationId": "getSupportBundle",
+        "summary": "Generate a redacted diagnostic support bundle for this process.",
+        "x-it-permission": "support:read",
+        "x-it-cli": "irtctl support-bundle",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/schema.json": {
+      "get": {
+        "operationId": "getSchema",
+        "summary": "Return the generated JSON Schema of the running configuration format.",
+        "description": "Requires an authenticated principal like every operation in this document. none reflects that a specification document carries no operator data, not that the request goes unauthenticated; an unauthenticated request is 401.",
+        "x-it-permission": "none",
+        "x-it-cli": "irtctl schema",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "operationId": "getOpenapi",
+        "summary": "Return this OpenAPI document as served by the running admin API.",
+        "description": "Requires an authenticated principal like every operation in this document. none reflects that a specification document carries no operator data, not that the request goes unauthenticated; an unauthenticated request is 401.",
+        "x-it-permission": "none",
+        "x-it-cli": "irtctl openapi",
+        "parameters": [
+          {
+            "$ref": "#/components/parameters/IfNoneMatch"
+          }
+        ],
+        "responses": {
+          "200": {
+            "$ref": "#/components/responses/Ok"
+          },
+          "304": {
+            "$ref": "#/components/responses/NotModified"
+          },
+          "401": {
+            "$ref": "#/components/responses/Unauthorized"
+          },
+          "403": {
+            "$ref": "#/components/responses/Forbidden"
+          },
+          "429": {
+            "$ref": "#/components/responses/TooManyRequests"
+          },
+          "500": {
+            "$ref": "#/components/responses/InternalError"
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Envelope": {
+        "type": "object",
+        "required": [
+          "data",
+          "as_of"
+        ],
+        "properties": {
+          "data": true,
+          "as_of": {
+            "type": "string",
+            "format": "date-time",
+            "description": "The server clock at the moment of the response. The client computes staleness from this, never from Date.now()."
+          },
+          "version": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "The monotonic snapshot generation. Absent when the payload is not config derived. This is the generation counter, not the bundle version, which is epoch-index."
+          },
+          "page": {
+            "$ref": "#/components/schemas/PageInfo",
+            "description": "Present on paginated operations only."
+          }
+        }
+      },
+      "PageInfo": {
+        "type": "object",
+        "required": [
+          "total"
+        ],
+        "properties": {
+          "next": {
+            "type": "string",
+            "maxLength": 512,
+            "description": "The cursor for the following page, absent at the end."
+          },
+          "total": {
+            "type": "integer",
+            "minimum": 0,
+            "description": "The count at the moment of the call, documented as approximate because no cursor scheme can give an exact concurrent total."
+          }
+        }
+      },
+      "Problem": {
+        "type": "object",
+        "required": [
+          "code",
+          "message",
+          "request_id"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_.]{0,63}$",
+            "description": "A stable machine readable code."
+          },
+          "message": {
+            "type": "string",
+            "maxLength": 2048,
+            "description": "Human readable; empty for an internal error; never a stack trace, a file path, a header value, a configuration value, or any part of a secret."
+          },
+          "request_id": {
+            "type": "string",
+            "maxLength": 64,
+            "description": "Echoed in the response header."
+          },
+          "correlation_id": {
+            "type": "string",
+            "maxLength": 64,
+            "description": "An alias of request_id, for the console's error block."
+          },
+          "missing_permission": {
+            "type": "string",
+            "maxLength": 64,
+            "description": "Present on every 403, drawn from x-it-permissions."
+          },
+          "details": {
+            "type": "array",
+            "maxItems": 100,
+            "items": {
+              "$ref": "#/components/schemas/Diagnostic"
+            },
+            "description": "Bounded so one rejected document cannot return a diagnostic per line."
+          }
+        }
+      },
+      "ResourceRef": {
+        "type": "object",
+        "required": [
+          "kind",
+          "namespace",
+          "name"
+        ],
+        "properties": {
+          "kind": {
+            "type": "string"
+          },
+          "namespace": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "provider": {
+            "type": "string"
+          }
+        }
+      },
+      "Provenance": {
+        "type": "object",
+        "required": [
+          "provider",
+          "owner_read_only"
+        ],
+        "properties": {
+          "provider": {
+            "type": "string"
+          },
+          "owner_read_only": {
+            "type": "boolean"
+          },
+          "source_path": {
+            "type": "string"
+          },
+          "k8s_uid": {
+            "type": "string"
+          },
+          "k8s_resource_version": {
+            "type": "string"
+          },
+          "last_changed_version": {
+            "type": "string"
+          }
+        }
+      },
+      "Diagnostic": {
+        "type": "object",
+        "required": [
+          "severity",
+          "pointer",
+          "message"
+        ],
+        "properties": {
+          "severity": {
+            "type": "string",
+            "enum": [
+              "error",
+              "warning",
+              "info"
+            ]
+          },
+          "pointer": {
+            "type": "string",
+            "description": "An RFC 6901 JSON Pointer."
+          },
+          "message": {
+            "type": "string"
+          }
+        }
+      },
+      "HealthState": {
+        "type": "string",
+        "enum": [
+          "healthy",
+          "unhealthy",
+          "ejected",
+          "draining",
+          "warming",
+          "unknown"
+        ]
+      }
+    },
+    "parameters": {
+      "Cursor": {
+        "name": "cursor",
+        "in": "query",
+        "required": false,
+        "description": "An opaque continuation token; absent means the first page. Re-authorized on every use; never a plain serialized offset the caller can edit past an authorization boundary.",
+        "schema": {
+          "type": "string",
+          "maxLength": 512,
+          "pattern": "^[A-Za-z0-9_-]{1,512}$"
+        }
+      },
+      "Limit": {
+        "name": "limit",
+        "in": "query",
+        "required": false,
+        "description": "Page size. A well formed integer above 500 is clamped to 500; a malformed value is 400.",
+        "schema": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 500,
+          "default": 100
+        }
+      },
+      "From": {
+        "name": "from",
+        "in": "query",
+        "required": false,
+        "description": "The start of the requested window, either a relative expression such as now-15m or an RFC 3339 timestamp.",
+        "schema": {
+          "type": "string",
+          "maxLength": 64,
+          "default": "now-15m",
+          "pattern": "^(now(-[0-9]{1,6}[smhdw])?|[0-9]{4}-[0-9]{2}-[0-9]{2}T[^ ]{1,40})$"
+        }
+      },
+      "To": {
+        "name": "to",
+        "in": "query",
+        "required": false,
+        "description": "The end of the requested window, either a relative expression such as now or an RFC 3339 timestamp.",
+        "schema": {
+          "type": "string",
+          "maxLength": 64,
+          "default": "now",
+          "pattern": "^(now(-[0-9]{1,6}[smhdw])?|[0-9]{4}-[0-9]{2}-[0-9]{2}T[^ ]{1,40})$"
+        }
+      },
+      "Step": {
+        "name": "step",
+        "in": "query",
+        "required": false,
+        "description": "The bucket width for getStatsTimeseries. Rounded up to the ring's resolution when finer; the response reports the step actually used.",
+        "schema": {
+          "type": "string",
+          "maxLength": 16,
+          "pattern": "^[0-9]{1,6}[smh]$",
+          "default": "10s"
+        }
+      },
+      "IfMatch": {
+        "name": "If-Match",
+        "in": "header",
+        "required": true,
+        "description": "The ETag of the resource last read by the caller. Required on every config mutating operation; a mismatch is 412.",
+        "schema": {
+          "type": "string",
+          "maxLength": 256
+        }
+      },
+      "IfNoneMatch": {
+        "name": "If-None-Match",
+        "in": "header",
+        "required": false,
+        "description": "The ETag the caller already holds. A match answers 304 with no body.",
+        "schema": {
+          "type": "string",
+          "maxLength": 4096
+        }
+      },
+      "IdempotencyKey": {
+        "name": "Idempotency-Key",
+        "in": "header",
+        "required": false,
+        "description": "A client chosen key deduplicating a retried mutation. A replay with a different body hash is 422.",
+        "schema": {
+          "type": "string",
+          "maxLength": 255
+        }
+      },
+      "Reason": {
+        "name": "X-IT-Reason",
+        "in": "header",
+        "required": false,
+        "description": "An operator supplied free text reason recorded in the audit log entry for this mutation.",
+        "schema": {
+          "type": "string",
+          "maxLength": 1024
+        }
+      },
+      "Csrf": {
+        "name": "X-IT-CSRF",
+        "in": "header",
+        "required": true,
+        "description": "The double submit CSRF token. Required on every mutating operation.",
+        "schema": {
+          "type": "string",
+          "maxLength": 256
+        }
+      }
+    },
+    "responses": {
+      "Ok": {
+        "description": "The operation succeeded.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "$ref": "#/components/schemas/Envelope"
+            }
+          }
+        }
+      },
+      "NoContent": {
+        "description": "The operation succeeded and there is no response body."
+      },
+      "NotModified": {
+        "description": "The resource has not changed since the value named by If-None-Match."
+      },
+      "BadRequest": {
+        "description": "The request was malformed or violated a documented bound.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "required": [
+                "error"
+              ],
+              "properties": {
+                "error": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "Unauthorized": {
+        "description": "No authenticated principal was presented.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "required": [
+                "error"
+              ],
+              "properties": {
+                "error": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "Forbidden": {
+        "description": "The authenticated principal lacks the permission this operation requires. Identical whether or not the addressed resource exists.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "required": [
+                "error"
+              ],
+              "properties": {
+                "error": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "NotFound": {
+        "description": "No resource exists at the addressed identifier. Only ever returned to a caller who already holds the operation's permission.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "required": [
+                "error"
+              ],
+              "properties": {
+                "error": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "Conflict": {
+        "description": "The mutation conflicts with the current state of the resource.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "required": [
+                "error"
+              ],
+              "properties": {
+                "error": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "PreconditionFailed": {
+        "description": "The If-Match value did not match the resource's current ETag.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "required": [
+                "error"
+              ],
+              "properties": {
+                "error": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "Unprocessable": {
+        "description": "A replayed Idempotency-Key was reused with a different request body.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "required": [
+                "error"
+              ],
+              "properties": {
+                "error": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "TooManyRequests": {
+        "description": "The caller or the process exceeded a concurrency or rate limit.",
+        "headers": {
+          "Retry-After": {
+            "description": "Seconds to wait before retrying.",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 0
+            }
+          }
+        },
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "required": [
+                "error"
+              ],
+              "properties": {
+                "error": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "PayloadTooLarge": {
+        "description": "The request body exceeded the server's independent body size limit.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "required": [
+                "error"
+              ],
+              "properties": {
+                "error": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "InternalError": {
+        "description": "An unexpected server error. message is always the empty string; correlate with request_id.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "type": "object",
+              "required": [
+                "error"
+              ],
+              "properties": {
+                "error": {
+                  "$ref": "#/components/schemas/Problem"
+                }
+              }
+            }
+          }
+        }
+      },
+      "EventStream": {
+        "description": "A server sent event stream. The connection stays open until the client closes it.",
+        "content": {
+          "text/event-stream": {
+            "schema": {
+              "type": "string"
+            }
+          }
+        }
+      }
+    }
+  }
+}
+

@@ -460,6 +460,13 @@ lockfile_check package-lock.json
 
 manifest_budget_check package.json
 
+# The console is a thin client of contract/openapi.v1.json: every generated
+# type, network call audit and screen parity manifest is derived from it, so
+# a broken contract document must fail before a single dashboard dependency
+# is fetched.
+echo '==> api contract check'
+"$(git rev-parse --show-toplevel)/scripts/api-contract-check.sh"
+
 npm ci --no-audit --no-fund
 
 npm_ls_tmp="$(mktemp)"
