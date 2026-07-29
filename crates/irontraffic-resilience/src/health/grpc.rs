@@ -302,6 +302,16 @@ fn varint_len(n: usize) -> usize {
     if n < 128 {
         1
     } else if n < 16_384 {
+        // `< 16_384` versus `<= 16_384` is unobservable from any caller of
+        // this function: `encode_health_request` also rejects whenever
+        // `1 + varint_len(n) + n > MAX_MESSAGE_LEN` (256), and even the
+        // smallest possible `n` this branch could take under either
+        // comparison, 16_384 itself, already makes `1 + 2 + 16_384` or
+        // `1 + 3 + 16_384` far exceed 256. So the one value where `<` and
+        // `<=` disagree (`n == 16_384` exactly) is always rejected before
+        // this return value can affect an accepted frame. Confirmed by
+        // mutating this comparison to `<=` and rerunning the suite, which
+        // stayed green.
         2
     } else {
         3
@@ -324,6 +334,12 @@ fn push_varint(mut n: usize, out: &mut Vec<u8>) {
             out.push(byte);
             return;
         }
+        // `byte` is `low7`, masked to the low 7 bits above, so its bit 7 is
+        // always 0; OR-ing and XOR-ing a fixed bit into a byte whose
+        // corresponding bit is always clear are the same operation. `|` is
+        // used because it is the conventional way to read "set this bit" in
+        // varint-encoding code. Confirmed by mutating this to `^` and
+        // rerunning the suite, which stayed green.
         out.push(byte | 0x80);
     }
 }
@@ -473,6 +489,14 @@ pub fn decode_health_response(frame: &[u8]) -> Result<Option<u32>, GrpcDecodeErr
     let Some(frame_len) = 5usize.checked_add(len) else {
         return Err(GrpcDecodeError::ShortFrame);
     };
+    // This check and the `frame.get(5..frame_len)` immediately below it produce
+    // the identical `Err(ShortFrame)` for the identical condition: `Range::get`
+    // already returns `None` whenever the upper bound exceeds the slice length,
+    // with no panic either way. Confirmed equivalent by mutating this
+    // comparison (`>` to `<`) and rerunning the suite, which stayed green: no
+    // input can distinguish "reject here" from "reject one line down", so this
+    // is defense in depth (and follows the issue's own algorithm text
+    // verbatim), not the sole enforcement of the bound.
     if frame_len > frame.len() {
         return Err(GrpcDecodeError::ShortFrame);
     }
@@ -603,6 +627,20 @@ mod tests {
     use super::*;
     use proptest::prelude::*;
 
+    /// The big-endian `u32` length declared in `frame`'s 5-byte prefix, read
+    /// independently of `decode_health_response`/`grpc_frame_admissible` (both
+    /// under test elsewhere) so the encode-side boundary tests below have their
+    /// own oracle for "does the declared length match what was actually
+    /// appended".
+    fn declared_len(frame: &[u8]) -> u32 {
+        u32::from_be_bytes([
+            frame.get(1).copied().unwrap_or(0),
+            frame.get(2).copied().unwrap_or(0),
+            frame.get(3).copied().unwrap_or(0),
+            frame.get(4).copied().unwrap_or(0),
+        ])
+    }
+
     #[test]
     fn default_spec_values() {
         let spec = GrpcCheckSpec::default();
@@ -633,6 +671,94 @@ mod tests {
         let mut v = Vec::new();
         let err =
             encode_health_request(&long, &mut v).expect_err("300-byte service name is too long");
+        assert_eq!(err.field, "grpc_health.service_name");
+    }
+
+    /// Not one of the issue's 34 named tests. `cargo mutants` found this gap live:
+    /// every other encode test uses a service name under 128 bytes, so
+    /// `push_varint`'s multi-byte path (the continuation-bit-setting
+    /// `byte | 0x80` line) and `varint_len`'s 1-byte/2-byte boundary at 128 were
+    /// never exercised by a test that checks exact output bytes.
+    /// `encode_rejects_long_service` above uses 300 bytes, which stays rejected
+    /// under almost any off-by-a-few mutation of that arithmetic because
+    /// `body_len` is already far past the cap either way. This checks the exact
+    /// frame bytes on both sides of the 128-byte varint-length boundary, AND that
+    /// the declared length prefix matches what was actually appended: `v.len()`
+    /// alone cannot catch a broken `varint_len` feeding a wrong `body_len` into
+    /// the prefix, because the bytes `push_varint` actually appends are computed
+    /// independently of `varint_len` and would still total the right length.
+    #[test]
+    fn encode_varint_length_prefix_one_and_two_byte_boundary() {
+        let name_127 = "x".repeat(127);
+        let mut v = Vec::new();
+        encode_health_request(&name_127, &mut v).expect("127-byte name is valid");
+        assert_eq!(
+            v.len(),
+            5 + 1 + 1 + 127,
+            "5 prefix + tag + 1-byte varint + name"
+        );
+        assert_eq!(v.get(5), Some(&0x0A), "field 1, wire type 2");
+        assert_eq!(v.get(6), Some(&127), "127 < 128 fits in one varint byte");
+        assert_eq!(
+            declared_len(&v),
+            u32::try_from(v.len() - 5).unwrap_or(u32::MAX),
+            "declared prefix length must match the bytes actually appended"
+        );
+
+        let name_128 = "x".repeat(128);
+        let mut v = Vec::new();
+        encode_health_request(&name_128, &mut v).expect("128-byte name is valid");
+        assert_eq!(
+            v.len(),
+            5 + 1 + 2 + 128,
+            "5 prefix + tag + 2-byte varint + name"
+        );
+        assert_eq!(v.get(5), Some(&0x0A), "field 1, wire type 2");
+        // varint(128): low 7 bits are 0 with the continuation bit set, then the
+        // next 7 bits are 1.
+        assert_eq!(
+            v.get(6),
+            Some(&0x80),
+            "continuation bit set on the first byte"
+        );
+        assert_eq!(
+            v.get(7),
+            Some(&0x01),
+            "no continuation bit on the last byte"
+        );
+        assert_eq!(
+            declared_len(&v),
+            u32::try_from(v.len() - 5).unwrap_or(u32::MAX),
+            "declared prefix length must match the bytes actually appended"
+        );
+    }
+
+    /// Not one of the issue's 34 named tests. The encode-side counterpart of
+    /// `decode_accepts_message_at_max_len`: proves `MAX_MESSAGE_LEN` is a genuine
+    /// boundary on the ENCODE path too, not merely something `encode_rejects_long_service`
+    /// trips from far away. A 253-byte name is exactly the largest that fits: 5-byte
+    /// prefix + 1 (field tag) + 2 (varint length of 253, which needs two bytes since
+    /// 253 is at least 128) + 253 name bytes = 261 = 5 + `MAX_MESSAGE_LEN`. 254 bytes
+    /// is one past it: a `varint_len` bug that undercounts by one (for example
+    /// always returning 1) would compute `body_len` as exactly `MAX_MESSAGE_LEN`
+    /// here instead of one over it, silently ACCEPTING a name that must be
+    /// rejected, which is why this pairs the accept and reject sides in one test.
+    #[test]
+    fn encode_accepts_at_256_byte_cap_rejects_one_byte_over() {
+        let name_253 = "x".repeat(253);
+        let mut v = Vec::new();
+        encode_health_request(&name_253, &mut v)
+            .expect("253-byte name lands exactly on the encoded-message cap");
+        assert_eq!(v.len(), 5 + MAX_MESSAGE_LEN);
+        assert_eq!(
+            declared_len(&v),
+            u32::try_from(MAX_MESSAGE_LEN).unwrap_or(u32::MAX)
+        );
+
+        let name_254 = "x".repeat(254);
+        let mut v = Vec::new();
+        let err = encode_health_request(&name_254, &mut v)
+            .expect_err("254 bytes is one byte past the encoded-message cap");
         assert_eq!(err.field, "grpc_health.service_name");
     }
 
@@ -739,6 +865,45 @@ mod tests {
         );
     }
 
+    /// Not one of the issue's 34 named tests. `cargo mutants` found this gap
+    /// live: no test ever sent a wire type 1 (fixed64) field, so its whole match
+    /// arm, its 8-byte skip amount, and its `BadLength` bound were all
+    /// unexercised (a mutant could delete the arm entirely, or loosen its bound
+    /// comparison, with the full suite green). Field 9 (arbitrary, unassigned)
+    /// wire type 1 is tag `0x49`.
+    #[test]
+    fn decode_wire_type_one_skips_eight_bytes() {
+        // 0x49 tag, 8 filler bytes, then field 1 (tag 0x08) varint 1.
+        let frame = [
+            0u8, 0, 0, 0, 11, 0x49, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0x08, 0x01,
+        ];
+        assert_eq!(decode_health_response(&frame), Ok(Some(1)));
+
+        // Same tag, but only 3 filler bytes present instead of the 8 required.
+        let short_frame = [0u8, 0, 0, 0, 4, 0x49, 0xAA, 0xAA, 0xAA];
+        assert_eq!(
+            decode_health_response(&short_frame),
+            Err(GrpcDecodeError::BadLength)
+        );
+    }
+
+    /// Not one of the issue's 34 named tests. The wire-type-5 (fixed32)
+    /// counterpart of `decode_wire_type_one_skips_eight_bytes` above, same gap:
+    /// field 9 wire type 5 is tag `0x4D`.
+    #[test]
+    fn decode_wire_type_five_skips_four_bytes() {
+        // 0x4D tag, 4 filler bytes, then field 1 (tag 0x08) varint 1.
+        let frame = [0u8, 0, 0, 0, 7, 0x4D, 0xAA, 0xAA, 0xAA, 0xAA, 0x08, 0x01];
+        assert_eq!(decode_health_response(&frame), Ok(Some(1)));
+
+        // Same tag, but only 2 filler bytes present instead of the 4 required.
+        let short_frame = [0u8, 0, 0, 0, 3, 0x4D, 0xAA, 0xAA];
+        assert_eq!(
+            decode_health_response(&short_frame),
+            Err(GrpcDecodeError::BadLength)
+        );
+    }
+
     #[test]
     fn decode_group_wire_types() {
         for wire in [3u8, 4, 6, 7] {
@@ -779,6 +944,22 @@ mod tests {
         assert_eq!(decode_health_response(&frame), Ok(Some(1)));
     }
 
+    /// Not one of the issue's 34 named tests. `cargo mutants` found this gap
+    /// live: `decode_non_minimal_varint` above encodes 1 in 3 bytes, but every
+    /// byte past the first contributes only zero bits (`0 << shift == 0 >> shift`
+    /// for any shift, and `shift`'s own accumulation is likewise unobservable
+    /// when every subsequent contribution is zero), so it cannot distinguish
+    /// `read_varint`'s `<< shift` from `>> shift`, nor `shift += 7` from a
+    /// broken accumulation. A value whose SECOND byte carries a nonzero bit
+    /// can: 128 encodes as `[0x80, 0x01]`, and the second byte's `1` must land
+    /// at bit 7 (`1 << 7 == 128`, reached only when `shift` correctly reached
+    /// 7), not bit 0 (`1 << 0 == 1`, what a broken shift accumulation gives).
+    #[test]
+    fn decode_two_byte_varint_shifts_into_high_bits() {
+        let frame = [0u8, 0, 0, 0, 3, 0x08, 0x80, 0x01];
+        assert_eq!(decode_health_response(&frame), Ok(Some(128)));
+    }
+
     #[test]
     fn decode_field_one_wrong_wire_type() {
         // Field 1, wire type 2 (tag 0x0A), length 0.
@@ -806,6 +987,21 @@ mod tests {
         assert_eq!(parse_grpc_status(b"-1"), None);
         assert_eq!(parse_grpc_status(b"1 "), None);
         assert_eq!(parse_grpc_status(b"99999999999"), None);
+    }
+
+    /// Not one of the issue's 34 named tests. `cargo mutants` found this gap
+    /// live: every 11-digit decimal exceeds `u32::MAX` (10,000,000,000 is
+    /// already past 4,294,967,295), so `99999999999` above is rejected by
+    /// `checked_mul`/`checked_add` overflow regardless of whether the `> 10`
+    /// length gate runs at all, which let a mutant change that gate to `== 10`
+    /// or `>= 10` (silently rejecting the legal 10-digit case below) without
+    /// failing anything. Mirrors `deadline::headers::parse_u32_ms_cases`'s
+    /// identical boundary pair for the sibling function this one is
+    /// deliberately not shared with.
+    #[test]
+    fn parse_grpc_status_ten_digit_boundary() {
+        assert_eq!(parse_grpc_status(b"4294967295"), Some(u32::MAX));
+        assert_eq!(parse_grpc_status(b"0000000000"), Some(0));
     }
 
     #[test]
@@ -885,6 +1081,34 @@ mod tests {
             let verdict = decode_error_verdict(e);
             assert_eq!(verdict.outcome, CheckOutcome::Fail(FailKind::Protocol));
         }
+    }
+
+    /// Not one of the issue's 34 named tests. `cargo mutants` found this gap
+    /// live: no test read `GrpcDecodeError`'s `Display` output, so a mutant that
+    /// replaced the whole `fmt` body with `Ok(Default::default())` (an empty
+    /// string, never an error) passed the whole suite.
+    #[test]
+    fn grpc_decode_error_display_is_non_empty_and_distinct() {
+        let variants = [
+            GrpcDecodeError::ShortFrame,
+            GrpcDecodeError::Compressed,
+            GrpcDecodeError::TooLong,
+            GrpcDecodeError::BadVarint,
+            GrpcDecodeError::GroupWireType,
+            GrpcDecodeError::BadLength,
+        ];
+        let texts: Vec<String> = variants.iter().map(ToString::to_string).collect();
+        for text in &texts {
+            assert!(!text.is_empty(), "Display output must not be empty");
+        }
+        let mut unique = texts.clone();
+        unique.sort();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            texts.len(),
+            "every variant must have a distinct Display message: {texts:?}"
+        );
     }
 
     /// Not one of the issue's 34 named tests. `decode_too_long` above only proves
