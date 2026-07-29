@@ -40,12 +40,16 @@
 #![forbid(unsafe_code)]
 
 pub mod ast;
+pub mod attrs;
+pub mod check;
 pub mod lex;
 pub mod limits;
 pub mod parse;
 pub mod token;
 
 pub use ast::{Ast, BinOp, Method, Node, NodeId};
+pub use attrs::{ATTRS, AttrEntry, AttrId, MAX_PATH_BYTES, MapId, NAMESPACES, Ty, resolve_path};
+pub use check::{AttrRef, CheckError, Checked, check};
 pub use limits::PolicyLimits;
 pub use parse::{ParseError, parse, parse_expr_at};
 pub use token::{LexError, Span, Spanned, Tok, TokenStream};
