@@ -11,11 +11,13 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 pub mod crl;
+pub mod hkdf;
 pub mod listener;
 pub mod name;
 pub mod policy;
 pub mod provider;
 pub mod store;
+pub mod ticket;
 pub mod time;
 
 pub use listener::{
@@ -32,3 +34,4 @@ pub use provider::{
 pub use store::{
     CertIndex, CertIndexBuilder, ChallengeCerts, ChallengeCertsBuilder, ClientCaps, IronResolver,
 };
+pub use ticket::{ClusterTicketer, TicketRoot};
