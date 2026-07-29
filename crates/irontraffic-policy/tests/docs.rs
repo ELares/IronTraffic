@@ -53,6 +53,85 @@ fn extract_ebnf(path: &str) -> String {
 }
 
 #[test]
+fn docs_attribute_table_is_complete() {
+    // Test 28: every AttrId::path() and MapId::path() appears in docs/ITPL.md. This
+    // checks the running code against documentation, not documentation against
+    // itself: deleting a row from `ATTRS`, or from the doc table, fails this test.
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let docs_path = crate_dir.join("../../docs/ITPL.md");
+    let docs_text = fs::read_to_string(&docs_path).expect("docs/ITPL.md must be readable");
+
+    let all_attr_ids = [
+        irontraffic_policy::AttrId::RequestMethod,
+        irontraffic_policy::AttrId::RequestPath,
+        irontraffic_policy::AttrId::RequestQuery,
+        irontraffic_policy::AttrId::RequestScheme,
+        irontraffic_policy::AttrId::RequestAuthority,
+        irontraffic_policy::AttrId::RequestHost,
+        irontraffic_policy::AttrId::RequestPort,
+        irontraffic_policy::AttrId::RequestProtocol,
+        irontraffic_policy::AttrId::RequestSize,
+        irontraffic_policy::AttrId::RequestId,
+        irontraffic_policy::AttrId::RequestHeaderCount,
+        irontraffic_policy::AttrId::ConnectionRemoteAddr,
+        irontraffic_policy::AttrId::ConnectionRemotePort,
+        irontraffic_policy::AttrId::ConnectionLocalAddr,
+        irontraffic_policy::AttrId::ConnectionTls,
+        irontraffic_policy::AttrId::ConnectionSni,
+        irontraffic_policy::AttrId::ConnectionAlpn,
+        irontraffic_policy::AttrId::ConnectionMtlsVerified,
+        irontraffic_policy::AttrId::ConnectionListener,
+        irontraffic_policy::AttrId::RouteId,
+        irontraffic_policy::AttrId::RouteCluster,
+        irontraffic_policy::AttrId::ResponseStatus,
+        irontraffic_policy::AttrId::ResponseSize,
+        irontraffic_policy::AttrId::StreamId,
+        irontraffic_policy::AttrId::StreamDurationMs,
+    ];
+    assert_eq!(all_attr_ids.len(), irontraffic_policy::AttrId::COUNT);
+    for id in all_attr_ids {
+        let path = id.path();
+        assert!(
+            docs_text.contains(path),
+            "docs/ITPL.md is missing the attribute path `{path}` ({id:?})"
+        );
+    }
+
+    let all_map_ids = [
+        irontraffic_policy::MapId::RequestHeaders,
+        irontraffic_policy::MapId::RequestQuery,
+        irontraffic_policy::MapId::ResponseHeaders,
+    ];
+    for id in all_map_ids {
+        let path = id.path();
+        assert!(
+            docs_text.contains(path),
+            "docs/ITPL.md is missing the map path `{path}` ({id:?})"
+        );
+    }
+}
+
+#[test]
+fn docs_carries_the_two_trust_warnings() {
+    // Test 28b: substring search, so deleting either warning fails the build
+    // rather than quietly shipping.
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let docs_path = crate_dir.join("../../docs/ITPL.md");
+    let docs_text = fs::read_to_string(&docs_path).expect("docs/ITPL.md must be readable");
+
+    assert!(
+        docs_text.contains("connection.remote_addr") && docs_text.contains("peer"),
+        "docs/ITPL.md must state that connection.remote_addr is the peer, not the client"
+    );
+    assert!(
+        docs_text.contains("constant time")
+            && docs_text.contains("api-key-mint-and-constant-time-verify"),
+        "docs/ITPL.md must warn that == on strings is not constant time and name \
+         api-key-mint-and-constant-time-verify (#351)"
+    );
+}
+
+#[test]
 fn docs_grammar_matches_module_docs() {
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let docs_path = crate_dir.join("../../docs/ITPL.md");

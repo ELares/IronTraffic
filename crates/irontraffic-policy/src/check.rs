@@ -28,7 +28,7 @@
 //! what does.
 
 use crate::ast::{Ast, BinOp, Method, Node, NodeId};
-use crate::attrs::{AttrId, MapId, NAMESPACES, Ty, MAX_PATH_BYTES, resolve_path};
+use crate::attrs::{AttrId, MAX_PATH_BYTES, MapId, NAMESPACES, Ty, resolve_path};
 use crate::limits::PolicyLimits;
 use crate::token::Span;
 use irontraffic_filter::Phase;
@@ -182,7 +182,10 @@ pub enum CheckError {
 
 /// The identifier at `sp` must be one of the five closed namespace prefixes.
 fn namespace_or_error(sp: Span, src: &[u8]) -> Result<(), CheckError> {
-    let err = || CheckError::UnknownAttribute { at: sp.start, path: sp };
+    let err = || CheckError::UnknownAttribute {
+        at: sp.start,
+        path: sp,
+    };
     let bytes = sp.slice(src).ok_or_else(err)?;
     if NAMESPACES.contains(&bytes) {
         Ok(())
@@ -193,7 +196,12 @@ fn namespace_or_error(sp: Span, src: &[u8]) -> Result<(), CheckError> {
 
 /// Writes `seg` into `buf[..cursor]` from the right, prefixed by a `.` unless
 /// `first`, and returns the new cursor, or `None` if it would not fit.
-fn push_segment(buf: &mut [u8; MAX_PATH_BYTES], cursor: usize, seg: &[u8], first: bool) -> Option<usize> {
+fn push_segment(
+    buf: &mut [u8; MAX_PATH_BYTES],
+    cursor: usize,
+    seg: &[u8],
+    first: bool,
+) -> Option<usize> {
     let need = seg.len().saturating_add(usize::from(!first));
     if need > cursor {
         return None;
@@ -204,8 +212,82 @@ fn push_segment(buf: &mut [u8; MAX_PATH_BYTES], cursor: usize, seg: &[u8], first
         *buf.get_mut(c)? = b'.';
     }
     c -= seg.len();
-    buf.get_mut(c..c.checked_add(seg.len())?)?.copy_from_slice(seg);
+    buf.get_mut(c..c.checked_add(seg.len())?)?
+        .copy_from_slice(seg);
     Some(c)
+}
+
+/// Walks back through `Field`/`Ident` nodes starting at `(base, name)`, assembling
+/// the dotted path into a fixed buffer written from the end, per `resolve_field`'s
+/// design: the walk runs from the leaf back to the root, so it produces the segments
+/// in reverse, and writing them into the buffer from the end and taking the tail
+/// slice avoids building a `String` or reversing in place.
+///
+/// Returns the buffer, the offset into it where the assembled path begins, and the
+/// whole path's span (for the caret in a later error).
+///
+/// Callers must have already checked that `base`'s type is `Ty::Map`: the walk's own
+/// fallback for a node that is neither `Ident` nor `Field` is total (never panics)
+/// but is unreachable under that precondition, since the only node kinds ever typed
+/// `Map` are `Ident` and a `Field` whose own base was itself `Map`-typed, all the way
+/// down to the root `Ident`.
+fn assemble_path(
+    ast: &Ast,
+    src: &[u8],
+    base: NodeId,
+    name: Span,
+) -> Result<([u8; MAX_PATH_BYTES], usize, Span), CheckError> {
+    let mut buf = [0u8; MAX_PATH_BYTES];
+    let mut cursor = MAX_PATH_BYTES;
+    let mut seg = name;
+    let mut cur = base;
+    let mut first = true;
+
+    loop {
+        let bytes = seg.slice(src).ok_or(CheckError::UnknownAttribute {
+            at: seg.start,
+            path: seg,
+        })?;
+        cursor =
+            push_segment(&mut buf, cursor, bytes, first).ok_or(CheckError::UnknownAttribute {
+                at: seg.start,
+                path: Span {
+                    start: seg.start,
+                    end: name.end,
+                },
+            })?;
+        first = false;
+
+        match ast.node(cur) {
+            Some(Node::Ident(root_span)) => {
+                let root_bytes = root_span.slice(src).ok_or(CheckError::UnknownAttribute {
+                    at: root_span.start,
+                    path: root_span,
+                })?;
+                cursor = push_segment(&mut buf, cursor, root_bytes, false).ok_or(
+                    CheckError::UnknownAttribute {
+                        at: root_span.start,
+                        path: Span {
+                            start: root_span.start,
+                            end: name.end,
+                        },
+                    },
+                )?;
+                let path_span = Span {
+                    start: root_span.start,
+                    end: name.end,
+                };
+                return Ok((buf, cursor, path_span));
+            }
+            Some(Node::Field { base: b2, name: n2 }) => {
+                seg = n2;
+                cur = b2;
+            }
+            // Unreachable given the precondition documented above. Kept as a total,
+            // panic-free fallback rather than relying on that argument at runtime.
+            _ => return Err(CheckError::NotANamespace { at: seg.start }),
+        }
+    }
 }
 
 /// Slot reuse compares the key BYTES, never the `Span`. Lowercasing a header key
@@ -294,7 +376,11 @@ impl Checker<'_> {
         if found == want {
             Ok(())
         } else {
-            Err(CheckError::TypeMismatch { at: self.start_of(id), expected: want, found })
+            Err(CheckError::TypeMismatch {
+                at: self.start_of(id),
+                expected: want,
+                found,
+            })
         }
     }
 
@@ -309,63 +395,12 @@ impl Checker<'_> {
         // ever how a dotted attribute path is spelled, never a general
         // field-of-a-value operator.
         if self.ty_of(base) != Ty::Map {
-            return Err(CheckError::NotANamespace { at: self.start_of(base) });
+            return Err(CheckError::NotANamespace {
+                at: self.start_of(base),
+            });
         }
 
-        let mut buf = [0u8; MAX_PATH_BYTES];
-        let mut cursor = MAX_PATH_BYTES;
-        let mut seg = name;
-        let mut cur = base;
-        let mut first = true;
-        let path_span;
-
-        loop {
-            let bytes = seg
-                .slice(self.src)
-                .ok_or(CheckError::UnknownAttribute { at: seg.start, path: seg })?;
-            cursor = match push_segment(&mut buf, cursor, bytes, first) {
-                Some(c) => c,
-                None => {
-                    return Err(CheckError::UnknownAttribute {
-                        at: seg.start,
-                        path: Span { start: seg.start, end: name.end },
-                    });
-                }
-            };
-            first = false;
-
-            match self.ast.node(cur) {
-                Some(Node::Ident(root_span)) => {
-                    let root_bytes = root_span.slice(self.src).ok_or(CheckError::UnknownAttribute {
-                        at: root_span.start,
-                        path: root_span,
-                    })?;
-                    cursor = match push_segment(&mut buf, cursor, root_bytes, false) {
-                        Some(c) => c,
-                        None => {
-                            return Err(CheckError::UnknownAttribute {
-                                at: root_span.start,
-                                path: Span { start: root_span.start, end: name.end },
-                            });
-                        }
-                    };
-                    path_span = Span { start: root_span.start, end: name.end };
-                    break;
-                }
-                Some(Node::Field { base: b2, name: n2 }) => {
-                    seg = n2;
-                    cur = b2;
-                }
-                // Unreachable given the `types[base] == Ty::Map` gate above: the
-                // only node kinds ever typed `Map` are `Ident` and a `Field` whose
-                // own base was itself `Map`-typed (by induction, all the way down
-                // to the root `Ident`), so every step of this walk only ever lands
-                // on one of the two arms above. Kept as a total, panic-free
-                // fallback rather than relying on that argument at runtime.
-                _ => return Err(CheckError::NotANamespace { at: self.start_of(cur) }),
-            }
-        }
-
+        let (buf, cursor, path_span) = assemble_path(self.ast, self.src, base, name)?;
         let path_bytes = buf.get(cursor..).unwrap_or(&[]);
         match resolve_path(path_bytes) {
             Some(entry) => match (entry.attr, entry.map) {
@@ -390,9 +425,15 @@ impl Checker<'_> {
                     }
                     Ok(Ty::Map)
                 }
-                (None, None) => Err(CheckError::UnknownAttribute { at: path_span.start, path: path_span }),
+                (None, None) => Err(CheckError::UnknownAttribute {
+                    at: path_span.start,
+                    path: path_span,
+                }),
             },
-            None => Err(CheckError::UnknownAttribute { at: path_span.start, path: path_span }),
+            None => Err(CheckError::UnknownAttribute {
+                at: path_span.start,
+                path: path_span,
+            }),
         }
     }
 
@@ -400,11 +441,16 @@ impl Checker<'_> {
     fn resolve_index(&mut self, i: usize, base: NodeId, index: NodeId) -> Result<Ty, CheckError> {
         let base_ty = self.ty_of(base);
         let Some(map) = self.node_map.get(base.index()).copied().flatten() else {
-            return Err(CheckError::NotIndexable { at: self.start_of(base), found: base_ty });
+            return Err(CheckError::NotIndexable {
+                at: self.start_of(base),
+                found: base_ty,
+            });
         };
 
         let Some(Node::Str(key_span)) = self.ast.node(index) else {
-            return Err(CheckError::DynamicIndex { at: self.start_of(index) });
+            return Err(CheckError::DynamicIndex {
+                at: self.start_of(index),
+            });
         };
 
         // Case handling happens before the phase check, as a side effect on
@@ -416,7 +462,8 @@ impl Checker<'_> {
             let end = usize::try_from(key_span.end).unwrap_or(usize::MAX);
             let original: Vec<u8> = self.strings.get(start..end).unwrap_or(&[]).to_vec();
             let new_start = self.strings.len();
-            self.strings.extend(original.iter().map(u8::to_ascii_lowercase));
+            self.strings
+                .extend(original.iter().map(u8::to_ascii_lowercase));
             let new_end = self.strings.len();
             Span {
                 start: u32::try_from(new_start).unwrap_or(u32::MAX),
@@ -447,14 +494,24 @@ impl Checker<'_> {
     }
 
     /// `check_call(base, method, args)`.
-    fn check_call(&mut self, base: NodeId, method: Method, args_from: u16, args_len: u16) -> Result<Ty, CheckError> {
+    fn check_call(
+        &mut self,
+        base: NodeId,
+        method: Method,
+        args_from: u16,
+        args_len: u16,
+    ) -> Result<Ty, CheckError> {
         let base_ty = self.ty_of(base);
 
         if method == Method::Size {
             return if matches!(base_ty, Ty::Str | Ty::List) {
                 Ok(Ty::Int)
             } else {
-                Err(CheckError::BadReceiver { at: self.start_of(base), method, found: base_ty })
+                Err(CheckError::BadReceiver {
+                    at: self.start_of(base),
+                    method,
+                    found: base_ty,
+                })
             };
         }
 
@@ -463,20 +520,34 @@ impl Checker<'_> {
         // `request.headers["x"].startsWith("y")` on an absent header must be false
         // rather than a config error.
         if !matches!(base_ty, Ty::Str | Ty::Null) {
-            return Err(CheckError::BadReceiver { at: self.start_of(base), method, found: base_ty });
+            return Err(CheckError::BadReceiver {
+                at: self.start_of(base),
+                method,
+                found: base_ty,
+            });
         }
 
         let call_args = self.ast.args_of(args_from, args_len);
         let Some(&arg0) = call_args.first() else {
-            return Err(CheckError::BadArgument { at: self.start_of(base), method, found: Ty::Null });
+            return Err(CheckError::BadArgument {
+                at: self.start_of(base),
+                method,
+                found: Ty::Null,
+            });
         };
         let arg_ty = self.ty_of(arg0);
         if arg_ty != Ty::Str {
-            return Err(CheckError::BadArgument { at: self.start_of(arg0), method, found: arg_ty });
+            return Err(CheckError::BadArgument {
+                at: self.start_of(arg0),
+                method,
+                found: arg_ty,
+            });
         }
 
         if method == Method::Matches && !matches!(self.ast.node(arg0), Some(Node::Str(_))) {
-            return Err(CheckError::NonConstantRegex { at: self.start_of(arg0) });
+            return Err(CheckError::NonConstantRegex {
+                at: self.start_of(arg0),
+            });
         }
 
         Ok(Ty::Bool)
@@ -488,7 +559,8 @@ impl Checker<'_> {
         let rty = self.ty_of(rhs);
         match op {
             BinOp::Eq | BinOp::Ne => {
-                let excluded = matches!(lty, Ty::Map | Ty::List) || matches!(rty, Ty::Map | Ty::List);
+                let excluded =
+                    matches!(lty, Ty::Map | Ty::List) || matches!(rty, Ty::Map | Ty::List);
                 let ok = if lty == rty {
                     !excluded
                 } else {
@@ -498,7 +570,11 @@ impl Checker<'_> {
                 if ok {
                     Ok(Ty::Bool)
                 } else {
-                    Err(CheckError::TypeMismatch { at: self.start_of(lhs), expected: lty, found: rty })
+                    Err(CheckError::TypeMismatch {
+                        at: self.start_of(lhs),
+                        expected: lty,
+                        found: rty,
+                    })
                 }
             }
             BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge => {
@@ -506,12 +582,18 @@ impl Checker<'_> {
                     Ok(Ty::Bool)
                 } else {
                     let found = if lty == Ty::Int { rty } else { lty };
-                    Err(CheckError::NotOrdered { at: self.start_of(lhs), found })
+                    Err(CheckError::NotOrdered {
+                        at: self.start_of(lhs),
+                        found,
+                    })
                 }
             }
             BinOp::In => {
                 let Some(Node::List { from, len }) = self.ast.node(rhs) else {
-                    return Err(CheckError::InRequiresList { at: self.start_of(rhs), found: rty });
+                    return Err(CheckError::InRequiresList {
+                        at: self.start_of(rhs),
+                        found: rty,
+                    });
                 };
                 let elems = self.ast.args_of(from, len);
                 if let Some(&first_id) = elems.first() {
@@ -568,7 +650,11 @@ impl Checker<'_> {
         if e == Ty::Null && matches!(t, Ty::Str | Ty::Int | Ty::Bool) {
             return Ok(t);
         }
-        Err(CheckError::TypeMismatch { at: self.start_of(then_), expected: t, found: e })
+        Err(CheckError::TypeMismatch {
+            at: self.start_of(then_),
+            expected: t,
+            found: e,
+        })
     }
 
     /// One arm of `check`'s per-node match, returning the node's type and the source
@@ -596,7 +682,12 @@ impl Checker<'_> {
                 let ty = self.resolve_index(i, base, index)?;
                 Ok((ty, self.start_of(base)))
             }
-            Node::Call { base, method, args_from, args_len } => {
+            Node::Call {
+                base,
+                method,
+                args_from,
+                args_len,
+            } => {
                 let ty = self.check_call(base, method, args_from, args_len)?;
                 Ok((ty, self.start_of(base)))
             }
@@ -620,7 +711,11 @@ impl Checker<'_> {
             }
             Node::List { from, len } => {
                 let ty = self.check_list(from, len)?;
-                let start = self.ast.args_of(from, len).first().map_or(0, |&e| self.start_of(e));
+                let start = self
+                    .ast
+                    .args_of(from, len)
+                    .first()
+                    .map_or(0, |&e| self.start_of(e));
                 Ok((ty, start))
             }
         }
@@ -684,18 +779,36 @@ pub fn check(
     }
 
     if chk.slots.len() > usize::from(limits.max_attr_slots) {
-        return Err(CheckError::TooManyAttrSlots { max: limits.max_attr_slots });
+        return Err(CheckError::TooManyAttrSlots {
+            max: limits.max_attr_slots,
+        });
     }
 
     let root_ty = chk.types.get(ast.root.index()).copied().unwrap_or(Ty::Null);
     let root_start = chk.starts.get(ast.root.index()).copied().unwrap_or(0);
     if root_ty == Ty::Map {
-        return Err(CheckError::TypeMismatch { at: root_start, expected: Ty::Bool, found: Ty::Map });
+        return Err(CheckError::TypeMismatch {
+            at: root_start,
+            expected: Ty::Bool,
+            found: Ty::Map,
+        });
     }
 
-    let Checker { types, node_slot, slots, .. } = chk;
+    let Checker {
+        types,
+        node_slot,
+        slots,
+        ..
+    } = chk;
 
-    Ok(Checked { ast, types, slots, node_slot, phase, result: root_ty })
+    Ok(Checked {
+        ast,
+        types,
+        slots,
+        node_slot,
+        phase,
+        result: root_ty,
+    })
 }
 
 #[cfg(test)]
@@ -718,7 +831,11 @@ mod tests {
         check(ast, &mut strings, src, phase, &limits)
     }
 
-    fn check_src_with_limits(src: &[u8], phase: Phase, limits: PolicyLimits) -> Result<Checked, CheckError> {
+    fn check_src_with_limits(
+        src: &[u8],
+        phase: Phase,
+        limits: PolicyLimits,
+    ) -> Result<Checked, CheckError> {
         let toks = lex(src, &limits).expect("valid ITPL source must lex");
         let ast = parse(&toks, src, &limits).expect("valid ITPL source must parse");
         let mut strings = toks.strings;
@@ -804,7 +921,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(checked.slots.len(), 1, "both keys must reuse the same slot");
-        assert!(matches!(checked.slots[0], AttrRef::Field { map: MapId::RequestHeaders, .. }));
+        assert!(matches!(
+            checked.slots[0],
+            AttrRef::Field {
+                map: MapId::RequestHeaders,
+                ..
+            }
+        ));
 
         // Both `Index` nodes must carry the same node_slot.
         let index_slots: Vec<u16> = checked
@@ -842,7 +965,13 @@ mod tests {
     fn double_index_rejected() {
         // Edge case 9: indexing a Str result is NotIndexable{found: str}.
         let err = check_src(br#"request.headers["a"]["b"]"#, Phase::RequestHeaders).unwrap_err();
-        assert_eq!(err, CheckError::NotIndexable { at: 0, found: Ty::Str });
+        assert_eq!(
+            err,
+            CheckError::NotIndexable {
+                at: 0,
+                found: Ty::Str
+            }
+        );
     }
 
     #[test]
@@ -851,13 +980,19 @@ mod tests {
         let err = check_src(b"request.nope", Phase::Log).unwrap_err();
         assert_eq!(
             err,
-            CheckError::UnknownAttribute { at: 0, path: Span { start: 0, end: 12 } }
+            CheckError::UnknownAttribute {
+                at: 0,
+                path: Span { start: 0, end: 12 }
+            }
         );
 
         let err = check_src(b"nope.path", Phase::Log).unwrap_err();
         assert_eq!(
             err,
-            CheckError::UnknownAttribute { at: 0, path: Span { start: 0, end: 9 } }
+            CheckError::UnknownAttribute {
+                at: 0,
+                path: Span { start: 0, end: 9 }
+            }
         );
     }
 
@@ -865,7 +1000,14 @@ mod tests {
     fn int_vs_str_mismatch() {
         // Edge case 12.
         let err = check_src(br#"request.port == "80""#, Phase::RequestHeaders).unwrap_err();
-        assert_eq!(err, CheckError::TypeMismatch { at: 0, expected: Ty::Int, found: Ty::Str });
+        assert_eq!(
+            err,
+            CheckError::TypeMismatch {
+                at: 0,
+                expected: Ty::Int,
+                found: Ty::Str
+            }
+        );
     }
 
     #[test]
@@ -892,7 +1034,13 @@ mod tests {
     fn ordered_comparison_requires_int() {
         // Edge case 16.
         let err = check_src(br#"request.path < "/b""#, Phase::RequestHeaders).unwrap_err();
-        assert_eq!(err, CheckError::NotOrdered { at: 0, found: Ty::Str });
+        assert_eq!(
+            err,
+            CheckError::NotOrdered {
+                at: 0,
+                found: Ty::Str
+            }
+        );
 
         // Edge case 17: the accept side of the same rule.
         let checked = check_src(b"request.size < 100", Phase::RequestHeaders).unwrap();
@@ -902,16 +1050,33 @@ mod tests {
     #[test]
     fn in_requires_homogeneous_list() {
         // Edge case 18: accept side.
-        let checked = check_src(br#"request.method in ["GET", "HEAD"]"#, Phase::RequestHeaders).unwrap();
+        let checked = check_src(
+            br#"request.method in ["GET", "HEAD"]"#,
+            Phase::RequestHeaders,
+        )
+        .unwrap();
         assert_eq!(checked.result, Ty::Bool);
 
         // Edge case 19: reject side, a heterogeneous list.
         let err = check_src(br#"request.method in ["GET", 1]"#, Phase::RequestHeaders).unwrap_err();
-        assert_eq!(err, CheckError::HeterogeneousList { at: 0, first: Ty::Str, found: Ty::Int });
+        assert_eq!(
+            err,
+            CheckError::HeterogeneousList {
+                at: 0,
+                first: Ty::Str,
+                found: Ty::Int
+            }
+        );
 
         // Edge case 20: `in` against a non-list.
         let err = check_src(br#"request.method in "GET""#, Phase::RequestHeaders).unwrap_err();
-        assert_eq!(err, CheckError::InRequiresList { at: 0, found: Ty::Str });
+        assert_eq!(
+            err,
+            CheckError::InRequiresList {
+                at: 0,
+                found: Ty::Str
+            }
+        );
     }
 
     #[test]
@@ -927,11 +1092,19 @@ mod tests {
     #[test]
     fn matches_requires_literal() {
         // Edge case 21.
-        let err = check_src(b"request.path.matches(request.query)", Phase::RequestHeaders).unwrap_err();
+        let err = check_src(
+            b"request.path.matches(request.query)",
+            Phase::RequestHeaders,
+        )
+        .unwrap_err();
         assert!(matches!(err, CheckError::NonConstantRegex { .. }));
 
         // Accept side: a literal regex.
-        let checked = check_src(br#"request.path.matches("^/v[0-9]+")"#, Phase::RequestHeaders).unwrap();
+        let checked = check_src(
+            br#"request.path.matches("^/v[0-9]+")"#,
+            Phase::RequestHeaders,
+        )
+        .unwrap();
         assert_eq!(checked.result, Ty::Bool);
     }
 
@@ -943,21 +1116,30 @@ mod tests {
         assert_eq!(checked.result, Ty::Bool);
 
         // A Str receiver, the ordinary case.
-        let checked = check_src(br#"request.method.startsWith("G")"#, Phase::RequestHeaders).unwrap();
+        let checked =
+            check_src(br#"request.method.startsWith("G")"#, Phase::RequestHeaders).unwrap();
         assert_eq!(checked.result, Ty::Bool);
 
         // A bad receiver: Int is neither Str nor Null.
         let err = check_src(br#"request.port.startsWith("8")"#, Phase::RequestHeaders).unwrap_err();
         assert_eq!(
             err,
-            CheckError::BadReceiver { at: 0, method: Method::StartsWith, found: Ty::Int }
+            CheckError::BadReceiver {
+                at: 0,
+                method: Method::StartsWith,
+                found: Ty::Int
+            }
         );
 
         // A bad argument: an Int argument to a Str-argument method.
         let err = check_src(b"request.method.startsWith(1)", Phase::RequestHeaders).unwrap_err();
         assert_eq!(
             err,
-            CheckError::BadArgument { at: 0, method: Method::StartsWith, found: Ty::Int }
+            CheckError::BadArgument {
+                at: 0,
+                method: Method::StartsWith,
+                found: Ty::Int
+            }
         );
     }
 
@@ -971,7 +1153,14 @@ mod tests {
 
         // A bad receiver for size: a Bool has no size.
         let err = check_src(b"true.size()", Phase::RequestHeaders).unwrap_err();
-        assert_eq!(err, CheckError::BadReceiver { at: 0, method: Method::Size, found: Ty::Bool });
+        assert_eq!(
+            err,
+            CheckError::BadReceiver {
+                at: 0,
+                method: Method::Size,
+                found: Ty::Bool
+            }
+        );
     }
 
     #[test]
@@ -1026,10 +1215,21 @@ mod tests {
     fn ternary_branches_must_unify() {
         // Edge case 27.
         let err = check_src(br#"true ? 1 : "a""#, Phase::RequestHeaders).unwrap_err();
-        assert_eq!(err, CheckError::TypeMismatch { at: 0, expected: Ty::Int, found: Ty::Str });
+        assert_eq!(
+            err,
+            CheckError::TypeMismatch {
+                at: 0,
+                expected: Ty::Int,
+                found: Ty::Str
+            }
+        );
 
         // Null unifies with the non-null branch.
-        let checked = check_src(br#"true ? request.headers["x"] : null"#, Phase::RequestHeaders).unwrap();
+        let checked = check_src(
+            br#"true ? request.headers["x"] : null"#,
+            Phase::RequestHeaders,
+        )
+        .unwrap();
         assert_eq!(checked.result, Ty::Str);
     }
 
@@ -1039,16 +1239,36 @@ mod tests {
         // the whole program (Invariant 4: a complete expression is never Map) and as
         // an operand.
         let err = check_src(b"request.headers", Phase::RequestHeaders).unwrap_err();
-        assert_eq!(err, CheckError::TypeMismatch { at: 0, expected: Ty::Bool, found: Ty::Map });
+        assert_eq!(
+            err,
+            CheckError::TypeMismatch {
+                at: 0,
+                expected: Ty::Bool,
+                found: Ty::Map
+            }
+        );
 
         let err = check_src(b"request.headers == null", Phase::RequestHeaders).unwrap_err();
-        assert_eq!(err, CheckError::TypeMismatch { at: 0, expected: Ty::Map, found: Ty::Null });
+        assert_eq!(
+            err,
+            CheckError::TypeMismatch {
+                at: 0,
+                expected: Ty::Map,
+                found: Ty::Null
+            }
+        );
     }
 
     #[test]
     fn bare_namespace_is_not_indexable() {
         let err = check_src(br#"request["x"]"#, Phase::RequestHeaders).unwrap_err();
-        assert_eq!(err, CheckError::NotIndexable { at: 0, found: Ty::Map });
+        assert_eq!(
+            err,
+            CheckError::NotIndexable {
+                at: 0,
+                found: Ty::Map
+            }
+        );
     }
 
     #[test]
@@ -1072,9 +1292,16 @@ mod tests {
             .stack_size(128 * 1024)
             .spawn(move || {
                 let toks = lex(src.as_bytes(), &limits).expect("lex must accept 15 nested parens");
-                let ast = parse(&toks, src.as_bytes(), &limits).expect("parse must accept 15 nested parens");
+                let ast = parse(&toks, src.as_bytes(), &limits)
+                    .expect("parse must accept 15 nested parens");
                 let mut strings = toks.strings;
-                check(ast, &mut strings, src.as_bytes(), Phase::RequestHeaders, &limits)
+                check(
+                    ast,
+                    &mut strings,
+                    src.as_bytes(),
+                    Phase::RequestHeaders,
+                    &limits,
+                )
             })
             .expect("spawn 128 KiB thread");
         let result = handle.join().expect("must not stack overflow or panic");
@@ -1116,7 +1343,11 @@ mod tests {
         .unwrap();
         for (i, &slot) in checked.node_slot.iter().enumerate() {
             if slot != Checked::NO_SLOT {
-                assert_ne!(checked.types[i], Ty::Map, "a slotted node must never be Map-typed");
+                assert_ne!(
+                    checked.types[i],
+                    Ty::Map,
+                    "a slotted node must never be Map-typed"
+                );
             }
         }
     }
