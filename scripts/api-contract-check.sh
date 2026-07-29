@@ -31,7 +31,7 @@
 # Implemented with node --eval reading the JSON, so it needs no npm package.
 #
 # Usage:  scripts/api-contract-check.sh              (checks contract/openapi.v1.json)
-#         scripts/api-contract-check.sh --selftest   (runs the 29 named self-tests)
+#         scripts/api-contract-check.sh --selftest   (runs the 32 named self-tests)
 set -euo pipefail
 
 if ! command -v node >/dev/null 2>&1; then
@@ -188,22 +188,66 @@ function templateParamNames(p) {
   return names;
 }
 
-function checkBoundedSchema(node, opId, pointer, failures) {
-  if (node === null || typeof node !== 'object' || Array.isArray(node)) {
-    if (Array.isArray(node)) {
-      node.forEach((v, i) => checkBoundedSchema(v, opId, pointer + '/' + i, failures));
-    }
+// Type in a 3.1 schema is either a plain string ("string") or an array of
+// strings (["string", "null"]); both forms are standard and this document
+// declares openapi: 3.1.0, so a node with a type ARRAY containing "string"
+// or "array" is exactly as much a string or an array as one with a plain
+// type STRING, and must be bounded the same way.
+function schemaHasType(node, t) {
+  if (typeof node.type === 'string') return node.type === t;
+  if (Array.isArray(node.type)) return node.type.includes(t);
+  return false;
+}
+
+// Follow a chain of $ref indirection to the schema it ultimately names,
+// guarding against a cycle with a visited set of ref strings seen on THIS
+// chain. Returns undefined for a dangling ref (step 13 reports that
+// separately) or a cycle, never throws.
+function resolveSchemaRef(doc, node, visited) {
+  let cur = node;
+  const seen = visited || new Set();
+  while (cur && typeof cur === 'object' && typeof cur['$ref'] === 'string') {
+    if (seen.has(cur['$ref'])) return undefined;
+    seen.add(cur['$ref']);
+    cur = resolveRef(doc, cur['$ref']);
+  }
+  return cur;
+}
+
+// Walks a schema node, resolving $ref before every test so the rule applies
+// identically to an inline schema and to a named component reached through
+// any number of $ref indirections, and recurses into every composition and
+// map keyword OpenAPI 3.1 (which is JSON Schema 2020-12) defines: properties,
+// items, prefixItems, additionalProperties, patternProperties, allOf, anyOf
+// and oneOf. opId and pointer name the operation and JSON Pointer an
+// unbounded node is reported at; visited is the $ref cycle guard threaded
+// through the whole walk, not reset per branch, so a cycle anywhere in the
+// composition is caught once rather than looping.
+function checkBoundedSchema(doc, node, opId, pointer, failures, visited) {
+  if (node === null || typeof node !== 'object') return;
+  if (Array.isArray(node)) {
+    node.forEach((v, i) => checkBoundedSchema(doc, v, opId, pointer + '/' + i, failures, visited));
     return;
   }
   if (typeof node['$ref'] === 'string') {
+    const ref = node['$ref'];
+    if (visited.has(ref)) return; // cycle: already walked this ref on this chain
+    const resolved = resolveRef(doc, ref);
+    if (resolved === undefined) return; // dangling ref: step 13 reports this
+    const nextVisited = new Set(visited);
+    nextVisited.add(ref);
+    // Report against the location of the referenced component, not the
+    // requestBody call site, because that is where the offending node
+    // actually lives and where a fix belongs.
+    checkBoundedSchema(doc, resolved, opId, '/' + ref.slice(2), failures, nextVisited);
     return;
   }
-  if (node.type === 'string') {
+  if (schemaHasType(node, 'string')) {
     if (typeof node.maxLength !== 'number') {
       failures.push('unbounded string in requestBody: ' + opId + ' at JSON Pointer ' + pointer);
     }
   }
-  if (node.type === 'array') {
+  if (schemaHasType(node, 'array')) {
     if (typeof node.maxItems !== 'number') {
       failures.push('unbounded array in requestBody: ' + opId + ' at JSON Pointer ' + pointer);
     }
@@ -212,15 +256,31 @@ function checkBoundedSchema(node, opId, pointer, failures) {
     if (typeof node.maxProperties !== 'number') {
       failures.push('unbounded object with additionalProperties and no maxProperties in requestBody: ' + opId + ' at JSON Pointer ' + pointer);
     }
-    checkBoundedSchema(node.additionalProperties, opId, pointer + '/additionalProperties', failures);
+    checkBoundedSchema(doc, node.additionalProperties, opId, pointer + '/additionalProperties', failures, visited);
+  }
+  if (node.patternProperties && typeof node.patternProperties === 'object') {
+    if (typeof node.maxProperties !== 'number') {
+      failures.push('unbounded object with patternProperties and no maxProperties in requestBody: ' + opId + ' at JSON Pointer ' + pointer);
+    }
+    for (const pk of Object.keys(node.patternProperties)) {
+      checkBoundedSchema(doc, node.patternProperties[pk], opId, pointer + '/patternProperties/' + encodeJsonPointerSegment(pk), failures, visited);
+    }
   }
   if (node.properties && typeof node.properties === 'object') {
     for (const k of Object.keys(node.properties)) {
-      checkBoundedSchema(node.properties[k], opId, pointer + '/properties/' + encodeJsonPointerSegment(k), failures);
+      checkBoundedSchema(doc, node.properties[k], opId, pointer + '/properties/' + encodeJsonPointerSegment(k), failures, visited);
     }
   }
   if (node.items) {
-    checkBoundedSchema(node.items, opId, pointer + '/items', failures);
+    checkBoundedSchema(doc, node.items, opId, pointer + '/items', failures, visited);
+  }
+  if (Array.isArray(node.prefixItems)) {
+    node.prefixItems.forEach((sub, i) => checkBoundedSchema(doc, sub, opId, pointer + '/prefixItems/' + i, failures, visited));
+  }
+  for (const keyword of ['allOf', 'anyOf', 'oneOf']) {
+    if (Array.isArray(node[keyword])) {
+      node[keyword].forEach((sub, i) => checkBoundedSchema(doc, sub, opId, pointer + '/' + keyword + '/' + i, failures, visited));
+    }
   }
 }
 
@@ -422,18 +482,22 @@ function checkDocument(doc, opts) {
       }
     }
 
-    // step 24
+    // step 24. pm.schema is resolved through any $ref chain before being
+    // examined, because a parameter whose schema is a $ref to a component
+    // (for example a Cursor-style shared schema) must be bounded by what it
+    // ultimately resolves to, not exempted for having one extra layer of
+    // indirection.
     for (const pm of op.params) {
       if (!pm || pm.in !== 'path') continue;
-      const sch = pm.schema || {};
-      if (sch.type === 'string') {
+      const sch = resolveSchemaRef(doc, pm.schema, new Set()) || {};
+      if (schemaHasType(sch, 'string')) {
         if (typeof sch.maxLength !== 'number' || sch.maxLength > 256) {
           fail('path parameter has no maxLength of at most 256: ' + id + ' parameter ' + pm.name);
         }
         if (typeof sch.pattern !== 'string' || sch.pattern.length === 0) {
           fail('path parameter has no pattern: ' + id + ' parameter ' + pm.name);
         }
-      } else if (sch.type === 'integer') {
+      } else if (schemaHasType(sch, 'integer')) {
         if (typeof sch.minimum !== 'number' || typeof sch.maximum !== 'number') {
           fail('integer path parameter has no minimum and maximum: ' + id + ' parameter ' + pm.name);
         }
@@ -442,11 +506,17 @@ function checkDocument(doc, opts) {
       }
     }
 
-    // step 25
+    // step 25. Same $ref resolution as step 24: a query or header parameter
+    // whose schema is a $ref (for example components.parameters.Cursor
+    // pointing its schema at a named component instead of declaring it
+    // inline) must not silently skip the maxLength check just because
+    // pm.schema.type is undefined on the unresolved $ref wrapper.
     for (const pm of op.params) {
       if (!pm) continue;
-      if ((pm.in === 'query' || pm.in === 'header') && pm.schema && pm.schema.type === 'string') {
-        if (typeof pm.schema.maxLength !== 'number') {
+      if (pm.in !== 'query' && pm.in !== 'header') continue;
+      const sch = resolveSchemaRef(doc, pm.schema, new Set());
+      if (sch && schemaHasType(sch, 'string')) {
+        if (typeof sch.maxLength !== 'number') {
           fail('query or header string parameter has no maxLength: ' + id + ' parameter ' + pm.name);
         }
       }
@@ -458,7 +528,7 @@ function checkDocument(doc, opts) {
         if (schema) {
           const pointer = '/paths/' + encodeJsonPointerSegment(op.path) + '/' + op.method +
             '/requestBody/content/' + encodeJsonPointerSegment(mt) + '/schema';
-          checkBoundedSchema(schema, id, pointer, failures);
+          checkBoundedSchema(doc, schema, id, pointer, failures, new Set());
         }
       }
     }
@@ -1473,6 +1543,151 @@ run('selftest_frozen_permission_vocabulary_pin_rejects_widening_and_reordering',
     JSON.stringify(rReordered.failures));
 });
 
+// 30. selftest_rejects_an_unbounded_request_body_behind_a_ref
+run('selftest_rejects_an_unbounded_request_body_behind_a_ref', () => {
+  // The Do NOT list in issue 380 requires every future request body to be a
+  // $ref to a named component schema, never inline. This is that shape,
+  // checked against the same rule test 22 already exercises against the
+  // inline form: the rule must produce the identical result behind a $ref.
+  function docWithRefBody(schemas) {
+    return mkDoc({
+      opCount: 1,
+      expensive: ['explainRequest'],
+      permissions: ['none', 'explain:run'],
+      paths: {
+        '/explain': {
+          post: {
+            operationId: 'explainRequest',
+            summary: 'Run a synthetic request for testing purposes.',
+            'x-it-permission': 'explain:run',
+            'x-it-cli': 'irtctl explain',
+            parameters: [
+              { name: 'X-IT-CSRF', in: 'header', required: true, schema: { type: 'string', maxLength: 256 } },
+              { name: 'Idempotency-Key', in: 'header', required: false, schema: { type: 'string', maxLength: 255 } },
+              { name: 'X-IT-Reason', in: 'header', required: false, schema: { type: 'string', maxLength: 1024 } },
+            ],
+            requestBody: { content: { 'application/json': { schema: { '$ref': '#/components/schemas/ExplainInput' } } } },
+            responses: {
+              '200': { description: 'x' }, '401': { description: 'x' }, '403': { description: 'x' },
+              '409': { description: 'x' }, '412': { description: 'x' }, '413': { description: 'x' }, '422': { description: 'x' },
+              '429': { description: 'x', headers: { 'Retry-After': retryHeader() } }, '500': { description: 'x' },
+            },
+          },
+        },
+      },
+      components: { schemas },
+    });
+  }
+
+  const unbounded = docWithRefBody({
+    ExplainInput: { type: 'object', properties: { expr: { type: 'string' } } },
+  });
+  const r1 = checkDocument(unbounded);
+  expect('selftest_rejects_an_unbounded_request_body_behind_a_ref (unbounded ref target fails)',
+    r1.failures.some((f) => f.includes('unbounded string in requestBody') &&
+      f.includes('/components/schemas/ExplainInput/properties/expr')),
+    JSON.stringify(r1.failures));
+
+  const bounded = docWithRefBody({
+    ExplainInput: { type: 'object', properties: { expr: { type: 'string', maxLength: 4096 } } },
+  });
+  const r2 = checkDocument(bounded);
+  expect('selftest_rejects_an_unbounded_request_body_behind_a_ref (bounded ref target accepts)',
+    r2.failures.length === 0, JSON.stringify(r2.failures));
+});
+
+// 31. selftest_rejects_unbounded_composition_type_array_and_pattern_properties
+run('selftest_rejects_unbounded_composition_type_array_and_pattern_properties', () => {
+  function docWithBody(schema) {
+    return mkDoc({
+      opCount: 1,
+      expensive: ['createThing'],
+      paths: {
+        '/things': {
+          post: {
+            operationId: 'createThing',
+            summary: 'Create one thing for testing purposes.',
+            'x-it-permission': 'widget:write',
+            'x-it-cli': 'irtctl things create',
+            parameters: [
+              { name: 'X-IT-CSRF', in: 'header', required: true, schema: { type: 'string', maxLength: 256 } },
+              { name: 'Idempotency-Key', in: 'header', required: false, schema: { type: 'string', maxLength: 255 } },
+              { name: 'X-IT-Reason', in: 'header', required: false, schema: { type: 'string', maxLength: 1024 } },
+            ],
+            requestBody: { content: { 'application/json': { schema } } },
+            responses: {
+              '200': { description: 'x' }, '401': { description: 'x' }, '403': { description: 'x' },
+              '409': { description: 'x' }, '412': { description: 'x' }, '413': { description: 'x' }, '422': { description: 'x' },
+              '429': { description: 'x', headers: { 'Retry-After': retryHeader() } }, '500': { description: 'x' },
+            },
+          },
+        },
+      },
+    });
+  }
+
+  const rAllOf = checkDocument(docWithBody({ allOf: [{ type: 'object', properties: { expr: { type: 'string' } } }] }));
+  expect('selftest_rejects_unbounded_composition_type_array_and_pattern_properties (allOf)',
+    rAllOf.failures.some((f) => f.includes('unbounded string in requestBody') && f.includes('allOf/0/properties/expr')),
+    JSON.stringify(rAllOf.failures));
+
+  const rOneOf = checkDocument(docWithBody({ oneOf: [{ type: 'array', items: { type: 'string', maxLength: 8 } }] }));
+  expect('selftest_rejects_unbounded_composition_type_array_and_pattern_properties (oneOf array with no maxItems)',
+    rOneOf.failures.some((f) => f.includes('unbounded array in requestBody') && f.includes('oneOf/0')),
+    JSON.stringify(rOneOf.failures));
+
+  const rTypeArray = checkDocument(docWithBody({ type: 'object', properties: { note: { type: ['string', 'null'] } } }));
+  expect('selftest_rejects_unbounded_composition_type_array_and_pattern_properties (type array containing string)',
+    rTypeArray.failures.some((f) => f.includes('unbounded string in requestBody') && f.includes('properties/note')),
+    JSON.stringify(rTypeArray.failures));
+
+  const rPatternProps = checkDocument(docWithBody({ type: 'object', patternProperties: { '^x-': { type: 'string', maxLength: 8 } } }));
+  expect('selftest_rejects_unbounded_composition_type_array_and_pattern_properties (patternProperties with no maxProperties)',
+    rPatternProps.failures.some((f) => f.includes('unbounded object with patternProperties and no maxProperties')),
+    JSON.stringify(rPatternProps.failures));
+});
+
+// 32. selftest_rejects_a_ref_schema_that_strips_a_query_parameter_bound
+run('selftest_rejects_a_ref_schema_that_strips_a_query_parameter_bound', () => {
+  function docWithCursorLike(cursorSchema) {
+    return mkDoc({
+      opCount: 1,
+      expensive: ['listThings'],
+      paths: {
+        '/things': {
+          get: {
+            operationId: 'listThings',
+            summary: 'List every thing for testing purposes.',
+            'x-it-permission': 'widget:read',
+            'x-it-cli': 'irtctl things',
+            parameters: [
+              { name: 'If-None-Match', in: 'header', required: false, schema: { type: 'string', maxLength: 4096 } },
+              { name: 'cursor', in: 'query', required: false, schema: { '$ref': '#/components/schemas/CursorSchema' } },
+            ],
+            responses: {
+              '200': { description: 'x' }, '304': { description: 'x' }, '401': { description: 'x' }, '403': { description: 'x' },
+              '429': { description: 'x', headers: { 'Retry-After': retryHeader() } }, '500': { description: 'x' },
+            },
+          },
+        },
+      },
+      components: { schemas: { CursorSchema: cursorSchema } },
+    });
+  }
+
+  const stripped = docWithCursorLike({ type: 'string' });
+  const r1 = checkDocument(stripped);
+  expect('selftest_rejects_a_ref_schema_that_strips_a_query_parameter_bound (ref target has no maxLength)',
+    r1.failures.some((f) => f.includes('query or header string parameter has no maxLength') &&
+      f.includes('listThings') && f.includes('cursor')),
+    JSON.stringify(r1.failures));
+
+  const bounded = docWithCursorLike({ type: 'string', maxLength: 512, pattern: '^[A-Za-z0-9_-]{1,512}$' });
+  const r2 = checkDocument(bounded);
+  expect('selftest_rejects_a_ref_schema_that_strips_a_query_parameter_bound (ref target bounded accepts)',
+    r2.failures.length === 0, JSON.stringify(r2.failures));
+});
+
   return { results, passCount, failCount };
 }
 
@@ -1483,7 +1698,7 @@ function main() {
     for (const line of results) {
       console.log(line);
     }
-    console.log('selftest: ' + passCount + ' passed, ' + failCount + ' failed (of ' + (passCount + failCount) + ' assertions across 29 named tests)');
+    console.log('selftest: ' + passCount + ' passed, ' + failCount + ' failed (of ' + (passCount + failCount) + ' assertions across 32 named tests)');
     process.exit(failCount === 0 ? 0 : 1);
   }
 
