@@ -877,6 +877,39 @@ mod tests {
     }
 
     #[test]
+    fn map_not_available_in_phase() {
+        // MapNotAvailableInPhase has no coverage anywhere else: every other test
+        // that indexes a map does so at or after that map's own `from_phase`. Both
+        // sides of the boundary, for `response.headers`, whose `from` is
+        // `ResponseHeaders`: rejected one phase early, accepted exactly at it.
+        let err = check_src(br#"response.headers["x"] == "1""#, Phase::RequestHeaders).unwrap_err();
+        assert_eq!(
+            err,
+            CheckError::MapNotAvailableInPhase {
+                at: 0,
+                map: MapId::ResponseHeaders,
+                phase: Phase::RequestHeaders,
+                from: Phase::ResponseHeaders,
+            }
+        );
+
+        let checked =
+            check_src(br#"response.headers["x"] == "1""#, Phase::ResponseHeaders).unwrap();
+        assert_eq!(checked.result, Ty::Bool);
+    }
+
+    #[test]
+    fn phase_availability_exact_boundary_is_accepted() {
+        // The accept side of the same boundary `phase_availability_request_in_stream_start`
+        // rejects one phase early for: `request.path`'s `from_phase` is
+        // `RequestHeaders`, so checking it AT that exact phase must succeed. A
+        // reject-only test cannot distinguish `>=` from `>` in the availability
+        // comparison.
+        let checked = check_src(b"request.path == \"/x\"", Phase::RequestHeaders).unwrap();
+        assert_eq!(checked.result, Ty::Bool);
+    }
+
+    #[test]
     fn stream_duration_ms_outside_log_is_rejected() {
         // Edge case 3: `stream.duration_ms` outside `on_log`.
         let err = check_src(b"stream.duration_ms", Phase::RequestHeaders).unwrap_err();
@@ -1179,8 +1212,9 @@ mod tests {
 
     #[test]
     fn too_many_attr_slots() {
-        // Edge case 25: 17 distinct attributes with max_attr_slots = 16.
-        let attrs = [
+        // 16 distinct attributes, exactly at the default max_attr_slots: the ACCEPT
+        // side of the boundary. A reject-only test cannot tell `>` from `>=`.
+        let attrs_16 = [
             "request.method",
             "request.path",
             "request.query",
@@ -1197,17 +1231,27 @@ mod tests {
             "connection.local_addr",
             "connection.tls",
             "connection.sni",
-            "connection.alpn",
         ];
-        assert_eq!(attrs.len(), 17);
+        assert_eq!(attrs_16.len(), 16);
         // Every attribute above is Str, Int or Bool (never Map/List), so comparing
-        // each to itself is always a legal, always-true clause: 17 distinct slots
-        // against a default max_attr_slots of 16.
-        let self_eq: Vec<String> = attrs.iter().map(|a| format!("{a} == {a}")).collect();
-        let src = self_eq.join(" && ");
+        // each to itself is always a legal, always-true clause.
+        let self_eq_16: Vec<String> = attrs_16.iter().map(|a| format!("{a} == {a}")).collect();
+        let src_16 = self_eq_16.join(" && ");
         let mut limits = default_limits();
         limits.max_tokens = 2048;
-        let err = check_src_with_limits(src.as_bytes(), Phase::Log, limits).unwrap_err();
+        let checked = check_src_with_limits(src_16.as_bytes(), Phase::Log, limits).unwrap();
+        assert_eq!(checked.slots.len(), 16);
+
+        // Edge case 25: 17 distinct attributes with max_attr_slots = 16, the REJECT
+        // side, one past the boundary just accepted above.
+        let mut attrs_17 = attrs_16.to_vec();
+        attrs_17.push("connection.alpn");
+        assert_eq!(attrs_17.len(), 17);
+        let self_eq_17: Vec<String> = attrs_17.iter().map(|a| format!("{a} == {a}")).collect();
+        let src_17 = self_eq_17.join(" && ");
+        let mut limits = default_limits();
+        limits.max_tokens = 2048;
+        let err = check_src_with_limits(src_17.as_bytes(), Phase::Log, limits).unwrap_err();
         assert_eq!(err, CheckError::TooManyAttrSlots { max: 16 });
     }
 
