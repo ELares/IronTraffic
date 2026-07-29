@@ -7,17 +7,28 @@
 //! one tokio timer per endpoint. [`http`] and [`tcp`] are the sans-IO response
 //! codecs that decide pass or fail for one in-flight check: they perform no I/O,
 //! read no clock, and share the [`StatusRange`], [`CodecStep`],
-//! [`ConnectionFate`], and [`patterns_match`] items defined in this module. A
-//! later issue in this milestone (the gRPC checker) builds directly on those
-//! same shared items.
+//! [`ConnectionFate`], and [`patterns_match`] items defined in this module.
+//! [`grpc`] and [`grpc_mode`] are the gRPC counterpart: a bounds-checked
+//! protobuf reader in place of an HTTP framing scan, and a Watch-versus-Check
+//! policy machine in place of a single linear parse phase, because a gRPC
+//! `Watch` stream has no single response byte stream to step through.
 
 pub mod bitmap;
+pub mod grpc;
+pub mod grpc_mode;
 pub mod http;
 pub mod schedule;
 pub mod tcp;
 pub mod wheel;
 
 pub use bitmap::{ClusterHealth, EndpointHealth, HealthBitmap};
+pub use grpc::{
+    CompiledGrpcCheck, GrpcCheckSpec, GrpcDecodeError, GrpcVerdict, MAX_MESSAGE_LEN,
+    MAX_WATCH_MESSAGES_PER_INTERVAL, MAX_WATCH_STREAMS, ServingStatus, decode_error_verdict,
+    decode_health_response, encode_health_request, grpc_frame_admissible, parse_grpc_status,
+    serving_status_verdict,
+};
+pub use grpc_mode::{GrpcAction, GrpcMode, GrpcModeMachine};
 pub use http::{CompiledHttpCheck, HttpCheckCodec, HttpCheckMethod, HttpCheckSpec};
 pub use schedule::{
     CheckOutcome, EndpointSchedule, FailKind, HealthCheckConfig, IntervalState, Transition,
