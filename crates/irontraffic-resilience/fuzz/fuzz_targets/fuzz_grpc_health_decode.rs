@@ -101,7 +101,7 @@ fn build_frame(shape: u8, status_seed: u32, raw: &[u8]) -> Vec<u8> {
 
 /// Build the bytes handed to `parse_grpc_status`. See the module doc.
 fn build_status_text(shape: u8, seed: &[u8]) -> Vec<u8> {
-    if shape % 2 == 0 {
+    if shape.is_multiple_of(2) {
         seed.to_vec()
     } else {
         seed.iter().take(10).map(|b| b'0' + (b % 10)).collect()
