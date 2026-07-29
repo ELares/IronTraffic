@@ -560,6 +560,50 @@ mod tests {
         }
     }
 
+    /// Every row's `ty` and `from` column must agree with the `AttrId` and
+    /// `MapId` methods that actually answer those questions.
+    ///
+    /// `resolve_field` reads only `entry.attr` and `entry.map`, then answers
+    /// everything else from `attr.ty()`, `attr.from_phase()` and
+    /// `attr.available_in()`; `resolve_index` likewise uses `map.from_phase()`
+    /// and `map.lowercase_keys()`. Nothing in the workspace reads `entry.ty` or
+    /// `entry.from`, so without this test both columns of all 28 rows can drift
+    /// from the methods and ship green, while `ATTRS` is `pub`, re-exported, and
+    /// documented as "the whole schema" for the compiler and evaluator to read.
+    #[test]
+    fn attrs_rows_agree_with_the_id_methods() {
+        for entry in &ATTRS {
+            let path = String::from_utf8_lossy(entry.path);
+            match (entry.attr, entry.map) {
+                (Some(attr), None) => {
+                    assert_eq!(
+                        entry.ty,
+                        attr.ty(),
+                        "{path}: the row's `ty` column disagrees with `AttrId::ty()`"
+                    );
+                    assert_eq!(
+                        entry.from,
+                        attr.from_phase(),
+                        "{path}: the row's `from` column disagrees with `AttrId::from_phase()`"
+                    );
+                }
+                (None, Some(map)) => {
+                    assert_eq!(
+                        entry.ty,
+                        Ty::Map,
+                        "{path}: a map row's `ty` column must be `Ty::Map`"
+                    );
+                    assert_eq!(
+                        entry.from,
+                        map.from_phase(),
+                        "{path}: the row's `from` column disagrees with `MapId::from_phase()`"
+                    );
+                }
+                _ => panic!("{path}: exactly one of `attr` and `map` must be `Some`"),
+            }
+        }
+    }
+
     #[test]
     fn attrs_paths_are_unique() {
         for i in 0..ATTRS.len() {
