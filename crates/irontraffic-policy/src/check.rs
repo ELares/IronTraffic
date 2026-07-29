@@ -598,6 +598,21 @@ impl Checker<'_> {
                         found: rty,
                     });
                 };
+                // The left operand must be a scalar, and this is checked BEFORE
+                // the element scan so that it applies to the empty list too.
+                // Reading the constraint off `elems.first()` alone would let
+                // `response.headers in []` through, which is not merely a stray
+                // `Ty::Map` node with `NO_SLOT` inside an accepted program: it
+                // also routes around the per-phase gate, because `resolve_field`
+                // records no phase check for a map row (that check lives in
+                // `resolve_index`, which an unindexed map never reaches).
+                if matches!(lty, Ty::Map | Ty::List) {
+                    return Err(CheckError::HeterogeneousList {
+                        at: self.start_of(lhs),
+                        first: lty,
+                        found: lty,
+                    });
+                }
                 let elems = self.ast.args_of(from, len);
                 if let Some(&first_id) = elems.first() {
                     let first_ty = self.ty_of(first_id);
@@ -1150,6 +1165,94 @@ mod tests {
                 at: 0,
                 found: Ty::Str
             }
+        );
+    }
+
+    /// The `In` arm's own element-type guard, which nothing else exercised.
+    ///
+    /// `in_requires_homogeneous_list`'s heterogeneous case is caught one level
+    /// earlier, by `check_list`'s homogeneity loop, with a byte identical error
+    /// value, so deleting this arm's guard entirely used to leave the suite
+    /// green. A HOMOGENEOUS list of the wrong element type reaches only this
+    /// guard, so it is the discriminating input.
+    #[test]
+    fn in_rejects_a_homogeneous_list_of_the_wrong_element_type() {
+        let err = check_src(br#"request.method in [1, 2]"#, Phase::RequestHeaders).unwrap_err();
+        assert_eq!(
+            err,
+            CheckError::HeterogeneousList {
+                at: 0,
+                first: Ty::Int,
+                found: Ty::Str
+            }
+        );
+    }
+
+    /// `in` against an EMPTY list must still constrain its left operand.
+    ///
+    /// Reading the constraint off `elems.first()` alone admitted a `Ty::Map`
+    /// node carrying `NO_SLOT` into an accepted program, and, because a map that
+    /// is never indexed never reaches `resolve_index`, it also bypassed the per
+    /// phase availability gate: `response.headers in []` type checked in
+    /// `stream_start`, the earliest phase, before any response exists.
+    #[test]
+    fn in_an_empty_list_still_rejects_a_map_or_list_operand() {
+        for (src, phase) in [
+            (&br#"response.headers in []"#[..], Phase::StreamStart),
+            (&br#"request.headers in []"#[..], Phase::StreamStart),
+            (&br#"request.query_params in []"#[..], Phase::RequestHeaders),
+            (&br#"[1, 2] in []"#[..], Phase::RequestHeaders),
+        ] {
+            let err = check_src(src, phase).unwrap_err();
+            let found = match err {
+                CheckError::HeterogeneousList { found, .. } => found,
+                other => panic!(
+                    "{} must be rejected as a non scalar `in` operand, got {other:?}",
+                    core::str::from_utf8(src).unwrap()
+                ),
+            };
+            assert!(
+                matches!(found, Ty::Map | Ty::List),
+                "{} was rejected, but for the wrong reason: found {found:?}",
+                core::str::from_utf8(src).unwrap()
+            );
+        }
+
+        // The accept side, so the guard above cannot be widened into rejecting
+        // every `in`: a scalar left operand against an empty list is legal and
+        // simply always false.
+        let checked = check_src(br#"request.method in []"#, Phase::RequestHeaders).unwrap();
+        assert_eq!(checked.result, Ty::Bool);
+    }
+
+    /// `intern_slot` must not merge a scalar attribute with a map lookup.
+    ///
+    /// The `_ => false` arm of its `same` closure is what keeps an
+    /// `AttrRef::Scalar` and an `AttrRef::Field` in separate slots. Flipping it
+    /// to `_ => true` used to leave the whole suite green, because no test mixed
+    /// the two kinds in one program and asserted the slot count: `slot_reuse` is
+    /// 50 scalars, `header_key_is_lowercased` is two fields, and
+    /// `too_many_attr_slots` is 16 scalars. With the arm flipped, the header's
+    /// `node_slot` points at the scalar's slot, so an evaluator reads
+    /// `request.path` where the policy asked for a header.
+    #[test]
+    fn a_scalar_and_a_map_lookup_never_share_a_slot() {
+        let checked = check_src(
+            br#"request.path == "/x" && request.headers["a"] == "v""#,
+            Phase::RequestHeaders,
+        )
+        .unwrap();
+        assert_eq!(
+            checked.slots.len(),
+            2,
+            "a scalar attribute and a header lookup are two distinct values"
+        );
+
+        // Kind alone is not enough: the two slots must also name different
+        // things, so that merging them in the other direction is caught too.
+        assert_ne!(
+            checked.slots[0], checked.slots[1],
+            "the two slots must reference different attributes"
         );
     }
 
