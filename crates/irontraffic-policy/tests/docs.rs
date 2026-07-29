@@ -9,6 +9,13 @@
     clippy::indexing_slicing,
     reason = "integration test code: the slices are bounded by prior position() calls on the same vector"
 )]
+#![allow(
+    clippy::panic,
+    reason = "integration test code: these panics are the designed failure mode for a table that \
+              has been renamed, deleted or given an unrecognised cell value. Failing loudly is the \
+              whole point: the previous version of these tests silently iterated an empty set when \
+              the documentation drifted, which is the defect being fixed"
+)]
 
 use std::fs;
 use std::path::Path;
@@ -62,7 +69,10 @@ fn table_cells(line: &str) -> Vec<String> {
         .strip_prefix('|')
         .and_then(|rest| rest.strip_suffix('|'))
         .unwrap_or(trimmed);
-    inner.split('|').map(|cell| cell.trim().to_owned()).collect()
+    inner
+        .split('|')
+        .map(|cell| cell.trim().to_owned())
+        .collect()
 }
 
 /// Returns the data rows of the markdown table whose header cells equal `header`.
@@ -140,8 +150,9 @@ fn docs_scalar_table_matches_the_schema() {
     for row in &rows {
         assert_eq!(row.len(), 3, "malformed scalar row: {row:?}");
         let path = unticked(&row[0]);
-        let entry = irontraffic_policy::resolve_path(path.as_bytes())
-            .unwrap_or_else(|| panic!("docs/ITPL.md documents `{path}`, which is not an attribute"));
+        let entry = irontraffic_policy::resolve_path(path.as_bytes()).unwrap_or_else(|| {
+            panic!("docs/ITPL.md documents `{path}`, which is not an attribute")
+        });
         let attr = entry
             .attr
             .unwrap_or_else(|| panic!("`{path}` is in the scalar table but is a map"));
@@ -192,13 +203,18 @@ fn docs_map_table_matches_the_schema() {
         .iter()
         .filter(|entry| entry.map.is_some())
         .collect();
-    assert_eq!(rows.len(), maps.len(), "the published map table is the wrong size");
+    assert_eq!(
+        rows.len(),
+        maps.len(),
+        "the published map table is the wrong size"
+    );
 
     for row in &rows {
         assert_eq!(row.len(), 4, "malformed map row: {row:?}");
         let path = unticked(&row[0]);
-        let entry = irontraffic_policy::resolve_path(path.as_bytes())
-            .unwrap_or_else(|| panic!("docs/ITPL.md documents `{path}`, which is not an attribute"));
+        let entry = irontraffic_policy::resolve_path(path.as_bytes()).unwrap_or_else(|| {
+            panic!("docs/ITPL.md documents `{path}`, which is not an attribute")
+        });
         let map = entry
             .map
             .unwrap_or_else(|| panic!("`{path}` is in the map table but is a scalar"));

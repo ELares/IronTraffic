@@ -1177,7 +1177,7 @@ mod tests {
     /// guard, so it is the discriminating input.
     #[test]
     fn in_rejects_a_homogeneous_list_of_the_wrong_element_type() {
-        let err = check_src(br#"request.method in [1, 2]"#, Phase::RequestHeaders).unwrap_err();
+        let err = check_src(br"request.method in [1, 2]", Phase::RequestHeaders).unwrap_err();
         assert_eq!(
             err,
             CheckError::HeterogeneousList {
@@ -1198,10 +1198,10 @@ mod tests {
     #[test]
     fn in_an_empty_list_still_rejects_a_map_or_list_operand() {
         for (src, phase) in [
-            (&br#"response.headers in []"#[..], Phase::StreamStart),
-            (&br#"request.headers in []"#[..], Phase::StreamStart),
-            (&br#"request.query_params in []"#[..], Phase::RequestHeaders),
-            (&br#"[1, 2] in []"#[..], Phase::RequestHeaders),
+            (&br"response.headers in []"[..], Phase::StreamStart),
+            (&br"request.headers in []"[..], Phase::StreamStart),
+            (&br"request.query_params in []"[..], Phase::RequestHeaders),
+            (&br"[1, 2] in []"[..], Phase::RequestHeaders),
         ] {
             let err = check_src(src, phase).unwrap_err();
             let found = match err {
@@ -1221,7 +1221,7 @@ mod tests {
         // The accept side, so the guard above cannot be widened into rejecting
         // every `in`: a scalar left operand against an empty list is legal and
         // simply always false.
-        let checked = check_src(br#"request.method in []"#, Phase::RequestHeaders).unwrap();
+        let checked = check_src(br"request.method in []", Phase::RequestHeaders).unwrap();
         assert_eq!(checked.result, Ty::Bool);
     }
 
@@ -1232,9 +1232,9 @@ mod tests {
     #[test]
     fn eq_rejects_map_and_list_operands_against_their_own_type() {
         for src in [
-            &br#"request.headers == request.headers"#[..],
-            &br#"request.headers != request.headers"#[..],
-            &br#"[1] == [1]"#[..],
+            &br"request.headers == request.headers"[..],
+            &br"request.headers != request.headers"[..],
+            &br"[1] == [1]"[..],
         ] {
             let err = check_src(src, Phase::RequestHeaders).unwrap_err();
             assert!(
@@ -1261,8 +1261,8 @@ mod tests {
     #[test]
     fn a_list_literal_rejects_a_non_scalar_first_element() {
         for src in [
-            &br#"request.method in [request.headers]"#[..],
-            &br#"request.method in [[1]]"#[..],
+            &br"request.method in [request.headers]"[..],
+            &br"request.method in [[1]]"[..],
         ] {
             let rendered = core::str::from_utf8(src).unwrap();
             let err = check_src(src, Phase::RequestHeaders).unwrap_err();
