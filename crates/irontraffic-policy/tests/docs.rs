@@ -52,63 +52,254 @@ fn extract_ebnf(path: &str) -> String {
         .expect("EBNF block slice is in range")
 }
 
+/// Splits a markdown table row into its cells, trimming each.
+///
+/// `| a | b |` yields `["a", "b"]`. Leading and trailing empties from the outer
+/// pipes are dropped; interior empties (an unset matrix cell) are kept.
+fn table_cells(line: &str) -> Vec<String> {
+    let trimmed = line.trim();
+    let inner = trimmed
+        .strip_prefix('|')
+        .and_then(|rest| rest.strip_suffix('|'))
+        .unwrap_or(trimmed);
+    inner.split('|').map(|cell| cell.trim().to_owned()).collect()
+}
+
+/// Returns the data rows of the markdown table whose header cells equal `header`.
+///
+/// Panics if no such table exists, which is the point: renaming a column or
+/// deleting a table fails the build here rather than silently emptying the loop
+/// that would otherwise iterate over it.
+fn table_rows(text: &str, header: &[&str]) -> Vec<Vec<String>> {
+    let lines: Vec<&str> = text.lines().collect();
+    let head = lines
+        .iter()
+        .position(|line| table_cells(line) == header)
+        .unwrap_or_else(|| panic!("docs/ITPL.md has no table with header {header:?}"));
+    // The row after the header is the `| --- |` separator; data starts after it.
+    let mut rows = Vec::new();
+    for line in lines.iter().skip(head + 2) {
+        if !line.trim_start().starts_with('|') {
+            break;
+        }
+        rows.push(table_cells(line));
+    }
+    assert!(
+        !rows.is_empty(),
+        "the table with header {header:?} has no data rows"
+    );
+    rows
+}
+
+/// Strips the surrounding backticks from a markdown code span.
+fn unticked(cell: &str) -> &str {
+    cell.trim_matches('`')
+}
+
+/// The published name for a scalar type, as the docs spell it.
+fn ty_name(ty: irontraffic_policy::Ty) -> &'static str {
+    match ty {
+        irontraffic_policy::Ty::Str => "string",
+        irontraffic_policy::Ty::Int => "int",
+        irontraffic_policy::Ty::Bool => "bool",
+        other => panic!("no published name for {other:?}"),
+    }
+}
+
 #[test]
-fn docs_attribute_table_is_complete() {
-    // Test 28: every AttrId::path() and MapId::path() appears in docs/ITPL.md. This
-    // checks the running code against documentation, not documentation against
-    // itself: deleting a row from `ATTRS`, or from the doc table, fails this test.
+fn docs_scalar_table_matches_the_schema() {
+    // Test 28: every column of the published scalar table is checked against the
+    // running code, in BOTH directions, cell by cell.
+    //
+    // This replaces a `docs_text.contains(path)` substring search that pinned
+    // almost nothing. Eight mutations of this file used to survive the whole
+    // suite, including deleting rows and inverting the availability column. The
+    // substring form could not even pin the 28 paths: `request.query` is a
+    // prefix of `request.query_params`, so its row could be deleted from every
+    // table and the assertion still passed, and `request.path` could be deleted
+    // from this table because it still appeared in the availability matrix,
+    // which is exactly the distinction the acceptance criterion asks for.
     let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
     let docs_path = crate_dir.join("../../docs/ITPL.md");
     let docs_text = fs::read_to_string(&docs_path).expect("docs/ITPL.md must be readable");
 
-    let all_attr_ids = [
-        irontraffic_policy::AttrId::RequestMethod,
-        irontraffic_policy::AttrId::RequestPath,
-        irontraffic_policy::AttrId::RequestQuery,
-        irontraffic_policy::AttrId::RequestScheme,
-        irontraffic_policy::AttrId::RequestAuthority,
-        irontraffic_policy::AttrId::RequestHost,
-        irontraffic_policy::AttrId::RequestPort,
-        irontraffic_policy::AttrId::RequestProtocol,
-        irontraffic_policy::AttrId::RequestSize,
-        irontraffic_policy::AttrId::RequestId,
-        irontraffic_policy::AttrId::RequestHeaderCount,
-        irontraffic_policy::AttrId::ConnectionRemoteAddr,
-        irontraffic_policy::AttrId::ConnectionRemotePort,
-        irontraffic_policy::AttrId::ConnectionLocalAddr,
-        irontraffic_policy::AttrId::ConnectionTls,
-        irontraffic_policy::AttrId::ConnectionSni,
-        irontraffic_policy::AttrId::ConnectionAlpn,
-        irontraffic_policy::AttrId::ConnectionMtlsVerified,
-        irontraffic_policy::AttrId::ConnectionListener,
-        irontraffic_policy::AttrId::RouteId,
-        irontraffic_policy::AttrId::RouteCluster,
-        irontraffic_policy::AttrId::ResponseStatus,
-        irontraffic_policy::AttrId::ResponseSize,
-        irontraffic_policy::AttrId::StreamId,
-        irontraffic_policy::AttrId::StreamDurationMs,
-    ];
-    assert_eq!(all_attr_ids.len(), irontraffic_policy::AttrId::COUNT);
-    for id in all_attr_ids {
-        let path = id.path();
-        assert!(
-            docs_text.contains(path),
-            "docs/ITPL.md is missing the attribute path `{path}` ({id:?})"
+    let rows = table_rows(&docs_text, &["path", "type", "available from"]);
+
+    let scalars: Vec<&irontraffic_policy::AttrEntry> = irontraffic_policy::ATTRS
+        .iter()
+        .filter(|entry| entry.attr.is_some())
+        .collect();
+    assert_eq!(
+        rows.len(),
+        scalars.len(),
+        "the published scalar table has {} rows, the schema has {} scalar attributes",
+        rows.len(),
+        scalars.len()
+    );
+
+    for row in &rows {
+        assert_eq!(row.len(), 3, "malformed scalar row: {row:?}");
+        let path = unticked(&row[0]);
+        let entry = irontraffic_policy::resolve_path(path.as_bytes())
+            .unwrap_or_else(|| panic!("docs/ITPL.md documents `{path}`, which is not an attribute"));
+        let attr = entry
+            .attr
+            .unwrap_or_else(|| panic!("`{path}` is in the scalar table but is a map"));
+
+        assert_eq!(
+            row[1],
+            ty_name(attr.ty()),
+            "`{path}`: published type is `{}`, the schema says `{}`",
+            row[1],
+            ty_name(attr.ty())
+        );
+        assert_eq!(
+            unticked(&row[2]),
+            attr.from_phase().as_str(),
+            "`{path}`: published availability is `{}`, the schema says `{}`",
+            unticked(&row[2]),
+            attr.from_phase().as_str()
         );
     }
 
-    let all_map_ids = [
-        irontraffic_policy::MapId::RequestHeaders,
-        irontraffic_policy::MapId::RequestQuery,
-        irontraffic_policy::MapId::ResponseHeaders,
-    ];
-    for id in all_map_ids {
-        let path = id.path();
+    // The other direction: no scalar attribute may be missing from the table.
+    for entry in scalars {
+        let path = core::str::from_utf8(entry.path).expect("paths are ascii");
         assert!(
-            docs_text.contains(path),
-            "docs/ITPL.md is missing the map path `{path}` ({id:?})"
+            rows.iter().any(|row| unticked(&row[0]) == path),
+            "docs/ITPL.md's scalar table is missing `{path}`"
         );
     }
+}
+
+#[test]
+fn docs_map_table_matches_the_schema() {
+    // Test 28c: the map table's `key casing` column is a SECURITY rule, not a
+    // note. Inverting it (telling an operator to write `X-Api-Key` when lookups
+    // are lowercased, or to expect query parameters to be case insensitive when
+    // they are not) silently breaks every policy an operator writes from the
+    // documentation. It used to be pinned by nothing.
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let docs_path = crate_dir.join("../../docs/ITPL.md");
+    let docs_text = fs::read_to_string(&docs_path).expect("docs/ITPL.md must be readable");
+
+    let rows = table_rows(
+        &docs_text,
+        &["path", "element type", "available from", "key casing"],
+    );
+
+    let maps: Vec<&irontraffic_policy::AttrEntry> = irontraffic_policy::ATTRS
+        .iter()
+        .filter(|entry| entry.map.is_some())
+        .collect();
+    assert_eq!(rows.len(), maps.len(), "the published map table is the wrong size");
+
+    for row in &rows {
+        assert_eq!(row.len(), 4, "malformed map row: {row:?}");
+        let path = unticked(&row[0]);
+        let entry = irontraffic_policy::resolve_path(path.as_bytes())
+            .unwrap_or_else(|| panic!("docs/ITPL.md documents `{path}`, which is not an attribute"));
+        let map = entry
+            .map
+            .unwrap_or_else(|| panic!("`{path}` is in the map table but is a scalar"));
+
+        assert_eq!(
+            unticked(&row[2]),
+            map.from_phase().as_str(),
+            "`{path}`: published availability disagrees with the schema"
+        );
+        let published_lowercased = match row[3].as_str() {
+            "lowercased" => true,
+            "case sensitive" => false,
+            other => panic!("`{path}`: unrecognised key casing `{other}`"),
+        };
+        assert_eq!(
+            published_lowercased,
+            map.lowercase_keys(),
+            "`{path}`: published key casing is `{}`, which is backwards",
+            row[3]
+        );
+    }
+
+    for entry in maps {
+        let path = core::str::from_utf8(entry.path).expect("paths are ascii");
+        assert!(
+            rows.iter().any(|row| unticked(&row[0]) == path),
+            "docs/ITPL.md's map table is missing `{path}`"
+        );
+    }
+}
+
+#[test]
+fn docs_availability_matrix_matches_the_schema() {
+    // Test 28d: all 28 rows by all 10 phases, 280 published cells, each checked
+    // against `available_in`. Whole matrix rows used to be invertible without
+    // failing anything.
+    let crate_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let docs_path = crate_dir.join("../../docs/ITPL.md");
+    let docs_text = fs::read_to_string(&docs_path).expect("docs/ITPL.md must be readable");
+
+    let phases: Vec<irontraffic_filter::Phase> = (0..irontraffic_filter::Phase::COUNT)
+        .map(|i| {
+            let index = u8::try_from(i).expect("COUNT is 10");
+            irontraffic_filter::Phase::from_index(index).expect("index is in range")
+        })
+        .collect();
+
+    let mut header = vec!["attribute".to_owned()];
+    header.extend(phases.iter().map(|p| (*p).as_str().to_owned()));
+    let header_refs: Vec<&str> = header.iter().map(String::as_str).collect();
+    let rows = table_rows(&docs_text, &header_refs);
+
+    assert_eq!(
+        rows.len(),
+        irontraffic_policy::ATTRS.len(),
+        "the availability matrix has {} rows, the schema has {}",
+        rows.len(),
+        irontraffic_policy::ATTRS.len()
+    );
+
+    let mut checked_cells = 0u32;
+    for row in &rows {
+        assert_eq!(
+            row.len(),
+            phases.len() + 1,
+            "malformed matrix row (wrong number of columns): {row:?}"
+        );
+        let path = unticked(&row[0]);
+        let entry = irontraffic_policy::resolve_path(path.as_bytes())
+            .unwrap_or_else(|| panic!("the matrix documents `{path}`, which is not an attribute"));
+        let from = match (entry.attr, entry.map) {
+            (Some(attr), None) => attr.from_phase(),
+            (None, Some(map)) => map.from_phase(),
+            _ => panic!("`{path}`: exactly one of attr and map must be set"),
+        };
+
+        for (col, phase) in phases.iter().enumerate() {
+            let cell = row
+                .get(col + 1)
+                .unwrap_or_else(|| panic!("`{path}`: missing cell for {}", (*phase).as_str()));
+            let published = match cell.as_str() {
+                "x" => true,
+                "" => false,
+                other => panic!("`{path}`: unrecognised matrix cell `{other}`"),
+            };
+            let actual = phase.index() >= from.index();
+            assert_eq!(
+                published,
+                actual,
+                "`{path}` at `{}`: published {}, the schema says {actual}",
+                (*phase).as_str(),
+                published
+            );
+            checked_cells += 1;
+        }
+    }
+
+    // Pinned against a literal, deliberately, not against `rows.len() *
+    // phases.len()`: emptying either loop must FAIL this test rather than
+    // silently checking nothing.
+    assert_eq!(checked_cells, 280, "expected 28 attributes by 10 phases");
 }
 
 #[test]

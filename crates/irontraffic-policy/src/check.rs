@@ -1225,6 +1225,63 @@ mod tests {
         assert_eq!(checked.result, Ty::Bool);
     }
 
+    /// `==` and `!=` must reject a `Map` or `List` operand even against its own
+    /// type, which is the `!matches!(lty, Ty::Map | Ty::List)` sub-guard inside
+    /// the `lty == rty` branch. Deleting that sub-guard used to leave the suite
+    /// green, because no test compared two operands of the SAME non scalar type.
+    #[test]
+    fn eq_rejects_map_and_list_operands_against_their_own_type() {
+        for src in [
+            &br#"request.headers == request.headers"#[..],
+            &br#"request.headers != request.headers"#[..],
+            &br#"[1] == [1]"#[..],
+        ] {
+            let err = check_src(src, Phase::RequestHeaders).unwrap_err();
+            assert!(
+                matches!(err, CheckError::TypeMismatch { .. }),
+                "{} must be a TypeMismatch, got {err:?}",
+                core::str::from_utf8(src).unwrap()
+            );
+        }
+    }
+
+    /// A list literal's elements must be scalars, which is `check_list`'s
+    /// first-element guard. Deleting it used to leave the suite green, because
+    /// every existing list test uses scalar elements throughout.
+    ///
+    /// The assertion is on `first == found`, not merely on the variant, and that
+    /// distinction is load-bearing. With the guard deleted these inputs are
+    /// still rejected, by the `In` arm one level up, with the SAME
+    /// `HeterogeneousList` variant. Only the field values tell the two guards
+    /// apart: `check_list` reports the offending element against itself
+    /// (`first == found`), whereas the `In` arm reports the element against the
+    /// left operand's type (`first != found`, here `Map` against `Str`). A test
+    /// that matched only on the variant passed under the mutation, which is how
+    /// this survivor was missed the first time.
+    #[test]
+    fn a_list_literal_rejects_a_non_scalar_first_element() {
+        for src in [
+            &br#"request.method in [request.headers]"#[..],
+            &br#"request.method in [[1]]"#[..],
+        ] {
+            let rendered = core::str::from_utf8(src).unwrap();
+            let err = check_src(src, Phase::RequestHeaders).unwrap_err();
+            let CheckError::HeterogeneousList { first, found, .. } = err else {
+                panic!("{rendered} must be rejected as a non scalar list element, got {err:?}");
+            };
+            assert!(
+                matches!(first, Ty::Map | Ty::List),
+                "{rendered}: expected a non scalar element type, got {first:?}"
+            );
+            assert_eq!(
+                first, found,
+                "{rendered} must be rejected by `check_list`'s own element guard, \
+                 which reports the element against itself. Getting `first != found` \
+                 means the `In` arm caught it instead and the element guard is dead."
+            );
+        }
+    }
+
     /// `intern_slot` must not merge a scalar attribute with a map lookup.
     ///
     /// The `_ => false` arm of its `same` closure is what keeps an
