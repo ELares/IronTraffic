@@ -31,7 +31,7 @@
 # Implemented with node --eval reading the JSON, so it needs no npm package.
 #
 # Usage:  scripts/api-contract-check.sh              (checks contract/openapi.v1.json)
-#         scripts/api-contract-check.sh --selftest   (runs the 32 named self-tests)
+#         scripts/api-contract-check.sh --selftest   (runs the 33 named self-tests)
 set -euo pipefail
 
 if ! command -v node >/dev/null 2>&1; then
@@ -349,6 +349,14 @@ function checkDocument(doc, opts) {
     const id = op.operationId || (op.method.toUpperCase() + ' ' + op.path);
     const isGet = op.method === 'get';
     const hasParam = (name, at) => op.params.some((pm) => pm && pm.name === name && pm.in === at);
+    // Present AND required: a parameter that is merely referenced is not
+    // enough for a security header, because required defaults to false and
+    // an optional Csrf or IfMatch header is not the guarantee the name
+    // promises. Step 11 already applies this same required === true test to
+    // Retry-After; this is the same one-line check on the other two
+    // security-relevant headers.
+    const hasRequiredParam = (name, at) =>
+      op.params.some((pm) => pm && pm.name === name && pm.in === at && pm.required === true);
 
     // step 6
     const perm = op.obj['x-it-permission'];
@@ -379,16 +387,24 @@ function checkDocument(doc, opts) {
     }
 
     // step 9
-    if (!isGet && !hasParam('X-IT-CSRF', 'header')) {
-      fail('non-GET operation does not reference the Csrf parameter: ' + id);
+    if (!isGet) {
+      if (!hasParam('X-IT-CSRF', 'header')) {
+        fail('non-GET operation does not reference the Csrf parameter: ' + id);
+      } else if (!hasRequiredParam('X-IT-CSRF', 'header')) {
+        fail('non-GET operation Csrf parameter is not required: ' + id);
+      }
     }
 
     // step 10
     const isConfigMutating =
       (['put', 'patch', 'delete'].includes(op.method) && op.path.startsWith('/config')) ||
       op.operationId === 'loadConfig' || op.operationId === 'rollbackConfig';
-    if (isConfigMutating && !hasParam('If-Match', 'header')) {
-      fail('config mutating operation does not reference the IfMatch parameter: ' + id);
+    if (isConfigMutating) {
+      if (!hasParam('If-Match', 'header')) {
+        fail('config mutating operation does not reference the IfMatch parameter: ' + id);
+      } else if (!hasRequiredParam('If-Match', 'header')) {
+        fail('config mutating operation IfMatch parameter is not required: ' + id);
+      }
     }
 
     // step 11
@@ -1688,6 +1704,68 @@ run('selftest_rejects_a_ref_schema_that_strips_a_query_parameter_bound', () => {
     r2.failures.length === 0, JSON.stringify(r2.failures));
 });
 
+// 33. selftest_rejects_an_optional_csrf_or_if_match_header
+run('selftest_rejects_an_optional_csrf_or_if_match_header', () => {
+  const csrfOptional = baseValidTwoOpDoc();
+  csrfOptional.paths['/widgets/{id}'].put.parameters =
+    csrfOptional.paths['/widgets/{id}'].put.parameters.map((p) =>
+      p.name === 'X-IT-CSRF' ? Object.assign({}, p, { required: false }) : p);
+  const r1 = checkDocument(csrfOptional);
+  expect('selftest_rejects_an_optional_csrf_or_if_match_header (Csrf required flipped to false)',
+    r1.failures.some((f) => f.includes('Csrf parameter is not required') && f.includes('putWidget')),
+    JSON.stringify(r1.failures));
+
+  // An inline replacement is exactly as unenforced as a required flip on the
+  // shared component: neither goes through resolveParam differently, both
+  // simply carry required !== true on the resolved parameter object.
+  const csrfInlineOptional = baseValidTwoOpDoc();
+  csrfInlineOptional.paths['/widgets/{id}'].put.parameters =
+    csrfInlineOptional.paths['/widgets/{id}'].put.parameters.map((p) =>
+      p.name === 'X-IT-CSRF'
+        ? { name: 'X-IT-CSRF', in: 'header', required: false, schema: { type: 'string', maxLength: 1048576 } }
+        : p);
+  const r2 = checkDocument(csrfInlineOptional);
+  expect('selftest_rejects_an_optional_csrf_or_if_match_header (inline Csrf replacement, required false)',
+    r2.failures.some((f) => f.includes('Csrf parameter is not required') && f.includes('putWidget')),
+    JSON.stringify(r2.failures));
+
+  const ifMatchOptional = mkDoc({
+    opCount: 1,
+    expensive: ['putConfigResource'],
+    paths: {
+      '/config/{kind}/{ns}/{name}': {
+        parameters: [
+          { name: 'kind', in: 'path', required: true, schema: { type: 'string', maxLength: 64, pattern: '^[a-z][a-z0-9-]{0,63}$' } },
+          { name: 'ns', in: 'path', required: true, schema: { type: 'string', maxLength: 63, pattern: '^[a-z0-9-]{1,63}$' } },
+          { name: 'name', in: 'path', required: true, schema: { type: 'string', maxLength: 253, pattern: '^[a-z0-9.-]{1,253}$' } },
+        ],
+        put: {
+          operationId: 'putConfigResource',
+          summary: 'Replace one namespaced configuration resource.',
+          'x-it-permission': 'config:write',
+          'x-it-cli': 'irtctl config apply -f -',
+          parameters: [
+            { name: 'X-IT-CSRF', in: 'header', required: true, schema: { type: 'string', maxLength: 256 } },
+            { name: 'If-Match', in: 'header', required: false, schema: { type: 'string', maxLength: 256 } },
+            { name: 'Idempotency-Key', in: 'header', required: false, schema: { type: 'string', maxLength: 255 } },
+            { name: 'X-IT-Reason', in: 'header', required: false, schema: { type: 'string', maxLength: 1024 } },
+          ],
+          responses: {
+            '200': { description: 'x' }, '401': { description: 'x' }, '403': { description: 'x' },
+            '404': { description: 'x' }, '409': { description: 'x' }, '412': { description: 'x' },
+            '413': { description: 'x' }, '422': { description: 'x' },
+            '429': { description: 'x', headers: { 'Retry-After': retryHeader() } }, '500': { description: 'x' },
+          },
+        },
+      },
+    },
+  });
+  const r3 = checkDocument(ifMatchOptional);
+  expect('selftest_rejects_an_optional_csrf_or_if_match_header (IfMatch required false)',
+    r3.failures.some((f) => f.includes('IfMatch parameter is not required') && f.includes('putConfigResource')),
+    JSON.stringify(r3.failures));
+});
+
   return { results, passCount, failCount };
 }
 
@@ -1698,7 +1776,7 @@ function main() {
     for (const line of results) {
       console.log(line);
     }
-    console.log('selftest: ' + passCount + ' passed, ' + failCount + ' failed (of ' + (passCount + failCount) + ' assertions across 32 named tests)');
+    console.log('selftest: ' + passCount + ' passed, ' + failCount + ' failed (of ' + (passCount + failCount) + ' assertions across 33 named tests)');
     process.exit(failCount === 0 ? 0 : 1);
   }
 
