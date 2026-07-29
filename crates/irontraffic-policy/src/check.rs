@@ -1793,10 +1793,15 @@ mod tests {
         (0..GEN_KEYS.len()).prop_map(|i| GEN_KEYS[i])
     }
 
-    /// A well-typed comparison: an attribute (or header lookup) against a literal of
-    /// a plausible type, biased so most draws produce matching types and therefore an
-    /// `Ok` check result, with a minority of intentional mismatches so `Err` paths
-    /// stay exercised too.
+    /// A comparison of an attribute (or header lookup) against a literal, biased so
+    /// most draws produce matching types and therefore an `Ok` check result, with a
+    /// minority of intentional mismatches so `check`'s `Err` paths stay exercised
+    /// too.
+    ///
+    /// The mismatch arm must pick a literal of a genuinely incompatible type. `null`
+    /// will NOT do, and using it was this generator's original defect: `null`
+    /// unifies with `Str`, `Int` and `Bool` for equality, so every "mismatch" type
+    /// checked and the property saw zero `CheckError`s of any variant.
     fn arb_comparison() -> BoxedStrategy<GenExpr> {
         prop_oneof![
             3 => (arb_attr(), any::<bool>()).prop_map(|(a, matched)| {
@@ -1805,7 +1810,11 @@ mod tests {
                     (GenAttr::Scalar(_, Ty::Int), true) => GenExpr::IntLit(80),
                     (GenAttr::Scalar(_, Ty::Bool), true) => GenExpr::BoolLit(true),
                     (GenAttr::HeaderIndex(_), true) => GenExpr::StrLit("v".to_owned()),
-                    (_, false) | (GenAttr::Scalar(_, _), true) => GenExpr::NullLit,
+                    (GenAttr::Scalar(_, _), true) => GenExpr::NullLit,
+                    // An `Int` attribute against a string, and everything else
+                    // (all of which are `Str` or `Bool` typed) against an integer.
+                    (GenAttr::Scalar(_, Ty::Int), false) => GenExpr::StrLit("no".to_owned()),
+                    (_, false) => GenExpr::IntLit(1),
                 };
                 GenExpr::Eq(Box::new(GenExpr::Attr(a)), Box::new(rhs))
             }),
@@ -1900,15 +1909,19 @@ mod tests {
         }
     }
 
-    /// Measures the fraction of `arb_itpl_src` draws that reach a successful
-    /// `check`, over proptest's default 256 cases, and asserts it stays well above
-    /// zero. This is the check this crate's own house lesson demands: a property
-    /// test whose generator never reaches the code under test is decorative, and a
-    /// bare `Ok`-or-`Err` assertion cannot tell the difference between "the
-    /// generator reaches real programs" and "every case fails at a gate before
-    /// `check` runs". Asserting a concrete minimum fails the build the moment the
-    /// generator regresses back to that state, rather than merely reporting a number
-    /// nobody reads.
+    /// Measures how `arb_itpl_src` draws land, over proptest's default 256 cases,
+    /// and asserts a floor on BOTH `check` verdicts. This is the check this crate's
+    /// own house lesson demands: a property test whose generator never reaches the
+    /// code under test is decorative, and a bare `Ok`-or-`Err` assertion cannot tell
+    /// the difference between "the generator reaches real programs" and "every case
+    /// fails at a gate before `check` runs". Asserting concrete minima fails the
+    /// build the moment the generator regresses back to that state, rather than
+    /// merely reporting a number nobody reads.
+    ///
+    /// Two floors, not one. Pinning only the `Ok` side is how the generator came to
+    /// produce 223 successful checks and not a single `CheckError` of any variant,
+    /// so that none of `check`'s fourteen error returns was ever taken while both
+    /// properties passed and a doc comment claimed the `Err` paths stayed exercised.
     #[test]
     fn prop_generator_reaches_check_ok() {
         use proptest::strategy::ValueTree as _;
@@ -1917,6 +1930,7 @@ mod tests {
         let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig::with_cases(256));
         let strategy = arb_itpl_src();
         let mut ok = 0u32;
+        let mut check_err = 0u32;
         let mut total = 0u32;
         for _ in 0..256 {
             let Ok(tree) = strategy.new_tree(&mut runner) else {
@@ -1930,18 +1944,38 @@ mod tests {
                 let mut strings = toks.strings;
                 if check(ast, &mut strings, &src, Phase::Log, &limits).is_ok() {
                     ok += 1;
+                } else {
+                    check_err += 1;
                 }
             }
         }
         assert!(total > 0);
-        // Measured on this generator: 224/256 (87%) reach a successful `check`,
-        // well above the floor below. That number is reported in the PR
-        // description rather than printed here (this crate denies
-        // `print_stdout`/`print_stderr` even in tests), and this assertion pins
-        // the floor a future regression must not fall below.
+        // Both floors are pinned, because each guards a different way for this
+        // property to go quiet, and each floor sits below a MEASURED range
+        // rather than below a number nobody has run. Over five runs of this
+        // loop (proptest seeds the runner afresh each time, so these vary):
+        //
+        //     ok        120 to 141 of 256   (47% to 55%)
+        //     check_err  88 to 106 of 256   (34% to 41%)
+        //
+        // The counts are asserted rather than printed, because this crate denies
+        // `print_stdout` and `print_stderr` even in tests.
+        //
+        // Reaching `check` successfully: a generator that never gets past lex or
+        // parse makes `prop_check_never_panics` decorative.
         assert!(
-            ok * 4 >= total,
-            "expected at least 25% of generated programs to reach a successful check, got {ok}/{total}"
+            ok * 3 >= total,
+            "expected at least a third of generated programs to reach a successful check, got {ok}/{total}"
+        );
+        // Reaching `check`'s ERROR paths. Without this floor the generator can
+        // drift back to producing only well-typed programs, leaving every one of
+        // `check`'s fourteen error returns unexercised while the assertion above
+        // still passes. That was this generator's original state, at exactly
+        // zero: its mismatch arm emitted `null`, which unifies with `Str`, `Int`
+        // and `Bool` for equality and therefore type checks.
+        assert!(
+            check_err * 5 >= total,
+            "expected at least a fifth of generated programs to reach a check error, got {check_err}/{total}"
         );
     }
 }
