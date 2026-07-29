@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::name::{self, MAX_NAME_LEN, NameHasher, NameKey};
-use crate::store::{CertError, Credentials, KeyType};
+use crate::store::{CertError, CertFingerprint, Credentials, KeyType};
 
 /// Index of a `CredSet` inside `CertIndex::cred_sets`.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -178,6 +178,27 @@ const SUFFIX_DENY: &[&str] = &[
 /// Pending entry in a builder.
 type PendingEntry = (Box<str>, bool, Arc<Credentials>);
 
+/// Validate a wildcard's raw `"*.parent"` form the same way [`CertIndexBuilder::upsert_wildcard`]
+/// does, without staging anything.
+///
+/// `pub(crate)` for `store::builder::CertUpdateCoalescer::submit`, which must reject a bad
+/// wildcard **before** it enters the pending queue (see that module's docs for why: one bad
+/// wildcard left in a builder's pending list would abort every later flush). `SUFFIX_DENY` is
+/// private to this module, so this lives here rather than as a second, driftable copy of the
+/// same denylist in `builder.rs`.
+pub(crate) fn validate_wildcard_parent(raw: &str) -> Result<(), CertError> {
+    if raw == "*" {
+        return Err(CertError::WildcardTooBroad);
+    }
+    let parent = name::wildcard_parent(raw)?;
+    let mut buf = [0u8; MAX_NAME_LEN];
+    let normalized = name::normalize(parent, &mut buf)?;
+    if name::label_count(normalized) < 2 || SUFFIX_DENY.contains(&normalized) {
+        return Err(CertError::WildcardTooBroad);
+    }
+    Ok(())
+}
+
 /// A group of entries sharing the same `(is_wild, name)` after sorting.
 struct Group {
     is_wild: bool,
@@ -190,6 +211,11 @@ pub struct CertIndexBuilder {
     seed: [u8; 16],
     entries: Vec<PendingEntry>,
     default_cred: Option<Arc<Credentials>>,
+    /// Set only by `store::builder::CertIndexBuilder::from_previous` (via
+    /// [`CertIndexBuilder::new_from_inherited`]): the previous generation's own hasher, reused
+    /// verbatim as attempt 0's hasher so a name that already resolved keeps the same `NameKey`.
+    /// `None` for every from-scratch builder, which is unaffected by any of this.
+    inherited_hasher: Option<NameHasher>,
     #[cfg(test)]
     force_collision_on_attempt_0: bool,
     #[cfg(test)]
@@ -223,6 +249,7 @@ impl CertIndexBuilder {
             seed,
             entries: Vec::new(), // it-allow: hot-path-allocation reason: builder path, not resolve; one allocation per generation build
             default_cred: None,
+            inherited_hasher: None,
             #[cfg(test)]
             force_collision_on_attempt_0: false,
             #[cfg(test)]
@@ -230,6 +257,59 @@ impl CertIndexBuilder {
             #[cfg(test)]
             max_groups: MAX_INDEX_GROUPS,
         }
+    }
+
+    /// `pub(crate)` constructor for `store::builder::CertIndexBuilder::from_previous`.
+    ///
+    /// `builder.rs` is a sibling module of this one and cannot build a `CertIndexBuilder` value
+    /// directly with struct-literal syntax: every field above is private to `index.rs`, the same
+    /// privacy boundary `rebuild_entries`, `hasher()` and `default_cred()` on `CertIndex` exist to
+    /// cross for reads. This is the write-side equivalent, taking the already-flattened pending
+    /// list and the inherited hasher directly rather than re-validating and re-normalizing `E`
+    /// already-valid names through `upsert_exact`/`upsert_wildcard`.
+    ///
+    /// There is no "seed" here at all, deliberately: attempt 0 of the collision-retry loop uses
+    /// `inherited_hasher` verbatim, and a retry (see [`Self::hasher_for_attempt_from_previous`])
+    /// draws fresh CSPRNG entropy rather than deriving from a stored seed, so this constructor
+    /// never stores a placeholder byte pattern that could be mistaken for a real, security-
+    /// sensitive seed the way a literal argument to `new` would.
+    #[must_use]
+    pub(crate) fn new_from_inherited(
+        entries: Vec<PendingEntry>,
+        default_cred: Option<Arc<Credentials>>,
+        inherited_hasher: NameHasher,
+    ) -> Self {
+        Self {
+            seed: [0u8; 16], // Never read: build_inner takes the inherited_hasher branch unconditionally whenever it is Some, and that branch never reads `seed`.
+            entries,
+            default_cred,
+            inherited_hasher: Some(inherited_hasher),
+            #[cfg(test)]
+            force_collision_on_attempt_0: false,
+            #[cfg(test)]
+            max_arena_bytes: MAX_NAME_ARENA_BYTES,
+            #[cfg(test)]
+            max_groups: MAX_INDEX_GROUPS,
+        }
+    }
+
+    /// `pub(crate)` for `store::builder::CertIndexBuilder::replace_by_fingerprint`, which cannot
+    /// reach `self.entries` directly (private to this module). Substitutes `cred` for every
+    /// pending entry whose credential has `fingerprint`, keeping the entry's stored name and
+    /// wildcard flag, and returns how many entries were replaced.
+    pub(crate) fn replace_pending_by_fingerprint(
+        &mut self,
+        fingerprint: CertFingerprint,
+        cred: &Arc<Credentials>,
+    ) -> usize {
+        let mut replaced = 0usize;
+        for entry in &mut self.entries {
+            if entry.2.fingerprint() == fingerprint {
+                entry.2 = Arc::clone(cred);
+                replaced = replaced.saturating_add(1);
+            }
+        }
+        replaced
     }
 
     /// Index `cred` under an exact name.
@@ -359,6 +439,7 @@ impl CertIndexBuilder {
             entries,
             group_limit,
             seed,
+            self.inherited_hasher.as_ref(),
             force_collision,
             arena_limit,
             default_cred,
@@ -375,6 +456,7 @@ impl CertIndexBuilder {
         entries: Vec<PendingEntry>,
         max_groups: usize,
         seed: [u8; 16],
+        inherited_hasher: Option<&NameHasher>,
         force_collision: bool,
         max_arena_bytes: usize,
         default_cred: Option<Arc<Credentials>>,
@@ -426,7 +508,12 @@ impl CertIndexBuilder {
         }
 
         'attempt: for attempt in 0u32..3 {
-            let hasher = Self::hasher_for_attempt_inner(seed, force_collision, attempt);
+            let hasher = match inherited_hasher {
+                Some(prev_hasher) => {
+                    Self::hasher_for_attempt_from_previous(prev_hasher, force_collision, attempt)?
+                }
+                None => Self::hasher_for_attempt_inner(seed, force_collision, attempt),
+            };
             let mut exact = HashMap::with_capacity_and_hasher(groups.len(), NameKeyHashBuilder);
             let mut wild = HashMap::with_capacity_and_hasher(groups.len(), NameKeyHashBuilder);
             for (i, group) in groups.iter().enumerate() {
@@ -477,6 +564,44 @@ impl CertIndexBuilder {
         let mut key = [0u8; 16];
         key.copy_from_slice(&digest.as_bytes()[..16]);
         NameHasher::new(key)
+    }
+
+    /// Attempt-0 hasher for a from-previous rebuild: the inherited key itself, so a `NameKey`
+    /// computed for a name that was already indexed under it is identical to what the previous
+    /// generation stored. Attempts 1 and 2 are reached only if a genuinely NEW entry (from an
+    /// `Install` since the previous generation) collides with an existing name under the
+    /// inherited key, at the same probability as any other cross-key collision; this branch is
+    /// exercised by `from_previous_collision_retry_succeeds` via `force_collision_on_attempt_0`,
+    /// which is the only way ordinary test data reaches it.
+    ///
+    /// `CertIndexBuilder::from_previous` is infallible by design (its signature is `-> Self`, not
+    /// `-> Result<Self, _>`) and must never read the CSPRNG: this workspace's own rule is that an
+    /// entropy failure is a fatal, visible error, never a silently substituted fixed key, and an
+    /// infallible function has no way to surface a fatal error. So `from_previous` never touches
+    /// `irontraffic_rand`; the read happens here instead, lazily, only on this otherwise-
+    /// unreachable retry path, and its failure folds into the same `NameHashCollision` error the
+    /// caller already handles for "the retry loop is exhausted", which this is a stricter version
+    /// of (an entropy failure here is at least as fatal to indexing as a triple collision).
+    #[allow(
+        unused_variables,
+        reason = "force_collision is read only in #[cfg(test)] builds; a plain build never \
+                  reaches the branch that names it"
+    )]
+    fn hasher_for_attempt_from_previous(
+        inherited: &NameHasher,
+        force_collision: bool,
+        attempt: u32,
+    ) -> Result<NameHasher, CertError> {
+        #[cfg(test)]
+        if force_collision && attempt == 0 {
+            return Ok(NameHasher::degenerate_for_test());
+        }
+        if attempt == 0 {
+            return Ok(inherited.clone()); // it-allow: hot-path-allocation reason: builder path, not resolve; NameHasher::clone is a 16-byte key copy, not an allocation, but the plain `.clone()` spelling still matches this rule's text scan, the same reason ChallengeCertsBuilder::from_previous already carries this exact comment
+        }
+        let mut key = [0u8; 16];
+        irontraffic_rand::SecureRng::fill(&mut key).map_err(|_| CertError::NameHashCollision)?;
+        Ok(NameHasher::new(key))
     }
 
     #[allow(
@@ -745,6 +870,74 @@ impl CertIndex {
     #[must_use]
     pub fn stats(&self) -> &CertStats {
         &self.stats
+    }
+
+    /// Every indexed entry, flattened for a rebuild: the stored name, whether it lives in the
+    /// wildcard map, and the credential. Allocates; runs off the hot path only.
+    ///
+    /// `pub(crate)` for `store::builder::CertIndexBuilder::from_previous`, which is a sibling
+    /// module and cannot read `self.exact`, `self.wild`, `self.cred_sets`, `self.creds` or
+    /// `self.name_refs` directly: every field on this struct is private to `index.rs`.
+    ///
+    /// Walks `0..self.name_refs.len()` directly rather than iterating `self.exact.values()` then
+    /// `self.wild.values()`: `name_refs` and `cred_sets` are stored in the SAME sorted order
+    /// `build_index_finish` wrote them in (`(is_wild, name, key_type, ...)`, exact groups first
+    /// since `false < true`, so index `< self.exact.len()` is exact and the rest is wildcard),
+    /// while a `HashMap`'s iteration order bears no relation to insertion order at all. This
+    /// distinction is load-bearing, not stylistic: `from_previous`'s whole cost budget rests on
+    /// `CertIndexBuilder::build_inner`'s stable sort seeing an ALREADY near-sorted input (about
+    /// `E` comparisons rather than `E log E`), and the two hash maps would have handed it
+    /// effectively random order instead, silently costing `E log E` regardless of which sort
+    /// function ran. Walking the stored arrays by position is what actually delivers the ordering
+    /// the design's own cost argument depends on.
+    #[must_use]
+    #[allow(
+        clippy::expect_used,
+        reason = "normalize() (crate::name) guarantees its output is ASCII, and every stored \
+                  name came from normalize(); a failure here would be an index-corruption bug \
+                  that must be loud rather than silently producing an empty rebuild"
+    )]
+    #[allow(
+        clippy::indexing_slicing,
+        reason = "i is bounded by 0..self.name_refs.len(), and cred_sets/name_refs are the same \
+                  length by construction (build_index_finish pushes both together for every \
+                  group); slot is bounded by set.len, itself capped at 4 by build_index_finish"
+    )]
+    pub(crate) fn rebuild_entries(&self) -> Vec<(Box<str>, bool, Arc<Credentials>)> {
+        let mut out = Vec::with_capacity(self.cred_sets.len()); // it-allow: hot-path-allocation reason: builder path (from_previous), not resolve; runs once per rebuild
+        let exact_count = self.exact.len();
+        for i in 0..self.name_refs.len() {
+            let r = &self.name_refs[i];
+            let name_bytes = &self.names[r.offset as usize..r.offset as usize + r.len as usize];
+            let name = core::str::from_utf8(name_bytes)
+                .expect("names are ASCII by construction") // it-allow: no-panic reason: every stored name byte range was written by build_index_finish from a str that already passed name::normalize, which guarantees ASCII; a failure here is index corruption, not attacker input, and must be loud
+                .to_owned() // it-allow: hot-path-allocation reason: builder path (from_previous), not resolve; the one byte copy from_previous's own design accepts
+                .into_boxed_str(); // it-allow: hot-path-allocation reason: builder path (from_previous), not resolve; converts the already-allocated owned String into the Box<str> the pending list stores, no second allocation
+            let is_wild = i >= exact_count;
+            let set = &self.cred_sets[i];
+            for slot in 0..usize::from(set.len) {
+                out.push((
+                    name.clone(), // it-allow: hot-path-allocation reason: builder path (from_previous), not resolve; shares the arena bytes already copied above across every key-type slot for this name
+                    is_wild,
+                    Arc::clone(&self.creds[set.idx[slot] as usize]),
+                ));
+            }
+        }
+        out
+    }
+
+    /// The name hasher key, so a rebuild inherits it and re-hashes nothing new: see
+    /// `store::builder::CertIndexBuilder::from_previous`.
+    #[must_use]
+    pub(crate) fn hasher(&self) -> &NameHasher {
+        &self.hasher
+    }
+
+    /// The configured default credential, for `store::builder::CertIndexBuilder::from_previous`
+    /// to carry forward.
+    #[must_use]
+    pub(crate) fn default_cred(&self) -> Option<&Arc<Credentials>> {
+        self.default_cred.as_ref()
     }
 
     /// Test-only: number of times `resolve` has probed the `wild` map on `self`. See the

@@ -32,6 +32,9 @@ der = { workspace = true }
 irontraffic-rand = { path = "../irontraffic-rand", version = "0.1.0" }
 serde = { workspace = true }
 schemars = { workspace = true, optional = true }
+# TlsMaterialCell's wait-free publication of a rebuilt certificate index; see
+# the workspace Cargo.toml comment on this dependency and issue #118.
+arc-swap = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }
@@ -55,4 +58,8 @@ harness = false
 
 [[bench]]
 name = "crl"
+harness = false
+
+[[bench]]
+name = "index_build"
 harness = false
