@@ -1004,6 +1004,25 @@ mod tests {
         assert_eq!(parse_grpc_status(b"0000000000"), Some(0));
     }
 
+    /// #747 `SHOULD_FIX` 2: the two cases above only prove the length gate and the
+    /// checked arithmetic AGREE at the boundary (an 11-digit value is rejected
+    /// either way, and a 10-digit value at `u32::MAX` is accepted either way), not
+    /// that either one alone still does its job. `D18-parse-status-checked-to-wrapping`
+    /// (`checked_mul`/`checked_add` weakened to `wrapping_mul`/`wrapping_add`) and
+    /// `D20-del-parse-status-maxlen` (the `v.len() > 10` gate deleted) both survived
+    /// the shipped suite. Two cases close both: a 10-digit value one past `u32::MAX`
+    /// (still passes the length gate, so only the checked arithmetic can reject it),
+    /// and a value longer than 10 bytes that never overflows arithmetically (all
+    /// leading zeros, so only the length gate can reject it).
+    #[test]
+    fn parse_grpc_status_overflow_and_overlong_are_none() {
+        // 4294967296 == u32::MAX + 1, still exactly 10 digits.
+        assert_eq!(parse_grpc_status(b"4294967296"), None);
+        // 14 bytes of leading zeros then "12": the value is 12, which never
+        // overflows; only the length gate can reject this.
+        assert_eq!(parse_grpc_status(b"00000000000012"), None);
+    }
+
     #[test]
     fn verdict_matrix() {
         use CheckOutcome::{Fail, Pass};
