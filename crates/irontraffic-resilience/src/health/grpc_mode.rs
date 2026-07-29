@@ -128,8 +128,28 @@ impl GrpcModeMachine {
                 // `saturating_mul`, because `interval_ms` may be as large as
                 // `Millis::HORIZON_MS` and the multiplier as large as 100, so the
                 // product overflows `u32`.
-                let liveness_deadline_ms =
-                    interval_ms.saturating_mul(compiled.liveness_multiplier());
+                //
+                // #747 NOTE: `saturating_mul` alone is not enough. `Millis::since`
+                // never returns more than `Millis::HORIZON_MS` (it reads any larger
+                // wrapping difference as "in the past" and clamps to 0), so a
+                // deadline saturated at `u32::MAX` could never be exceeded: once
+                // `interval_ms * liveness_multiplier` passes `HORIZON_MS`, the
+                // liveness timer would be permanently OFF, the same fail-open
+                // direction as the BLOCKING finding. This is reachable by
+                // configuration alone: `HealthCheckConfig::validate`
+                // (`health::schedule`, outside this issue's Files table) permits
+                // `interval_ms` up to `HORIZON_MS` itself, and `liveness_multiplier`
+                // up to 100 (invariant 8), so an interval above roughly
+                // `HORIZON_MS / liveness_multiplier` (about 8.3 days at the default
+                // multiplier of 3) reaches it. `.min(Millis::HORIZON_MS - 1)` keeps
+                // the comparison alive: `since()` can still reach exactly
+                // `HORIZON_MS`, one past the clamped deadline, so an absurdly large
+                // configured product degrades to "close the stream once it has been
+                // silent for the longest gap `since` can measure" rather than never
+                // firing again.
+                let liveness_deadline_ms = interval_ms
+                    .saturating_mul(compiled.liveness_multiplier())
+                    .min(Millis::HORIZON_MS - 1);
                 if now.since(self.last_message_at) > liveness_deadline_ms {
                     // The name says fallback; the mode goes to `WatchDesired`
                     // because a dead stream is retried as a stream once, and
@@ -381,6 +401,35 @@ mod tests {
             "expected SendPing or Idle exactly at the deadline, got {action:?}"
         );
         assert_eq!(machine.mode(), GrpcMode::WatchOpen);
+    }
+
+    /// #747 NOTE: `interval_ms * liveness_multiplier` can overflow `u32` by
+    /// orders of magnitude (`HORIZON_MS * 100` here), which
+    /// `HealthCheckConfig::validate` permits (it bounds `interval_ms` alone, not
+    /// this product). Before the `.min(Millis::HORIZON_MS - 1)` clamp,
+    /// `saturating_mul` pinned the deadline at `u32::MAX`, and `Millis::since`
+    /// never returns more than `HORIZON_MS`, so the liveness timer could never
+    /// fire again: the same fail-open direction as the BLOCKING finding. `t0`
+    /// and `later` are `HORIZON_MS` apart, the longest gap `since` can ever
+    /// report, which must still be recognized as a dead stream.
+    #[test]
+    fn liveness_deadline_is_not_permanently_disabled_by_overflow() {
+        let t0 = Millis(0);
+        let spec = GrpcCheckSpec {
+            liveness_multiplier: 100,
+            ..GrpcCheckSpec::default()
+        };
+        let compiled = spec.compile().expect("valid spec");
+        let mut machine = GrpcModeMachine::new(t0);
+        machine.on_watch_open(t0, Millis::HORIZON_MS);
+
+        let later = Millis(Millis::HORIZON_MS);
+        assert_eq!(
+            machine.on_check_due(later, Millis::HORIZON_MS, &compiled),
+            GrpcAction::CloseStreamAndFallback,
+            "an interval * liveness_multiplier product that overflows u32 must \
+             not permanently disable the liveness timer"
+        );
     }
 
     #[test]
