@@ -15,18 +15,23 @@
 #
 # FAIL CLOSED. Every check below is a positive assertion over the parsed
 # document: it enumerates what is required and fails on anything that does
-# not satisfy it, rather than scanning for a specific known-bad pattern. A
-# deleted operation, an added one, a mutated path or method, or an empty
-# document are all caught by the same small set of rules (chiefly the
-# x-it-operation-count invariant and the per-operation structural checks),
-# not by a special case for each. See the self-test steps below and the
-# implementation's own PR description for a record of each failure mode
-# proven to fail loud, then reverted to green.
+# not satisfy it, rather than scanning for a specific known-bad pattern. An
+# empty document is caught by the per-operation structural checks having
+# nothing to satisfy them (x-it-operation-count itself, step 16). A deleted
+# operation, an added one, or a mutated path, method or permission on an
+# EXISTING operation are caught by step 23, which pins the operation set and
+# the permission vocabulary #380 froze against a copy of that table living in
+# this script (FROZEN_OPERATIONS, FROZEN_PERMISSION_VOCABULARY), not against
+# anything read out of the document under test: a check that compares the
+# document to a value read from the same document proves only internal
+# consistency, and step 6 and step 16 alone do exactly that. See the
+# self-test steps below and the implementation's own PR description for a
+# record of each failure mode proven to fail loud, then reverted to green.
 #
 # Implemented with node --eval reading the JSON, so it needs no npm package.
 #
 # Usage:  scripts/api-contract-check.sh              (checks contract/openapi.v1.json)
-#         scripts/api-contract-check.sh --selftest   (runs the 26 named self-tests)
+#         scripts/api-contract-check.sh --selftest   (runs the 29 named self-tests)
 set -euo pipefail
 
 if ! command -v node >/dev/null 2>&1; then
@@ -38,6 +43,99 @@ JS="$(cat <<'NODE'
 'use strict';
 
 const METHODS = ['get', 'put', 'post', 'patch', 'delete'];
+
+// step 23: the frozen operation set and the frozen permission vocabulary,
+// reproduced here from the operation table in issue 380, BY THE CHECKER,
+// rather than read out of the document under test. Step 6 and step 16
+// already compare the document to itself (a permission against
+// x-it-permissions, a count against x-it-operation-count, both read from the
+// same file); neither can catch a mutation that edits both the operation and
+// the value it is checked against in the same stroke. This pair of constants
+// is a copy the checker keeps of what issue 380 froze, so an edit to the
+// document alone cannot pass step 23.
+//
+// Each entry is [operationId, METHOD, path, x-it-permission], in the order
+// the operation table in issue 380 lists them. Do not derive this array from
+// the document at runtime: that would reintroduce the exact defect this step
+// exists to close.
+const FROZEN_OPERATIONS = [
+  ['getOverview', 'GET', '/overview', 'overview:read'],
+  ['getWhoami', 'GET', '/whoami', 'none'],
+  ['getStatsTimeseries', 'GET', '/stats/timeseries', 'stats:read'],
+  ['getStatsTopN', 'GET', '/stats/topn', 'stats:read'],
+  ['getConfig', 'GET', '/config', 'config:read'],
+  ['listConfigKind', 'GET', '/config/{kind}', 'config:read'],
+  ['getConfigResource', 'GET', '/config/{kind}/{ns}/{name}', 'config:read'],
+  ['putConfigResource', 'PUT', '/config/{kind}/{ns}/{name}', 'config:write'],
+  ['patchConfigResource', 'PATCH', '/config/{kind}/{ns}/{name}', 'config:write'],
+  ['deleteConfigResource', 'DELETE', '/config/{kind}/{ns}/{name}', 'config:write'],
+  ['loadConfig', 'POST', '/config:load', 'config:write'],
+  ['dryrunConfig', 'POST', '/config:dryrun', 'config:read'],
+  ['adaptConfig', 'POST', '/config:adapt', 'config:read'],
+  ['rollbackConfig', 'POST', '/config:rollback', 'config:write'],
+  ['getFreeze', 'GET', '/config/freeze', 'config:read'],
+  ['unfreezeConfig', 'DELETE', '/config/freeze', 'config:freeze'],
+  ['freezeConfig', 'POST', '/config:freeze', 'config:freeze'],
+  ['listConfigVersions', 'GET', '/config/versions', 'config:read'],
+  ['getConfigVersion', 'GET', '/config/versions/{version}', 'config:read'],
+  ['diffConfigVersions', 'GET', '/config/versions/{from}/diff/{to}', 'config:read'],
+  ['createTransaction', 'POST', '/transactions', 'config:write'],
+  ['getTransaction', 'GET', '/transactions/{id}', 'config:read'],
+  ['abortTransaction', 'DELETE', '/transactions/{id}', 'config:write'],
+  ['commitTransaction', 'POST', '/transactions/{id}:commit', 'config:write'],
+  ['getStatus', 'GET', '/status', 'config:read'],
+  ['getRouteEffective', 'GET', '/routes/{id}/effective', 'config:read'],
+  ['explainRequest', 'POST', '/explain', 'explain:run'],
+  ['getRecordedExplain', 'GET', '/explain/requests/{request_id}', 'explain:run'],
+  ['listRuntimeUpstreams', 'GET', '/runtime/upstreams', 'runtime:read'],
+  ['getUpstreamEndpoints', 'GET', '/runtime/upstreams/{id}/endpoints', 'runtime:read'],
+  ['getUpstreamEvents', 'GET', '/runtime/upstreams/{id}/events', 'runtime:read'],
+  ['queryLogs', 'GET', '/logs/query', 'logs:read'],
+  ['streamLogs', 'GET', '/logs/stream', 'logs:read'],
+  ['streamEvents', 'GET', '/events/stream', 'events:read'],
+  ['getTrace', 'GET', '/traces/{trace_id}', 'traces:read'],
+  ['listCerts', 'GET', '/certs', 'certs:read'],
+  ['getCert', 'GET', '/certs/{id}', 'certs:read'],
+  ['listAcmeOrders', 'GET', '/acme/orders', 'certs:read'],
+  ['listLimits', 'GET', '/limits', 'limits:read'],
+  ['getLimitTopK', 'GET', '/limits/topk', 'limits:read'],
+  ['getLimitKey', 'GET', '/limits/keys/{key}', 'limits:read'],
+  ['listClusterNodes', 'GET', '/cluster/nodes', 'cluster:read'],
+  ['queryAudit', 'GET', '/audit', 'audit:read'],
+  ['verifyAuditChain', 'GET', '/audit/verify', 'audit:read'],
+  ['listSessions', 'GET', '/sessions', 'sessions:read'],
+  ['revokeSession', 'DELETE', '/sessions/{id}', 'sessions:manage'],
+  ['listTokens', 'GET', '/tokens', 'tokens:read'],
+  ['createToken', 'POST', '/tokens', 'tokens:manage'],
+  ['revokeToken', 'DELETE', '/tokens/{id}', 'tokens:manage'],
+  ['listRoles', 'GET', '/roles', 'rbac:read'],
+  ['listApimProducts', 'GET', '/apim/products', 'apim:read'],
+  ['getApimProduct', 'GET', '/apim/products/{id}', 'apim:read'],
+  ['listApimPlans', 'GET', '/apim/plans', 'apim:read'],
+  ['listApimConsumers', 'GET', '/apim/consumers', 'apim:read'],
+  ['getApimConsumer', 'GET', '/apim/consumers/{id}', 'apim:read'],
+  ['listApimCredentials', 'GET', '/apim/consumers/{id}/credentials', 'apim:read'],
+  ['createApimCredential', 'POST', '/apim/consumers/{id}/credentials', 'apim:write'],
+  ['deleteApimCredential', 'DELETE', '/apim/consumers/{id}/credentials/{credential_id}', 'apim:write'],
+  ['getApimAnalytics', 'GET', '/apim/analytics', 'apim:read'],
+  ['getSupportBundle', 'GET', '/support-bundle', 'support:read'],
+  ['getSchema', 'GET', '/schema.json', 'none'],
+  ['getOpenapi', 'GET', '/openapi.json', 'none'],
+];
+
+// The closed permission vocabulary #380 defines, in the order the issue lists
+// it. x-it-permissions in the document must equal this exactly: not a
+// subset, not a superset, and not merely the same set in a different order,
+// so that a widened vocabulary (a permission string added and then used by
+// some operation) cannot pass just because it is internally consistent.
+const FROZEN_PERMISSION_VOCABULARY = [
+  'none',
+  'overview:read', 'stats:read', 'config:read', 'config:write', 'config:freeze',
+  'runtime:read', 'explain:run', 'logs:read', 'events:read', 'traces:read',
+  'certs:read', 'limits:read', 'cluster:read', 'audit:read', 'rbac:read',
+  'sessions:read', 'sessions:manage', 'tokens:read', 'tokens:manage',
+  'apim:read', 'apim:write', 'support:read',
+];
 
 function decodeJsonPointerSegment(s) {
   return s.replace(/~1/g, '/').replace(/~0/g, '~');
@@ -126,7 +224,8 @@ function checkBoundedSchema(node, opId, pointer, failures) {
   }
 }
 
-function checkDocument(doc) {
+function checkDocument(doc, opts) {
+  opts = opts || {};
   const failures = [];
   function fail(msg) { failures.push(msg); }
 
@@ -408,6 +507,63 @@ function checkDocument(doc) {
   const declaredCount = doc['x-it-operation-count'];
   if (declaredCount !== opCount) {
     fail('operation count mismatch: x-it-operation-count is ' + JSON.stringify(declaredCount) + ' but paths contains ' + opCount);
+  }
+
+  // step 23: the frozen operation set and the frozen permission vocabulary,
+  // pinned against a constant the caller supplies (opts.frozenOperations,
+  // opts.frozenPermissionVocabulary) rather than against anything read out of
+  // the document itself. main() supplies the real 62-operation table from
+  // issue 380 and the 23-entry vocabulary when checking the committed
+  // document; the generic self-tests below exercise every OTHER rule against
+  // small synthetic documents that were never meant to reproduce that table,
+  // so they do not supply these options and this step is a no-op for them.
+  // Dedicated self-tests further down supply their own small frozen table to
+  // exercise this mechanism in isolation. Without this step, a mutation that
+  // edits the method, path or permission of an existing operation and
+  // nothing else is invisible to every other check, because steps 6 and 16
+  // only ever compare the document to a value read from the same document.
+  if (Array.isArray(opts.frozenOperations)) {
+    const actualById = new Map();
+    for (const op of ops) {
+      if (typeof op.operationId !== 'string') continue;
+      actualById.set(op.operationId, {
+        method: op.method.toUpperCase(),
+        path: op.path,
+        permission: op.obj['x-it-permission'],
+      });
+    }
+    const expectedIds = new Set(opts.frozenOperations.map((e) => e[0]));
+    for (const [expectedId, expectedMethod, expectedPath, expectedPermission] of opts.frozenOperations) {
+      const actual = actualById.get(expectedId);
+      if (!actual) {
+        fail('frozen operation is missing from the document: ' + expectedId +
+          ' (expected ' + expectedMethod + ' ' + expectedPath + ')');
+        continue;
+      }
+      if (actual.method !== expectedMethod || actual.path !== expectedPath) {
+        fail('frozen operation ' + expectedId + ' has moved: expected ' +
+          expectedMethod + ' ' + expectedPath + ', found ' + actual.method + ' ' + actual.path);
+      }
+      if (actual.permission !== expectedPermission) {
+        fail('frozen operation ' + expectedId + ' permission has changed: expected "' +
+          expectedPermission + '", found ' + JSON.stringify(actual.permission));
+      }
+    }
+    for (const id of actualById.keys()) {
+      if (!expectedIds.has(id)) {
+        fail('operation is not in the frozen operation set: ' + id);
+      }
+    }
+  }
+  if (Array.isArray(opts.frozenPermissionVocabulary)) {
+    const actualPerms = Array.isArray(doc['x-it-permissions']) ? doc['x-it-permissions'] : [];
+    const vocabOk = actualPerms.length === opts.frozenPermissionVocabulary.length &&
+      opts.frozenPermissionVocabulary.every((v, i) => actualPerms[i] === v);
+    if (!vocabOk) {
+      fail('x-it-permissions must be exactly the frozen permission vocabulary, ' +
+        opts.frozenPermissionVocabulary.length + ' entries in the frozen order: found ' +
+        JSON.stringify(actualPerms));
+    }
   }
 
   // step 19: CLI command path uniqueness
@@ -1234,6 +1390,89 @@ run('selftest_rejects_missing_413_on_a_request_body', () => {
     JSON.stringify(r.failures));
 });
 
+// 27. selftest_frozen_operation_pin_rejects_permission_path_and_deletion_mutations
+run('selftest_frozen_operation_pin_rejects_permission_path_and_deletion_mutations', () => {
+  // A small frozen table, independent of FROZEN_OPERATIONS, that describes
+  // exactly the two operations baseValidTwoOpDoc() defines. This is the same
+  // mechanism step 23 uses against the real 62-operation table, exercised
+  // here against a synthetic document so the mechanism itself is tested
+  // without needing every fixture in this file to reproduce the table in issue 380.
+  const SMALL_FROZEN_TABLE = [
+    ['getWidget', 'GET', '/widgets/{id}', 'widget:read'],
+    ['putWidget', 'PUT', '/widgets/{id}', 'widget:write'],
+  ];
+
+  const accepted = checkDocument(baseValidTwoOpDoc(), { frozenOperations: SMALL_FROZEN_TABLE });
+  expect('selftest_frozen_operation_pin_rejects_permission_path_and_deletion_mutations (accepts the matching document)',
+    accepted.failures.length === 0, JSON.stringify(accepted.failures));
+
+  const permChanged = baseValidTwoOpDoc();
+  // "config:write" remains part of x-it-permissions in this document, so
+  // step 6 does not fail; only the frozen pin can catch this mutation.
+  permChanged.paths['/widgets/{id}'].put['x-it-permission'] = 'config:write';
+  const rPerm = checkDocument(permChanged, { frozenOperations: SMALL_FROZEN_TABLE });
+  expect('selftest_frozen_operation_pin_rejects_permission_path_and_deletion_mutations (permission changed)',
+    rPerm.failures.some((f) => f.includes('frozen operation putWidget permission has changed') &&
+      f.includes('widget:write') && f.includes('config:write')),
+    JSON.stringify(rPerm.failures));
+
+  const pathMoved = baseValidTwoOpDoc();
+  const movedItem = pathMoved.paths['/widgets/{id}'];
+  delete pathMoved.paths['/widgets/{id}'];
+  pathMoved.paths['/widgets/{id}/moved'] = movedItem;
+  const rPath = checkDocument(pathMoved, { frozenOperations: SMALL_FROZEN_TABLE });
+  expect('selftest_frozen_operation_pin_rejects_permission_path_and_deletion_mutations (path moved)',
+    rPath.failures.some((f) => f.includes('frozen operation getWidget has moved')) &&
+    rPath.failures.some((f) => f.includes('frozen operation putWidget has moved')),
+    JSON.stringify(rPath.failures));
+
+  const deleted = baseValidTwoOpDoc();
+  delete deleted.paths['/widgets/{id}'].put;
+  deleted['x-it-operation-count'] = 1;
+  const rDel = checkDocument(deleted, { frozenOperations: SMALL_FROZEN_TABLE });
+  expect('selftest_frozen_operation_pin_rejects_permission_path_and_deletion_mutations (operation deleted)',
+    rDel.failures.some((f) => f.includes('frozen operation is missing from the document: putWidget')),
+    JSON.stringify(rDel.failures));
+});
+
+// 28. selftest_frozen_operation_pin_rejects_an_undeclared_extra_operation
+run('selftest_frozen_operation_pin_rejects_an_undeclared_extra_operation', () => {
+  const SMALL_FROZEN_TABLE = [
+    ['getWidget', 'GET', '/widgets/{id}', 'widget:read'],
+    ['putWidget', 'PUT', '/widgets/{id}', 'widget:write'],
+  ];
+  const d = baseValidTwoOpDoc();
+  d.paths['/widgets/extra'] = { get: okGetOp('getWidgetExtra', 'widget:read', 'irtctl widgets extra') };
+  d['x-it-operation-count'] = 3;
+  const r = checkDocument(d, { frozenOperations: SMALL_FROZEN_TABLE });
+  expect('selftest_frozen_operation_pin_rejects_an_undeclared_extra_operation',
+    r.failures.some((f) => f.includes('operation is not in the frozen operation set: getWidgetExtra')),
+    JSON.stringify(r.failures));
+});
+
+// 29. selftest_frozen_permission_vocabulary_pin_rejects_widening_and_reordering
+run('selftest_frozen_permission_vocabulary_pin_rejects_widening_and_reordering', () => {
+  const SMALL_FROZEN_PERM_VOCAB = ['none', 'widget:read', 'widget:write', 'config:read', 'config:write'];
+
+  const accepted = checkDocument(baseValidTwoOpDoc(), { frozenPermissionVocabulary: SMALL_FROZEN_PERM_VOCAB });
+  expect('selftest_frozen_permission_vocabulary_pin_rejects_widening_and_reordering (accepts the matching vocabulary)',
+    accepted.failures.length === 0, JSON.stringify(accepted.failures));
+
+  const widened = baseValidTwoOpDoc();
+  widened['x-it-permissions'] = widened['x-it-permissions'].concat(['widget:admin']);
+  const rWidened = checkDocument(widened, { frozenPermissionVocabulary: SMALL_FROZEN_PERM_VOCAB });
+  expect('selftest_frozen_permission_vocabulary_pin_rejects_widening_and_reordering (widened)',
+    rWidened.failures.some((f) => f.includes('x-it-permissions must be exactly the frozen permission vocabulary')),
+    JSON.stringify(rWidened.failures));
+
+  const reordered = baseValidTwoOpDoc();
+  reordered['x-it-permissions'] = ['none', 'widget:write', 'widget:read', 'config:read', 'config:write'];
+  const rReordered = checkDocument(reordered, { frozenPermissionVocabulary: SMALL_FROZEN_PERM_VOCAB });
+  expect('selftest_frozen_permission_vocabulary_pin_rejects_widening_and_reordering (reordered)',
+    rReordered.failures.some((f) => f.includes('x-it-permissions must be exactly the frozen permission vocabulary')),
+    JSON.stringify(rReordered.failures));
+});
+
   return { results, passCount, failCount };
 }
 
@@ -1244,7 +1483,7 @@ function main() {
     for (const line of results) {
       console.log(line);
     }
-    console.log('selftest: ' + passCount + ' passed, ' + failCount + ' failed (of ' + (passCount + failCount) + ' assertions across 26 named tests)');
+    console.log('selftest: ' + passCount + ' passed, ' + failCount + ' failed (of ' + (passCount + failCount) + ' assertions across 29 named tests)');
     process.exit(failCount === 0 ? 0 : 1);
   }
 
@@ -1281,7 +1520,10 @@ function main() {
     process.exit(1);
   }
 
-  const result = checkDocument(doc);
+  const result = checkDocument(doc, {
+    frozenOperations: FROZEN_OPERATIONS,
+    frozenPermissionVocabulary: FROZEN_PERMISSION_VOCABULARY,
+  });
   if (result.failures.length > 0) {
     for (const f of result.failures) console.log(f);
     process.exit(1);

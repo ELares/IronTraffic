@@ -27,11 +27,16 @@ is decided by the issue that displays it.
 
 `scripts/api-contract-check.sh` is the mechanical half of "frozen". It parses
 this file and asserts its internal consistency and its house rules: every
-operation carries a permission from the closed vocabulary in
-`x-it-permissions`, every mutating operation carries the headers this project
-requires, every path parameter is bounded, every `$ref` resolves, and every
-component is used by something. Run it with no arguments to check the
-committed document, or with `--selftest` to run its own fixtures.
+mutating operation carries the headers this project requires, every path
+parameter is bounded, every `$ref` resolves, and every component is used by
+something. It also pins the frozen operation set itself: the script carries
+its own copy of every `(operationId, method, path, permission)` tuple in
+#380's table and of the closed permission vocabulary, and compares the
+document against that copy rather than against a value read out of the
+document, so a mutated path, method or permission on an existing operation
+fails loudly instead of only an operation count that was hand-edited in the
+same change. Run it with no arguments to check the committed document, or
+with `--selftest` to run its own fixtures.
 
 `x-it-cli` is not decoration. It is what the parity gate in the dashboard CI
 gates issue, and the command table in the `irtctl` crate, are derived from:
