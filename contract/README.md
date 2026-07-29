@@ -2,12 +2,18 @@
 
 This file is the source of truth for the v1 admin API. It is hand maintained,
 not generated, and the admin API implementation is gated against it rather
-than the other way around: the crate that serves this API generates its own
-document (`schema/openapi.json`) from its handlers, and a route census asserts
-that every operation the router actually serves appears in this file with the
-same method, path and `operationId`. When the two disagree, the disagreement
-is a bug in one of them, and it is resolved here, not papered over in the
-console or the CLI.
+than the other way around.
+
+That gate is a future obligation, not something shipped yet. As of this
+document, no admin API crate exists in this repository: issue 151 is what
+creates it, and issue 157 is what makes the crate generate its own document
+(`schema/openapi.json`) from its handlers and runs a route census asserting
+that every operation the router actually serves appears in this file with
+the same method, path and `operationId`. Until issue 157 lands, this file is
+checked for internal consistency only (`scripts/api-contract-check.sh`); it
+is not yet compared against anything the server emits. When issue 157 lands
+and the two documents disagree, the disagreement is a bug in one of them,
+and it is resolved here, not papered over in the console or the CLI.
 
 ## What is frozen
 
