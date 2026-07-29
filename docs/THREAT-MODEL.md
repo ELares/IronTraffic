@@ -1344,6 +1344,93 @@ half ever again goes back to parsing zero status lines after a meaningful number
 TCP half is intentionally left driven by the unmodified byte stream: `TcpCheckCodec` has no phase
 machine to gate on an HTTP-shaped prefix, so reshaping its input would only cost it entropy.
 
+## Session resumption (`cluster-derived-session-ticketer`, #120)
+
+*Status: `ClusterTicketer` ships in `irontraffic-tls`'s `ticket` module, constructible and fully
+tested, but installed into no `ServerConfig` yet. `mtls-client-auth-fail-closed` (#124) is the first
+issue able to supply the 16-byte client-authentication context this ticketer requires, and is
+therefore the issue that installs it.*
+
+**The ticket format.** `ticket = name_e (16 bytes) || nonce (24 bytes) ||
+XChaCha20-Poly1305(key_e, nonce, aad = name_e, plaintext)`, minimum 56 bytes (name plus nonce plus
+16-byte AEAD tag), maximum 4,096. Both `key_e` and `name_e` are HKDF-SHA384-derived from one
+32-byte cluster root plus a 16-byte context plus an 8-byte big-endian epoch number, never
+distributed over any channel: `prk = HKDF-Extract-SHA384("irontraffic/ticket-root/v1", root)`,
+`key_e = HKDF-Expand-SHA384(prk, "irontraffic/ticket/v1" || context || be64(e))`, `name_e` the same
+with a distinct info label. `e = floor(unix_seconds / rotation_secs)`, and a node accepts the
+current epoch plus the two before it, a minimum 12-hour window at the default 6-hour rotation.
+Deriving rather than distributing means every node in a fleet holds the same key at the same time
+with zero coordination beyond clocks agreeing within a few hours, and rotation happens fleet-wide
+simultaneously by construction; every incumbent this design was compared against (Envoy, nginx,
+Traefik) instead distributes key material or defaults silently to a per-process key that turns
+every cross-node resumption into a full handshake, invisibly, until a traffic spike makes the CPU
+cost visible.
+
+**What the three-epoch window bounds, and what it does not, stated because the difference is the
+whole security story.** A leaked derived epoch key `key_e` is useless outside its own three-epoch
+acceptance window: 12 to 18 hours at the default rotation. It does **not** bound the damage from a
+leaked root. Every epoch key that has ever existed or ever will is computable from the root, so an
+attacker who records ticket traffic for months and later obtains the root can decrypt every one of
+those recorded tickets and recover the resumption master secret of every resumed session in the
+recording. This is not forward secrecy with respect to the root; describing it that way anywhere in
+operator-facing documentation is a defect. The consequences, all non-optional:
+
+- The root is the highest-value secret in this product. It is stored sealed
+  (`sealed-secret-blobs-and-secret-refs`, #333), never written to a log, never returned by the admin
+  API (`TicketRoot`'s `Debug` impl prints only an 8-byte fingerprint, never the root), and zeroized
+  on drop.
+- The root is rotated on a schedule, not only after a suspected compromise. The recommended cadence
+  is 90 days, using the two-root overlap `ClusterTicketer::with_previous_root` implements: derive
+  from both roots, accept either for decryption, encrypt only with the new one. Rotation is what
+  converts "unbounded retroactive decryption" into "at most one rotation period of retroactive
+  decryption".
+- After a suspected root compromise, rotating the root is the break-glass action, and
+  `with_previous_root` must **not** be called with the compromised root in that case: including a
+  compromised root in the overlap keeps every ticket it issued decryptable, which is the opposite of
+  the point of rotating away from it. The operator command is
+  `task-leader-lease-fencing-and-ticket-root-rotation` (#334).
+
+**The context binds a ticket to the configuration it was issued under, closing CVE-2025-68121.** A
+resumed TLS 1.3 handshake sends no certificate and does not re-run the client-certificate verifier,
+so a ticket issued while one trust bundle was live would otherwise still be accepted after the
+bundle changed. That is exactly CVE-2025-68121 in Go's `crypto/tls` ("unexpected session
+resumption": a resumed handshake succeeds although `Config.ClientCAs` or `RootCAs` changed between
+the original and the resumed handshake; CVSS 9.1; Traefik was an affected downstream under
+GHSA-gv8r-9rw9-9697). `ClusterTicketer::new` takes a 16-byte `context` as a mandatory constructor
+argument, mixed into both the key and key-name derivation, so a ticket encrypted under one context
+produces a key name nothing matches under a different context: `different_context_never_decrypts`
+is the test that is this correction, not a comment. `sni-server-config-selection` (#119) supplies 16
+zero bytes for `ClientAuthKind::None` and `TrustAnchors::id()` otherwise, so a ticket never
+resumes across a client-certificate trust-bundle change. The failure mode when the context does not
+match is `decrypt_unknown_key`, which falls back to a full handshake, not an error: a client that
+cannot resume simply re-authenticates from scratch, and the client-certificate verifier runs again.
+
+**Residual risk: resumption skips certificate re-validation, so a ticket can outlive a
+certificate.** A resumed TLS 1.3 handshake sends no certificate, so a client that resumes does not
+re-validate the server identity, and a certificate that was replaced, expired, or revoked in the
+last three epochs is still effectively in force for clients holding a valid ticket. The exposure is
+bounded by the acceptance window (12 to 18 hours at the default rotation), and shortening it means
+shortening `rotation_secs`, which also shortens the resumption benefit this design exists to
+capture. An operator who must cut resumption off immediately after a key compromise rotates the
+ticket root; that is the only lever, and it is documented as such here rather than left for an
+operator to discover mid-incident. This is a property of TLS session resumption in general, not a
+defect specific to this design, and is written down so that "we revoked the certificate" is never
+mistaken for "no client can still use it".
+
+**Structural controls on the decrypt path, which is fully attacker controlled.** `decrypt` never
+reads a lifetime, an epoch, or any other decision input out of the ticket beyond the 16-byte key
+name and the 24-byte nonce, both of which are authenticated (the name as AEAD associated data, the
+nonce as the AEAD nonce itself); rustls's own `ProducesTickets` documentation requires exactly this
+("this decryption must be side-channel free, panic-proof, and otherwise bullet-proof", and the
+lifetime "must be implemented by key rolling and erasure, not by storing a lifetime in the
+ticket"). Key-name comparison against all six candidates (2 roots x 3 epochs) runs in constant time
+with `subtle::ConstantTimeEq` and no early exit, so an attacker cannot use timing to probe a key
+name byte by byte; `ticket/decrypt_unknown_key_near_miss`, benchmarked at within roughly 1% of
+`ticket/decrypt_unknown_key`, is the measurement that this is not merely a code-review claim.
+`decrypt` allocates nothing on the unknown-key path (the path an attacker drives): key selection
+happens before the AEAD is ever opened, so a flood of bogus tickets costs six constant-time
+comparisons and no heap traffic, enforced by this module's `//! HOT PATH` marker under
+`scripts/invariant-lints.sh`'s `hot-path-allocation` rule.
 ## gRPC health checking
 
 **What `health::grpc` and `health::grpc_mode` parse.** The gRPC length-prefixed frame and the
