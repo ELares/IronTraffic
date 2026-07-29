@@ -24,7 +24,6 @@ use criterion::{Criterion, criterion_group, criterion_main};
 use irontraffic_tls::store::TimeView;
 use irontraffic_tls::ticket::{ClusterTicketer, NonceSource, TicketRoot};
 use irontraffic_tls::time::UnixSeconds;
-use rustls::server::ProducesTickets;
 
 /// A movable clock: `set` lets a benchmark build a ticket at one epoch and measure decryption
 /// at another, mirroring `ticket.rs`'s own `TestClock`.

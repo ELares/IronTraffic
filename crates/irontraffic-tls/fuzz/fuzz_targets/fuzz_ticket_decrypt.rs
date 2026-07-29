@@ -49,7 +49,6 @@ use irontraffic_tls::store::TimeView;
 use irontraffic_tls::ticket::{ClusterTicketer, MAX_TICKET_LEN, NonceSource, TicketRoot};
 use irontraffic_tls::time::UnixSeconds;
 use libfuzzer_sys::fuzz_target;
-use rustls::server::ProducesTickets;
 
 /// Fixed clock: 2025-01-01T00:00:00Z, unix seconds. Never a live read; see
 /// `irontraffic_tls::time`'s own module doc on why a fuzz target's inputs must be reproducible.

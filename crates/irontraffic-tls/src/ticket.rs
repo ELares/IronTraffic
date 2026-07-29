@@ -445,28 +445,11 @@ impl ClusterTicketer {
             name,
         }
     }
-}
 
-/// Hand-written rather than derived: a `#[derive(Debug)]` would print the primary and previous
-/// HKDF pseudorandom keys. Prints exactly
-/// `ClusterTicketer(fp=<16 hex chars> epoch=<n> rotation_secs=<n> previous=<bool>)`, where `fp`
-/// is the same value `TicketRoot::fingerprint_hex` would print for the root this ticketer was
-/// built from, and `epoch` is a live read through the time seam rather than a stale snapshot.
-impl core::fmt::Debug for ClusterTicketer {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let text = core::str::from_utf8(&self.fingerprint).map_err(|_| core::fmt::Error)?;
-        write!(
-            f,
-            "ClusterTicketer(fp={text} epoch={} rotation_secs={} previous={})",
-            self.epoch_now(),
-            self.rotation_secs,
-            self.previous.is_some(),
-        )
-    }
-}
-
-impl ProducesTickets for ClusterTicketer {
-    fn enabled(&self) -> bool {
+    /// Returns `true` if this ticketer will encrypt and decrypt tickets. Always `true`: a
+    /// disabled ticketer is a dummy implementation this crate does not have.
+    #[must_use]
+    pub fn enabled(&self) -> bool {
         true
     }
 
@@ -474,7 +457,8 @@ impl ProducesTickets for ClusterTicketer {
     /// this long from issuance and at most three epochs of acceptance. RFC 8446 caps a ticket
     /// lifetime hint at 7 days; the maximum configurable `rotation_secs` (86,400, one day) is
     /// far below that.
-    fn lifetime(&self) -> u32 {
+    #[must_use]
+    pub fn lifetime(&self) -> u32 {
         self.rotation_secs
     }
 
@@ -484,7 +468,8 @@ impl ProducesTickets for ClusterTicketer {
     /// nonce the entropy source did not actually write would be a repeated nonce, which breaks
     /// confidentiality outright, whereas failing to issue one only costs the client a full
     /// handshake next time.
-    fn encrypt(&self, plain: &[u8]) -> Option<Vec<u8>> {
+    #[must_use]
+    pub fn encrypt(&self, plain: &[u8]) -> Option<Vec<u8>> {
         let e = self.epoch_now();
         // Fully qualified rather than `self.stats.epoch_current.store(...)`: this is a plain
         // AtomicU64 snapshot counter, not an ArcSwap, but scripts/invariant-lints.sh's
@@ -525,7 +510,8 @@ impl ProducesTickets for ClusterTicketer {
     /// epoch, or any other decision input out of the ticket besides the 16-byte key name and the
     /// 24-byte nonce, both of which are authenticated (the name as AAD, the nonce as the AEAD
     /// nonce).
-    fn decrypt(&self, cipher: &[u8]) -> Option<Vec<u8>> {
+    #[must_use]
+    pub fn decrypt(&self, cipher: &[u8]) -> Option<Vec<u8>> {
         if cipher.len() < MIN_TICKET_LEN || cipher.len() > MAX_TICKET_LEN {
             self.stats.decrypt_malformed.fetch_add(1, Ordering::Relaxed);
             return None;
@@ -588,6 +574,47 @@ impl ProducesTickets for ClusterTicketer {
     }
 }
 
+/// Hand-written rather than derived: a `#[derive(Debug)]` would print the primary and previous
+/// HKDF pseudorandom keys. Prints exactly
+/// `ClusterTicketer(fp=<16 hex chars> epoch=<n> rotation_secs=<n> previous=<bool>)`, where `fp`
+/// is the same value `TicketRoot::fingerprint_hex` would print for the root this ticketer was
+/// built from, and `epoch` is a live read through the time seam rather than a stale snapshot.
+impl core::fmt::Debug for ClusterTicketer {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let text = core::str::from_utf8(&self.fingerprint).map_err(|_| core::fmt::Error)?;
+        write!(
+            f,
+            "ClusterTicketer(fp={text} epoch={} rotation_secs={} previous={})",
+            self.epoch_now(),
+            self.rotation_secs,
+            self.previous.is_some(),
+        )
+    }
+}
+
+/// Adds no public item of its own (per this crate's Public API contract): every method here
+/// forwards to the identically named, identically behaved inherent method above, which is what
+/// every caller in this crate (including its own tests, benchmarks, and fuzz target) actually
+/// calls. This impl exists only so a `ClusterTicketer` satisfies the trait rustls's
+/// `ServerConfig` requires, for the later issue that installs one.
+impl ProducesTickets for ClusterTicketer {
+    fn enabled(&self) -> bool {
+        Self::enabled(self)
+    }
+
+    fn lifetime(&self) -> u32 {
+        Self::lifetime(self)
+    }
+
+    fn encrypt(&self, plain: &[u8]) -> Option<Vec<u8>> {
+        Self::encrypt(self, plain)
+    }
+
+    fn decrypt(&self, cipher: &[u8]) -> Option<Vec<u8>> {
+        Self::decrypt(self, cipher)
+    }
+}
+
 // `ClusterTicketer` is `Send + Sync` and immutable apart from `OnceLock` initialization and
 // relaxed counters (invariant 7). Checked at compile time rather than by a runtime test, which
 // is what a `Send + Sync` property actually calls for: a runtime test can only ever demonstrate
@@ -606,7 +633,7 @@ mod tests {
 
     use proptest::prelude::*;
 
-    use super::{ClusterTicketer, NonceSource, ProducesTickets, RootSel, TicketRoot, TimeView};
+    use super::{ClusterTicketer, NonceSource, RootSel, TicketRoot, TimeView};
     use crate::time::UnixSeconds;
 
     /// A `TimeView` whose value can be moved after construction, for tests that encrypt at one
