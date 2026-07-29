@@ -1343,3 +1343,104 @@ are explored in the same corpus, and a process-lifetime counter fails the run ou
 half ever again goes back to parsing zero status lines after a meaningful number of executions. The
 TCP half is intentionally left driven by the unmodified byte stream: `TcpCheckCodec` has no phase
 machine to gate on an HTTP-shaped prefix, so reshaping its input would only cost it entropy.
+
+## gRPC health checking
+
+**What `health::grpc` and `health::grpc_mode` parse.** The gRPC length-prefixed frame and the
+protobuf `HealthCheckResponse` body an upstream `grpc.health.v1.Health` service sends back to an
+active `Check` or `Watch` probe, in `crates/irontraffic-resilience/src/health/grpc.rs`, and the
+`grpc-status` trailer value that accompanies it. As with the HTTP and TCP checkers above, a probe
+target is not held to the same trust level as a normal upstream serving real traffic: reaching it
+requires none of the authentication a real request would need, and a broken or hostile probe target
+is exactly the condition active health checking exists to detect. Unlike the HTTP and TCP checkers,
+a `Watch` probe is a long-lived stream rather than one bounded request-response exchange, which adds
+two abuse surfaces neither of the other two codecs has: an unbounded number of open streams, and an
+unbounded number of messages on one already-open stream.
+
+**Abuse cases.** A malicious or broken upstream that declares a gRPC frame length of `0xFFFFFFFF`
+(4 GiB) in the 5-byte prefix, aiming to make the proxy allocate or buffer toward that length before
+ever checking it. A `HealthCheckResponse` body engineered with deeply nested or enormous
+length-delimited unknown fields, aiming to make the protobuf reader walk off the end of the message
+or loop forever. A backend that answers `Watch` and then never sends another message, aiming to pin
+a stream, a connection, and a TLS session open forever while looking alive. A backend that instead
+pushes `HealthCheckResponse` messages continuously, aiming to spend the check runner's CPU on decodes
+and mode-machine updates. An operator configuration, or a compromised control plane, that would open
+one `Watch` stream per endpoint with no process-wide ceiling, aiming to exhaust file descriptors
+across the whole proxy through the health-check subsystem alone, which would take request serving
+down with it.
+
+**Structural controls: the prefix-enforced 256-byte cap and its fixed reassembly buffer.**
+
+- **`grpc_frame_admissible`** is the control that makes the 4-GiB-declaration abuse case above
+  unrepresentable rather than merely rejected late. It takes exactly the 5-byte prefix, before any
+  message byte is read, and returns `Err(GrpcDecodeError::TooLong)` the instant the declared length
+  exceeds `MAX_MESSAGE_LEN` (256), or `Err(GrpcDecodeError::Compressed)` if the flag byte is nonzero.
+  The runner MUST call this the moment it has five bytes and MUST NOT buffer a sixth until it
+  returns `Ok`, so the reassembly buffer is a fixed `[u8; 5 + MAX_MESSAGE_LEN]` (261 bytes) that never
+  grows regardless of what the peer declares: `frame_admissible_bounds` (`health::grpc::tests`)
+  asserts a declared length of `u32::MAX`, and one of exactly 257 (one byte over the cap), both
+  return `Err(TooLong)` from the prefix alone, and that a declared length of exactly 256 is accepted,
+  proving the cap is reachable from five bytes without needing to buffer the message body first.
+- **`decode_health_response`** re-checks the same 256-byte cap on the length embedded in a complete
+  frame (`decode_too_long`, `health::grpc::tests`), which matters for any caller that already has a
+  whole frame in hand rather than streaming it through the prefix check above; the `TooLong`
+  comparison runs before the arithmetic that computes the message's end offset, so a declared length
+  of `u32::MAX` cannot overflow that computation on any target.
+- The protobuf reader inside `decode_health_response` never reads past the message end: every varint
+  read is bounds-checked one byte at a time and is capped at 10 continuation bytes
+  (`decode_bad_varint`), and every length-delimited or fixed-width field advances the read position
+  with `checked_add` filtered against the message length before the position is trusted again
+  (`decode_bad_length`). The read loop always advances by at least one byte before it can loop again,
+  which is what makes it terminate on adversarial input rather than spin (`prop_decode_never_panics`
+  and the `fuzz_grpc_health_decode` fuzz target both drive this with generated and fuzzed byte
+  strings and assert it always returns rather than hangs). Wire types 3, 4, 6, and 7 (the removed
+  `group` encoding and the unassigned remainder of the 3-bit wire-type space) are rejected outright
+  as `GroupWireType` rather than given any bespoke handling (`decode_group_wire_types`).
+
+**Two more bounds for the `Watch` stream, which is unbounded in both directions that a bounded
+request-response exchange is not.**
+
+- **`MAX_WATCH_STREAMS`** (4096) bounds the number of `Watch` streams open at once across the whole
+  process. This is a runner-owned budget rather than something `health::grpc`/`health::grpc_mode`
+  enforce directly, because neither module speaks HTTP/2 or owns a connection; the constant is
+  exported for the runner (`dataplane-resilience-wiring`, outside milestone 5) to enforce. Past the
+  budget the runner constructs the endpoint with `prefer_watch: false`, which
+  `prefer_watch_false_never_opens` (`health::grpc_mode::tests`) proves keeps `GrpcModeMachine` in
+  unary `Check` polling for at least 100 consecutive checks rather than ever attempting to open a
+  stream: a `Watch` stream is a connection, a TLS session, and an HTTP/2 stream held open for the
+  endpoint's whole life, so falling back to polling under the budget is a freshness cost, while
+  opening one per endpoint with no ceiling would be a file-descriptor exhaustion outage that also
+  takes down request serving.
+- **`MAX_WATCH_MESSAGES_PER_INTERVAL`** (100) bounds how many `HealthCheckResponse` messages the
+  runner accepts from one open `Watch` stream per check interval, which is what makes the
+  continuous-push abuse case above cost a fixed amount of CPU rather than an amount the peer
+  chooses. This is likewise runner-owned (the sans-IO codec has no notion of "per interval" since it
+  reads no clock), but the mode machine's contribution is that going over the limit is defined to
+  report `Fail(Protocol)` and move the endpoint back to `WatchDesired`, not `UnaryFallback`: a
+  backend that pushes without bound is treated the same as any other dead-or-hostile stream
+  (retried as a stream once) rather than permanently downgraded to polling, which
+  `network_close_retries_watch` (`health::grpc_mode::tests`) exercises for the general
+  network-failure case this shares its mode transition with.
+
+**A network failure never becomes a sticky fallback; only `UNIMPLEMENTED` does.** This matters for
+the abuse surface because a hostile or overloaded upstream that can merely cause a `Watch` stream to
+drop (far easier than answering `UNIMPLEMENTED` correctly) gains nothing from doing so:
+`on_watch_closed` routes a non-`UNIMPLEMENTED` closure back to `WatchDesired`, and only
+`unimplemented: true` (which requires the peer to have actually and correctly answered gRPC status
+12) moves the endpoint to sticky `UnaryFallback` for `watch_retry_after_checks` checks before `Watch`
+is retried. `unimplemented_is_sticky` and `network_close_retries_watch`
+(`health::grpc_mode::tests`) each exercise one side of this distinction and would fail if the two
+were conflated.
+
+**Fuzzing.** `fuzz_grpc_health_decode` (`crates/irontraffic-resilience/fuzz`) drives
+`decode_health_response` with an `Arbitrary`-chosen mix of an unmodified byte stream, an arbitrary
+payload wrapped in a syntactically valid 5-byte prefix, and a fully well-formed frame carrying one
+arbitrary status value, and drives `parse_grpc_status` with an `Arbitrary`-chosen mix of an
+unmodified byte stream and one mapped byte-for-byte into ASCII digits. Both mixes exist for the same
+reason `fuzz_health_response_parser`'s `build_http_response` does (#739 BLOCKING 2): a uniformly
+random byte string essentially never carries a valid 5-byte prefix, let alone a valid protobuf
+message behind it, or a valid ASCII-decimal `grpc-status` value, so a generator of nothing but
+arbitrary bytes would leave the wire-type dispatch loop, the varint reader, and the status
+accumulation loop unexercised. Two process-lifetime counters, mirroring
+`assert_http_half_is_reached`, fail the run outright if either target ever again goes back to
+completing zero real parses after a meaningful number of executions.
