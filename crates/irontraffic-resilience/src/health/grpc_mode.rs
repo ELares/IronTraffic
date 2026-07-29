@@ -101,6 +101,18 @@ impl GrpcModeMachine {
                     // because a dead stream is retried as a stream once, and
                     // only an `UNIMPLEMENTED` answer moves to `UnaryFallback`.
                     self.mode = GrpcMode::WatchDesired;
+                    // #747 BLOCKING: this exit from `WatchOpen` never calls
+                    // `on_watch_closed` (there is no `GrpcVerdict`: nothing
+                    // was received to decode, and the mode transition above
+                    // is already this method's own decision), so the reset
+                    // that method performs on every other exit does not run
+                    // here on its own. Without this line the next stream
+                    // opened for this endpoint inherits a dead stream's
+                    // `last_serving` and `current_outcome()` reports `Pass`
+                    // before that stream has received a single message: a
+                    // backend that accepts every stream and then sends
+                    // nothing is never ejected.
+                    self.last_serving = None;
                     GrpcAction::CloseStreamAndFallback
                 } else if !now.is_at_or_before(self.next_ping_at) {
                     self.next_ping_at = now.add_ms(interval_ms);
@@ -137,9 +149,21 @@ impl GrpcModeMachine {
     }
 
     /// A `HealthCheckResponse` arrived on the open stream.
+    ///
+    /// A no-op unless the mode is `WatchOpen`. #747 BLOCKING (second path): this
+    /// machine carries no stream identity, so a frame drained from a stream that
+    /// has already closed (the runner is draining a socket buffer, or the frame
+    /// was already in flight when the liveness timer or `on_watch_closed` fired)
+    /// would otherwise be recorded as evidence about whatever stream opens next.
+    /// Gating on the mode means such a frame lands strictly between a close and
+    /// the following `on_watch_open`, when the mode is `WatchDesired` or
+    /// `UnaryFallback`, not `WatchOpen`, so it is dropped rather than
+    /// misattributed.
     pub fn on_watch_message(&mut self, now: Millis, raw: Option<u32>) {
-        self.last_message_at = now;
-        self.last_serving = raw;
+        if self.mode == GrpcMode::WatchOpen {
+            self.last_message_at = now;
+            self.last_serving = raw;
+        }
     }
 
     /// The `Watch` stream ended. `verdict.unimplemented` decides whether this
@@ -345,6 +369,187 @@ mod tests {
         assert_eq!(
             machine.on_check_due(t0, 1000, &compiled),
             GrpcAction::OpenWatch
+        );
+    }
+
+    /// #747 BLOCKING, path 1: the liveness-timeout exit from `WatchOpen` never
+    /// calls `on_watch_closed` (there is no `GrpcVerdict` for a silent stream),
+    /// so it must clear `last_serving` itself. Reproduces the reviewer's
+    /// end-to-end shape at the unit level: a stream reports `Pass`, goes
+    /// silent, is closed by the liveness timer, and the freshly reopened
+    /// stream must report `Fail`, not inherit the dead stream's `Pass`, even
+    /// though it too has received zero messages.
+    #[test]
+    fn watch_reopen_after_liveness_timeout_reports_fail_with_zero_messages() {
+        let t0 = Millis(0);
+        let compiled = valid_spec(true).compile().expect("valid spec");
+        let mut machine = GrpcModeMachine::new(t0, true);
+        machine.on_watch_open(t0, 1000);
+        machine.on_watch_message(t0, Some(1));
+        assert_eq!(machine.current_outcome(), Some(CheckOutcome::Pass));
+
+        let later = t0.add_ms(3_001);
+        assert_eq!(
+            machine.on_check_due(later, 1000, &compiled),
+            GrpcAction::CloseStreamAndFallback
+        );
+        assert_eq!(machine.mode(), GrpcMode::WatchDesired);
+        assert_eq!(
+            machine.on_check_due(later, 1000, &compiled),
+            GrpcAction::OpenWatch
+        );
+
+        // The runner reopens a stream. Zero messages have arrived on it.
+        machine.on_watch_open(later, 1000);
+        assert_eq!(
+            machine.current_outcome(),
+            Some(CheckOutcome::Fail(FailKind::Status)),
+            "a freshly opened stream with zero messages must not inherit the dead stream's Pass"
+        );
+    }
+
+    /// #747: kills `M7-del-last-serving-reset-on-close`, which survives against
+    /// the shipped suite because nothing reopens Watch after a normal
+    /// (`on_watch_closed`) exit and checks `current_outcome()` again. This is
+    /// the network-failure sibling of
+    /// `watch_reopen_after_liveness_timeout_reports_fail_with_zero_messages`
+    /// above: same stale-`Pass` shape, but reached through the exit that DOES
+    /// call `on_watch_closed`, to pin the reset that method already performs
+    /// (deleting `self.last_serving = None;` there is otherwise unobserved by
+    /// any test).
+    #[test]
+    fn watch_reopen_after_close_reports_fail_with_zero_messages() {
+        let t0 = Millis(0);
+        let mut machine = GrpcModeMachine::new(t0, true);
+        machine.on_watch_open(t0, 1000);
+        machine.on_watch_message(t0, Some(1));
+        assert_eq!(machine.current_outcome(), Some(CheckOutcome::Pass));
+
+        let verdict = GrpcVerdict {
+            outcome: CheckOutcome::Fail(FailKind::Protocol),
+            raw_serving_status: None,
+            grpc_status: None,
+            unimplemented: false,
+        };
+        machine.on_watch_closed(t0, verdict);
+        assert_eq!(machine.mode(), GrpcMode::WatchDesired);
+
+        machine.on_watch_open(t0, 1000);
+        assert_eq!(
+            machine.current_outcome(),
+            Some(CheckOutcome::Fail(FailKind::Status)),
+            "on_watch_closed's last_serving reset must survive into the next stream"
+        );
+    }
+
+    /// #747 BLOCKING, path 2: `on_watch_message` carries no stream identity, so
+    /// a frame drained from a stream that already closed must not be
+    /// attributed to whatever stream opens next. Simulates a frame from stream
+    /// A that was already in flight when A closed, draining after
+    /// `on_watch_closed` has already moved the mode off `WatchOpen` but before
+    /// stream B's `on_watch_open` runs.
+    #[test]
+    fn late_watch_message_after_close_is_ignored() {
+        let t0 = Millis(0);
+        let compiled = valid_spec(true).compile().expect("valid spec");
+        let mut machine = GrpcModeMachine::new(t0, true);
+        machine.on_watch_open(t0, 1000);
+        machine.on_watch_message(t0, Some(1));
+        assert_eq!(machine.current_outcome(), Some(CheckOutcome::Pass));
+
+        let verdict = GrpcVerdict {
+            outcome: CheckOutcome::Fail(FailKind::Protocol),
+            raw_serving_status: None,
+            grpc_status: None,
+            unimplemented: false,
+        };
+        machine.on_watch_closed(t0, verdict);
+        assert_eq!(machine.mode(), GrpcMode::WatchDesired);
+
+        // A frame from the just-closed stream A, already in flight, drains
+        // after the close but before B's `on_watch_open`. Without the mode
+        // gate this would set `last_serving` back to `Some(1)`.
+        machine.on_watch_message(t0, Some(1));
+
+        assert_eq!(
+            machine.on_check_due(t0, 1000, &compiled),
+            GrpcAction::OpenWatch
+        );
+        machine.on_watch_open(t0, 1000);
+        assert_eq!(
+            machine.current_outcome(),
+            Some(CheckOutcome::Fail(FailKind::Status)),
+            "a message drained from the closed stream must not be attributed to the next one"
+        );
+    }
+
+    /// #747 VERIFICATION: the reviewer's end-to-end probe, driven through the
+    /// shipped `EndpointSchedule` with `HealthCheckConfig::default()` for 200
+    /// intervals. The backend accepts every stream and sends exactly one real
+    /// `SERVING` message ever, on the very first stream, then black-holes
+    /// every reopened stream after it (accepts the stream, sends nothing, and
+    /// -- this is a true black hole, not merely a quiet server -- never acks
+    /// a PING either, since a middlebox that silently drops a connection
+    /// drops everything on it): the canonical "was healthy, then
+    /// black-holed" case the BLOCKING finding's title names. Before the fix
+    /// this stayed `Healthy` forever with zero `ToUnhealthy` transitions,
+    /// because every reopened stream inherited the one real `Pass` verdict;
+    /// the fixed machine must eject it.
+    #[test]
+    fn endpoint_schedule_ejects_a_black_holing_watch_backend() {
+        use crate::health::bitmap::EndpointHealth;
+        use crate::health::schedule::{EndpointSchedule, HealthCheckConfig, Transition};
+
+        let cfg = HealthCheckConfig::default();
+        let compiled = valid_spec(true).compile().expect("valid spec");
+        let t0 = Millis(0);
+        let mut schedule = EndpointSchedule::init(t0, 1, 1, &cfg, true);
+        let mut machine = GrpcModeMachine::new(t0, true);
+
+        let mut t = t0;
+        let mut sent_first_message = false;
+        let mut to_unhealthy = 0u32;
+        let mut passes = 0u32;
+        let mut fails = 0u32;
+
+        for _ in 0..200 {
+            let action = machine.on_check_due(t, cfg.interval_ms, &compiled);
+            if let GrpcAction::OpenWatch = action {
+                machine.on_watch_open(t, cfg.interval_ms);
+                if !sent_first_message {
+                    machine.on_watch_message(t, Some(1));
+                    sent_first_message = true;
+                }
+            }
+            // `SendPing`, `CloseStreamAndFallback`, `SendUnaryCheck`, and
+            // `Idle` all need no reaction from this probe: a true black hole
+            // never acks the PING the runner would send, never answers the
+            // unary `Check` the runner would dispatch after falling back
+            // (both would time out, which this probe does not need to model
+            // since the mode machine already treats a stream it has not
+            // heard from as the failure it is), and closing or idling needs
+            // no event call at all.
+            if let Some(outcome) = machine.current_outcome() {
+                match outcome {
+                    CheckOutcome::Pass => passes += 1,
+                    CheckOutcome::Fail(_) => fails += 1,
+                }
+                if schedule.apply_outcome(outcome, &cfg) == Transition::ToUnhealthy {
+                    to_unhealthy += 1;
+                }
+            }
+            t = t.add_ms(cfg.interval_ms);
+        }
+
+        assert!(
+            to_unhealthy >= 1,
+            "a backend that black-holes after one real message must eventually be ejected \
+             (passes={passes} fails={fails} to_unhealthy={to_unhealthy})"
+        );
+        assert_eq!(
+            schedule.active_health,
+            EndpointHealth::Unhealthy,
+            "passes={passes} fails={fails} to_unhealthy={to_unhealthy}"
         );
     }
 
