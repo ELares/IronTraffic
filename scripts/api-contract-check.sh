@@ -31,7 +31,7 @@
 # Implemented with node --eval reading the JSON, so it needs no npm package.
 #
 # Usage:  scripts/api-contract-check.sh              (checks contract/openapi.v1.json)
-#         scripts/api-contract-check.sh --selftest   (runs the 33 named self-tests)
+#         scripts/api-contract-check.sh --selftest   (runs the 34 named self-tests)
 set -euo pipefail
 
 if ! command -v node >/dev/null 2>&1; then
@@ -136,6 +136,27 @@ const FROZEN_PERMISSION_VOCABULARY = [
   'sessions:read', 'sessions:manage', 'tokens:read', 'tokens:manage',
   'apim:read', 'apim:write', 'support:read',
 ];
+
+// The path-parameter vocabulary the operation table in issue 380 pins:
+// name -> { maxLength, pattern }. Step 24 on its own only checks that A
+// pattern is present, of nonzero length; "^.*$" satisfies that and matches
+// anything. This is a record the checker keeps of the exact bound named for
+// each parameter name, so a pattern widened to something vacuous cannot pass
+// merely because a pattern is there. Reproduced here rather than derived
+// from the document at runtime, for the same reason FROZEN_OPERATIONS is.
+const FROZEN_PATH_PARAMETER_VOCABULARY = {
+  kind: { maxLength: 64, pattern: '^[a-z][a-z0-9-]{0,63}$' },
+  ns: { maxLength: 63, pattern: '^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$' },
+  name: { maxLength: 253, pattern: '^[a-z0-9]([a-z0-9.-]{0,251}[a-z0-9])?$' },
+  id: { maxLength: 128, pattern: '^[A-Za-z0-9._-]{1,128}$' },
+  credential_id: { maxLength: 128, pattern: '^[A-Za-z0-9._-]{1,128}$' },
+  version: { maxLength: 41, pattern: '^[0-9]{1,20}-[0-9]{1,20}$' },
+  from: { maxLength: 41, pattern: '^[0-9]{1,20}-[0-9]{1,20}$' },
+  to: { maxLength: 41, pattern: '^[0-9]{1,20}-[0-9]{1,20}$' },
+  trace_id: { maxLength: 32, pattern: '^[0-9a-f]{32}$' },
+  request_id: { maxLength: 64, pattern: '^[A-Za-z0-9._-]{1,64}$' },
+  key: { maxLength: 128, pattern: '^[A-Za-z0-9._:~-]{1,128}$' },
+};
 
 function decodeJsonPointerSegment(s) {
   return s.replace(/~1/g, '/').replace(/~0/g, '~');
@@ -512,6 +533,21 @@ function checkDocument(doc, opts) {
         }
         if (typeof sch.pattern !== 'string' || sch.pattern.length === 0) {
           fail('path parameter has no pattern: ' + id + ' parameter ' + pm.name);
+        }
+        // Presence of a pattern is not the same as the pattern constraining
+        // anything: "^.*$" satisfies the two checks above and matches every
+        // string. When the caller supplies a pinned vocabulary (main()
+        // supplies the real one from issue 380), a parameter whose name is
+        // in it must match the pinned maxLength and pattern exactly.
+        if (pm.name && opts.pathParameterVocabulary &&
+          Object.prototype.hasOwnProperty.call(opts.pathParameterVocabulary, pm.name)) {
+          const pinned = opts.pathParameterVocabulary[pm.name];
+          if (sch.maxLength !== pinned.maxLength || sch.pattern !== pinned.pattern) {
+            fail('path parameter does not match the frozen vocabulary for its name: ' + id +
+              ' parameter ' + pm.name + ' expected maxLength ' + pinned.maxLength + ' and pattern ' +
+              JSON.stringify(pinned.pattern) + ', found maxLength ' + JSON.stringify(sch.maxLength) +
+              ' and pattern ' + JSON.stringify(sch.pattern));
+          }
         }
       } else if (schemaHasType(sch, 'integer')) {
         if (typeof sch.minimum !== 'number' || typeof sch.maximum !== 'number') {
@@ -1766,6 +1802,39 @@ run('selftest_rejects_an_optional_csrf_or_if_match_header', () => {
     JSON.stringify(r3.failures));
 });
 
+// 34. selftest_path_parameter_vocabulary_pin_rejects_a_vacuous_pattern
+run('selftest_path_parameter_vocabulary_pin_rejects_a_vacuous_pattern', () => {
+  // A small vocabulary, independent of FROZEN_PATH_PARAMETER_VOCABULARY,
+  // pinned to the exact schema baseValidTwoOpDoc() gives its "id" path
+  // parameter. Presence-only step 24 accepts "^.*$" because it has nonzero
+  // length; only a pin against a value the document under test cannot edit
+  // can tell that pattern apart from one that actually constrains anything.
+  const SMALL_PARAM_VOCAB = { id: { maxLength: 64, pattern: '^[a-z0-9]{1,64}$' } };
+
+  const accepted = checkDocument(baseValidTwoOpDoc(), { pathParameterVocabulary: SMALL_PARAM_VOCAB });
+  expect('selftest_path_parameter_vocabulary_pin_rejects_a_vacuous_pattern (accepts the matching schema)',
+    accepted.failures.length === 0, JSON.stringify(accepted.failures));
+
+  const vacuous = baseValidTwoOpDoc();
+  vacuous.paths['/widgets/{id}'].parameters =
+    vacuous.paths['/widgets/{id}'].parameters.map((p) =>
+      p.name === 'id' ? Object.assign({}, p, { schema: { type: 'string', maxLength: 256, pattern: '^.*$' } }) : p);
+  const rVacuous = checkDocument(vacuous, { pathParameterVocabulary: SMALL_PARAM_VOCAB });
+  expect('selftest_path_parameter_vocabulary_pin_rejects_a_vacuous_pattern (widened to ^.*$ and 256, still present, still rejected)',
+    rVacuous.failures.some((f) => f.includes('path parameter does not match the frozen vocabulary for its name') &&
+      f.includes('getWidget') && f.includes('id')),
+    JSON.stringify(rVacuous.failures));
+
+  const shortened = baseValidTwoOpDoc();
+  shortened.paths['/widgets/{id}'].parameters =
+    shortened.paths['/widgets/{id}'].parameters.map((p) =>
+      p.name === 'id' ? Object.assign({}, p, { schema: { type: 'string', maxLength: 8, pattern: '^[a-z0-9]{1,64}$' } }) : p);
+  const rShortened = checkDocument(shortened, { pathParameterVocabulary: SMALL_PARAM_VOCAB });
+  expect('selftest_path_parameter_vocabulary_pin_rejects_a_vacuous_pattern (maxLength narrowed still rejected, not just widened)',
+    rShortened.failures.some((f) => f.includes('path parameter does not match the frozen vocabulary for its name')),
+    JSON.stringify(rShortened.failures));
+});
+
   return { results, passCount, failCount };
 }
 
@@ -1776,7 +1845,7 @@ function main() {
     for (const line of results) {
       console.log(line);
     }
-    console.log('selftest: ' + passCount + ' passed, ' + failCount + ' failed (of ' + (passCount + failCount) + ' assertions across 33 named tests)');
+    console.log('selftest: ' + passCount + ' passed, ' + failCount + ' failed (of ' + (passCount + failCount) + ' assertions across 34 named tests)');
     process.exit(failCount === 0 ? 0 : 1);
   }
 
@@ -1816,6 +1885,7 @@ function main() {
   const result = checkDocument(doc, {
     frozenOperations: FROZEN_OPERATIONS,
     frozenPermissionVocabulary: FROZEN_PERMISSION_VOCABULARY,
+    pathParameterVocabulary: FROZEN_PATH_PARAMETER_VOCABULARY,
   });
   if (result.failures.length > 0) {
     for (const f of result.failures) console.log(f);
