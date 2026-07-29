@@ -641,14 +641,27 @@ mod tests {
     #[test]
     fn over_cap_drops_oldest_install() {
         let (cell, mut coalescer) = test_setup(&[]);
-        coalescer.set_max_pending(16);
+        // set_max_pending(1) must clamp UP to MIN_MAX_PENDING (16), not down to 1: submitting
+        // exactly 16 must NOT drop anything (the accept side of that clamp boundary), and only
+        // the 17th submission crosses it. A mutation that removed the clamp, or inverted it to a
+        // .min instead of a .max, would drop starting at the 2nd submission instead.
+        coalescer.set_max_pending(1);
         let shared = gen_cred("shared-cap.example.com");
-        for i in 0..17 {
+        for i in 0..16 {
             let name = format!("h{i}.example.com");
             coalescer
                 .submit(install_exact(&name, &shared))
                 .expect("valid update");
         }
+        assert_eq!(
+            cell.stats().updates_dropped.load(Ordering::Relaxed),
+            0,
+            "set_max_pending(1) must clamp up to 16; 16 submissions must not drop anything"
+        );
+        assert_eq!(coalescer.pending_len(), 16);
+        coalescer
+            .submit(install_exact("h16.example.com", &shared))
+            .expect("valid update");
         assert_eq!(cell.stats().updates_dropped.load(Ordering::Relaxed), 1);
         assert_eq!(coalescer.pending_len(), 16);
         let published = coalescer.flush_now().expect("flush ok");
@@ -1050,6 +1063,18 @@ mod tests {
         let rebuilt = CertIndexBuilder::from_previous(&original)
             .build_with_generation(1)
             .expect("rebuild succeeds");
+
+        // The hasher key itself is inherited, not just the resolution behaviour: computed
+        // through the real `hash` method on both hashers, not asserted by trusting a comment.
+        // A mutant that always re-derives a fresh key at attempt 0 (skipping the inherited-key
+        // short-circuit) would still pass every resolve-based assertion below, since a build is
+        // internally consistent with whichever key it happens to use; this is the one assertion
+        // that would catch it.
+        assert_eq!(
+            original.hasher().hash("host0.example.com"),
+            rebuilt.hasher().hash("host0.example.com"),
+            "from_previous must inherit the previous generation's hasher key, not derive a fresh one"
+        );
 
         for i in 0..1_000 {
             let name = format!("host{i}.example.com");
