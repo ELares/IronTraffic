@@ -416,7 +416,19 @@ selftest() {
   selftest_pass rejects_stale_lifecycle_exception 1 'stale lifecycle-script exception' \
     lifecycle_check "$work/allowed.txt" "$work/node_modules" no-rebuild || return 1
 
-  echo 'selftest: all 17 checks passed'
+  # selftest_wires_api_contract_check_selftest. The real (non-selftest)
+  # invocation of this gate below runs scripts/api-contract-check.sh with no
+  # arguments, which checks the committed document and never reaches that
+  # script's own --selftest fixtures. Without this line, CI ran two commands
+  # (this gate's --selftest, then this gate for real) and between them
+  # executed zero of the contract checker self-tests, so a regression in a
+  # rule the committed document happens not to exercise could ship
+  # unnoticed. Running the contract checker self-test as one check of THIS
+  # gate self-test closes that gap without adding a third CI step.
+  selftest_pass wires_api_contract_check_selftest 0 '0 failed' \
+    "$(git rev-parse --show-toplevel)/scripts/api-contract-check.sh" --selftest || return 1
+
+  echo 'selftest: all 18 checks passed'
   return 0
 }
 
