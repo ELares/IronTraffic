@@ -31,7 +31,7 @@
 # Implemented with node --eval reading the JSON, so it needs no npm package.
 #
 # Usage:  scripts/api-contract-check.sh              (checks contract/openapi.v1.json)
-#         scripts/api-contract-check.sh --selftest   (runs the 38 named self-tests)
+#         scripts/api-contract-check.sh --selftest   (runs the 40 named self-tests)
 set -euo pipefail
 
 if ! command -v node >/dev/null 2>&1; then
@@ -619,6 +619,31 @@ function checkDocument(doc, opts) {
     }
     if (op.obj.requestBody && !('413' in responses)) {
       fail('operation has a requestBody but does not list 413: ' + id);
+    }
+
+    // step 28: every non-DELETE operation lists a 200 success response.
+    // (Step 22 already requires 204 on every DELETE.) The SSE logic in step
+    // 20 reads responses['200'], gets undefined when it is absent, and takes no
+    // branch either way, so deleting the entire 200 from a GET, POST, PUT or
+    // PATCH operation passed with no step naming it. A generated client
+    // types a missing success case as never, exactly the failure issue 380
+    // cites as the reason for requiring the 500 response.
+    if (op.method !== 'delete' && !('200' in responses)) {
+      fail('operation does not list a 200 response: ' + id);
+    }
+
+    // step 29: every mutating (non-GET) operation lists 409, 412 and 422, in
+    // addition to 413 when it has a requestBody (step 12, above). Issue 380
+    // says every mutating operation additionally lists PreconditionFailed,
+    // Conflict, Unprocessable and PayloadTooLarge; no step enforced the
+    // first three, so removing 412 from an operation that already had it
+    // passed with no failure naming it.
+    if (!isGet) {
+      for (const code of ['409', '412', '422']) {
+        if (!(code in responses)) {
+          fail('mutating operation does not list response ' + code + ': ' + id);
+        }
+      }
     }
 
     // step 17
@@ -2064,6 +2089,40 @@ run('selftest_json_parser_rejects_malformed_json_without_crashing', () => {
   }
 });
 
+// 39. selftest_rejects_a_deleted_success_response
+run('selftest_rejects_a_deleted_success_response', () => {
+  const d = mkDoc({ opCount: 1, expensive: ['getWidget'], paths: { '/widget': { get: okGetOp('getWidget', 'widget:read', 'irtctl widget show') } } });
+  delete d.paths['/widget'].get.responses['200'];
+  const r = checkDocument(d);
+  expect('selftest_rejects_a_deleted_success_response',
+    r.failures.some((f) => f.includes('operation does not list a 200 response') && f.includes('getWidget')),
+    JSON.stringify(r.failures));
+});
+
+// 40. selftest_rejects_a_mutating_operation_missing_409_412_or_422
+run('selftest_rejects_a_mutating_operation_missing_409_412_or_422', () => {
+  const d = baseValidTwoOpDoc();
+  delete d.paths['/widgets/{id}'].put.responses['412'];
+  const r = checkDocument(d);
+  expect('selftest_rejects_a_mutating_operation_missing_409_412_or_422 (412 removed)',
+    r.failures.some((f) => f.includes('mutating operation does not list response 412') && f.includes('putWidget')),
+    JSON.stringify(r.failures));
+
+  const d2 = baseValidTwoOpDoc();
+  delete d2.paths['/widgets/{id}'].put.responses['409'];
+  const r2 = checkDocument(d2);
+  expect('selftest_rejects_a_mutating_operation_missing_409_412_or_422 (409 removed)',
+    r2.failures.some((f) => f.includes('mutating operation does not list response 409') && f.includes('putWidget')),
+    JSON.stringify(r2.failures));
+
+  const d3 = baseValidTwoOpDoc();
+  delete d3.paths['/widgets/{id}'].put.responses['422'];
+  const r3 = checkDocument(d3);
+  expect('selftest_rejects_a_mutating_operation_missing_409_412_or_422 (422 removed)',
+    r3.failures.some((f) => f.includes('mutating operation does not list response 422') && f.includes('putWidget')),
+    JSON.stringify(r3.failures));
+});
+
   return { results, passCount, failCount };
 }
 
@@ -2074,7 +2133,7 @@ function main() {
     for (const line of results) {
       console.log(line);
     }
-    console.log('selftest: ' + passCount + ' passed, ' + failCount + ' failed (of ' + (passCount + failCount) + ' assertions across 38 named tests)');
+    console.log('selftest: ' + passCount + ' passed, ' + failCount + ' failed (of ' + (passCount + failCount) + ' assertions across 40 named tests)');
     process.exit(failCount === 0 ? 0 : 1);
   }
 
