@@ -489,14 +489,22 @@ pub fn decode_health_response(frame: &[u8]) -> Result<Option<u32>, GrpcDecodeErr
     let Some(frame_len) = 5usize.checked_add(len) else {
         return Err(GrpcDecodeError::ShortFrame);
     };
-    // This check and the `frame.get(5..frame_len)` immediately below it produce
-    // the identical `Err(ShortFrame)` for the identical condition: `Range::get`
-    // already returns `None` whenever the upper bound exceeds the slice length,
-    // with no panic either way. Confirmed equivalent by mutating this
-    // comparison (`>` to `<`) and rerunning the suite, which stayed green: no
-    // input can distinguish "reject here" from "reject one line down", so this
-    // is defense in depth (and follows the issue's own algorithm text
+    // This check and the `frame.get(5..frame_len)` immediately below it both
+    // reject a `frame` shorter than `frame_len`, with no panic either way, so
+    // this is defense in depth (and follows the issue's own algorithm text
     // verbatim), not the sole enforcement of the bound.
+    //
+    // #747 SHOULD_FIX 4: this comment used to call `>` and `<` here
+    // "confirmed equivalent" because mutating the comparison to `<` left the
+    // suite green. The survival was real, but the two are NOT equivalent:
+    // they disagree exactly when `frame.len() > frame_len` (a reassembly
+    // buffer, such as the fixed 261-byte one `docs/THREAT-MODEL.md`
+    // prescribes, holding a short message with trailing slack), where `>`
+    // correctly accepts and `<` incorrectly rejects every such frame as
+    // `ShortFrame`, which maps to `Fail(Protocol)` and would eject every
+    // endpoint. The green suite only showed a coverage gap: no test decoded a
+    // frame longer than its declared message.
+    // `decode_ignores_trailing_bytes_past_declared_length` below closes it.
     if frame_len > frame.len() {
         return Err(GrpcDecodeError::ShortFrame);
     }
@@ -1144,6 +1152,26 @@ mod tests {
         frame.extend(std::iter::repeat_n(0u8, MAX_MESSAGE_LEN));
         assert_eq!(frame.len(), 5 + MAX_MESSAGE_LEN);
         assert_eq!(decode_health_response(&frame), Ok(None));
+    }
+
+    /// #747 `SHOULD_FIX` 4: every decode test up to this one has `frame.len()`
+    /// exactly `5 + declared_len`; none decodes a buffer LONGER than its
+    /// declared message, which is exactly the shape `docs/THREAT-MODEL.md`
+    /// prescribes: a fixed `[u8; 5 + MAX_MESSAGE_LEN]` (261-byte) reassembly
+    /// buffer holding a short response with trailing slack. Declares length 2
+    /// (the `SERVING` message) but supplies 3 extra bytes past it.
+    #[test]
+    fn decode_ignores_trailing_bytes_past_declared_length() {
+        let frame = [0u8, 0, 0, 0, 2, 0x08, 0x01, 0xAA, 0xBB, 0xCC];
+        assert_eq!(frame.len(), 10, "declared length 2 plus 3 trailing bytes");
+        assert_eq!(decode_health_response(&frame), Ok(Some(1)));
+
+        // The full 261-byte fixed reassembly buffer shape: a 2-byte SERVING
+        // message followed by 254 bytes of untouched buffer slack.
+        let mut buf = vec![0u8, 0, 0, 0, 2, 0x08, 0x01];
+        buf.extend(std::iter::repeat_n(0u8, MAX_MESSAGE_LEN - 2));
+        assert_eq!(buf.len(), 5 + MAX_MESSAGE_LEN);
+        assert_eq!(decode_health_response(&buf), Ok(Some(1)));
     }
 
     #[test]
