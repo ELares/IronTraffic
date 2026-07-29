@@ -949,6 +949,14 @@ mod tests {
         let ct = a.encrypt(b"old root").expect("entropy never fails");
         assert_eq!(b.decrypt(&ct), None);
         assert_eq!(b.stats().decrypt_unknown_key.load(Ordering::Relaxed), 1);
+
+        // Directly proves the guard `epoch_key` documents: with no previous root configured,
+        // looking up a Previous-root candidate returns None immediately rather than silently
+        // falling back to the primary root's own key material for that slot. Without this
+        // assertion a fallback bug is invisible here: it would only ever recompute a candidate
+        // identical to the primary one already checked, never widen what a ticket from a
+        // genuinely different root can match.
+        assert!(b.epoch_key(RootSel::Previous, b.epoch_now()).is_none());
     }
 
     #[test]
