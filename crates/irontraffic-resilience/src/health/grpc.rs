@@ -444,7 +444,18 @@ fn read_varint(msg: &[u8], i: &mut usize) -> Result<u64, GrpcDecodeError> {
     reason = "protobuf's own rule for a 32-bit enum field read from a 64-bit varint is to keep the low 32 bits; this is the wire format's rule, not unintended data loss"
 )]
 fn truncate_varint_status(v: u64) -> u32 {
-    v as u32 // it-allow: unchecked-cast reason: bounded per the doc comment above
+    // #747 NOTE: the escape below used to say "bounded per the doc comment
+    // above", which was wrong: `v` is an arbitrary `u64` read straight off the
+    // wire, and nothing bounds it. This narrowing conversion is a deliberate
+    // truncation, not a proof that `v` fits in 32 bits without loss: protobuf's
+    // own rule for a 32-bit enum field read from a 64-bit varint is to discard
+    // the high 32 bits, which is exactly what happens below (`prost` and
+    // `protobuf-go` do the same). A hostile `v` with nonzero high bits
+    // truncates to whatever its low 32 bits say, which `ServingStatus::from_raw`
+    // and `serving_status_verdict` then treat like any other value: `Some(1)`
+    // truncated from is `Pass`, anything else is `Fail`. See
+    // `decode_status_truncates_high_bits_of_the_varint`.
+    v as u32 // it-allow: unchecked-cast reason: deliberate truncation per protobuf's own wire-format rule for a 32-bit field read from a 64-bit varint, not a bound on v (see the comment above); the high bits are intentionally discarded, not assumed zero
 }
 
 /// Decode a `HealthCheckResponse` frame, returning the raw `status` field value, or
@@ -966,6 +977,19 @@ mod tests {
     fn decode_two_byte_varint_shifts_into_high_bits() {
         let frame = [0u8, 0, 0, 0, 3, 0x08, 0x80, 0x01];
         assert_eq!(decode_health_response(&frame), Ok(Some(128)));
+    }
+
+    /// #747 NOTE: `truncate_varint_status`'s cast had no test in either
+    /// direction. Field 1 (tag `0x08`), varint `4_294_967_297` (`2^32 + 1`,
+    /// encoded as `[0x81, 0x80, 0x80, 0x80, 0x10]`): a value with nonzero high
+    /// 32 bits that low32-truncates to 1. Legal protobuf: an enum field is
+    /// wire-encoded as a full varint, and a reader keeps only the low 32 bits
+    /// (the wire format's own rule, not this decoder's invention, and what
+    /// `prost`/`protobuf-go` do too).
+    #[test]
+    fn decode_status_truncates_high_bits_of_the_varint() {
+        let frame = [0u8, 0, 0, 0, 6, 0x08, 0x81, 0x80, 0x80, 0x80, 0x10];
+        assert_eq!(decode_health_response(&frame), Ok(Some(1)));
     }
 
     #[test]
