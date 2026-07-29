@@ -692,12 +692,12 @@ impl Checker<'_> {
                 Ok((ty, self.start_of(base)))
             }
             Node::Not { inner } => {
-                self.expect(inner, Ty::Bool)?;
+                self.expect(inner, Ty::Bool)?; // it-allow: no-panic reason: Checker::expect returns Result and propagates via ?; not Result::expect/Option::expect.
                 Ok((Ty::Bool, self.start_of(inner)))
             }
             Node::And { lhs, rhs } | Node::Or { lhs, rhs } => {
-                self.expect(lhs, Ty::Bool)?;
-                self.expect(rhs, Ty::Bool)?;
+                self.expect(lhs, Ty::Bool)?; // it-allow: no-panic reason: Checker::expect returns Result and propagates via ?; not Result::expect/Option::expect.
+                self.expect(rhs, Ty::Bool)?; // it-allow: no-panic reason: Checker::expect returns Result and propagates via ?; not Result::expect/Option::expect.
                 Ok((Ty::Bool, self.start_of(lhs)))
             }
             Node::Bin { op, lhs, rhs } => {
@@ -705,7 +705,7 @@ impl Checker<'_> {
                 Ok((ty, self.start_of(lhs)))
             }
             Node::Ternary { cond, then_, else_ } => {
-                self.expect(cond, Ty::Bool)?;
+                self.expect(cond, Ty::Bool)?; // it-allow: no-panic reason: Checker::expect returns Result and propagates via ?; not Result::expect/Option::expect.
                 let ty = self.unify(then_, else_)?;
                 Ok((ty, self.start_of(cond)))
             }
