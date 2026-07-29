@@ -2171,7 +2171,15 @@ function main() {
     for (const f of result.failures) console.log(f);
     process.exit(1);
   }
-  console.log('api-contract-check: ' + result.opCount + ' operations, ' + result.permCount + ' permissions, ok');
+  // Both numbers are printed from the checker-side FROZEN_ constants, not
+  // from a count taken of the document under test, so the success line
+  // itself cannot be made to read differently by a document that has
+  // already passed step 23 (the frozen operation and permission pins). If
+  // this point is reached, result.opCount and result.permCount are already
+  // proven equal to these lengths; printing the constants directly instead
+  // is one fewer place the count could be sourced from the thing it counts.
+  console.log('api-contract-check: ' + FROZEN_OPERATIONS.length + ' operations, ' +
+    FROZEN_PERMISSION_VOCABULARY.length + ' permissions, ok');
   process.exit(0);
 }
 
@@ -2193,7 +2201,20 @@ if [ $# -gt 0 ]; then
   exit 2
 fi
 
-cd "$(git rev-parse --show-toplevel)"
+# git rev-parse failing outside a git repository leaves its own stdout
+# empty; command substitution failure inside `cd "$(...)"` is a case set -e
+# does not catch (the exit status that matters to the shell is cd's, and
+# `cd ""` is a silent no-op that returns 0), so the failure must be checked
+# explicitly rather than relying on set -e to stop the script here. Without
+# this guard, running outside a git repository with a stray
+# contract/openapi.v1.json in the current directory would validate that
+# stray file silently instead of failing loudly.
+toplevel="$(git rev-parse --show-toplevel 2>/dev/null || true)"
+if [ -z "$toplevel" ]; then
+  echo 'api-contract-check: not inside a git repository' >&2
+  exit 1
+fi
+cd "$toplevel"
 
 if [ ! -f contract/openapi.v1.json ]; then
   echo 'api-contract-check: contract/openapi.v1.json is missing' >&2
