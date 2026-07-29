@@ -31,7 +31,7 @@
 # Implemented with node --eval reading the JSON, so it needs no npm package.
 #
 # Usage:  scripts/api-contract-check.sh              (checks contract/openapi.v1.json)
-#         scripts/api-contract-check.sh --selftest   (runs the 34 named self-tests)
+#         scripts/api-contract-check.sh --selftest   (runs the 38 named self-tests)
 set -euo pipefail
 
 if ! command -v node >/dev/null 2>&1; then
@@ -163,6 +163,174 @@ function decodeJsonPointerSegment(s) {
 }
 function encodeJsonPointerSegment(s) {
   return String(s).replace(/~/g, '~0').replace(/\//g, '~1');
+}
+
+// A hand-written recursive-descent JSON parser, because JSON.parse keeps the
+// LAST occurrence of a duplicate object key with no diagnostic at all. On a
+// hand-maintained multi-thousand-line document that is a live fail-open
+// path: a second "x-it-permission": "none" inserted after the real one makes
+// the effective permission "none" while the visible line above still reads
+// something else, and a plain JSON.parse-based checker has no way to notice.
+// This function rejects a duplicate key at parse time and names the JSON
+// Pointer of the object it was duplicated in.
+//
+// It otherwise implements the JSON grammar directly (object, array, string,
+// number, true, false, null) rather than delegating to JSON.parse per node,
+// because the only way to see every key as it is parsed, in insertion order,
+// with the object it belongs to still in scope, is to build the object one
+// key at a time.
+function parseJsonRejectingDuplicateKeys(text) {
+  let i = 0;
+  const n = text.length;
+
+  function lineColAt(pos) {
+    const upto = text.slice(0, pos);
+    const lines = upto.split('\n');
+    return { line: lines.length, col: lines[lines.length - 1].length + 1 };
+  }
+
+  function fail(message, pos) {
+    const at = lineColAt(pos === undefined ? i : pos);
+    const e = new Error(message);
+    e.line = at.line;
+    e.col = at.col;
+    throw e;
+  }
+
+  function skipWs() {
+    while (i < n) {
+      const c = text[i];
+      if (c === ' ' || c === '\t' || c === '\n' || c === '\r') { i += 1; } else { break; }
+    }
+  }
+
+  function parseValue(pointer) {
+    skipWs();
+    if (i >= n) fail('unexpected end of input, expected a value');
+    const c = text[i];
+    if (c === '{') return parseObject(pointer);
+    if (c === '[') return parseArray(pointer);
+    if (c === '"') return parseString();
+    if (c === '-' || (c >= '0' && c <= '9')) return parseNumber();
+    if (text.startsWith('true', i)) { i += 4; return true; }
+    if (text.startsWith('false', i)) { i += 5; return false; }
+    if (text.startsWith('null', i)) { i += 4; return null; }
+    fail('unexpected token ' + JSON.stringify(c) + ', expected a value');
+  }
+
+  function parseNumber() {
+    const start = i;
+    if (text[i] === '-') i += 1;
+    if (text[i] === '0') {
+      i += 1;
+    } else if (text[i] >= '1' && text[i] <= '9') {
+      while (i < n && text[i] >= '0' && text[i] <= '9') i += 1;
+    } else {
+      fail('invalid number');
+    }
+    if (text[i] === '.') {
+      i += 1;
+      if (!(text[i] >= '0' && text[i] <= '9')) fail('invalid number: no digit after decimal point');
+      while (i < n && text[i] >= '0' && text[i] <= '9') i += 1;
+    }
+    if (text[i] === 'e' || text[i] === 'E') {
+      i += 1;
+      if (text[i] === '+' || text[i] === '-') i += 1;
+      if (!(text[i] >= '0' && text[i] <= '9')) fail('invalid number: no digit in exponent');
+      while (i < n && text[i] >= '0' && text[i] <= '9') i += 1;
+    }
+    return Number(text.slice(start, i));
+  }
+
+  function parseString() {
+    const startPos = i;
+    i += 1; // opening quote
+    let out = '';
+    for (;;) {
+      if (i >= n) fail('unterminated string', startPos);
+      const c = text[i];
+      if (c === '"') { i += 1; return out; }
+      if (c === '\\') {
+        i += 1;
+        if (i >= n) fail('unterminated escape sequence', startPos);
+        const e = text[i];
+        if (e === 'n') out += '\n';
+        else if (e === 't') out += '\t';
+        else if (e === 'r') out += '\r';
+        else if (e === 'b') out += '\b';
+        else if (e === 'f') out += '\f';
+        else if (e === '"') out += '"';
+        else if (e === '\\') out += '\\';
+        else if (e === '/') out += '/';
+        else if (e === 'u') {
+          const hex = text.slice(i + 1, i + 5);
+          if (!/^[0-9a-fA-F]{4}$/.test(hex)) fail('invalid unicode escape');
+          out += String.fromCharCode(parseInt(hex, 16));
+          i += 4;
+        } else {
+          fail('invalid escape character ' + JSON.stringify(e));
+        }
+        i += 1;
+      } else if (c.charCodeAt(0) < 0x20) {
+        fail('unescaped control character in string', startPos);
+      } else {
+        out += c;
+        i += 1;
+      }
+    }
+  }
+
+  function parseObject(pointer) {
+    i += 1; // {
+    const obj = {};
+    const seenKeys = new Set();
+    skipWs();
+    if (text[i] === '}') { i += 1; return obj; }
+    for (;;) {
+      skipWs();
+      if (text[i] !== '"') fail('expected a string key');
+      const keyPos = i;
+      const key = parseString();
+      if (seenKeys.has(key)) {
+        fail('duplicate key ' + JSON.stringify(key) + ' at JSON Pointer ' +
+          pointer + '/' + encodeJsonPointerSegment(key), keyPos);
+      }
+      seenKeys.add(key);
+      skipWs();
+      if (text[i] !== ':') fail('expected : after an object key');
+      i += 1;
+      const value = parseValue(pointer + '/' + encodeJsonPointerSegment(key));
+      obj[key] = value;
+      skipWs();
+      if (text[i] === ',') { i += 1; continue; }
+      if (text[i] === '}') { i += 1; break; }
+      fail('expected , or } in an object');
+    }
+    return obj;
+  }
+
+  function parseArray(pointer) {
+    i += 1; // [
+    const arr = [];
+    skipWs();
+    if (text[i] === ']') { i += 1; return arr; }
+    let idx = 0;
+    for (;;) {
+      const value = parseValue(pointer + '/' + idx);
+      arr.push(value);
+      idx += 1;
+      skipWs();
+      if (text[i] === ',') { i += 1; continue; }
+      if (text[i] === ']') { i += 1; break; }
+      fail('expected , or ] in an array');
+    }
+    return arr;
+  }
+
+  const result = parseValue('');
+  skipWs();
+  if (i !== n) fail('unexpected trailing content after the JSON value');
+  return result;
 }
 
 function resolveRef(doc, ref) {
@@ -1835,6 +2003,67 @@ run('selftest_path_parameter_vocabulary_pin_rejects_a_vacuous_pattern', () => {
     JSON.stringify(rShortened.failures));
 });
 
+// 35. selftest_json_parser_matches_native_parse_for_a_document_with_no_duplicates
+run('selftest_json_parser_matches_native_parse_for_a_document_with_no_duplicates', () => {
+  const text = JSON.stringify({
+    openapi: '3.1.0',
+    paths: { '/x': { get: { operationId: 'getX', 'x-it-permission': 'none' } } },
+    numbers: [0, -1, 1.5, -2.25e10, 3e-7],
+    nested: { a: { b: { c: [1, 2, 3] } } },
+    escapes: 'line one\nline two\ttabbed "quoted" back\\slash',
+  });
+  const native = JSON.parse(text);
+  const custom = parseJsonRejectingDuplicateKeys(text);
+  expect('selftest_json_parser_matches_native_parse_for_a_document_with_no_duplicates',
+    JSON.stringify(custom) === JSON.stringify(native),
+    'native=' + JSON.stringify(native) + ' custom=' + JSON.stringify(custom));
+});
+
+// 36. selftest_json_parser_rejects_a_top_level_duplicate_key
+run('selftest_json_parser_rejects_a_top_level_duplicate_key', () => {
+  let threw = null;
+  try {
+    parseJsonRejectingDuplicateKeys('{"a": 1, "b": 2, "a": 3}');
+  } catch (e) {
+    threw = e;
+  }
+  expect('selftest_json_parser_rejects_a_top_level_duplicate_key',
+    threw !== null && /duplicate key "a"/.test(threw.message) && threw.message.includes('JSON Pointer /a'),
+    threw ? threw.message : 'did not throw');
+});
+
+// 37. selftest_json_parser_rejects_a_nested_duplicate_key_naming_its_pointer
+run('selftest_json_parser_rejects_a_nested_duplicate_key_naming_its_pointer', () => {
+  const text = '{"paths": {"/overview": {"get": {"x-it-permission": "overview:read", ' +
+    '"summary": "s", "x-it-permission": "none"}}}}';
+  let threw = null;
+  try {
+    parseJsonRejectingDuplicateKeys(text);
+  } catch (e) {
+    threw = e;
+  }
+  expect('selftest_json_parser_rejects_a_nested_duplicate_key_naming_its_pointer',
+    threw !== null && threw.message.includes('duplicate key "x-it-permission"') &&
+    threw.message.includes('JSON Pointer /paths/~1overview/get/x-it-permission'),
+    threw ? threw.message : 'did not throw');
+});
+
+// 38. selftest_json_parser_rejects_malformed_json_without_crashing
+run('selftest_json_parser_rejects_malformed_json_without_crashing', () => {
+  const cases = ['{"a": 1,}', '{"a": 1 "b": 2}', '{"a": "unterminated', '{"a": tru}', 'not json at all'];
+  for (const text of cases) {
+    let threw = null;
+    try {
+      parseJsonRejectingDuplicateKeys(text);
+    } catch (e) {
+      threw = e;
+    }
+    expect('selftest_json_parser_rejects_malformed_json_without_crashing (' + JSON.stringify(text) + ')',
+      threw !== null && typeof threw.line === 'number' && typeof threw.col === 'number',
+      threw ? threw.message : 'did not throw');
+  }
+});
+
   return { results, passCount, failCount };
 }
 
@@ -1845,7 +2074,7 @@ function main() {
     for (const line of results) {
       console.log(line);
     }
-    console.log('selftest: ' + passCount + ' passed, ' + failCount + ' failed (of ' + (passCount + failCount) + ' assertions across 34 named tests)');
+    console.log('selftest: ' + passCount + ' passed, ' + failCount + ' failed (of ' + (passCount + failCount) + ' assertions across 38 named tests)');
     process.exit(failCount === 0 ? 0 : 1);
   }
 
@@ -1866,18 +2095,10 @@ function main() {
 
   let doc;
   try {
-    doc = JSON.parse(raw);
+    doc = parseJsonRejectingDuplicateKeys(raw);
   } catch (e) {
-    const m = /position (\d+)/.exec(e.message);
-    let line = 1;
-    let col = 1;
-    if (m) {
-      const pos = parseInt(m[1], 10);
-      const upto = raw.slice(0, pos);
-      const lns = upto.split('\n');
-      line = lns.length;
-      col = lns[lns.length - 1].length + 1;
-    }
+    const line = typeof e.line === 'number' ? e.line : 1;
+    const col = typeof e.col === 'number' ? e.col : 1;
     console.log('parse error at line ' + line + ' column ' + col + ': ' + e.message);
     process.exit(1);
   }
