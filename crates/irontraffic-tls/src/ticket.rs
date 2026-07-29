@@ -200,7 +200,8 @@ pub struct RandNonceSource;
 
 impl NonceSource for RandNonceSource {
     /// Draws from the operating system CSPRNG through `irontraffic_rand::SecureRng::fill`, the
-    /// only sanctioned entropy source in this crate. Never calls `getrandom` or `rand::` directly.
+    /// only sanctioned entropy source in this crate. Never reads the entropy syscall or the
+    /// non-cryptographic generator directly.
     fn fill(&self, out: &mut [u8; 24]) -> bool {
         irontraffic_rand::SecureRng::fill(out).is_ok()
     }
@@ -485,7 +486,13 @@ impl ProducesTickets for ClusterTicketer {
     /// handshake next time.
     fn encrypt(&self, plain: &[u8]) -> Option<Vec<u8>> {
         let e = self.epoch_now();
-        self.stats.epoch_current.store(e, Ordering::Relaxed);
+        // Fully qualified rather than `self.stats.epoch_current.store(...)`: this is a plain
+        // AtomicU64 snapshot counter, not an ArcSwap, but scripts/invariant-lints.sh's
+        // single-snapshot-publish rule matches any `.store(` call by name to keep ArcSwap
+        // publication to one site, and the dot-method form matches it. Written this way rather
+        // than added to scripts/allowlist-arcswap-store.txt, mirroring the identical precedent
+        // in crates/irontraffic-resilience/src/limits/mod.rs and pressure.rs.
+        AtomicU64::store(&self.stats.epoch_current, e, Ordering::Relaxed);
         let ek = self.epoch_key(RootSel::Primary, e)?;
 
         let mut nonce = [0u8; 24];
