@@ -399,6 +399,34 @@ mod tests {
         );
     }
 
+    /// #747 `SHOULD_FIX` 3: `on_watch_message` also sets `last_message_at`, exactly
+    /// like `on_ping_ack` does, but nothing pinned it: `ping_ack_defers_liveness`
+    /// above covers the PING side, and `M12-del-on-watch-message-timestamp`
+    /// (deleting the timestamp update in `on_watch_message` while leaving the
+    /// `last_serving` update) survived. Interleaves a real `SERVING` message with
+    /// `on_check_due` once per interval, past what would be the liveness deadline
+    /// if the message did not defer it, and asserts the stream never closes.
+    #[test]
+    fn watch_message_defers_liveness() {
+        let t0 = Millis(0);
+        let compiled = valid_spec(true).compile().expect("valid spec");
+        let mut machine = GrpcModeMachine::new(t0);
+        machine.on_watch_open(t0, 1000);
+
+        let mut t = t0;
+        for i in 0..5 {
+            t = t.add_ms(1000);
+            machine.on_watch_message(t, Some(1));
+            let action = machine.on_check_due(t, 1000, &compiled);
+            assert!(
+                matches!(action, GrpcAction::SendPing | GrpcAction::Idle),
+                "check {i} at t={t:?}: a message every interval must keep \
+                 deferring the liveness timer, got {action:?}"
+            );
+        }
+        assert_eq!(machine.mode(), GrpcMode::WatchOpen);
+    }
+
     #[test]
     fn unimplemented_is_sticky() {
         let t0 = Millis(0);
