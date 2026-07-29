@@ -59,15 +59,23 @@ pub struct GrpcModeMachine {
 }
 
 impl GrpcModeMachine {
-    /// A machine in `WatchDesired` when `prefer_watch`, else `UnaryFallback`.
+    /// A machine that starts wanting to open `Watch`.
+    ///
+    /// #747 `SHOULD_FIX` 1: an earlier revision took a separate `prefer_watch: bool`
+    /// argument here, read once to pick the initial mode and never consulted again,
+    /// which could disagree with [`CompiledGrpcCheck::prefer_watch`] (read fresh on
+    /// every [`GrpcModeMachine::on_check_due`] call): a machine constructed with
+    /// `prefer_watch: true` against a compiled spec whose `prefer_watch()` was
+    /// `false` opened one `Watch` stream per interval forever, exactly the file
+    /// descriptor exhaustion `prefer_watch: false` exists to prevent. `prefer_watch`
+    /// now has exactly one source of truth, so this constructor no longer takes it:
+    /// if `compiled.prefer_watch()` is `false`, the very first `on_check_due` call
+    /// self-corrects to `UnaryFallback` instead of opening a stream (see the
+    /// `WatchDesired` arm below).
     #[must_use]
-    pub fn new(now: Millis, prefer_watch: bool) -> Self {
+    pub fn new(now: Millis) -> Self {
         Self {
-            mode: if prefer_watch {
-                GrpcMode::WatchDesired
-            } else {
-                GrpcMode::UnaryFallback
-            },
+            mode: GrpcMode::WatchDesired,
             last_message_at: now,
             next_ping_at: now,
             unary_checks_since_fallback: 0,
@@ -89,7 +97,33 @@ impl GrpcModeMachine {
         compiled: &CompiledGrpcCheck,
     ) -> GrpcAction {
         match self.mode {
-            GrpcMode::WatchDesired => GrpcAction::OpenWatch,
+            GrpcMode::WatchDesired => {
+                if compiled.prefer_watch() {
+                    GrpcAction::OpenWatch
+                } else {
+                    // #747 SHOULD_FIX 1: this arm used to return `OpenWatch`
+                    // unconditionally, with no guard at all. `WatchDesired` is
+                    // reachable with `prefer_watch: false` in more than one
+                    // way: on the very first call from a freshly constructed
+                    // machine (which always starts here now that the
+                    // constructor no longer takes its own `prefer_watch`
+                    // flag), and also after `on_watch_closed`'s
+                    // non-`UNIMPLEMENTED` branch, which sets this mode
+                    // unconditionally on every network-failure close
+                    // regardless of `prefer_watch`. Without this guard,
+                    // either path opened one stream per interval forever for
+                    // an endpoint deliberately kept off `Watch` (worse than
+                    // the unbudgeted case `prefer_watch: false` exists to
+                    // prevent). Self-correct into `UnaryFallback` rather than
+                    // merely refusing this one call: a mode that claims to
+                    // want `Watch` while configured never to use it is
+                    // itself the inconsistency to fix, not something to
+                    // tolerate every time it recurs.
+                    self.mode = GrpcMode::UnaryFallback;
+                    self.unary_checks_since_fallback = 1;
+                    GrpcAction::SendUnaryCheck
+                }
+            }
             GrpcMode::WatchOpen => {
                 // `saturating_mul`, because `interval_ms` may be as large as
                 // `Millis::HORIZON_MS` and the multiplier as large as 100, so the
@@ -122,10 +156,17 @@ impl GrpcModeMachine {
                 }
             }
             GrpcMode::UnaryFallback => {
-                // The `prefer_watch` guard is what makes `prefer_watch: false`
-                // mean "never use Watch": without it this clause would open a
-                // stream after `watch_retry_after_checks` unary checks even
-                // though `Watch` was never wanted.
+                // #747 SHOULD_FIX 1 found this comment overstated: this guard
+                // alone does not make `prefer_watch: false` mean "never use
+                // Watch". It only stops THIS arm from retrying `UnaryFallback`
+                // into `WatchDesired` after `watch_retry_after_checks` unary
+                // checks. `WatchDesired` is reachable by a second, independent
+                // route regardless of `prefer_watch` -- see that arm above --
+                // so it is the `WatchDesired` arm's own `compiled.prefer_watch()`
+                // check that actually enforces the invariant on every path, not
+                // this one. Without it, this clause would open a stream after
+                // `watch_retry_after_checks` unary checks even though `Watch`
+                // was never wanted.
                 if compiled.prefer_watch()
                     && self.unary_checks_since_fallback >= compiled.watch_retry_after_checks()
                 {
@@ -220,7 +261,7 @@ mod tests {
     fn starts_watch_desired() {
         let now = Millis(0);
         let compiled = valid_spec(true).compile().expect("valid spec");
-        let mut machine = GrpcModeMachine::new(now, true);
+        let mut machine = GrpcModeMachine::new(now);
         assert_eq!(machine.mode(), GrpcMode::WatchDesired);
         assert_eq!(
             machine.on_check_due(now, 1000, &compiled),
@@ -232,7 +273,7 @@ mod tests {
     fn prefer_watch_false_never_opens() {
         let now = Millis(0);
         let compiled = valid_spec(false).compile().expect("valid spec");
-        let mut machine = GrpcModeMachine::new(now, false);
+        let mut machine = GrpcModeMachine::new(now);
         let mut t = now;
         for i in 0..100 {
             assert_eq!(
@@ -244,11 +285,49 @@ mod tests {
         }
     }
 
+    /// #747 `SHOULD_FIX` 1: `prefer_watch_false_never_opens` above only proves the
+    /// guard holds for the FIRST call from a freshly constructed machine, which
+    /// is exactly the case dropping the constructor's own `prefer_watch` argument
+    /// made trivial. This exercises the disagreeing configuration the finding
+    /// named: a machine that reaches `WatchDesired` a second way -- opening,
+    /// receiving a real message, and then closing on a network failure, which
+    /// sets `WatchDesired` unconditionally regardless of `prefer_watch` -- while
+    /// `compiled.prefer_watch()` is `false` throughout. `OpenWatch` must never
+    /// be returned.
+    #[test]
+    fn watch_desired_guard_holds_after_reaching_it_via_close_not_only_at_start() {
+        let t0 = Millis(0);
+        let compiled = valid_spec(false).compile().expect("valid spec");
+        let mut machine = GrpcModeMachine::new(t0);
+        machine.on_watch_open(t0, 1000);
+        machine.on_watch_message(t0, Some(1));
+
+        let verdict = GrpcVerdict {
+            outcome: CheckOutcome::Fail(FailKind::Protocol),
+            raw_serving_status: None,
+            grpc_status: None,
+            unimplemented: false,
+        };
+        machine.on_watch_closed(t0, verdict);
+        assert_eq!(machine.mode(), GrpcMode::WatchDesired);
+
+        let mut t = t0;
+        for i in 0..120 {
+            let action = machine.on_check_due(t, 1000, &compiled);
+            assert_ne!(
+                action,
+                GrpcAction::OpenWatch,
+                "check {i}: prefer_watch: false must never open a stream"
+            );
+            t = t.add_ms(1000);
+        }
+    }
+
     #[test]
     fn watch_open_pings_then_idles() {
         let now = Millis(0);
         let compiled = valid_spec(true).compile().expect("valid spec");
-        let mut machine = GrpcModeMachine::new(now, true);
+        let mut machine = GrpcModeMachine::new(now);
         machine.on_watch_open(now, 1000);
 
         // `next_ping_at` is `now + 1000`. A check exactly at that instant is
@@ -269,7 +348,7 @@ mod tests {
     fn watch_liveness_fires() {
         let t0 = Millis(5_000);
         let compiled = valid_spec(true).compile().expect("valid spec");
-        let mut machine = GrpcModeMachine::new(t0, true);
+        let mut machine = GrpcModeMachine::new(t0);
         machine.on_watch_open(t0, 1000);
 
         let later = t0.add_ms(3_001);
@@ -292,7 +371,7 @@ mod tests {
     fn watch_liveness_does_not_fire_at_exact_deadline() {
         let t0 = Millis(5_000);
         let compiled = valid_spec(true).compile().expect("valid spec");
-        let mut machine = GrpcModeMachine::new(t0, true);
+        let mut machine = GrpcModeMachine::new(t0);
         machine.on_watch_open(t0, 1000);
 
         let at_deadline = t0.add_ms(3_000);
@@ -308,7 +387,7 @@ mod tests {
     fn ping_ack_defers_liveness() {
         let t0 = Millis(1_000);
         let compiled = valid_spec(true).compile().expect("valid spec");
-        let mut machine = GrpcModeMachine::new(t0, true);
+        let mut machine = GrpcModeMachine::new(t0);
         machine.on_watch_open(t0, 1000);
         machine.on_ping_ack(t0.add_ms(2_000));
 
@@ -324,7 +403,7 @@ mod tests {
     fn unimplemented_is_sticky() {
         let t0 = Millis(0);
         let compiled = valid_spec(true).compile().expect("valid spec");
-        let mut machine = GrpcModeMachine::new(t0, true);
+        let mut machine = GrpcModeMachine::new(t0);
 
         let verdict = GrpcVerdict {
             outcome: CheckOutcome::Fail(FailKind::Protocol),
@@ -355,7 +434,7 @@ mod tests {
     fn network_close_retries_watch() {
         let t0 = Millis(0);
         let compiled = valid_spec(true).compile().expect("valid spec");
-        let mut machine = GrpcModeMachine::new(t0, true);
+        let mut machine = GrpcModeMachine::new(t0);
         machine.on_watch_open(t0, 1000);
 
         let verdict = GrpcVerdict {
@@ -383,7 +462,7 @@ mod tests {
     fn watch_reopen_after_liveness_timeout_reports_fail_with_zero_messages() {
         let t0 = Millis(0);
         let compiled = valid_spec(true).compile().expect("valid spec");
-        let mut machine = GrpcModeMachine::new(t0, true);
+        let mut machine = GrpcModeMachine::new(t0);
         machine.on_watch_open(t0, 1000);
         machine.on_watch_message(t0, Some(1));
         assert_eq!(machine.current_outcome(), Some(CheckOutcome::Pass));
@@ -420,7 +499,7 @@ mod tests {
     #[test]
     fn watch_reopen_after_close_reports_fail_with_zero_messages() {
         let t0 = Millis(0);
-        let mut machine = GrpcModeMachine::new(t0, true);
+        let mut machine = GrpcModeMachine::new(t0);
         machine.on_watch_open(t0, 1000);
         machine.on_watch_message(t0, Some(1));
         assert_eq!(machine.current_outcome(), Some(CheckOutcome::Pass));
@@ -452,7 +531,7 @@ mod tests {
     fn late_watch_message_after_close_is_ignored() {
         let t0 = Millis(0);
         let compiled = valid_spec(true).compile().expect("valid spec");
-        let mut machine = GrpcModeMachine::new(t0, true);
+        let mut machine = GrpcModeMachine::new(t0);
         machine.on_watch_open(t0, 1000);
         machine.on_watch_message(t0, Some(1));
         assert_eq!(machine.current_outcome(), Some(CheckOutcome::Pass));
@@ -504,7 +583,7 @@ mod tests {
         let compiled = valid_spec(true).compile().expect("valid spec");
         let t0 = Millis(0);
         let mut schedule = EndpointSchedule::init(t0, 1, 1, &cfg, true);
-        let mut machine = GrpcModeMachine::new(t0, true);
+        let mut machine = GrpcModeMachine::new(t0);
 
         let mut t = t0;
         let mut sent_first_message = false;
@@ -556,7 +635,7 @@ mod tests {
     #[test]
     fn current_outcome_tracks_last_message() {
         let t0 = Millis(0);
-        let mut machine = GrpcModeMachine::new(t0, true);
+        let mut machine = GrpcModeMachine::new(t0);
         assert_eq!(machine.current_outcome(), None, "WatchDesired reports None");
 
         machine.on_watch_open(t0, 1000);
