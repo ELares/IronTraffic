@@ -1216,6 +1216,23 @@ mod tests {
         );
     }
 
+    /// #747 NOTE: `MAX_WATCH_STREAMS` and `MAX_WATCH_MESSAGES_PER_INTERVAL` are
+    /// cited by value in `docs/THREAT-MODEL.md`, but neither one is used inside
+    /// this crate (both are runner-owned budgets: `health::grpc`/`health::
+    /// grpc_mode` speak no HTTP/2 and read no clock, so the runner outside
+    /// milestone 5 is what actually enforces them) and neither was pinned by a
+    /// test: raising them to 4,000,000 and 100,000 left every test in this crate
+    /// green. `MAX_MESSAGE_LEN`, by contrast, IS pinned (`decode_too_long` and
+    /// `decode_accepts_message_at_max_len` both fail if it moves). Pin the other
+    /// two against the literals `docs/THREAT-MODEL.md` documents, so a drifting
+    /// constant is a deliberate, reviewed edit rather than a silent change every
+    /// symbolic reference elsewhere would stay quiet about.
+    #[test]
+    fn watch_stream_and_message_budget_constants_are_pinned() {
+        assert_eq!(MAX_WATCH_STREAMS, 4096);
+        assert_eq!(MAX_WATCH_MESSAGES_PER_INTERVAL, 100);
+    }
+
     /// Not one of the issue's 34 named tests, but `ServingStatus::from_raw` is
     /// public API used nowhere else in this module (`decode_health_response`
     /// returns the raw `u32` directly, per its documented contract), so without
