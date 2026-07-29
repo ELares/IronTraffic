@@ -559,10 +559,13 @@ impl Checker<'_> {
         let rty = self.ty_of(rhs);
         match op {
             BinOp::Eq | BinOp::Ne => {
-                let excluded =
-                    matches!(lty, Ty::Map | Ty::List) || matches!(rty, Ty::Map | Ty::List);
+                // Equal types unify, except a `Map` or `List` operand is always a
+                // mismatch even against its own type. `lty == rty` here already
+                // implies checking just one side names both, so there is no `||`
+                // against `rty` to get backwards: that would only ever be
+                // consulted with `lty == rty` already established.
                 let ok = if lty == rty {
-                    !excluded
+                    !matches!(lty, Ty::Map | Ty::List)
                 } else {
                     (lty == Ty::Null && matches!(rty, Ty::Str | Ty::Int | Ty::Bool))
                         || (rty == Ty::Null && matches!(lty, Ty::Str | Ty::Int | Ty::Bool))
@@ -1030,6 +1033,27 @@ mod tests {
     }
 
     #[test]
+    fn standalone_unknown_identifier_is_unknown_attribute() {
+        // A gap `cargo mutants` found: replacing namespace_or_error's whole body
+        // with `Ok(())` left every other test green, because every other test's
+        // invalid identifier is some Field's base and so defers to
+        // resolve_field's own check instead of calling namespace_or_error
+        // directly. A bare, standalone identifier that is nobody's Field base
+        // (here, the entire program) is the one shape that calls
+        // namespace_or_error's own failure path, and without it "nope" would
+        // type as Map and fail via the root-is-Map guard with a different error
+        // (TypeMismatch, not UnknownAttribute).
+        let err = check_src(b"nope", Phase::Log).unwrap_err();
+        assert_eq!(
+            err,
+            CheckError::UnknownAttribute {
+                at: 0,
+                path: Span { start: 0, end: 4 }
+            }
+        );
+    }
+
+    #[test]
     fn int_vs_str_mismatch() {
         // Edge case 12.
         let err = check_src(br#"request.port == "80""#, Phase::RequestHeaders).unwrap_err();
@@ -1078,6 +1102,23 @@ mod tests {
         // Edge case 17: the accept side of the same rule.
         let checked = check_src(b"request.size < 100", Phase::RequestHeaders).unwrap();
         assert_eq!(checked.result, Ty::Bool);
+    }
+
+    #[test]
+    fn ordered_comparison_rejects_a_mixed_int_and_str_pair() {
+        // The case above has BOTH sides Str, which cannot distinguish
+        // `lty == Int && rty == Int` from `lty == Int || rty == Int`: neither
+        // side is Int, so both the real check and an `&&`-to-`||` mutant reject
+        // it the same way. This is the case where exactly one side is Int: the
+        // real check (both sides required) must still reject it.
+        let err = check_src(br#"request.port < "80""#, Phase::RequestHeaders).unwrap_err();
+        assert_eq!(
+            err,
+            CheckError::NotOrdered {
+                at: 0,
+                found: Ty::Str
+            }
+        );
     }
 
     #[test]
@@ -1275,6 +1316,140 @@ mod tests {
         )
         .unwrap();
         assert_eq!(checked.result, Ty::Str);
+    }
+
+    #[test]
+    fn not_and_or_and_ternary_cond_each_require_bool() {
+        // `Checker::expect` backs all four of these call sites (`Not`, both sides
+        // of `And`/`Or`, and the ternary condition). Stubbing `expect` itself to
+        // always `Ok(())` left every other test green: none of them independently
+        // exercises a non-Bool operand at each of the four call sites, only the
+        // ternary's `unify` (a different function) for its non-cond branches.
+        let err = check_src(b"!request.method", Phase::RequestHeaders).unwrap_err();
+        assert_eq!(
+            err,
+            CheckError::TypeMismatch {
+                at: 1,
+                expected: Ty::Bool,
+                found: Ty::Str
+            }
+        );
+
+        let err = check_src(b"request.method && true", Phase::RequestHeaders).unwrap_err();
+        assert_eq!(
+            err,
+            CheckError::TypeMismatch {
+                at: 0,
+                expected: Ty::Bool,
+                found: Ty::Str
+            }
+        );
+
+        let err = check_src(b"true || request.method", Phase::RequestHeaders).unwrap_err();
+        assert!(matches!(
+            err,
+            CheckError::TypeMismatch {
+                expected: Ty::Bool,
+                found: Ty::Str,
+                ..
+            }
+        ));
+
+        let err = check_src(b"1 ? 2 : 3", Phase::RequestHeaders).unwrap_err();
+        assert_eq!(
+            err,
+            CheckError::TypeMismatch {
+                at: 0,
+                expected: Ty::Bool,
+                found: Ty::Int
+            }
+        );
+    }
+
+    #[test]
+    fn error_offset_is_not_always_zero() {
+        // Nearly every other test in this module puts the offending construct at
+        // the very start of the source, so `at: 0` is what almost all of them
+        // expect. That cannot distinguish a real source offset from a stub that
+        // always returns 0. `request.path` here starts at byte 8, after `true &&
+        // `.
+        let err = check_src(b"true && request.path", Phase::StreamStart).unwrap_err();
+        assert_eq!(
+            err,
+            CheckError::NotAvailableInPhase {
+                at: 8,
+                attr: AttrId::RequestPath,
+                phase: Phase::StreamStart,
+                from: Phase::RequestHeaders,
+            }
+        );
+    }
+
+    #[test]
+    fn field_chain_through_a_map_attribute_reaches_the_field_arm() {
+        // `assemble_path`'s walk-back has two arms once past the initial
+        // `Ty::Map` gate: the terminal `Ident` (every other test in this module
+        // that reaches the walk at all), and a `Field` whose OWN base was already
+        // `Map`-typed, which is only reachable through one of the three MAP
+        // attributes (a scalar attribute's Field, like `request.method`, gates
+        // out one level higher, in `NotANamespace`, before the walk ever
+        // starts). `request.headers.foo` walks: "foo" (this node's own name),
+        // then back through the `request.headers` Field node (Map-typed, the
+        // Field arm), then to the `request` Ident (the terminal arm), assembling
+        // the full 3-segment path.
+        let err = check_src(b"request.headers.foo", Phase::RequestHeaders).unwrap_err();
+        assert_eq!(
+            err,
+            CheckError::UnknownAttribute {
+                at: 0,
+                path: Span { start: 0, end: 19 }
+            }
+        );
+    }
+
+    #[test]
+    fn path_length_boundary() {
+        // MAX_PATH_BYTES's accept side: nothing in the real schema comes anywhere
+        // near 64 bytes (the longest real path, `connection.mtls_verified`, is
+        // 24), so the buffer's own overflow guard has no coverage from realistic
+        // attribute names, and a reject-only test cannot tell `push_segment`'s
+        // `need > cursor` from `>=` or from a `!first` typo that shifts which
+        // call the extra separator byte is charged to.
+        //
+        // A single field-name segment of exactly 64 bytes sits precisely on
+        // that seam: `push_segment`'s FIRST call (the name itself, `first =
+        // true`, no separator charged) computes `need = 64`, which is accepted
+        // (`64 > 64` is false) against the fresh 64-byte buffer, so the walk
+        // proceeds to its second call (for "request" plus a separator dot,
+        // `need = 8`) against a now-EMPTY buffer (`cursor == 0`), which
+        // overflows there instead, reporting the root's own start (0). A
+        // `!first` typo charges the separator to the FIRST call instead
+        // (`need = 65`), which overflows immediately, reporting the *segment's*
+        // start (8) rather than the root's: a different, distinguishing `at`.
+        let name_64 = "a".repeat(64);
+        let src_64 = format!("request.{name_64}");
+        let err = check_src(src_64.as_bytes(), Phase::Log).unwrap_err();
+        assert_eq!(
+            err,
+            CheckError::UnknownAttribute {
+                at: 0,
+                path: Span { start: 0, end: 72 }
+            }
+        );
+
+        // One segment alone, one byte longer (65 bytes), already exceeds
+        // MAX_PATH_BYTES on its own: the walk bails at the segment's own start
+        // (8) on the very first call, before ever attempting the root.
+        let name_65 = "a".repeat(65);
+        let src_65 = format!("request.{name_65}");
+        let err = check_src(src_65.as_bytes(), Phase::Log).unwrap_err();
+        assert_eq!(
+            err,
+            CheckError::UnknownAttribute {
+                at: 8,
+                path: Span { start: 8, end: 73 }
+            }
+        );
     }
 
     #[test]
