@@ -643,7 +643,7 @@ mod tests {
     use proptest::prelude::*;
     use rustls::server::ProducesTickets;
 
-    use super::{ClusterTicketer, NonceSource, RootSel, TicketRoot, TimeView};
+    use super::{ClusterTicketer, NonceSource, RandNonceSource, RootSel, TicketRoot, TimeView};
     use crate::time::UnixSeconds;
 
     /// A `TimeView` whose value can be moved after construction, for tests that encrypt at one
@@ -1231,46 +1231,175 @@ mod tests {
         assert_eq!(t.stats().encrypts.load(Ordering::Relaxed), 0);
     }
 
+    /// `RandNonceSource` is the only production `NonceSource`, and every other test in this
+    /// module deliberately uses a deterministic source instead (for reproducibility), so nothing
+    /// else in this crate ever constructs or calls it. It is the sole defense against
+    /// XChaCha20-Poly1305 nonce reuse: a `fill` that reports success without writing real
+    /// entropy, most plausibly `let _ = SecureRng::fill(out); true`, which swallows the entropy
+    /// error the `bool` return exists to surface, would silently reuse the ticket's own
+    /// `[0u8; 24]` initializer as the nonce for every ticket.
+    #[test]
+    fn rand_nonce_source_fills_with_real_entropy() {
+        let mut a = [0u8; 24];
+        let mut b = [0u8; 24];
+        assert!(
+            RandNonceSource.fill(&mut a),
+            "fill must report success under normal entropy availability"
+        );
+        assert!(
+            RandNonceSource.fill(&mut b),
+            "fill must report success under normal entropy availability"
+        );
+        assert_ne!(a, [0u8; 24], "a filled nonce must not be all zero");
+        assert_ne!(b, [0u8; 24], "a filled nonce must not be all zero");
+        assert_ne!(
+            a, b,
+            "two draws from RandNonceSource must not repeat a nonce"
+        );
+    }
+
+    /// Calls that can allocate on the heap, textually: mostly the same deny-list vocabulary
+    /// `crates/irontraffic-tls/tests/alloc_gate.rs` uses for the identical pattern (this file
+    /// keeps its own copy for the same reason that file states: no shared helper crosses a
+    /// module boundary for a dozen lines of arithmetic). A best-effort net, not a proof: it
+    /// cannot see a call taken by function pointer, or one reached through a fully qualified
+    /// path (`ToOwned::to_owned(x)` instead of `x.to_owned()`), which is a known, documented
+    /// blind spot of this exact pattern, not one specific to this file.
+    ///
+    /// Deliberately missing `.clone()`, unlike `alloc_gate.rs`'s copy of this list: `epoch_key`
+    /// calls `EpochKey::clone()` twice, both known non-allocating (56 bytes of stack data, no
+    /// heap touched at all) and already vetted with a `// it-allow: hot-path-allocation reason:
+    /// ...` comment that `scripts/invariant-lints.sh`'s real scanner respects. This scan has no
+    /// such escape mechanism, so keeping `.clone()` on the list would fail this test against
+    /// code the real gate already accepts, which is the same shape of false positive
+    /// `alloc_gate.rs`'s own module doc calls out for `to_ascii_lowercase`.
+    const ALLOCATING_CALLS: [&str; 12] = [
+        "format!",
+        ".to_string()",
+        ".to_owned()",
+        ".to_vec()",
+        "vec![",
+        "Vec::new()",
+        "Vec::with_capacity(",
+        "String::new()",
+        "String::from(",
+        "Box::new(",
+        "HashMap::new()",
+        ".collect::<Vec",
+    ];
+
+    /// Returns the source text of the function whose signature is `signature`, from its opening
+    /// brace through its matching closing brace, or `None` if not found. A plain brace-depth
+    /// text scan, not a Rust parser, correct as long as the scanned body holds no string or char
+    /// literal with an unmatched `{` or `}`, which every function scanned below satisfies.
+    /// Mirrors `crates/irontraffic-tls/tests/alloc_gate.rs::extract_fn_body`.
+    fn extract_fn_body<'a>(source: &'a str, signature: &str) -> Option<&'a str> {
+        let start = source.find(signature)?;
+        let open = source[start..].find('{').map(|offset| start + offset)?;
+        let mut depth = 0usize;
+        let mut end = open;
+        for (offset, ch) in source[open..].char_indices() {
+            match ch {
+                '{' => depth += 1,
+                '}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = open + offset + 1;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        if end > open {
+            Some(&source[open..end])
+        } else {
+            None
+        }
+    }
+
     #[test]
     fn unknown_key_path_allocates_nothing() {
-        // WHAT THIS DOES AND DOES NOT PROVE, stated plainly (mirrors name.rs's
-        // no_allocations_in_normalize, the established precedent for this exact tension in this
-        // crate). This module carries the `//! HOT PATH` marker (asserted below), which puts the
-        // whole file under scripts/invariant-lints.sh's hot-path-allocation rule: a text scan
-        // for a fixed list of allocating call spellings, denied in CI unless escaped with a
-        // stated reason. That CI-enforced scan, not this test, is what would catch a future edit
-        // that adds a real heap allocation to decrypt's unknown-key path. This test's own
-        // counter (crate::name::alloc_probe, the thread_local Cell<usize> event counter added by
-        // sni-name-normalization, #113) only counts calls to alloc_probe::record, and nothing in
-        // decrypt's unknown-key path calls it, because that path has no allocation site to
-        // instrument: it touches only fixed-size stack arrays and Option<(EpochKey, RootSel)>,
-        // and `EpochKey::clone` (see epoch_key's own escape comments) copies stack bytes, not a
-        // heap allocation. So this loop's own job is to call decrypt 10,000 times on the
-        // attacker's own input shape and confirm the counter stays exactly where it started.
+        // WHAT THIS DOES AND DOES NOT PROVE, stated plainly. There is no counting global
+        // allocator available in this crate: `scripts/invariant-lints.sh`'s `no-unsafe` rule
+        // denies `unsafe_code` outright and its own failure text grants no self-authorized
+        // exception ("raise it on the issue instead"), which is the exact wall
+        // `crates/irontraffic-tls/tests/alloc_gate.rs`'s module doc documents hitting for the
+        // identical zero-allocation claim, and the precedent `sni-name-normalization` (#113) set
+        // for this crate. This module's OLD version of this test asked
+        // `crate::name::alloc_probe`, a thread-local counter, a question it structurally could
+        // not answer: nothing in `ticket.rs` ever calls `alloc_probe::record`, so
+        // `count() == 0` held by construction and would have kept holding even if `decrypt`
+        // allocated a 4 KiB `Vec` on every call. This version instead text-scans the actual
+        // source of the three functions the unknown-key path reaches (`decrypt` itself,
+        // `epoch_key`, the cache lookup consulted for every one of the six candidates, and
+        // `derive`, the inline-derivation fallback on a cache miss) for the same allocating-call
+        // deny list `tests/alloc_gate.rs` uses. This is a best-effort net, not a proof: it would
+        // not see a call routed through a function pointer or a fully qualified path.
         let source = include_str!("ticket.rs");
         assert!(
             source.lines().any(|line| line == "//! HOT PATH"),
             "ticket.rs must carry `//! HOT PATH` so scripts/invariant-lints.sh's \
-             hot-path-allocation rule scans decrypt's unknown-key path at all"
+             hot-path-allocation rule scans decrypt's unknown-key path in production code too"
         );
 
+        for (name, signature) in [
+            (
+                "decrypt",
+                "pub fn decrypt(&self, cipher: &[u8]) -> Option<Vec<u8>> {",
+            ),
+            (
+                "epoch_key",
+                "fn epoch_key(&self, root: RootSel, epoch: u64) -> Option<EpochKey> {",
+            ),
+            (
+                "derive",
+                "fn derive(&self, prk: &[u8; 48], epoch: u64) -> EpochKey {",
+            ),
+        ] {
+            let body = extract_fn_body(source, signature).unwrap_or_else(|| {
+                panic!(
+                    "`fn {name}` not found via `{signature}`; has it moved, been renamed, or \
+                     been reformatted onto a different single-line signature?"
+                )
+            });
+            for call in ALLOCATING_CALLS {
+                assert!(
+                    !body.contains(call),
+                    "{name}'s body contains `{call}`, which can allocate; decrypt's unknown-key \
+                     path is fully attacker driven and must not buy heap traffic"
+                );
+            }
+        }
+
+        // Functional complement to the text scan above: run decrypt 10,000 times on random
+        // 200-byte inputs and prove the loop actually reached decrypt's unknown-key branch by
+        // observing a real counter side effect, rather than trusting a bare loop whose body
+        // could be emptied without failing anything (the exact shape of the defect issue #719
+        // already found in tests/alloc_gate.rs).
         let clock = TestClock::new(1_700_000_000);
         let t = test_ticketer([0x16; 32], [0u8; 16], 21_600, Arc::clone(&clock));
         let mut rng = irontraffic_rand::Rng::from_seed(0xA110_C000_D00D_u64);
 
-        crate::name::alloc_probe::reset();
+        let mut ran = 0usize;
         for _ in 0..10_000u32 {
             let mut cipher = [0u8; 200];
             rng.fill_bytes(&mut cipher);
             // A random 200-byte buffer matching a live 16-byte key name has probability 2^-128
-            // across this whole run; either outcome of decrypt here is fine, the point is that
-            // it ran without allocating.
+            // across this whole run and is not a test flake.
             let _ = t.decrypt(&cipher);
+            ran += 1;
         }
         assert_eq!(
-            crate::name::alloc_probe::count(),
-            0,
-            "no known allocation site fired while decrypting 10,000 unknown-key tickets"
+            ran, 10_000,
+            "the loop must actually execute all 10,000 iterations"
+        );
+        assert_eq!(
+            t.stats().decrypt_unknown_key.load(Ordering::Relaxed),
+            10_000,
+            "every one of the 10,000 random 200-byte inputs must land in the unknown-key path \
+             under measurement; this is the real, observable side effect a hollowed-out loop \
+             body could not produce"
         );
     }
 
