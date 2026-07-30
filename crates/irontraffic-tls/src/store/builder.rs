@@ -410,6 +410,11 @@ impl CertUpdateCoalescer {
             certs,
             challenge,
             resolver,
+            // A certificate or challenge update never changes listener compilation, so the
+            // previous value carries forward unchanged. Compiling `ListenerTls` values and
+            // putting a new set into `TlsMaterial` is the configuration plane's job, through a
+            // `TlsMaterialCell::publish` call it makes itself; the coalescer never builds one.
+            listeners: Arc::clone(&cur.listeners),
             generation: self.next_generation,
         });
         self.track_live(&material);
@@ -564,6 +569,7 @@ mod tests {
             certs,
             challenge,
             resolver,
+            listeners: Arc::from(Vec::new()),
             generation: 0,
         })
     }

@@ -1444,3 +1444,100 @@ arbitrary bytes would leave the wire-type dispatch loop, the varint reader, and 
 accumulation loop unexercised. Two process-lifetime counters, mirroring
 `assert_http_half_is_reached`, fail the run outright if either target ever again goes back to
 completing zero real parses after a meaningful number of executions.
+
+## TLS termination
+
+The listener's acceptor is the first thing an unauthenticated peer reaches. Before any policy
+applies, before any certificate is chosen, before the peer has proved anything, it can send bytes
+that cost us asymmetric cryptography. Everything below follows from that.
+
+### The attack surface an unauthenticated peer reaches
+
+A peer that has completed a TCP handshake and nothing else can:
+
+- open a connection and send nothing at all
+- send a partial `ClientHello` and stop
+- send bytes that are not TLS
+- send a `ClientHello` with any server name it likes, including names it has no relationship with
+- send a `ClientHello` with no server name
+- repeat all of the above at whatever rate its network allows
+
+None of these require a certificate, a credential, or a prior relationship. The design assumption
+is that every one of them arrives continuously.
+
+### Fail-closed selection
+
+Policy selection resolves the presented server name through the same normalization and the same
+two probes as certificate selection: one exact match, then one wildcard match on the parent
+domain, case-insensitive, ignoring one trailing dot. A name that matches nothing rejects the
+handshake unless the operator explicitly configured a fallback. No SNI rejects unless a no-SNI
+policy is explicitly configured. A malformed or truncated `ClientHello` is a hard error and is
+never treated as "no SNI".
+
+The threat this closes is a peer choosing which policy applies to it. If option lookup and
+certificate lookup disagreed about what "the same name" means, or if a miss inherited a
+permissive default, then presenting a name that matches a certificate but misses its policy would
+select the default instead. Traefik shipped that four times: CVE-2026-32305 (fragmented
+`ClientHello` read as empty SNI), CVE-2026-48491 (wildcard mappings ignored), CVE-2026-53622
+(case-sensitive lookup), and Caddy shipped the adjacent one, CVE-2026-27586 (mTLS failing open on
+an unreadable CA file). All four are fail-open. Here a miss is a rejection.
+
+A startup lint refuses, at configuration time, an exact binding and a covering wildcard that
+disagree on client authentication; a fallback or no-SNI policy weaker than the strongest binding;
+and duplicate bindings. Those are configuration errors rather than runtime surprises.
+
+### Handshake-flood limits
+
+The cost asymmetry is roughly 500 bytes and one `write()` for the attacker against one signature
+and one key agreement for us. Four limits bound it: a handshake deadline started at accept time,
+a cap on handshakes in progress per listener, a cap per source address, and a cap on `KeyUpdate`
+messages per connection. A fifth bounds how many bytes are buffered while waiting for a complete
+`ClientHello`.
+
+The acceptor is sans-IO and enforces only the byte cap; it has no clock, no connection table and
+no view of the peer address. The other four are enforced by the accept loop, and
+`docs/tls/SNI-POLICY.md` states that contract. This is a real residual risk until that loop
+exists: the limits are values and a written obligation, not running code.
+
+### The cross-name authority re-check
+
+A listener may bind different names to different client-authentication requirements. That is the
+mixed public-and-mTLS deployment the design exists to support, and it cannot be linted away,
+because the names are disjoint and each binding is individually correct.
+
+The hole: an attacker completes a handshake under a permissive name, then sends a `Host` header
+naming a name that requires a client certificate. A certificate-scope check does not catch this,
+because one wildcard certificate legitimately covers both names. The connection is authorized for
+the authority; it is not authorized for that authority's client-auth requirement.
+
+Every request must therefore be re-checked against the requirement bound to its authority, and
+refused when the connection authenticated more weakly. Per request, not per connection: the
+authority can change between requests on one connection. This is enforcement the HTTP layer owns;
+until it exists, a listener that mixes client-authentication requirements across names is
+bypassable by anyone who can send a `Host` header, and that is a residual risk to be aware of.
+
+### Residual risks, stated plainly
+
+- The four handshake-flood limits are not enforced by any running code yet; the accept loop that
+  must enforce them is separate work.
+- The per-request authority re-check is not enforced by any running code yet; the HTTP layer that
+  must enforce it is separate work. Until then, do not deploy a listener that mixes
+  client-authentication requirements across different names.
+- No client-certificate verifier exists yet, so every compiled configuration authenticates no
+  client. The divergence lint reasons about requirement labels, and until verifiers land there is
+  only one label in use, which means the lint is correct but has nothing yet to distinguish.
+- Session resumption is not bound to the client-auth identity yet, because no ticketer is
+  installed. When one is, it must carry that context or CVE-2025-68121 is reproduced.
+- A peer still chooses which name it presents, so it chooses which of the configured policies it
+  is measured against. Fail-closed selection bounds that to the set the operator configured; it
+  does not remove the choice.
+- A handshake still costs a signature before any peer identity exists. Every one of the controls
+  in this section bounds how much of that cost an attacker can buy; none of them make the cost
+  zero, because the asymmetry between an attacker's `write()` and our signature is inherent to
+  terminating TLS, not a bug to be fixed.
+- 0-RTT replay cannot be fully prevented in a distributed system: a 0-RTT `ClientHello` can be
+  replayed to more than one node before any single node can prove it has seen that ticket before,
+  and no coordination-free anti-replay scheme closes that window completely. This design does not
+  negotiate 0-RTT today, so the risk is not live, but the residual risk is recorded here rather
+  than left implicit for whenever it is. `early-data-policy-and-replay-filter` (#121) owns this
+  paragraph and the policy that must exist before 0-RTT is turned on.

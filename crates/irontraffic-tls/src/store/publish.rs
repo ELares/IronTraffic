@@ -29,6 +29,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::{CertIndex, ChallengeCerts, IronResolver};
+use crate::listener::ListenerTls;
 
 /// Everything the TLS accept path needs, as one immutable value.
 pub struct TlsMaterial {
@@ -38,6 +39,8 @@ pub struct TlsMaterial {
     pub challenge: Arc<ChallengeCerts>,
     /// The resolver built over `certs` and `challenge`.
     pub resolver: Arc<IronResolver>,
+    /// Compiled per-listener TLS configuration, indexed by listener ordinal.
+    pub listeners: Arc<[Arc<ListenerTls>]>,
     /// Monotonic generation number.
     pub generation: u64,
 }
@@ -178,6 +181,7 @@ mod tests {
             certs,
             challenge,
             resolver,
+            listeners: Arc::from(Vec::new()),
             generation,
         })
     }
