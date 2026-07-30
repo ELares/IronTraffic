@@ -1056,11 +1056,35 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
-          curl --proto '=https' --tlsv1.2 -fsSL \
-            https://musl.cc/aarch64-linux-musl-cross.tgz -o /tmp/aarch64-linux-musl-cross.tgz
-          echo "c909817856d6ceda86aa510894fa3527eac7989f0ef6e87b5721c58737a06c38  /tmp/aarch64-linux-musl-cross.tgz" \
-            | sha256sum -c -
-          sudo tar -xzf /tmp/aarch64-linux-musl-cross.tgz -C /opt
+          # Two sources, one checksum.
+          #
+          # musl.cc is a community host with no SLA and no mirror, and it is
+          # demonstrably not reachable from this runner: the first pull request
+          # run of this job (after it stopped being tag gated) failed with
+          # `curl: (28) Failed to connect to musl.cc port 443 after 135045 ms`,
+          # while the same URL answered in 0.33 seconds from a developer
+          # machine. So it is blocked or rate limited from Actions rather than
+          # briefly down, and retrying it alone would fail every release the
+          # same way. Had this job stayed tag gated, that failure would have
+          # landed while cutting a version.
+          #
+          # The fallback is an asset this project controls. The sha256 pin
+          # below gates BOTH paths and is checked before anything extracts or
+          # executes, so a mirror cannot substitute different bytes: the worst a
+          # compromised mirror achieves is failing the build.
+          tb=/tmp/aarch64-linux-musl-cross.tgz
+          sum="c909817856d6ceda86aa510894fa3527eac7989f0ef6e87b5721c58737a06c38"
+          if ! curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 20 --max-time 300 \
+                 --retry 5 --retry-all-errors \
+                 https://musl.cc/aarch64-linux-musl-cross.tgz -o "$tb"; then
+            echo "musl.cc unreachable; falling back to this project's pinned mirror"
+            curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 20 --max-time 300 \
+              --retry 5 --retry-all-errors \
+              "https://github.com/${GITHUB_REPOSITORY}/releases/download/toolchains/aarch64-linux-musl-cross.tgz" \
+              -o "$tb"
+          fi
+          echo "$sum  $tb" | sha256sum -c -
+          sudo tar -xzf "$tb" -C /opt
           echo "/opt/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc" >> "$GITHUB_ENV"
       - name: Build the four-target matrix
