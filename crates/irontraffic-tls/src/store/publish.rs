@@ -69,6 +69,9 @@ pub struct PublishStats {
     /// `tls_material_live_generations`: published generations still reachable, that is still held
     /// by at least one connection or task. Maintained in `publish` from a pruned `Vec<Weak<_>>`.
     pub live_generations: AtomicU64,
+    /// `tls_ocsp_must_staple_refused_total`: an `Install` was refused because the credential
+    /// carries `id-pe-tlsfeature` with `status_request` and had no staple attached.
+    pub must_staple_refused: AtomicU64,
 }
 
 /// The publication cell. This is the third and final allowlisted `ArcSwap` declaration site in

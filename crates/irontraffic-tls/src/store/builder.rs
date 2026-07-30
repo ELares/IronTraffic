@@ -252,7 +252,11 @@ impl CertUpdateCoalescer {
     ///
     /// # Errors
     /// `CertError::Name`, `CertError::Wildcard` or `CertError::WildcardTooBroad` if any name in
-    /// the update fails validation. The update is not recorded and the pending list is unchanged.
+    /// the update fails validation. `CertError::MustStapleWithoutStaple` if an `Install` carries
+    /// a must-staple credential with no OCSP staple attached: a permanent property of that
+    /// credential that will never become valid by waiting, so it is refused here rather than at
+    /// flush time, where it would sit in the pending list and abort every later flush. The
+    /// update is not recorded and the pending list is unchanged in either case.
     pub fn submit(&mut self, update: CertUpdate) -> Result<(), CertError> {
         if let Err(e) = validate_update(&update) {
             self.cell
@@ -260,6 +264,19 @@ impl CertUpdateCoalescer {
                 .updates_rejected
                 .fetch_add(1, Ordering::Relaxed);
             return Err(e);
+        }
+
+        if let CertUpdate::Install { cred, .. } = &update
+            && cred.must_staple()
+            && cred.staple().is_none()
+        {
+            self.cell
+                .stats()
+                .must_staple_refused
+                .fetch_add(1, Ordering::Relaxed);
+            return Err(CertError::MustStapleWithoutStaple {
+                fingerprint: cred.fingerprint(),
+            });
         }
 
         self.pending.push(update);
@@ -1715,5 +1732,92 @@ mod tests {
                 prop_assert_eq!(a, b, "query={}", q);
             }
         }
+    }
+
+    /// A credential carrying `id-pe-tlsfeature` with `status_request` (RFC 7633 must-staple).
+    fn gen_cred_must_staple(san: &str) -> Arc<Credentials> {
+        ensure_provider_installed();
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("keygen");
+        let mut params = rcgen::CertificateParams::new(vec![san.to_owned()]).expect("valid SANs");
+        params
+            .custom_extensions
+            .push(rcgen::CustomExtension::from_oid_content(
+                &[1, 3, 6, 1, 5, 5, 7, 1, 24],
+                vec![0x30, 0x03, 0x02, 0x01, 0x05],
+            ));
+        let cert = params.self_signed(&key).expect("sign");
+        let mut interner = ChainInterner::new();
+        Arc::new(
+            Credentials::load(&[cert.der()], &key.serialize_der(), &mut interner)
+                .expect("valid leaf and key"),
+        )
+    }
+
+    /// Also listed as an acceptance criterion: submitting an `Install` of a must-staple
+    /// credential with no staple attached must be refused at `submit`, must leave `pending`
+    /// and the published generation untouched, and, the assertion that proves the refusal is
+    /// not a poison pill, a later valid update must still publish.
+    #[test]
+    fn must_staple_install_without_staple_fails_batch() {
+        let cred = gen_cred_must_staple("must-staple-batch.example.com");
+        assert!(
+            cred.must_staple() && cred.staple().is_none(),
+            "the fixture must actually be a must-staple credential with no staple attached, or \
+             this test proves nothing"
+        );
+        let (cell, mut coalescer) = test_setup(&[]);
+
+        let result = coalescer.submit(install_exact("must-staple-batch.example.com", &cred));
+        assert_eq!(
+            result,
+            Err(CertError::MustStapleWithoutStaple {
+                fingerprint: cred.fingerprint()
+            })
+        );
+        assert_eq!(
+            coalescer.pending_len(),
+            0,
+            "a refused Install must never enter the pending list"
+        );
+        assert_eq!(cell.stats().generation.load(Ordering::Relaxed), 0);
+        assert_eq!(cell.stats().must_staple_refused.load(Ordering::Relaxed), 1);
+
+        // Not a poison pill: a later, unrelated valid update must still publish.
+        let other = gen_cred("must-staple-batch-followup.example.com");
+        coalescer
+            .submit(install_exact(
+                "must-staple-batch-followup.example.com",
+                &other,
+            ))
+            .expect("a later, unrelated valid update must still be accepted");
+        let published = coalescer.flush_now().expect("flush ok");
+        assert_eq!(published, Some(1));
+        assert!(
+            cell.load()
+                .certs
+                .resolve("must-staple-batch-followup.example.com", ClientCaps::all())
+                .is_some(),
+            "the followup update must actually have published"
+        );
+
+        // The accept side, folded into this same test rather than a second, unlisted function:
+        // the SAME must-staple leaf, once it carries a staple, must install normally.
+        let staple: Arc<[u8]> = Arc::from(vec![1u8, 2, 3].as_slice());
+        let stapled_cred = Arc::new(cred.with_staple(Some(staple)));
+        coalescer
+            .submit(install_exact(
+                "must-staple-batch.example.com",
+                &stapled_cred,
+            ))
+            .expect("a must-staple credential WITH a staple attached must be accepted");
+        let published2 = coalescer.flush_now().expect("flush ok");
+        assert_eq!(published2, Some(2));
+        assert_eq!(
+            cell.load()
+                .certs
+                .resolve("must-staple-batch.example.com", ClientCaps::all())
+                .map(|c| c.fingerprint()),
+            Some(stapled_cred.fingerprint())
+        );
     }
 }
