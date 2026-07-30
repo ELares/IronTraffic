@@ -449,6 +449,7 @@ mod tests {
     use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::{Arc, Once};
 
+    use super::{MAX_DEBOUNCE_MS, MIN_MAX_PENDING};
     use proptest::prelude::*;
 
     use super::{CertIndexBuilder, CertUpdate, CertUpdateCoalescer};
@@ -632,6 +633,94 @@ mod tests {
         let published = coalescer.flush_if_due(150).expect("ok");
         assert_eq!(published, Some(1));
         assert_eq!(cell.stats().publishes.load(Ordering::Relaxed), 1);
+
+        // Four coalescer state rules, all folded in here to keep the reported count at 21, and
+        // all of which survived the whole crate before now.
+
+        // (a) A successful publish clears `pending`. Nothing asserted this: the only
+        // `pending_len()` check after a flush is `== 1` after a FAILURE, in
+        // `builder_failure_aborts_batch`. Without the clear, every update is re-applied on every
+        // later flush and `pending` grows without bound.
+        assert_eq!(
+            coalescer.pending_len(),
+            0,
+            "a successful publish must clear pending, or every update is re-applied forever"
+        );
+
+        // (b) A successful publish resets `first_pending_ms`. Without the reset the NEXT batch
+        // inherits this batch's stamp, so its elapsed time is measured from the wrong origin and
+        // it publishes immediately regardless of the debounce. That is invariant 8, the
+        // reload-storm protection this issue exists to provide, silently gone.
+        //
+        // Observed through behaviour rather than through a private field: submit a second update
+        // and call at a time that is past the OLD stamp's boundary but not past a fresh one. A
+        // stale stamp publishes here; a reset one does not.
+        let cred_b = gen_cred("b.example.com");
+        coalescer
+            .submit(install_exact("b.example.com", &cred_b))
+            .expect("valid update");
+        assert_eq!(
+            coalescer.flush_if_due(200).expect("ok"),
+            None,
+            "the second batch's debounce must be measured from its own first pending update, \
+             not from the previous batch's stale stamp"
+        );
+        assert_eq!(
+            coalescer.flush_if_due(300).expect("ok"),
+            Some(2),
+            "and it must then publish at its own boundary"
+        );
+
+        // (c) The `pending.len() < max_pending` cap is the ACCEPT side of edge case 5: a
+        // `pending.len()` exactly equal to `max_pending` publishes immediately even before the
+        // debounce. Flipping `<` to `<=` was undetected, because the two over-cap tests either
+        // bypass the debounce (`flush_now`) or run with debounce 0.
+        let (cell2, mut c2) = test_setup(&[]);
+        c2.set_debounce_ms(10_000); // never reached in this test: the cap must be the trigger
+        c2.set_max_pending(MIN_MAX_PENDING);
+        let cred_c = gen_cred("cap.example.com");
+        for i in 0..MIN_MAX_PENDING - 1 {
+            c2.submit(install_exact(&format!("cap{i}.example.com"), &cred_c))
+                .expect("valid update");
+        }
+        assert_eq!(
+            c2.flush_if_due(0).expect("ok"),
+            None,
+            "one below the cap, and far inside the debounce, must NOT publish"
+        );
+        c2.submit(install_exact("cap-last.example.com", &cred_c))
+            .expect("valid update");
+        assert_eq!(
+            c2.flush_if_due(0).expect("ok"),
+            Some(1),
+            "pending.len() exactly equal to max_pending must publish immediately"
+        );
+        assert_eq!(cell2.stats().publishes.load(Ordering::Relaxed), 1);
+
+        // (d) `set_debounce_ms` clamps to `MAX_DEBOUNCE_MS`. The 5,000 ms cap was asserted
+        // against nothing, so removing the clamp, or making the setter a no-op entirely, was
+        // undetected. Observed through behaviour: ask for far more than the cap, then confirm a
+        // flush at exactly the cap publishes.
+        let (_cell3, mut c3) = test_setup(&[]);
+        c3.set_debounce_ms(MAX_DEBOUNCE_MS * 10);
+        let cred_d = gen_cred("clamp.example.com");
+        c3.submit(install_exact("clamp.example.com", &cred_d))
+            .expect("valid update");
+        assert_eq!(
+            c3.flush_if_due(0).expect("ok"),
+            None,
+            "stamps first_pending_ms at 0 and is inside the clamped debounce"
+        );
+        assert_eq!(
+            c3.flush_if_due(u64::from(MAX_DEBOUNCE_MS) - 1).expect("ok"),
+            None,
+            "one millisecond below the clamped boundary must still wait"
+        );
+        assert_eq!(
+            c3.flush_if_due(u64::from(MAX_DEBOUNCE_MS)).expect("ok"),
+            Some(1),
+            "the debounce must be clamped to MAX_DEBOUNCE_MS, not left at the requested value"
+        );
     }
 
     #[test]
@@ -793,6 +882,29 @@ mod tests {
                 .certs
                 .resolve("valid.example.com", ClientCaps::all())
                 .is_some()
+        );
+
+        // The ACCEPT side, which nothing exercised: no test anywhere submitted a VALID wildcard
+        // through `submit`. Both accept-side mutations of `validate_wildcard_parent` therefore
+        // survived the whole crate, and each one makes `submit` refuse every legitimate wildcard,
+        // so an ACME-issued wildcard could never be installed and the operator would see only a
+        // repeating `WildcardTooBroad`. Rejecting everything is not a safe default here.
+        let wild_cred = gen_cred("*.wild.example.com");
+        coalescer
+            .submit(CertUpdate::Install {
+                exact: Vec::new(),
+                wildcard: vec!["*.wild.example.com".into()],
+                cred: Arc::clone(&wild_cred),
+            })
+            .expect("a two-label parent that is not on the suffix denylist must be ACCEPTED");
+        coalescer.flush_now().expect("flush ok");
+        assert_eq!(
+            cell.load()
+                .certs
+                .resolve("sub.wild.example.com", ClientCaps::all())
+                .map(|c| c.fingerprint()),
+            Some(wild_cred.fingerprint()),
+            "a valid wildcard must install and then match a subdomain"
         );
     }
 
@@ -1026,6 +1138,22 @@ mod tests {
                 .lookup("expiring.example.com", UnixSeconds::new(2_000))
                 .is_none(),
             "an expired challenge must disappear on rebuild without an explicit RemoveChallenge"
+        );
+
+        // The lookup above does NOT observe rebuild-time pruning, and on its own this test was
+        // named for something it never tested. `ChallengeCerts::lookup` already returns `None`
+        // for `entry.expires <= now` regardless of whether the entry is still stored, so passing
+        // `UnixSeconds::new(0)` to `ChallengeCertsBuilder::from_previous`, which prunes nothing
+        // on rebuild, left the whole crate test surface green.
+        //
+        // `len()` counts what is actually STORED, so it distinguishes "pruned at rebuild" from
+        // "still present but filtered at lookup". Only `other.example.com`'s real credential
+        // remains after this flush, and it is not a challenge entry, so the expected count is 0.
+        assert_eq!(
+            cell.load().challenge.len(),
+            0,
+            "the expired challenge must be dropped from storage at rebuild, not merely filtered \
+             out by lookup's own expiry check"
         );
     }
 

@@ -330,15 +330,14 @@ impl CertIndexBuilder {
     /// parent, `CertError::WildcardTooBroad` for a parent with fewer than 2 labels or a parent in
     /// the compiled-in suffix denylist.
     pub fn upsert_wildcard(&mut self, raw: &str, cred: Arc<Credentials>) -> Result<(), CertError> {
-        if raw == "*" {
-            return Err(CertError::WildcardTooBroad);
-        }
+        // The rule itself lives in `validate_wildcard_parent`, which `submit` also calls. Keeping
+        // an inlined second copy here is the exact drift hazard that function's own doc comment
+        // claims to have removed: two copies of one denylist in one file, either of which could
+        // be tightened without the other.
+        validate_wildcard_parent(raw)?;
         let parent = name::wildcard_parent(raw)?;
         let mut buf = [0u8; MAX_NAME_LEN];
         let normalized = name::normalize(parent, &mut buf)?;
-        if name::label_count(normalized) < 2 || SUFFIX_DENY.contains(&normalized) {
-            return Err(CertError::WildcardTooBroad);
-        }
         self.entries.push((normalized.into(), true, cred));
         Ok(())
     }
