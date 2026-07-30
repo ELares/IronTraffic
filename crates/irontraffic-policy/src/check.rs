@@ -62,6 +62,21 @@ pub struct Checked {
     pub phase: Phase,
     /// The type of the root node.
     pub result: Ty,
+    /// The decoded string arena `check` was given, after every side effect
+    /// (a header key ASCII lowercased into it by `resolve_index`) has been
+    /// applied. Every `Node::Str` span and every `AttrRef::Field` key span
+    /// names a range into this buffer, never into the raw source, so a
+    /// consumer of `Checked` that needs those bytes (the compiler in
+    /// `{{itpl-compile-to-bytecode-and-regex-table}}`, issue #271) has no
+    /// other way to reach them: `Checked` is the only handle it is given.
+    ///
+    /// `check`'s own signature still takes `strings` by mutable reference,
+    /// unchanged, for its existing callers; this field is a copy of that
+    /// buffer's final content, not a second owner of the same allocation.
+    /// #271's Files table does not list this file, and this field is the one
+    /// minimal addition that issue needed to compile at all; see its PR for
+    /// the full explanation.
+    pub strings: Vec<u8>,
 }
 
 impl Checked {
@@ -812,6 +827,8 @@ pub fn check(
         });
     }
 
+    let strings_copy = chk.strings.clone();
+
     let Checker {
         types,
         node_slot,
@@ -826,6 +843,7 @@ pub fn check(
         node_slot,
         phase,
         result: root_ty,
+        strings: strings_copy,
     })
 }
 
