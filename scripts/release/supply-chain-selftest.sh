@@ -617,22 +617,60 @@ PYEOF
 # ---------------------------------------------------------------------------
 # 14 / 15: a real signed, attested fixture, produced only when this run
 # actually has an ambient GitHub Actions OIDC identity (see this file's
-# header). Both tests share it.
-# ---------------------------------------------------------------------------
+# header). Built at most ONCE (cached in $WORK) and shared by both tests:
+# `sign.sh`/`attest.sh` are real, slow, network round trips against the
+# public Sigstore instance, and calling them twice bought nothing but risk.
+#
+# WHY THESE TWO TESTS DO NOT CALL verify.sh: verify.sh's own
+# --certificate-identity-regexp is deliberately pinned to `refs/tags/v*`
+# ONLY (see verify.sh's own header and docs/SUPPLY-CHAIN.md); a fixture
+# signed by THIS test run, which is a pull-request run
+# (".../ci.yml@refs/pull/N/merge"), can never match that pin, by design,
+# the identical reason a real release signature could never be produced
+# from a pull request either. Using verify.sh here would make this test
+# either permanently fail on every pull request (the identity check is
+# supposed to refuse it) or require weakening verify.sh's own pin, which is
+# precisely the mistake this issue's whole design exists to prevent. These
+# two tests instead verify with cosign directly, using a
+# --certificate-identity-regexp built from THIS run's own
+# GITHUB_WORKFLOW_REF, which proves the sign -> attest round trip itself
+# works for real; verify_fails_without_identity_pin (test 11) is what
+# proves the pin mechanism itself is load-bearing.
+REAL_FIXTURE_ARTIFACT=""
+REAL_FIXTURE_IDENTITY_REGEXP=""
+
 build_real_signed_fixture() {
+    if [ -n "$REAL_FIXTURE_ARTIFACT" ]; then
+        printf '%s' "$REAL_FIXTURE_ARTIFACT"
+        return 0
+    fi
     if ! have_actions_oidc; then
         return 1
     fi
     fixture_dir="$WORK/real-signed"
     mkdir -p "$fixture_dir"
-    artifact="$fixture_dir/selftest-fixture.txt"
+    # A real-shaped filename (not an arbitrary name): verify.sh's own
+    # version-from-filename regex, exercised indirectly by other tests, is
+    # part of what this fixture stands in for being a genuine release
+    # artifact.
+    artifact="$fixture_dir/irontraffic-0.0.0-selftest-fixture.tar.gz"
     printf 'supply-chain-selftest fixture, %s\n' "$(date -u +%s 2>/dev/null || echo 0)" > "$artifact"
+    write_sha256sums_line "$artifact"
     if ! sh "$REPO_ROOT/scripts/release/sign.sh" "$artifact" >"$WORK/real-sign.log" 2>&1; then
+        cat "$WORK/real-sign.log" >&2
         return 1
     fi
     if ! sh "$REPO_ROOT/scripts/release/attest.sh" "$artifact" "$FIXTURE_TARGET" "control-plane" >"$WORK/real-attest.log" 2>&1; then
+        cat "$WORK/real-attest.log" >&2
         return 1
     fi
+    # https://github.com/<GITHUB_WORKFLOW_REF> -> the certificate-identity
+    # this run's own signature actually carries, mirroring attest.sh's own
+    # builder_id construction. GITHUB_WORKFLOW_REF's only regex metachar is
+    # ".", escaped before this is used as a --certificate-identity-regexp.
+    escaped_workflow_ref="$(printf '%s' "$GITHUB_WORKFLOW_REF" | sed 's/\./\\./g')"
+    REAL_FIXTURE_IDENTITY_REGEXP="^https://github\\.com/${escaped_workflow_ref}\$"
+    REAL_FIXTURE_ARTIFACT="$artifact"
     printf '%s' "$artifact"
 }
 
@@ -642,11 +680,22 @@ test_verify_prints_source_commit() {
         return
     }
     expected_commit="$(git rev-parse HEAD)"
-    out="$(sh "$REPO_ROOT/scripts/release/verify.sh" --artifact "$artifact" --allow-skipped 2>&1)" || true
-    if printf '%s' "$out" | grep -q "source commit: $expected_commit"; then
+    if ! cosign verify-blob-attestation \
+        --certificate "$artifact.pem" \
+        --signature "$artifact.intoto.jsonl" \
+        --certificate-identity-regexp "$REAL_FIXTURE_IDENTITY_REGEXP" \
+        --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
+        --type slsaprovenance \
+        "$artifact" >"$WORK/real-verify-attest.log" 2>&1; then
+        fail "verify_prints_source_commit" "cosign verify-blob-attestation against this run's own real signature failed: $(cat "$WORK/real-verify-attest.log")"
+        return
+    fi
+    payload="$(jq -r '.payload' "$artifact.intoto.jsonl" 2>/dev/null | base64 -d 2>/dev/null || true)"
+    commit="$(printf '%s' "$payload" | jq -r '.predicate.invocation.configSource.digest.sha1 // empty' 2>/dev/null || true)"
+    if [ "$commit" = "$expected_commit" ]; then
         pass "verify_prints_source_commit"
     else
-        fail "verify_prints_source_commit" "expected commit $expected_commit in output: $out"
+        fail "verify_prints_source_commit" "provenance names commit \"$commit\", expected \"$expected_commit\""
     fi
 }
 
@@ -657,11 +706,16 @@ test_provenance_subject_matches_digest() {
     }
     actual_sha256="$(sha256_of "$artifact")"
     intoto_file="$artifact.intoto.jsonl"
-    if [ ! -f "$intoto_file" ]; then
-        fail "provenance_subject_matches_digest" "no .intoto.jsonl produced alongside $artifact"
+    if [ ! -s "$intoto_file" ]; then
+        fail "provenance_subject_matches_digest" "no (or empty) .intoto.jsonl produced alongside $artifact"
         return
     fi
-    subject_sha256="$(jq -r '.payload' "$intoto_file" | base64 -d | jq -r '.subject[0].digest.sha256 // empty')"
+    payload="$(jq -r '.payload' "$intoto_file" 2>/dev/null | base64 -d 2>/dev/null || true)"
+    if [ -z "$payload" ]; then
+        fail "provenance_subject_matches_digest" "could not decode the DSSE payload in $intoto_file"
+        return
+    fi
+    subject_sha256="$(printf '%s' "$payload" | jq -r '.subject[0].digest.sha256 // empty' 2>/dev/null || true)"
     if [ -n "$subject_sha256" ] && [ "$subject_sha256" = "$actual_sha256" ]; then
         pass "provenance_subject_matches_digest"
     else
