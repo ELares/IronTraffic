@@ -1698,12 +1698,14 @@ whole store onto one instant, and two nodes restarting together do not fetch in 
 **A must-staple certificate is refused at install, not discovered at handshake time.** RFC 7633's
 `id-pe-tlsfeature` with `status_request` obligates a server to staple a response for that
 certificate on every handshake; serving it without one is a protocol violation an inspecting client
-may treat as a failure on its own. `CertUpdateCoalescer::submit` refuses an `Install` of a
-must-staple credential with no OCSP staple attached (`CertError::MustStapleWithoutStaple`), in the
-same eager-validation step that already checks names, so the credential never enters the pending
-list and never becomes part of a published index at all; the previously installed material for that
-name keeps serving. The check lives at `submit` rather than at flush time because a must-staple
-credential with no staple is a permanent property of that submission, not a transient one: it will
+may treat as a failure on its own. `CertUpdateCoalescer::submit` refuses an `Install`, `Replace` or
+`SetDefault` of a must-staple credential with no OCSP staple attached
+(`CertError::MustStapleWithoutStaple`), in the same eager-validation step that already checks
+names, so the credential never enters the pending list and never becomes part of a published index
+at all, through any of the three update kinds that can publish one; the previously installed
+material for that name keeps serving. The check lives at `submit` rather than at flush time
+because a must-staple credential with no staple is a permanent property of that submission, not a
+transient one: it will
 never become valid by waiting, and rejecting it at flush time would sit it in the pending list and
 abort every later flush behind it, freezing the whole store at its last good generation. Symmetrically,
 `OcspUpdater::tick` treats a must-staple certificate whose live staple has gone stale (past

@@ -117,7 +117,8 @@ pub enum CertError {
     IndexTooLarge,
     /// A challenge-map operation failed. Carries the challenge error unchanged.
     Challenge(ChallengeError),
-    /// A must-staple certificate was submitted for installation with no OCSP staple attached.
+    /// A must-staple certificate was submitted (as an `Install`, `Replace` or `SetDefault`) with
+    /// no OCSP staple attached.
     MustStapleWithoutStaple {
         /// Which credential.
         fingerprint: CertFingerprint,

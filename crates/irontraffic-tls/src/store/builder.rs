@@ -252,11 +252,16 @@ impl CertUpdateCoalescer {
     ///
     /// # Errors
     /// `CertError::Name`, `CertError::Wildcard` or `CertError::WildcardTooBroad` if any name in
-    /// the update fails validation. `CertError::MustStapleWithoutStaple` if an `Install` carries
-    /// a must-staple credential with no OCSP staple attached: a permanent property of that
-    /// credential that will never become valid by waiting, so it is refused here rather than at
-    /// flush time, where it would sit in the pending list and abort every later flush. The
-    /// update is not recorded and the pending list is unchanged in either case.
+    /// the update fails validation. `CertError::MustStapleWithoutStaple` if an `Install`,
+    /// `Replace` or `SetDefault` carries a must-staple credential with no OCSP staple attached: a
+    /// permanent property of that credential that will never become valid by waiting, so it is
+    /// refused here rather than at flush time, where it would sit in the pending list and abort
+    /// every later flush. All three variants can put a credential into the published index
+    /// (`Replace` is the OCSP staple-refresh path itself; `SetDefault` publishes the
+    /// no-name-matched credential), so invariant 4 ("a must-staple credential with no staple is
+    /// never present in a published `CertIndex`") is enforced identically for each rather than
+    /// only for `Install`. The update is not recorded and the pending list is unchanged in either
+    /// case.
     pub fn submit(&mut self, update: CertUpdate) -> Result<(), CertError> {
         if let Err(e) = validate_update(&update) {
             self.cell
@@ -266,7 +271,15 @@ impl CertUpdateCoalescer {
             return Err(e);
         }
 
-        if let CertUpdate::Install { cred, .. } = &update
+        let published_cred = match &update {
+            CertUpdate::Install { cred, .. }
+            | CertUpdate::Replace { cred, .. }
+            | CertUpdate::SetDefault { cred } => Some(cred),
+            CertUpdate::Remove { .. }
+            | CertUpdate::InstallChallenge { .. }
+            | CertUpdate::RemoveChallenge { .. } => None,
+        };
+        if let Some(cred) = published_cred
             && cred.must_staple()
             && cred.staple().is_none()
         {
@@ -1819,5 +1832,73 @@ mod tests {
                 .map(|c| c.fingerprint()),
             Some(stapled_cred.fingerprint())
         );
+    }
+
+    /// Invariant 4 ("a must-staple credential with no staple is never present in a published
+    /// `CertIndex`") is stated as absolute, and `SetDefault` publishes a credential into the index
+    /// exactly as much as `Install` does: the default is served whenever no name matches, so a
+    /// must-staple default with no staple would violate the same RFC 7633 obligation an `Install`
+    /// of the same credential is refused for.
+    #[test]
+    fn must_staple_set_default_without_staple_fails() {
+        let cred = gen_cred_must_staple("must-staple-default.example.com");
+        assert!(
+            cred.must_staple() && cred.staple().is_none(),
+            "the fixture must actually be a must-staple credential with no staple attached, or \
+             this test proves nothing"
+        );
+        let (cell, mut coalescer) = test_setup(&[]);
+
+        let result = coalescer.submit(CertUpdate::SetDefault {
+            cred: Arc::clone(&cred),
+        });
+        assert_eq!(
+            result,
+            Err(CertError::MustStapleWithoutStaple {
+                fingerprint: cred.fingerprint()
+            })
+        );
+        assert_eq!(
+            coalescer.pending_len(),
+            0,
+            "a refused SetDefault must never enter the pending list"
+        );
+        assert_eq!(cell.stats().generation.load(Ordering::Relaxed), 0);
+    }
+
+    /// The same invariant, for the OCSP staple-refresh path: `Replace` swaps a credential into
+    /// every entry that already carries it, so a must-staple credential with no staple reaching
+    /// `Replace` would publish it exactly as directly as an `Install` would.
+    #[test]
+    fn must_staple_replace_without_staple_fails() {
+        let original = gen_cred_must_staple("must-staple-replace.example.com");
+        let staple: Arc<[u8]> = Arc::from(vec![1u8, 2, 3].as_slice());
+        let stapled = Arc::new(original.with_staple(Some(staple)));
+        let (cell, mut coalescer) = test_setup(&[("must-staple-replace.example.com", &stapled)]);
+
+        // The replacement carries no staple at all: the same credential family, further along
+        // its OCSP schedule, whose staple has expired without a fresh one attached.
+        let unstapled_replacement = gen_cred_must_staple("must-staple-replace.example.com");
+        assert!(
+            unstapled_replacement.must_staple() && unstapled_replacement.staple().is_none(),
+            "the fixture must actually be a must-staple credential with no staple attached, or \
+             this test proves nothing"
+        );
+        let result = coalescer.submit(CertUpdate::Replace {
+            fingerprint: stapled.fingerprint(),
+            cred: Arc::clone(&unstapled_replacement),
+        });
+        assert_eq!(
+            result,
+            Err(CertError::MustStapleWithoutStaple {
+                fingerprint: unstapled_replacement.fingerprint()
+            })
+        );
+        assert_eq!(
+            coalescer.pending_len(),
+            0,
+            "a refused Replace must never enter the pending list"
+        );
+        assert_eq!(cell.stats().generation.load(Ordering::Relaxed), 0);
     }
 }
