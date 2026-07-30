@@ -694,6 +694,77 @@ fn json_number(json: &str, key: &str) -> Option<u64> {
 }
 
 // ---------------------------------------------------------------------------
+// 14b. stats_endpoint_does_not_inflate_its_own_counters
+//
+// `GET /stats` responses must not be counted in the SAME `requests`/`bytes`
+// counters the endpoint exists to let a harness reconcile against the main
+// listener's own traffic. Before this fix, the stats listener's own
+// response fell through to the same `shared.counters.add_request(...)` call
+// the main listener uses, so a harness that polls `/stats` more than once
+// during a run would see `requests` inflated by exactly the number of prior
+// polls, with zero main-listener traffic ever having occurred.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn stats_endpoint_does_not_inflate_its_own_counters() {
+    let mut config = base_config();
+    config.stats_listen = Some(SocketAddr::from(([127, 0, 0, 1], 0)));
+    let origin = start(config).await.expect("origin starts");
+    let stats_addr = origin.stats_addr.expect("stats listener is configured");
+
+    // Three successive stats queries, zero main-listener traffic at any
+    // point: `requests` must read 0 every single time.
+    for query in 0..3 {
+        let mut stream = connect(stats_addr).await.expect("connects to the origin");
+        let response = roundtrip(&mut stream, b"GET /stats HTTP/1.1\r\n\r\n")
+            .await
+            .expect("a response arrives");
+        assert_eq!(response.status, 200);
+        let json = String::from_utf8(response.body).expect("stats body is UTF-8 JSON");
+        assert_eq!(
+            json_number(&json, "requests").expect("requests key present"),
+            0,
+            "query {query}: stats: {json}"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 22b. stats_404_connection_is_actually_closed
+//
+// The stats listener's 404 response advertises `Connection: close`
+// (`RESPONSE_404`, the same preallocated constant the main listener's error
+// paths use). Before this fix, the `Role::Stats` branch wrote that response
+// and then fell through to loop again for another request on the SAME
+// connection instead of closing it, so a client that honours the framing it
+// was told and reads to EOF would stall for the full idle timeout instead
+// of seeing the close it was promised.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn stats_404_connection_is_actually_closed() {
+    let mut config = base_config();
+    config.stats_listen = Some(SocketAddr::from(([127, 0, 0, 1], 0)));
+    let origin = start(config).await.expect("origin starts");
+    let stats_addr = origin.stats_addr.expect("stats listener is configured");
+
+    let mut stream = connect(stats_addr).await.expect("connects to the origin");
+    let response = roundtrip(&mut stream, b"GET / HTTP/1.1\r\n\r\n")
+        .await
+        .expect("a response arrives");
+    assert_eq!(response.status, 404);
+    assert_eq!(response.header("connection"), Some("close"));
+
+    let mut probe = [0u8; 1];
+    let n = tokio::time::timeout(Duration::from_secs(2), stream.read(&mut probe))
+        .await
+        .expect("the connection closes within the safety window")
+        .expect("a clean EOF, not a read error");
+    assert_eq!(
+        n, 0,
+        "a 404 that advertises Connection: close must actually close the connection"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // 17. max_connections_is_enforced_and_released
 // ---------------------------------------------------------------------------
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -810,9 +881,84 @@ async fn idle_keepalive_is_closed_on_the_deadline() {
 }
 
 // ---------------------------------------------------------------------------
-// 20. byte_at_a_time_head_is_linear
+// 19b. head_timeout_bounds_every_head_not_only_the_first
+//
+// `--head-timeout-ms` must bound EVERY request's head on a keepalive
+// connection, not only the connection's first one. Before this fix, the
+// second and every later request's head-reading loop reused a single
+// deadline variable last set to `now + idle_timeout` after the previous
+// response, so a slowloris that completes one trivial request and then
+// trickles its next head got the (typically much longer) idle timeout to
+// finish it, not the head timeout.
 // ---------------------------------------------------------------------------
 #[tokio::test]
+async fn head_timeout_bounds_every_head_not_only_the_first() {
+    let mut config = base_config();
+    config.head_timeout_ms = 400;
+    config.idle_timeout_ms = 5_000;
+    let origin = start(config).await.expect("origin starts");
+    let mut stream = connect(origin.listen_addrs[0])
+        .await
+        .expect("connects to the origin");
+
+    // Complete one full request first, so the connection is genuinely on
+    // its SECOND request when the partial head below is sent.
+    let response = roundtrip(&mut stream, b"GET / HTTP/1.1\r\n\r\n")
+        .await
+        .expect("a response arrives");
+    assert_eq!(response.status, 200);
+
+    // Now send a partial second head and stop.
+    let started = Instant::now();
+    stream
+        .write_all(b"GET / HTTP/1.1\r\n")
+        .await
+        .expect("write succeeds");
+    let mut probe = [0u8; 1];
+    let n = tokio::time::timeout(Duration::from_secs(4), stream.read(&mut probe))
+        .await
+        .expect("the connection closes within the safety window")
+        .expect("a clean EOF, not a read error");
+    let elapsed = started.elapsed();
+    assert_eq!(n, 0);
+    assert!(
+        elapsed >= Duration::from_millis(350) && elapsed <= Duration::from_millis(1500),
+        "the connection's SECOND request must be bound by --head-timeout-ms \
+         (400ms), not --idle-timeout-ms (5000ms); closed at {elapsed:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 20. byte_at_a_time_head_is_linear
+// ---------------------------------------------------------------------------
+// Two measured facts drove this test's shape (do not "simplify" either
+// choice away without re-measuring):
+//
+// 1. `set_nodelay(true)` on the client stream, BY ITSELF, changed nothing:
+//    the examined-byte count stayed at ~16,693 either way. The client's own
+//    Nagle behaviour turned out not to be the bottleneck.
+// 2. Switching this test from the single-threaded default `#[tokio::test]`
+//    flavor to `multi_thread` is what actually mattered, because on the
+//    default single-threaded runtime the client's writer loop and the
+//    server's reader task are cooperatively scheduled on the SAME OS thread:
+//    a loopback `write_all` of one byte very rarely blocks, so the writer
+//    loop runs to completion, handing off all 16,384 bytes, before the
+//    executor ever gets a chance to poll the server's read future -- which
+//    then drains everything already sitting in the socket buffer in one or
+//    two reads (measured: ~16,693 bytes examined, barely above one pass).
+//    `multi_thread` lets the reader genuinely run on a second OS thread,
+//    concurrently with the writer, so more of the 16,384 writes are
+//    actually observed by a `read()` before the next one lands. Measured
+//    over three runs after switching: 29,805 / 27,787 / 29,620 bytes
+//    examined, roughly 1.7x this test's own former single-threaded number.
+//    Real, verified movement toward the "delivered incrementally" regime
+//    this test's own name promises, though (being a genuine OS thread race,
+//    not a deterministic mechanism) still short of the four-H-minus-six
+//    ceiling a client that could force one-byte reads deterministically
+//    would reach. `set_nodelay(true)` is kept anyway: it costs nothing and
+//    rules out the client's OWN transmission batching as a contributing
+//    factor, even though it was not, on its own, the fix.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn byte_at_a_time_head_is_linear() {
     // One well-formed header line, padded with a single long value, rather
     // than many repeated short lines truncated at an arbitrary byte offset:
@@ -826,6 +972,7 @@ async fn byte_at_a_time_head_is_linear() {
     let mut stream = connect(origin.listen_addrs[0])
         .await
         .expect("connects to the origin");
+    stream.set_nodelay(true).expect("sets TCP_NODELAY");
 
     let padding_len = 16_384 - PREFIX.len() - SUFFIX.len();
     let mut request = Vec::with_capacity(16_384);
@@ -884,6 +1031,73 @@ async fn content_length_with_transfer_encoding_is_400() {
             String::from_utf8_lossy(request)
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// 21b. content_length_with_transfer_encoding_non_canonical_forms_is_400
+//
+// Pins, over a REAL socket against the running server (not just a direct
+// `scan_head` call), that the smuggling refusal fires on the non-canonical
+// spellings a lenient parser tends to miss: whitespace before the colon
+// (both space and tab), mixed case, a duplicated `Transfer-Encoding` line,
+// and an obs-fold continuation. Every case here answered 200 before the
+// parsing fix (`Invariant 8` violated), because the header name comparison
+// either carried the extra whitespace or the continuation line was parsed
+// as an unrecognised header of its own.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn content_length_with_transfer_encoding_non_canonical_forms_is_400() {
+    let origin = start(base_config()).await.expect("origin starts");
+
+    let cases: [&[u8]; 5] = [
+        // Space before the colon.
+        b"GET / HTTP/1.1\r\nTransfer-Encoding : chunked\r\nContent-Length: 5\r\n\r\n",
+        // Tab before the colon.
+        b"GET / HTTP/1.1\r\nTransfer-Encoding\t: chunked\r\nContent-Length: 5\r\n\r\n",
+        // Mixed case.
+        b"GET / HTTP/1.1\r\ntRaNsFeR-EnCoDiNg: chunked\r\nContent-Length: 5\r\n\r\n",
+        // Duplicated Transfer-Encoding lines.
+        b"GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n",
+        // Obs-fold continuation line.
+        b"GET / HTTP/1.1\r\nContent-Length: 5\r\n Transfer-Encoding: chunked\r\n\r\n",
+    ];
+    for request in cases {
+        let mut stream = connect(origin.listen_addrs[0])
+            .await
+            .expect("connects to the origin");
+        let response = roundtrip(&mut stream, request)
+            .await
+            .expect("a response arrives");
+        assert_eq!(
+            response.status,
+            400,
+            "request: {:?}",
+            String::from_utf8_lossy(request)
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 21c. bare_lf_line_terminator_is_rejected_over_the_wire
+//
+// The exact request-smuggling reproduction: bare LF (no CR) between the
+// request line and each header used to collapse this parser's CRLF-only
+// line splitting, hiding BOTH `Content-Length` and `Transfer-Encoding` and
+// answering 200 with `content_length: 0` -- so the 5 declared body bytes
+// the client actually sends would have been read back as the start of the
+// next pipelined request on this same connection.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn bare_lf_line_terminator_is_rejected_over_the_wire() {
+    let origin = start(base_config()).await.expect("origin starts");
+    let mut stream = connect(origin.listen_addrs[0])
+        .await
+        .expect("connects to the origin");
+    let request = b"POST / HTTP/1.1\nContent-Length: 5\nTransfer-Encoding: chunked\r\n\r\n";
+    let response = roundtrip(&mut stream, request)
+        .await
+        .expect("a response arrives");
+    assert_eq!(response.status, 400);
 }
 
 // ---------------------------------------------------------------------------

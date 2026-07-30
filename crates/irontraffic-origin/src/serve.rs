@@ -150,6 +150,25 @@ fn parse_ascii_u64(value: &[u8]) -> Option<u64> {
     Some(acc)
 }
 
+/// The byte offset of the first `\n` in `head` that is not immediately
+/// preceded by `\r`, or `None` when every line terminator is a proper CRLF
+/// pair.
+///
+/// RFC 9112 requires CRLF line endings throughout the head. A bare LF is not
+/// a tolerance to extend here: this parser's line splitting recognises only
+/// the two-byte sequence `\r\n`, so a client that terminates its lines with a
+/// lone LF instead collapses everything up to the next REAL `\r\n` into one
+/// long "line" this parser then either rejects outright (no colon in it) or,
+/// worse, silently fails to recognise as any header at all -- hiding
+/// `Content-Length` and `Transfer-Encoding` alike from the smuggling refusal
+/// below. Refuse outright rather than normalise.
+fn bare_lf_position(head: &[u8]) -> Option<usize> {
+    head.iter()
+        .enumerate()
+        .find(|&(i, &byte)| byte == b'\n' && head.get(i.wrapping_sub(1)) != Some(&b'\r'))
+        .map(|(i, _)| i)
+}
+
 /// Scans an already-terminator-confirmed head (`head`'s last four bytes are
 /// `\r\n\r\n`) for the three headers this fixture honours, in one forward
 /// pass. Shared by [`scan_head`] (which finds the terminator itself, for
@@ -159,6 +178,10 @@ fn parse_ascii_u64(value: &[u8]) -> Option<u64> {
 fn parse_headers(head: &[u8]) -> Result<RequestIntent, ScanError> {
     let head_len = head.len();
 
+    if let Some(pos) = bare_lf_position(head) {
+        return Err(ScanError::Malformed(pos));
+    }
+
     // The request line is never parsed (no method, no path): skip past its
     // terminating CRLF and start scanning header lines from there.
     let mut pos = match memchr::memmem::find(head, b"\r\n") {
@@ -166,7 +189,12 @@ fn parse_headers(head: &[u8]) -> Result<RequestIntent, ScanError> {
         None => head_len,
     };
 
-    let mut content_length: Option<u64> = None;
+    // The RAW (uncapped) parsed value, compared for conflicts BEFORE either
+    // side is capped: two distinct declared lengths that both happen to
+    // exceed the cap must still conflict, rather than both rounding down to
+    // the same capped value and comparing equal. `RequestIntent::content_length`
+    // is capped only once, below, when the final answer is built.
+    let mut content_length_raw: Option<u64> = None;
     let mut delay_us: Option<u32> = None;
     let mut has_transfer_encoding = false;
 
@@ -189,6 +217,32 @@ fn parse_headers(head: &[u8]) -> Result<RequestIntent, ScanError> {
             return Err(ScanError::Malformed(pos));
         };
         let name = line.get(..colon).unwrap_or(&[]);
+
+        // RFC 9110 Section 5.1's `field-name` is a `token`, which by
+        // definition contains no whitespace at all, and RFC 9112 Section 5.1
+        // requires a server to REJECT (not merely ignore) any field line
+        // carrying whitespace between the name and the colon: a lenient
+        // parser that instead treats such a line as an unrecognised header
+        // lets `Transfer-Encoding : chunked` (space before the colon) or
+        // `Transfer-Encoding\t: chunked` (a tab) slip past the
+        // Content-Length/Transfer-Encoding smuggling refusal below entirely
+        // unrecognised, because this fixture then reads `name` as
+        // containing that trailing whitespace and it no longer
+        // case-insensitively equals either honoured header name. The very
+        // same check also rejects an obs-fold continuation line that
+        // happens to contain a colon (for example a `Content-Length: 5`
+        // line followed by ` Transfer-Encoding: chunked`, i.e. an
+        // RFC 7230-obsolete folded value): once split on ITS OWN colon,
+        // that continuation line's `name` slice is ` Transfer-Encoding`,
+        // carrying exactly the same leading whitespace this check refuses.
+        // A continuation line with no colon at all was already rejected
+        // above (`Malformed`, no colon found). Refuse, per this fixture's
+        // own rule for the refusal below, rather than silently treating
+        // either shape as some other header.
+        if name.iter().any(u8::is_ascii_whitespace) {
+            return Err(ScanError::Malformed(pos));
+        }
+
         let raw_value = line.get(colon.saturating_add(1)..).unwrap_or(&[]);
         let value = raw_value.trim_ascii();
 
@@ -201,16 +255,21 @@ fn parse_headers(head: &[u8]) -> Result<RequestIntent, ScanError> {
             }
         } else if name.eq_ignore_ascii_case(b"content-length") {
             let parsed = parse_ascii_u64(value).ok_or(ScanError::Malformed(pos))?;
-            let capped = parsed.min(16_777_216);
-            match content_length {
-                Some(existing) if existing != capped => {
+            match content_length_raw {
+                Some(existing) if existing != parsed => {
                     return Err(ScanError::ConflictingContentLength);
                 }
                 Some(_) => {}
-                None => content_length = Some(capped),
+                None => content_length_raw = Some(parsed),
             }
         } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
             // Presence only: this fixture never interprets the value.
+            // Duplicated `Transfer-Encoding` lines (seen more than once, with
+            // the same or a different value) are already handled correctly
+            // by this being a plain presence flag rather than a stored
+            // value: the flag is set exactly once and every later
+            // occurrence is a no-op, so the request is still refused below
+            // precisely as if it carried only one such header.
             has_transfer_encoding = true;
         }
         // Any other header, honoured or not: skip. Its value is never
@@ -220,7 +279,7 @@ fn parse_headers(head: &[u8]) -> Result<RequestIntent, ScanError> {
     }
 
     if has_transfer_encoding {
-        return Err(if content_length.is_some() {
+        return Err(if content_length_raw.is_some() {
             ScanError::ConflictingFraming
         } else {
             ScanError::Chunked
@@ -229,7 +288,7 @@ fn parse_headers(head: &[u8]) -> Result<RequestIntent, ScanError> {
 
     Ok(RequestIntent {
         head_len,
-        content_length: content_length.unwrap_or(0),
+        content_length: content_length_raw.unwrap_or(0).min(16_777_216),
         delay_us,
         chunked: false,
     })
@@ -240,10 +299,29 @@ fn parse_headers(head: &[u8]) -> Result<RequestIntent, ScanError> {
 ///
 /// Returns `Ok(None)` when the head is incomplete and more bytes are needed.
 ///
+/// The terminator search is bounded to `buf`'s first [`HEAD_CAP`] bytes,
+/// never the whole buffer, which matters only when a direct caller (this
+/// crate's own tests, the property test, or the fuzz target) hands this
+/// function a buffer longer than `HEAD_CAP`: a REAL connection's read buffer
+/// is fixed at exactly `HEAD_CAP` bytes (see `handle_connection`), so it can
+/// never even accumulate a terminator located past that many bytes in the
+/// first place, and this function must give the identical answer regardless
+/// of whether the input technically contains one somewhere further out.
+/// Searching the whole buffer here used to make this function's answer
+/// depend on the buffer's TOTAL length, not merely on where the terminator
+/// falls within the first `HEAD_CAP` bytes: a client-controlled distinction
+/// nothing else in this fixture makes, and one that broke this function's
+/// own documented contract that a prefix's answer is always `Ok(None)` or
+/// exactly the full input's terminal answer (watched to fail: a crafted
+/// 17,477-byte input with no terminator in its first 16,384 bytes used to
+/// return `Ok(Some(_))` on the full input but `Err(HeadTooLarge)` on its own
+/// 16,384-byte prefix).
+///
 /// # Errors
 /// See `ScanError`. Every variant maps to a fixed response status, listed there.
 pub fn scan_head(buf: &[u8]) -> Result<Option<RequestIntent>, ScanError> {
-    match memchr::memmem::find(buf, b"\r\n\r\n") {
+    let capped = buf.get(..HEAD_CAP).unwrap_or(buf);
+    match memchr::memmem::find(capped, b"\r\n\r\n") {
         Some(pos) => {
             let head_len = pos.saturating_add(4);
             let head = buf.get(..head_len).unwrap_or(buf);
@@ -378,13 +456,30 @@ fn now() -> Instant {
 
 /// A connection counted in `shared.live` is uncounted on every exit path
 /// from its task, including a panic unwind, because this runs in `Drop`.
+///
+/// The increment itself is NOT here: it happens synchronously in
+/// `accept_loop`, in the very same atomic operation that decides admission
+/// (see the Design section's step 2, `live.fetch_add(1, Relaxed); spawn the
+/// connection task.`). An earlier version incremented here instead, in
+/// `handle_connection`, which only runs on the spawned task's first poll --
+/// an arbitrary amount of time after `accept_loop` already decided to admit
+/// the connection. Between that decision and the first poll, every OTHER
+/// accept, on this listener or any other, still saw the pre-increment count
+/// and could admit too, so `live_connections <= max_connections` (Invariant
+/// 6) could be violated by however many connections were in that window at
+/// once. Watched to fail: reproduced live as a flake in
+/// `max_connections_is_enforced_and_released` (33 open against a
+/// `--max-connections` of 32) under this test file's own concurrency, not
+/// synthetic contention. This guard's only remaining job is releasing the
+/// already-reserved slot on every exit path, including a panic.
 struct LiveGuard {
     shared: Arc<Shared>,
 }
 
 impl LiveGuard {
-    fn new(shared: Arc<Shared>) -> Self {
-        shared.live.fetch_add(1, Ordering::Relaxed);
+    /// Wraps a slot `accept_loop` has ALREADY reserved via `fetch_add`.
+    /// Performs no increment of its own.
+    fn already_armed(shared: Arc<Shared>) -> Self {
         Self { shared }
     }
 }
@@ -436,6 +531,19 @@ struct Shared {
     /// number of one-byte reads; the resumed search keeps it linear. A field
     /// here, not a bare `static`, for the same cross-test-isolation reason as
     /// `sequence` above.
+    ///
+    /// `#[cfg(debug_assertions)]`, not always-on: this is instrumentation for
+    /// one test, not a counter this fixture's own value proposition (a
+    /// known, minimal, constant per-request cost) can afford to carry into a
+    /// release binary. An always-on version cost two extra relaxed RMWs per
+    /// request on a shared cache line -- on top of the `requests` and
+    /// `bytes` counters this crate deliberately does NOT shard per worker --
+    /// in a binary whose entire point is that cost. `cargo test` (every
+    /// script in this repository's gate) builds in the dev profile by
+    /// default, so `debug_assertions` is true there and this field, and the
+    /// read loop's use of it, are both present for the test that needs them;
+    /// `cargo build --release` and `cargo bench` compile it away entirely.
+    #[cfg(debug_assertions)]
     scan_probe_bytes: AtomicU64,
 }
 
@@ -447,12 +555,20 @@ pub struct Origin {
     pub listen_addrs: Vec<SocketAddr>,
     /// The stats listener address, if `--stats-listen` was configured.
     pub stats_addr: Option<SocketAddr>,
+    // In a release build (`not(debug_assertions)`), the only reader of this
+    // field is `scan_probe_bytes_examined`, which is itself
+    // `#[cfg(debug_assertions)]`-gated (see `Shared::scan_probe_bytes`'s doc
+    // comment): the field is genuinely unused there, not a bug.
+    #[cfg_attr(not(debug_assertions), allow(dead_code))]
     shared: Arc<Shared>,
 }
 
 impl Origin {
     /// Total bytes examined so far by this origin's own connections'
-    /// incremental terminator search. See `Shared::scan_probe_bytes`.
+    /// incremental terminator search. See `Shared::scan_probe_bytes`. Present
+    /// only in a debug build (`#[cfg(debug_assertions)]`); see that field's
+    /// doc comment for why.
+    #[cfg(debug_assertions)]
     #[must_use]
     pub fn scan_probe_bytes_examined(&self) -> u64 {
         self.shared.scan_probe_bytes.load(Ordering::Relaxed)
@@ -494,6 +610,7 @@ pub async fn start(config: OriginConfig) -> std::io::Result<Origin> {
         started_at: now(),
         accept_seq: AtomicU64::new(0),
         sequence: AtomicU64::new(0),
+        #[cfg(debug_assertions)]
         scan_probe_bytes: AtomicU64::new(0),
     });
 
@@ -528,20 +645,35 @@ pub async fn start(config: OriginConfig) -> std::io::Result<Origin> {
 /// process stuck retrying both read to a client as a connect timeout, which
 /// looks exactly like a proxy stall.
 async fn accept_loop(listener: TcpListener, role: Role, shared: Arc<Shared>) {
+    let max_connections = usize::try_from(shared.config.max_connections).unwrap_or(usize::MAX);
     loop {
         match listener.accept().await {
             Ok((stream, _peer)) => {
-                let live_now = shared.live.load(Ordering::Relaxed);
-                let max_connections =
-                    usize::try_from(shared.config.max_connections).unwrap_or(usize::MAX);
-                if live_now >= max_connections {
+                // Reserve the slot HERE, synchronously, in the same atomic
+                // operation that decides admission (Design section, step 2):
+                // `fetch_add` returns the count as it stood immediately
+                // before this accept, so `previous >= max_connections` means
+                // this very reservation is the one that pushed the counter
+                // past the bound, and it is released again immediately. A
+                // single shared atomic's `fetch_add` is what keeps this
+                // correct across every accept loop at once (main listeners
+                // and `--stats-listen` all share `shared.live`): the
+                // hardware totally orders concurrent `fetch_add`s on the
+                // same atomic, so no two loops can ever both observe room
+                // for the same slot the way a separate load-then-branch
+                // could. See `LiveGuard`'s doc comment for what this
+                // replaces and why.
+                let previous = shared.live.fetch_add(1, Ordering::Relaxed);
+                if previous >= max_connections {
+                    shared.live.fetch_sub(1, Ordering::Relaxed);
                     shared.counters.add_reject();
                     drop(stream);
                     continue;
                 }
                 let conn_index = shared.accept_seq.fetch_add(1, Ordering::Relaxed);
+                let guard = LiveGuard::already_armed(Arc::clone(&shared));
                 let shared = Arc::clone(&shared);
-                spawn(handle_connection(stream, role, shared, conn_index));
+                spawn(handle_connection(stream, role, shared, conn_index, guard));
             }
             Err(_error) => {
                 // Any accept() failure, EMFILE included: count it, back off
@@ -642,8 +774,8 @@ async fn handle_connection(
     role: Role,
     shared: Arc<Shared>,
     conn_index: u64,
+    _guard: LiveGuard,
 ) {
-    let _guard = LiveGuard::new(Arc::clone(&shared));
     let mut rng = Rng::new(conn_index);
 
     let head_timeout = std::time::Duration::from_millis(u64::from(shared.config.head_timeout_ms));
@@ -655,9 +787,38 @@ async fn handle_connection(
     let mut buf = vec![0u8; HEAD_CAP];
     let mut filled: usize = 0;
     let mut probed_to: usize = 0;
-    let mut head_deadline = now() + head_timeout;
+
+    // The two deadlines are tracked SEPARATELY, per the Design section's
+    // step 0, rather than one variable reused for both purposes (an earlier
+    // version's bug: `--head-timeout-ms` bounded only the connection's very
+    // first head, because every later "wait for the next request" reused the
+    // same variable last set to `now + idle_timeout`, and the read loop for
+    // request 2 onward never recomputed a head-specific deadline at all).
+    //
+    // `idle_deadline` bounds the wait for the very first byte of the NEXT
+    // request while NOTHING of it has arrived yet. It starts `None` and
+    // stays `None` until the first response is ever sent (Design: "set...
+    // idle_deadline = now + idle_timeout_ms AFTER EACH COMPLETE RESPONSE"),
+    // so the fallback below is what gives the connection's very first
+    // request the head timeout rather than the idle one, matching step 0's
+    // "set head_deadline = now + head_timeout_ms ON CONNECTION OPEN".
+    let mut idle_deadline: Option<Instant> = None;
+    // `head_deadline` bounds finishing a head ALREADY in progress. `None`
+    // exactly when `filled == 0`: nothing of the next head exists yet, so
+    // there is nothing to bound with a head-specific deadline. Recomputed
+    // fresh, from `now`, the moment any byte of the next head is known to
+    // exist -- either a fresh read delivering it, or (a pipelined request)
+    // it already sitting in `buf` as leftover from the previous request's
+    // compaction -- which is exactly the "switch from idle to head as soon
+    // as the first byte of a new request arrives" the Design section calls
+    // for.
+    let mut head_deadline_slot: Option<Instant> = None;
 
     'connection: loop {
+        if filled > 0 && head_deadline_slot.is_none() {
+            head_deadline_slot = Some(now() + head_timeout);
+        }
+
         // 1. Read until a complete head is present, resuming the terminator
         //    search from `probed_to` rather than restarting at 0 (Design,
         //    Request scan, step 2).
@@ -666,6 +827,7 @@ async fn handle_connection(
             let Some(window) = buf.get(window_start..filled) else {
                 break 'connection;
             };
+            #[cfg(debug_assertions)]
             shared
                 .scan_probe_bytes
                 .fetch_add(u64::try_from(window.len()).unwrap_or(0), Ordering::Relaxed);
@@ -681,11 +843,22 @@ async fn handle_connection(
             let Some(read_target) = buf.get_mut(filled..HEAD_CAP) else {
                 break 'connection;
             };
-            match read_under_deadline(&mut stream, read_target, head_deadline).await {
+            let active_deadline = head_deadline_slot
+                .unwrap_or_else(|| idle_deadline.unwrap_or_else(|| now() + head_timeout));
+            match read_under_deadline(&mut stream, read_target, active_deadline).await {
                 Ok(Some(0) | None) | Err(_) => break 'connection,
-                Ok(Some(n)) => filled = filled.saturating_add(n),
+                Ok(Some(n)) => {
+                    filled = filled.saturating_add(n);
+                    if head_deadline_slot.is_none() {
+                        head_deadline_slot = Some(now() + head_timeout);
+                    }
+                }
             }
         };
+        // By construction `head_len` was only reached with `filled > 0`, so
+        // `head_deadline_slot` is always `Some` here; the fallback exists
+        // only to avoid an `unwrap`/`expect`, which are denied outside tests.
+        let head_deadline = head_deadline_slot.unwrap_or_else(|| now() + head_timeout);
 
         let head_parsed_at = now();
         let head = buf.get(..head_len).unwrap_or(&[]);
@@ -735,10 +908,17 @@ async fn handle_connection(
             sleep_until(delay_deadline).await;
         }
 
-        // 5. Respond.
-        let written = match role {
+        // 5. Respond. Only `Role::Main` responses are counted in
+        //    `shared.counters`: the stats listener exists so a harness can
+        //    reconcile `client_requests == origin_requests + proxy_errors`
+        //    for the MAIN listener's own traffic, and counting the stats
+        //    listener's own responses in that same counter would inflate
+        //    `requests`/`bytes` by however many times the harness itself
+        //    polled `/stats`, breaking the very reconciliation the endpoint
+        //    exists for.
+        match role {
             Role::Main => {
-                if shared.config.sequence {
+                let written = if shared.config.sequence {
                     let seq = shared.sequence.fetch_add(1, Ordering::Relaxed);
                     let mut scratch = [0u8; 512];
                     let head_written = shared.arena.patched_head(seq, &mut scratch);
@@ -751,39 +931,50 @@ async fn handle_connection(
                     {
                         break 'connection;
                     }
-                    Some(
-                        u64::try_from(head_written)
-                            .unwrap_or(0)
-                            .saturating_add(u64::try_from(shared.arena.body().len()).unwrap_or(0)),
-                    )
+                    u64::try_from(head_written)
+                        .unwrap_or(0)
+                        .saturating_add(u64::try_from(shared.arena.body().len()).unwrap_or(0))
                 } else {
                     let bytes = shared.arena.bytes();
                     if stream.write_all(bytes).await.is_err() {
                         break 'connection;
                     }
-                    Some(u64::try_from(bytes.len()).unwrap_or(0))
-                }
+                    u64::try_from(bytes.len()).unwrap_or(0)
+                };
+                shared.counters.add_request(written);
             }
             Role::Stats => {
-                let response = if stats_hit {
-                    stats_body(&shared)
+                if stats_hit {
+                    let response = stats_body(&shared);
+                    if stream.write_all(&response).await.is_err() {
+                        break 'connection;
+                    }
+                    // `Connection: keep-alive` in `stats_body`'s own
+                    // response: falling through to loop again is what
+                    // actually honours that, unlike the 404 case below.
                 } else {
-                    RESPONSE_404.to_vec()
-                };
-                if stream.write_all(&response).await.is_err() {
+                    // `RESPONSE_404` advertises `Connection: close`
+                    // (`serve.rs`'s own preallocated constant): closing
+                    // right after writing it, rather than looping for
+                    // another request on this connection, is what makes
+                    // that advertised framing true. A client that honours
+                    // the framing it was told and reads to EOF must not be
+                    // left waiting out the idle timeout for a close that
+                    // was already promised.
+                    let _ = stream.write_all(RESPONSE_404).await; // it-allow: no-swallowed-error reason: the connection is closed unconditionally on the next line regardless of whether this write succeeds
                     break 'connection;
                 }
-                Some(u64::try_from(response.len()).unwrap_or(0))
             }
-        };
-
-        if let Some(bytes_written) = written {
-            shared.counters.add_request(bytes_written);
         }
 
-        // 6. Loop for the next request on this keepalive connection, subject
-        //    to the idle timeout.
-        head_deadline = now() + idle_timeout;
+        // 6. Loop for the next request on this keepalive connection: the
+        //    wait for its first byte is bound by the idle timeout. Resetting
+        //    `head_deadline_slot` to `None` here is what makes the next
+        //    outer-loop iteration recompute it fresh (from the moment any
+        //    byte of the next head actually arrives) instead of carrying
+        //    over a deadline instant already in the past.
+        idle_deadline = Some(now() + idle_timeout);
+        head_deadline_slot = None;
     }
 }
 
@@ -875,6 +1066,141 @@ mod tests {
     fn malformed_header_line_has_no_colon() {
         let result = scan_head(b"GET / HTTP/1.1\r\nnotaheader\r\n\r\n");
         assert!(matches!(result, Err(ScanError::Malformed(_))));
+    }
+
+    // -------------------------------------------------------------------
+    // Non-canonical Content-Length/Transfer-Encoding smuggling spellings.
+    // Each of these answered 200 (with the space/tab cases) or silently
+    // dropped the folded header (obs-fold) before this fix, because
+    // `Transfer-Encoding` split against a name slice that carried the extra
+    // whitespace no longer matched `eq_ignore_ascii_case(b"transfer-encoding")`.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn space_before_colon_still_conflicts_with_content_length() {
+        let result = scan_head(
+            b"GET / HTTP/1.1\r\nTransfer-Encoding : chunked\r\nContent-Length: 5\r\n\r\n",
+        );
+        assert!(
+            matches!(result, Err(ScanError::Malformed(_))),
+            "a space before the colon must be refused as malformed, not silently \
+             treated as an unrecognised header: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn tab_before_colon_still_conflicts_with_content_length() {
+        let result = scan_head(
+            b"GET / HTTP/1.1\r\nTransfer-Encoding\t: chunked\r\nContent-Length: 5\r\n\r\n",
+        );
+        assert!(
+            matches!(result, Err(ScanError::Malformed(_))),
+            "a tab before the colon must be refused as malformed: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn obs_fold_continuation_is_rejected_not_silently_dropped() {
+        // An RFC 7230-obsolete folded continuation line: per the header
+        // grammar this is (invalidly) a continuation of the PRECEDING
+        // header's value, not a header of its own. Before this fix, this
+        // fixture split it on its own colon anyway, saw a `name` of
+        // ` Transfer-Encoding` (leading space), failed the case-insensitive
+        // match, and answered 200 with `content_length: 5` -- exactly the
+        // desync the Content-Length/Transfer-Encoding refusal exists to
+        // catch.
+        let result = scan_head(
+            b"GET / HTTP/1.1\r\nContent-Length: 5\r\n Transfer-Encoding: chunked\r\n\r\n",
+        );
+        assert!(
+            matches!(result, Err(ScanError::Malformed(_))),
+            "an obs-fold continuation line must be refused, not parsed as a \
+             fresh (and then unrecognised) header: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn mixed_case_transfer_encoding_still_conflicts_with_content_length() {
+        // Header names are already matched case-insensitively
+        // (`eq_ignore_ascii_case`); this pins that the smuggling refusal
+        // still fires under a mixed-case spelling, guarding against a
+        // future regression that narrows the match to an exact string.
+        let result =
+            scan_head(b"GET / HTTP/1.1\r\ntRaNsFeR-EnCoDiNg: chunked\r\nContent-Length: 5\r\n\r\n");
+        assert_eq!(result, Err(ScanError::ConflictingFraming));
+    }
+
+    #[test]
+    fn duplicated_transfer_encoding_headers_still_conflict_with_content_length() {
+        // Two Transfer-Encoding lines (a TE.TE smuggling shape): the
+        // presence flag this parser uses is set exactly once and every
+        // later occurrence is a no-op, so this must refuse identically to
+        // a single Transfer-Encoding line, not, say, treat the second as an
+        // unrelated duplicate and let it slip through some other path.
+        let result = scan_head(
+            b"GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n",
+        );
+        assert_eq!(result, Err(ScanError::ConflictingFraming));
+
+        let chunked_only = scan_head(
+            b"GET / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked\r\n\r\n",
+        );
+        assert_eq!(chunked_only, Err(ScanError::Chunked));
+    }
+
+    #[test]
+    fn bare_lf_line_terminator_is_malformed() {
+        // The exact request-smuggling reproduction: bare LF (no CR) between
+        // the request line and each header collapses this parser's
+        // CRLF-only line splitting, so `Content-Length` and
+        // `Transfer-Encoding` were both silently unrecognised and the
+        // request was answered 200 with `content_length: 0` -- meaning the
+        // 5 bytes of declared body the client actually sends would be read
+        // back as the start of the NEXT pipelined request.
+        let result =
+            scan_head(b"POST / HTTP/1.1\nContent-Length: 5\nTransfer-Encoding: chunked\r\n\r\n");
+        assert!(
+            matches!(result, Err(ScanError::Malformed(_))),
+            "a bare LF line terminator must be refused: got {result:?}"
+        );
+    }
+
+    #[test]
+    fn duplicate_content_length_over_cap_with_different_raw_values_is_rejected() {
+        // Two distinct declared lengths that both happen to exceed the
+        // 16_777_216 cap must still conflict: comparing the CAPPED values
+        // (both 16_777_216) would wrongly accept them as equal.
+        let result = scan_head(
+            b"GET / HTTP/1.1\r\nContent-Length: 99999999999\r\nContent-Length: 88888888888\r\n\r\n",
+        );
+        assert_eq!(result, Err(ScanError::ConflictingContentLength));
+    }
+
+    #[test]
+    fn terminator_past_head_cap_in_larger_buffer_is_head_too_large() {
+        // The exact crash reproduction from the fuzz target's own
+        // incremental-prefix property: a 17,477-byte buffer whose first
+        // 16,384 bytes contain no terminator, which only appears in the
+        // last four bytes. Before this fix, `scan_head` searched the WHOLE
+        // buffer for the terminator before ever checking the cap, so this
+        // returned `Ok(Some(_))` on the full input while a real connection
+        // (whose read buffer is fixed at `HEAD_CAP` bytes) would already
+        // have rejected it with `HeadTooLarge` well before ever seeing
+        // those last four bytes -- and the 16,384-byte prefix of this very
+        // buffer answers `Err(HeadTooLarge)` too, so the two disagreed.
+        let mut buf = vec![b'a'; 17_473];
+        buf.extend_from_slice(b"\r\n\r\n");
+        assert_eq!(buf.len(), 17_477);
+
+        let result = scan_head(&buf);
+        assert_eq!(result, Err(ScanError::HeadTooLarge));
+
+        let prefix = buf.get(..HEAD_CAP).unwrap_or(&buf);
+        assert_eq!(
+            scan_head(prefix),
+            result,
+            "the cap-exceeding prefix and the full buffer must agree"
+        );
     }
 
     #[test]
