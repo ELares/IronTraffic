@@ -636,15 +636,29 @@ PYEOF
 # GITHUB_WORKFLOW_REF, which proves the sign -> attest round trip itself
 # works for real; verify_fails_without_identity_pin (test 11) is what
 # proves the pin mechanism itself is load-bearing.
-REAL_FIXTURE_ARTIFACT=""
-REAL_FIXTURE_IDENTITY_REGEXP=""
+# State crosses into two FILES under $WORK, never shell variables: both
+# tests below call this function as a plain statement (never inside
+# `$(...)`), because command substitution forks a subshell, and a variable
+# assigned INSIDE a function called that way never reaches the caller. Found
+# exactly that way, on this issue's own real pull-request CI run: an
+# artifact path and an identity regexp were both assigned as plain
+# variables inside build_real_signed_fixture, called as
+# `artifact="$(build_real_signed_fixture)"`, and the regexp variable read
+# back empty in the caller, which made cosign refuse with "certificate
+# identity ... is required for verification in keyless mode" against a
+# perfectly valid, freshly-signed fixture.
+REAL_FIXTURE_PATH_FILE="$WORK/real-fixture-path.txt"
+REAL_FIXTURE_REGEXP_FILE="$WORK/real-fixture-regexp.txt"
+REAL_FIXTURE_BUILT=0
+REAL_FIXTURE_OK=1
 
 build_real_signed_fixture() {
-    if [ -n "$REAL_FIXTURE_ARTIFACT" ]; then
-        printf '%s' "$REAL_FIXTURE_ARTIFACT"
-        return 0
+    if [ "$REAL_FIXTURE_BUILT" -eq 1 ]; then
+        return "$REAL_FIXTURE_OK"
     fi
+    REAL_FIXTURE_BUILT=1
     if ! have_actions_oidc; then
+        REAL_FIXTURE_OK=1
         return 1
     fi
     fixture_dir="$WORK/real-signed"
@@ -658,10 +672,12 @@ build_real_signed_fixture() {
     write_sha256sums_line "$artifact"
     if ! sh "$REPO_ROOT/scripts/release/sign.sh" "$artifact" >"$WORK/real-sign.log" 2>&1; then
         cat "$WORK/real-sign.log" >&2
+        REAL_FIXTURE_OK=1
         return 1
     fi
     if ! sh "$REPO_ROOT/scripts/release/attest.sh" "$artifact" "$FIXTURE_TARGET" "control-plane" >"$WORK/real-attest.log" 2>&1; then
         cat "$WORK/real-attest.log" >&2
+        REAL_FIXTURE_OK=1
         return 1
     fi
     # https://github.com/<GITHUB_WORKFLOW_REF> -> the certificate-identity
@@ -669,21 +685,24 @@ build_real_signed_fixture() {
     # builder_id construction. GITHUB_WORKFLOW_REF's only regex metachar is
     # ".", escaped before this is used as a --certificate-identity-regexp.
     escaped_workflow_ref="$(printf '%s' "$GITHUB_WORKFLOW_REF" | sed 's/\./\\./g')"
-    REAL_FIXTURE_IDENTITY_REGEXP="^https://github\\.com/${escaped_workflow_ref}\$"
-    REAL_FIXTURE_ARTIFACT="$artifact"
-    printf '%s' "$artifact"
+    printf '%s' "$artifact" > "$REAL_FIXTURE_PATH_FILE"
+    printf '^https://github\\.com/%s$' "$escaped_workflow_ref" > "$REAL_FIXTURE_REGEXP_FILE"
+    REAL_FIXTURE_OK=0
+    return 0
 }
 
 test_verify_prints_source_commit() {
-    artifact="$(build_real_signed_fixture)" || {
+    if ! build_real_signed_fixture; then
         skip "verify_prints_source_commit" "no ambient GitHub Actions OIDC identity in this run"
         return
-    }
+    fi
+    artifact="$(cat "$REAL_FIXTURE_PATH_FILE")"
+    identity_regexp="$(cat "$REAL_FIXTURE_REGEXP_FILE")"
     expected_commit="$(git rev-parse HEAD)"
     if ! cosign verify-blob-attestation \
         --certificate "$artifact.pem" \
         --signature "$artifact.intoto.jsonl" \
-        --certificate-identity-regexp "$REAL_FIXTURE_IDENTITY_REGEXP" \
+        --certificate-identity-regexp "$identity_regexp" \
         --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
         --type slsaprovenance \
         "$artifact" >"$WORK/real-verify-attest.log" 2>&1; then
@@ -700,10 +719,11 @@ test_verify_prints_source_commit() {
 }
 
 test_provenance_subject_matches_digest() {
-    artifact="$(build_real_signed_fixture)" || {
+    if ! build_real_signed_fixture; then
         skip "provenance_subject_matches_digest" "no ambient GitHub Actions OIDC identity in this run"
         return
-    }
+    fi
+    artifact="$(cat "$REAL_FIXTURE_PATH_FILE")"
     actual_sha256="$(sha256_of "$artifact")"
     intoto_file="$artifact.intoto.jsonl"
     if [ ! -s "$intoto_file" ]; then

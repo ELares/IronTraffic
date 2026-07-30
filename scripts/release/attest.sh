@@ -18,23 +18,34 @@
 #   invocation.configSource.uri/digest   the source repository and commit
 #   invocation.parameters  target, features, SOURCE_DATE_EPOCH, dirty (from
 #                          IT_GIT_DIRTY, the same flag build.sh stamps;
-#                          edge case 9 is what reads this back)
+#                          edge case 9 is what reads this back), plus
+#                          workflowFileSha256 and cargoLockSha256 (see below)
 #   materials[0].digest.sha1              the same commit, restated as a
 #                          SLSA "material", for tooling that reads materials
 #                          rather than configSource
-#   metadata.workflowFileSha256           the sha256 of the workflow file
-#                          itself, so a change to ci.yml is independently
-#                          checkable against the commit named above
-#   metadata.cargoLockSha256              the resolved dependency digest:
-#                          sha256(Cargo.lock), which is what lets a verifier
-#                          check that the SBOM and this artifact describe
-#                          the same dependency graph (invariant 8)
 #
+# workflowFileSha256 (the workflow file's own digest, so a change to ci.yml
+# is independently checkable against the commit named above) and
+# cargoLockSha256 (sha256(Cargo.lock), the resolved dependency digest that
+# lets a verifier check the SBOM and this artifact describe the same
+# dependency graph, invariant 8) live under invocation.parameters, NOT under
+# metadata, though SLSA v0.2's own "parameters" field is the closer
+# conceptual fit for the workflow file digest. This was not the first
+# version of this script: `cosign attest-blob --type slsaprovenance`
+# deserialises the given --predicate into its OWN typed Go struct for the
+# official SLSA v0.2 schema and re-serialises FROM that struct, so any field
+# placed under `metadata` that is not part of the spec (buildInvocationID,
+# completeness, buildStartedOn, buildFinishedOn, reproducible) is silently
+# dropped from the signed attestation. Verified directly, locally, with a
+# throwaway `cosign attest-blob --key` (not the keyless path this project
+# ships): a predicate with `metadata.cargoLockSha256` set produced a signed
+# attestation whose metadata object did NOT contain that key at all; the
+# identical value placed under `invocation.parameters.cargoLockSha256`
+# survived byte for byte, because SLSA v0.2's own spec leaves `parameters`
+# an arbitrary, buildType-specific object cosign's struct does not filter.
 # This uses the standard SLSA v0.2 provenance field names (builder,
 # buildType, invocation, materials, metadata) where they exist, so a
-# SLSA-aware consumer reads a familiar shape, and adds two fields neither
-# name has a slot for (metadata.workflowFileSha256,
-# metadata.cargoLockSha256) rather than overloading an existing one.
+# SLSA-aware consumer reads a familiar shape.
 set -eu
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
@@ -167,13 +178,14 @@ main() {
           buildType: $build_type,
           invocation: {
             configSource: { uri: $config_uri, digest: { sha1: $commit_sha } },
-            parameters: { target: $target, features: $features, SOURCE_DATE_EPOCH: $epoch, dirty: $dirty }
+            parameters: {
+              target: $target, features: $features, SOURCE_DATE_EPOCH: $epoch, dirty: $dirty,
+              workflowFileSha256: $workflow_sha256, cargoLockSha256: $cargo_lock_sha256
+            }
           },
           materials: [ { uri: $config_uri, digest: { sha1: $commit_sha } } ],
           metadata: {
             buildInvocationId: $run_id,
-            workflowFileSha256: $workflow_sha256,
-            cargoLockSha256: $cargo_lock_sha256,
             completeness: { parameters: true, environment: false, materials: true }
           }
         }' > "$predicate_file"
