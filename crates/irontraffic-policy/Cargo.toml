@@ -20,6 +20,21 @@ logos = "0.15"
 # the only item `irontraffic-policy` needs from it until
 # `{{itpl-mutation-plan-and-policy-filter}}` implements the `Filter` trait.
 irontraffic-filter = { path = "../irontraffic-filter", version = "0.1.0" }
+# Linear-time, backtracking-free matching for the `matches` operator. It is the only
+# regex engine permitted in the workspace precisely because it cannot backtrack, so a
+# pattern from configuration cannot be a regex bomb. `bytes` because ITPL strings are
+# bytes; `unicode` stays enabled at the crate level for correctness of the parser but
+# every compiled pattern sets `unicode(false)`.
+regex = "1"
+
+[features]
+# Exposes `Program::from_parts`, the unchecked constructor `verify`'s unit tests and
+# the fuzz target in `{{itpl-differential-oracle-and-fuzz}}` need. Off by default and
+# never enabled by a release build. It MUST be declared here even though only
+# `#[cfg(any(test, feature = "test-util"))]` reads it: an undeclared feature makes the
+# `cfg` unconditionally false and raises `unexpected_cfgs`, which is a hard error under
+# the `-D warnings` clippy gate this issue's acceptance criteria run.
+test-util = []
 
 [dev-dependencies]
 criterion = { workspace = true }

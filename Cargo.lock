@@ -1124,6 +1124,7 @@ dependencies = [
  "irontraffic-filter",
  "logos",
  "proptest",
+ "regex",
 ]
 
 [[package]]
