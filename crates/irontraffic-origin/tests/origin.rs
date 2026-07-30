@@ -1100,6 +1100,57 @@ fn free_port() -> std::io::Result<u16> {
     Ok(listener.local_addr()?.port())
 }
 
+/// Minimal POSIX single-quote shell escaping: wraps `value` in single quotes,
+/// replacing any embedded single quote with `'\''` (close the quote, an
+/// escaped literal quote, reopen the quote). Used only to build the
+/// `/bin/sh -c` command line `spawn_with_rlimit` hands to a real shell; every
+/// value passed through it here is a fixed test-controlled path or socket
+/// address, never untrusted input, but quoting it properly is what makes the
+/// command line correct regardless.
+fn shell_quote(value: &str) -> String {
+    let mut quoted = String::with_capacity(value.len() + 2);
+    quoted.push('\'');
+    for ch in value.chars() {
+        if ch == '\'' {
+            quoted.push_str("'\\''");
+        } else {
+            quoted.push(ch);
+        }
+    }
+    quoted.push('\'');
+    quoted
+}
+
+/// Blocks the calling thread until `addr` accepts a TCP connection, up to a
+/// generous bound, then returns.
+///
+/// Replaces a fixed `sleep(300ms)`-and-hope wait that both spawn paths used
+/// to rely on. Watched to fail: under this file's own concurrency (`cargo
+/// test` runs every test in this file, several of them multi-threaded, on
+/// this one process's CPUs at once), a flat 300ms sleep occasionally elapsed
+/// before the just-spawned child had actually bound its listener, and the
+/// very next `connect` in the test then failed with `ConnectionRefused`;
+/// reproduced directly with the fixed sleep still in place, 2 failures (both
+/// subprocess tests together, in the same run) across 8 consecutive `cargo
+/// test --locked -p irontraffic-origin --all-features` runs. Polling for a
+/// real, successful connect is unaffected by how loaded the host happens to
+/// be at the moment any one child was spawned, unlike a fixed guess.
+fn wait_until_listening(addr: SocketAddr) {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        if std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
+            return;
+        }
+        if std::time::Instant::now() >= deadline {
+            // Best-effort: give up and let the caller's own next connect
+            // attempt surface the real error, exactly as the old fixed
+            // sleep would have on a child that never came up at all.
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(15));
+    }
+}
+
 /// A real, separate `it-origin` process, killed on drop.
 struct ChildOrigin {
     child: std::process::Child,
@@ -1108,35 +1159,66 @@ struct ChildOrigin {
 
 impl ChildOrigin {
     /// Spawns `it-origin --listen <a free port>` plus `extra_args`, waiting
-    /// briefly for it to bind before returning. Returns a `Result` rather
-    /// than panicking, per `start`'s doc comment.
+    /// for it to bind before returning. Returns a `Result` rather than
+    /// panicking, per `start`'s doc comment.
     fn spawn(extra_args: &[&str]) -> std::io::Result<Self> {
         let spawned = Self::spawn_child(extra_args)?;
-        std::thread::sleep(Duration::from_millis(300));
+        wait_until_listening(spawned.addr);
         Ok(spawned)
     }
 
-    /// Spawns with this process's own `RLIMIT_NOFILE` lowered to
-    /// `nofile_limit` just long enough for the child to inherit it at fork,
-    /// then restored immediately: `Command::spawn` returns as soon as the
-    /// child is forked and exec'd, and this process's limit is put back
-    /// before the readiness sleep below runs, not after it. `cargo test`
-    /// runs every test in this file concurrently on other threads of this
-    /// same process, and `RLIMIT_NOFILE` is process-wide state; holding the
-    /// lowered limit for the whole ~300ms readiness wait (rather than just
-    /// the `spawn()` call) starved unrelated concurrently running tests of
-    /// file descriptors, which is exactly the failure this ordering avoids.
+    /// Spawns `it-origin` with its own `RLIMIT_NOFILE` soft limit lowered to
+    /// `nofile_limit` before it execs, WITHOUT ever touching this test
+    /// binary's own process-wide limit.
+    ///
+    /// An earlier version of this function lowered THIS PROCESS's own
+    /// `RLIMIT_NOFILE`, spawned the child, then restored it. That is broken
+    /// in both directions, because `cargo test` runs every test in this file
+    /// concurrently, on many threads, in one process, and `RLIMIT_NOFILE` is
+    /// process-wide state shared by every one of them:
+    ///
+    /// - Watched to fail: on a clean checkout, 5 consecutive runs of `cargo
+    ///   test --locked -p irontraffic-origin --all-features` produced 1, 1,
+    ///   10, 1, and 13 failures, every one of them an unrelated sibling test
+    ///   whose own `TcpListener::bind` or socket allocation hit `EMFILE`
+    ///   while this function's window held the limit at 64.
+    /// - Even confined to that window, the lowered limit never actually
+    ///   reached the child: `spawn_child` calls `ensure_high_fd_limit()` as
+    ///   its first statement, and that function's `Once` -- if this is the
+    ///   first call in the process -- raises the limit right back up before
+    ///   `Command::spawn` forks, so the child always inherited a high limit
+    ///   and this test's own EMFILE condition was never actually created.
+    ///
+    /// The fix lowers the limit only in the CHILD, never in this shared test
+    /// binary: spawn `/bin/sh -c 'ulimit -n <n> && exec <bin> <args...>'`
+    /// rather than the binary directly. The shell's own `ulimit` builtin
+    /// calls `setrlimit` on the freshly forked shell process (never on this
+    /// test binary's own process), and `exec` then replaces that process's
+    /// image with `it-origin` while carrying the just-lowered limit forward
+    /// -- unaffected by whatever this test binary's own limit is, or later
+    /// becomes, regardless of run order or `ensure_high_fd_limit`. `/bin/sh`
+    /// and its `ulimit` builtin are present on both platforms this crate is
+    /// required to run on (Design section, point 2).
     fn spawn_with_rlimit(extra_args: &[&str], nofile_limit: u64) -> std::io::Result<Self> {
-        let original = rustix::process::getrlimit(rustix::process::Resource::Nofile);
-        let lowered = rustix::process::Rlimit {
-            current: Some(nofile_limit),
-            maximum: original.maximum,
-        };
-        rustix::process::setrlimit(rustix::process::Resource::Nofile, lowered)?;
-        let spawned = Self::spawn_child(extra_args);
-        rustix::process::setrlimit(rustix::process::Resource::Nofile, original)?;
-        std::thread::sleep(Duration::from_millis(300));
-        spawned
+        ensure_high_fd_limit();
+        let port = free_port()?;
+        let addr = SocketAddr::from(([127, 0, 0, 1], port));
+        let bin = env!("CARGO_BIN_EXE_it-origin");
+
+        let mut command_line = format!("ulimit -n {nofile_limit} && exec {}", shell_quote(bin));
+        command_line.push_str(" --listen ");
+        command_line.push_str(&shell_quote(&addr.to_string()));
+        for arg in extra_args {
+            command_line.push(' ');
+            command_line.push_str(&shell_quote(arg));
+        }
+
+        let child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg(&command_line)
+            .spawn()?;
+        wait_until_listening(addr);
+        Ok(Self { child, addr })
     }
 
     fn spawn_child(extra_args: &[&str]) -> std::io::Result<Self> {
