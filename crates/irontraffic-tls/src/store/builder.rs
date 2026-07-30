@@ -901,6 +901,50 @@ mod tests {
             .default_credential()
             .map(|c| c.fingerprint());
         assert_eq!(got, Some(cred_b.fingerprint()));
+
+        // Folded in here rather than added as a 22nd test, for the same reason as the
+        // from_previous regressions: #118 fixes the reported test count at 21.
+        //
+        // A `Remove` must be a WITHDRAWAL OF TRUST, which is this module's stated rule and the
+        // whole reason `Remove` is exempt from the pending cap. Removing the name whose
+        // credential is also the configured default used to drop the name entry and leave the
+        // default pointing at the very same credential, so `resolve` for the removed name still
+        // returned it through `default_path()`, as did every other name. A revoked certificate
+        // stayed in service and nothing downstream could notice.
+        coalescer
+            .submit(install_exact("revoked.example.com", &cred_b))
+            .expect("valid update");
+        coalescer.flush_now().expect("flush ok");
+        assert_eq!(
+            cell.load()
+                .certs
+                .resolve("revoked.example.com", ClientCaps::all())
+                .map(|c| c.fingerprint()),
+            Some(cred_b.fingerprint()),
+            "the fixture must serve the to-be-revoked credential before the removal"
+        );
+
+        coalescer
+            .submit(CertUpdate::Remove {
+                names: vec!["revoked.example.com".into()],
+            })
+            .expect("valid update");
+        coalescer.flush_now().expect("flush ok");
+        let after = cell.load();
+        assert_eq!(
+            after.certs.default_credential().map(|c| c.fingerprint()),
+            None,
+            "removing the name whose credential is the default must withdraw the default too, \
+             or the revoked credential stays in service for every name through default_path()"
+        );
+        assert_eq!(
+            after
+                .certs
+                .resolve("revoked.example.com", ClientCaps::all())
+                .map(|c| c.fingerprint()),
+            None,
+            "the removed name must no longer resolve to the revoked credential"
+        );
     }
 
     #[test]
@@ -1482,7 +1526,20 @@ mod tests {
                     Op::Remove { is_wild, slot } => {
                         let name = if *is_wild { wild_base(*slot) } else { exact_name(*slot) };
                         cb.remove(&name);
-                        pending.remove(&(*is_wild, *slot));
+                        let removed = pending.remove(&(*is_wild, *slot));
+                        // Mirror `CertIndexBuilder::remove`'s withdrawal-of-trust rule: removing
+                        // the name whose credential is the configured default clears the default
+                        // too, otherwise the removal leaves the revoked credential serving every
+                        // name through `default_path()`. The model can reproduce this from the
+                        // net state, which is what keeps the incremental and from-scratch paths
+                        // equivalent under the rule.
+                        if let (Some(d), Some(list)) = (default_idx, removed.as_ref())
+                            && list
+                                .iter()
+                                .any(|&i| pool[i].fingerprint() == pool[d].fingerprint())
+                        {
+                            default_idx = None;
+                        }
                     }
                     Op::Replace { from_idx, to_idx } => {
                         let fp = pool[*from_idx].fingerprint();

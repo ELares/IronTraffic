@@ -394,11 +394,30 @@ impl CertIndexBuilder {
     /// `upsert_wildcard("*.example.com", _)` pass `"example.com"`, because that is what the
     /// wildcard map is keyed on. Passing `"*.example.com"` normalizes to an error and is a no-op.
     /// This method removes every key type for the name; there is no per-key-type removal.
+    ///
+    /// **It also clears the default credential when the credential being withdrawn is the one
+    /// configured as the default.** Without this, a removal is not a withdrawal of trust at all:
+    /// the entry disappears from the name maps, but `default_path()` keeps serving the very same
+    /// `Arc<Credentials>` for the removed name and for every other name too, so a revoked or
+    /// compromised certificate stays in service with nothing downstream to notice. That is the
+    /// exact failure this module's "a removal is never dropped" rule exists to prevent, and the
+    /// cap rule alone does not deliver it.
     pub fn remove(&mut self, name: &str) {
         let mut buf = [0u8; MAX_NAME_LEN];
         let Ok(normalized) = name::normalize(name, &mut buf) else {
             return;
         };
+        // Identity is the fingerprint, not the `Arc` pointer: the same certificate loaded twice
+        // is the same trust decision and must be withdrawn either way.
+        if let Some(default) = self.default_cred.as_ref() {
+            let default_fingerprint = default.fingerprint();
+            let withdrawn = self.entries.iter().any(|(entry_name, _, cred)| {
+                entry_name.as_ref() == normalized && cred.fingerprint() == default_fingerprint
+            });
+            if withdrawn {
+                self.default_cred = None;
+            }
+        }
         self.entries
             .retain(|(entry_name, _, _)| entry_name.as_ref() != normalized);
     }
