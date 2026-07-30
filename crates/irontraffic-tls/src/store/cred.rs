@@ -117,6 +117,12 @@ pub enum CertError {
     IndexTooLarge,
     /// A challenge-map operation failed. Carries the challenge error unchanged.
     Challenge(ChallengeError),
+    /// A must-staple certificate was submitted (as an `Install`, `Replace` or `SetDefault`) with
+    /// no OCSP staple attached.
+    MustStapleWithoutStaple {
+        /// Which credential.
+        fingerprint: CertFingerprint,
+    },
 }
 
 impl core::fmt::Display for CertError {
@@ -159,6 +165,11 @@ impl core::fmt::Display for CertError {
                 "the certificate index exceeds its 1 GiB name arena or 16777216 group limit",
             ),
             CertError::Challenge(e) => write!(f, "challenge map error: {e}"),
+            CertError::MustStapleWithoutStaple { fingerprint } => write!(
+                f,
+                "credential {} carries the must-staple extension but has no OCSP staple attached",
+                core::str::from_utf8(&fingerprint.to_hex()).unwrap_or("<invalid fingerprint>")
+            ),
         }
     }
 }

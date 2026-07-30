@@ -1634,3 +1634,81 @@ bypassable by anyone who can send a `Host` header, and that is a residual risk t
   negotiate 0-RTT today, so the risk is not live, but the residual risk is recorded here rather
   than left implicit for whenever it is. `early-data-policy-and-replay-filter` (#121) owns this
   paragraph and the policy that must exist before 0-RTT is turned on.
+
+## OCSP stapling
+
+**No OCSP fetch, DNS lookup or socket operation ever happens on the handshake path.** The only OCSP
+work a handshake does is copying an already-validated staple byte slice that rustls sends;
+`irontraffic-tls`'s own module docs on `ocsp.rs` and `ocsp_update.rs` state this as a structural
+property, and `rg -n 'reqwest|hyper|ureq|isahc|curl|TcpStream|std::net' crates/irontraffic-tls/`
+finding nothing is the same property, checked mechanically rather than by convention. Turning one
+inbound handshake into one outbound HTTP request would be a connection amplification attack against
+both this process and the CA operating the responder: an attacker who can open handshakes for a
+must-staple name would otherwise be able to make this process generate an unbounded number of
+outbound fetches at will, at both our expense and the responder's. `OcspUpdater::tick` is instead
+driven only by the control-plane loop, on a blocking-capable task, never on a data-plane thread,
+because each fetch blocks for up to 5 seconds.
+
+**The AIA URL comes out of a certificate, and a certificate is not always operator-written.**
+Certificates arrive from the configuration plane, from an ACME CA, and in Kubernetes from a Secret a
+namespace owner controls, so "the operator wrote it" is not true in every deployment. A certificate
+carrying `http://169.254.169.254/latest/meta-data/iam/security-credentials/` as its OCSP AIA URL
+turns the staple updater into a cloud-metadata fetcher; one carrying `http://10.0.0.5:6379/` turns it
+into a request generator against an internal service; one carrying `file:///etc/shadow` depends
+entirely on what the underlying HTTP client does with an unexpected scheme. This is the standard
+shape of server-side request forgery, with a certificate as the delivery vector instead of a request
+parameter.
+
+`ocsp::validate_aia_url` is the gate, and it runs before **every** fetch, including every redirect
+hop, because a policy that lives only inside the fetcher is a policy the next fetcher forgets:
+
+1. The URL must parse, must be at most 1,024 bytes, and its scheme must be exactly `http` or
+   `https`. Everything else, including `file`, `ftp`, `gopher` and a schemeless string, is refused.
+   RFC 6960 responders are HTTP.
+2. There must be no userinfo component (`http://user:pass@host/`), a credential-smuggling and
+   host-confusion vector.
+3. The port, if present, must be 80 or 443. A responder on port 6379 is not a responder.
+4. The host must not be an IP literal in, and (the fetcher's job, below) must not resolve to,
+   loopback (`127.0.0.0/8`, `::1`), link-local (`169.254.0.0/16`, `fe80::/10`, where cloud metadata
+   lives), private (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7`), unspecified
+   (`0.0.0.0`, `::`), or multicast.
+5. `OcspConfig::allow_private_responders` (default `false`) relaxes rule 4 only, for the operator
+   running an internal CA with an internal responder. It never relaxes rules 1 to 3.
+
+**The DNS-rebinding re-check is split across two components on purpose.** `validate_aia_url` checks
+the URL's own literal host, which closes the case where the certificate names an IP address
+directly. It cannot close the case where the certificate names an innocuous hostname whose DNS
+answer changes between the check and the connection: the fetcher (the in-tree implementation is the
+unpublished slug `ocsp-http-fetcher`) is contractually required to re-check the **resolved** peer
+address against the same private-address rules immediately before connecting. Neither check alone
+closes DNS rebinding; both are required, and the fetcher contract states this obligation rather than
+leaving it to be inferred from the URL check having already run once.
+
+**The per-tick fetch budget bounds a restart-shaped flood.** After a restart, every tracked
+certificate is due for a refresh at once. Without a cap, one `OcspUpdater::tick` call over a
+100,000-certificate store would start 100,000 fetches: a self-inflicted outbound flood, a
+CA-hammering event that risks the deployment being rate-limited or blocked outright, and a single
+call that blocks its caller for hours at 5 seconds per fetch. `OcspConfig::max_fetches_per_tick`
+(default 8) bounds how many fetches one `tick` call may start; entries beyond the budget keep their
+scheduled time and are picked up by a later tick, oldest due first, so no certificate can starve.
+The initial due time for a freshly tracked certificate is also spread over
+`OcspConfig::min_interval_secs` rather than set to "now", so a restart does not synchronise the
+whole store onto one instant, and two nodes restarting together do not fetch in lockstep either.
+
+**A must-staple certificate is refused at install, not discovered at handshake time.** RFC 7633's
+`id-pe-tlsfeature` with `status_request` obligates a server to staple a response for that
+certificate on every handshake; serving it without one is a protocol violation an inspecting client
+may treat as a failure on its own. `CertUpdateCoalescer::submit` refuses an `Install`, `Replace` or
+`SetDefault` of a must-staple credential with no OCSP staple attached
+(`CertError::MustStapleWithoutStaple`), in the same eager-validation step that already checks
+names, so the credential never enters the pending list and never becomes part of a published index
+at all, through any of the three update kinds that can publish one; the previously installed
+material for that name keeps serving. The check lives at `submit` rather than at flush time
+because a must-staple credential with no staple is a permanent property of that submission, not a
+transient one: it will
+never become valid by waiting, and rejecting it at flush time would sit it in the pending list and
+abort every later flush behind it, freezing the whole store at its last good generation. Symmetrically,
+`OcspUpdater::tick` treats a must-staple certificate whose live staple has gone stale (past
+`nextUpdate` plus clock skew, with no successful refresh) as a reason to remove the credential from
+the index, so a name with another credential falls through to it and a name with none fails the
+handshake instead of serving a certificate the extension says must never appear without a staple.

@@ -29,6 +29,10 @@ siphasher = { workspace = true }
 blake3 = { workspace = true }
 x509-cert = { workspace = true }
 der = { workspace = true }
+# Request building and response validation for OCSP stapling (#122).
+x509-ocsp = { workspace = true }
+# The `CertID` identifier hash RFC 6960 mandates (#122); never used as a signature algorithm.
+sha1 = { workspace = true }
 irontraffic-rand = { path = "../irontraffic-rand", version = "0.1.0" }
 serde = { workspace = true }
 schemars = { workspace = true, optional = true }

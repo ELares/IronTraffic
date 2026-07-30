@@ -432,9 +432,13 @@ dependencies = [
 name = "irontraffic-tls-fuzz"
 version = "0.0.0"
 dependencies = [
+ "der",
  "irontraffic-tls",
  "libfuzzer-sys",
  "rcgen",
+ "sha1",
+ "x509-cert",
+ "x509-ocsp",
 ]
 
 [[package]]
