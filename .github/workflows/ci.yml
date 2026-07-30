@@ -993,7 +993,21 @@ jobs:
   # for real.
   release-artifacts:
     name: release artifacts
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Runs on tags AND on pull requests, deliberately.
+    #
+    # Gating the whole job on a tag meant the four target build, the
+    # reproducibility check, the static-linking checks and the allowlist check
+    # were never executed by any run a reviewer could see, so `merge-guard`
+    # refused the PR: a skipped required check is as unmet as a failing one. It
+    # also meant a defect in this job could only surface while cutting a real
+    # release. That is exactly what happened: a review found `build-matrix.sh`
+    # dirtied the worktree before the first build, poisoning the git-dirty stamp
+    # on every artifact, and the repair for it would have gone unexercised until
+    # the next tag.
+    #
+    # Only PUBLISHING is tag-gated now; everything that can fail without a
+    # release existing runs on every pull request.
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     permissions:
@@ -1120,6 +1134,11 @@ jobs:
           done
           echo "allowlist: ok"
       - name: Create the GitHub release
+        # Tag only. On a pull request every step above has already run, so the
+        # artifacts are built and checked; there is simply no release to attach
+        # them to, and this job holds `contents: write`, which a pull request
+        # must never exercise.
+        if: startsWith(github.ref, 'refs/tags/v')
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
