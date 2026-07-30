@@ -30,7 +30,9 @@ use irontraffic_tls::store::{
     CertIndexBuilder, ChainInterner, ChallengeCerts, Credentials, IronResolver, TimeView,
 };
 use irontraffic_tls::time::UnixSeconds;
-use irontraffic_tls::verify_client::{ClientAuth, RevocationMode, TrustAnchors};
+use irontraffic_tls::verify_client::{
+    ClientAuth, ClientAuthConfig, ClientAuthMode, RevocationMode, TrustAnchors,
+};
 
 const SEED: [u8; 16] = [11u8; 16];
 
@@ -459,7 +461,11 @@ fn truncated_client_hello_is_an_error_not_no_sni() {
 }
 
 /// Drives two in-memory TLS endpoints through a full handshake, returning the first error either
-/// side reports, or `None` if both complete. Same shape as `policy.rs`'s and
+/// side reports, `None` if both complete, or `Some` synthetic error if the 16-round-trip budget is
+/// exhausted while either side is STILL handshaking: without that third outcome, a stalled
+/// handshake that never errors and never finishes is indistinguishable from a completed one, and a
+/// caller asserting `is_none()` to mean "succeeded" would pass on a connection that never actually
+/// exchanged the bytes a completed handshake requires. Same shape as `policy.rs`'s and
 /// `handshake_resolver.rs`'s own `pump_handshake`, duplicated rather than shared because each of
 /// those lives in a module or crate this file cannot see (see this crate's other test files for
 /// the identical note next to their own copies). Needed here, and not by any test above, because
@@ -502,10 +508,12 @@ fn pump_handshake(
             return Some(e);
         }
         if !client.is_handshaking() && !server.is_handshaking() {
-            break;
+            return None;
         }
     }
-    None
+    Some(std::io::Error::other(
+        "handshake did not complete within the 16-round-trip budget",
+    ))
 }
 
 /// A client with no client certificate, trusting `trust` (server certificate DERs).
@@ -609,6 +617,11 @@ fn real_config_required_and_der(
     ));
     let anchors = TrustAnchors::from_der_bundle(&[ca_der]).expect("a real CA must build");
     let auth = ClientAuth::Required(anchors);
+    let auth_cfg = ClientAuthConfig {
+        mode: ClientAuthMode::Required,
+        allow_unknown_revocation_status: false,
+        revocation: RevocationMode::Disabled,
+    };
     let cfg = Arc::new(
         TlsServerConfig::compile_with_client_auth(
             policy,
@@ -616,8 +629,7 @@ fn real_config_required_and_der(
             &auth,
             Arc::new(CrlSet::empty()),
             CrlConfig::default(),
-            false,
-            RevocationMode::Disabled,
+            &auth_cfg,
             time,
             None,
         )
