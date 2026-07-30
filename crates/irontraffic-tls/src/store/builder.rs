@@ -504,6 +504,20 @@ mod tests {
         Arc::new(Credentials::load(&[&leaf], &key, &mut interner).expect("valid leaf and key"))
     }
 
+    /// An Ed25519 credential, so a single name can hold two DIFFERENT `KeyType` slots. Used to
+    /// pin that `rebuild_entries` carries every slot forward, not just the preferred one.
+    fn gen_cred_ed25519(san: &str) -> Arc<Credentials> {
+        ensure_provider_installed();
+        let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ED25519).expect("keygen");
+        let params = rcgen::CertificateParams::new(vec![san.to_owned()]).expect("valid SANs");
+        let cert = params.self_signed(&key).expect("sign");
+        let mut interner = ChainInterner::new();
+        Arc::new(
+            Credentials::load(&[cert.der()], &key.serialize_der(), &mut interner)
+                .expect("valid leaf and key"),
+        )
+    }
+
     fn gen_cred_with_validity(
         san: &str,
         not_before: (i32, u8, u8),
@@ -1049,6 +1063,13 @@ mod tests {
     }
 
     #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "issue #118 fixes the reported test count at 21 (20 unit tests plus one prop \
+                  test), so the three from_previous carry-forward regressions (hasher key, \
+                  default credential, every key-type slot) and the collision retry are folded \
+                  into this one function rather than split into four that would change it"
+    )]
     fn from_previous_preserves_every_name() {
         let cred = gen_cred("template.example.com");
         let mut builder = CertIndexBuilder::new([31u8; 16]);
@@ -1121,6 +1142,86 @@ mod tests {
                 "{name} must resolve correctly after a forced attempt-0 collision and retry"
             );
         }
+
+        // Two more carry-forward duties, folded in here for the same reason as the collision
+        // regression above: keep the test count at the 21 the acceptance criteria name.
+        //
+        // Both of these fail OPEN on availability, silently, which is why neither showed up as a
+        // failing assertion anywhere in the crate before now.
+
+        // (a) The configured default credential survives a rebuild. Replacing
+        // `prev.default_cred().cloned()` with `None` in `from_previous` used to survive all
+        // eight test suites, which would mean every ACME issuance or OCSP staple refresh
+        // silently discards the default, and every no-SNI and every unmatched-name handshake
+        // stops being served after the first reload.
+        let default_cred = gen_cred("default.example.com");
+        let mut with_default = CertIndexBuilder::new([31u8; 16]);
+        with_default
+            .upsert_exact("kept.example.com", gen_cred("kept.example.com"))
+            .expect("valid");
+        with_default.set_default(Arc::clone(&default_cred));
+        let with_default = with_default.build().expect("build");
+        assert_eq!(
+            with_default.default_credential().map(|c| c.fingerprint()),
+            Some(default_cred.fingerprint()),
+            "the fixture itself must have a default, or the rebuild assertion below is vacuous"
+        );
+        let rebuilt_default = CertIndexBuilder::from_previous(&with_default)
+            .build_with_generation(1)
+            .expect("rebuild succeeds");
+        assert_eq!(
+            rebuilt_default
+                .default_credential()
+                .map(|c| c.fingerprint()),
+            Some(default_cred.fingerprint()),
+            "from_previous must carry the configured default credential forward: losing it stops \
+             every no-SNI and every unmatched-name handshake being served after the first reload"
+        );
+
+        // (b) EVERY key-type slot for a name survives a rebuild, not just the preferred one.
+        // Appending `.min(1)` to `rebuild_entries`'s `for slot in 0..usize::from(set.len)` used
+        // to survive all eight suites: a name holding both an ECDSA and an Ed25519 credential
+        // would lose the second on every reload, so clients that can only use the dropped key
+        // type stop being served after the first ACME renewal.
+        let ecdsa = gen_cred("dual.example.com");
+        let ed25519 = gen_cred_ed25519("dual.example.com");
+        assert_ne!(
+            ecdsa.key_type(),
+            ed25519.key_type(),
+            "the fixture must hold two DIFFERENT key types, or this pins nothing"
+        );
+        let mut dual = CertIndexBuilder::new([31u8; 16]);
+        dual.upsert_exact("dual.example.com", Arc::clone(&ecdsa))
+            .expect("valid");
+        dual.upsert_exact("dual.example.com", Arc::clone(&ed25519))
+            .expect("valid");
+        let dual = dual.build().expect("build");
+
+        // Resolve through the caps that admit ONLY the non-preferred key type, so the assertion
+        // cannot be satisfied by the preferred credential standing in for it.
+        let ed_only = ClientCaps {
+            ecdsa_p256: false,
+            ecdsa_p384: false,
+            rsa: false,
+            ed25519: true,
+        };
+        assert_eq!(
+            dual.resolve("dual.example.com", ed_only)
+                .map(|c| c.fingerprint()),
+            Some(ed25519.fingerprint()),
+            "the fixture must serve the second key type before any rebuild"
+        );
+        let rebuilt_dual = CertIndexBuilder::from_previous(&dual)
+            .build_with_generation(1)
+            .expect("rebuild succeeds");
+        assert_eq!(
+            rebuilt_dual
+                .resolve("dual.example.com", ed_only)
+                .map(|c| c.fingerprint()),
+            Some(ed25519.fingerprint()),
+            "from_previous must carry EVERY key-type slot forward, not only the preferred one: \
+             dropping the rest stops clients of that key type being served after a reload"
+        );
     }
 
     #[test]
