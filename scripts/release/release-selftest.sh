@@ -419,9 +419,19 @@ cleanup_server() {
 }
 
 install_with_server() {
+    # --no-verify-signature: release-sbom-signing-and-provenance (#428) made
+    # scripts/install.sh verify a signature and provenance attestation by
+    # default, which this file's own fixture server (built before that
+    # issue existed, and unrelated to what any test below is actually
+    # checking) never serves; every call site here tests something else
+    # entirely (checksum handling, root refusal, atomic rename, umask,
+    # interrupt cleanup) and would otherwise fail on a downloaded verify.sh
+    # correctly refusing an artifact with no signature at all. #428's own
+    # supply-chain-selftest.sh is what tests the new default-verify
+    # behavior for real, including against a real (missing) signature.
     CURL_CA_BUNDLE="$CERT_DIR/cert.pem" \
         IT_RELEASE_BASE_URL="https://localhost:$SERVER_PORT/releases" \
-        sh scripts/install.sh "$@"
+        sh scripts/install.sh --no-verify-signature "$@"
 }
 
 if start_test_server; then
@@ -505,9 +515,12 @@ EOF
         IT_RELEASE_BASE_URL="https://localhost:$SERVER_PORT/releases" \
         sh scripts/install.sh --prefix "$WORK/prefix8" 2>&1)"
     status8=$?
+    # --no-verify-signature: see install_with_server's own comment above;
+    # this arm expects a successful install (to prove IT_ALLOW_ROOT works),
+    # not to test signature verification.
     out8b="$(PATH="$fake_id_bin:$PATH" IT_ALLOW_ROOT=1 CURL_CA_BUNDLE="$CERT_DIR/cert.pem" \
         IT_RELEASE_BASE_URL="https://localhost:$SERVER_PORT/releases" \
-        sh scripts/install.sh --prefix "$WORK/prefix8b" 2>&1)"
+        sh scripts/install.sh --prefix "$WORK/prefix8b" --no-verify-signature 2>&1)"
     status8b=$?
     set -e
     if [ "$status8" -ne 0 ] \
