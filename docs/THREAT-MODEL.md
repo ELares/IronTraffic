@@ -1437,6 +1437,61 @@ this section, not restated here as a single number this file cannot keep current
 happens before the AEAD is ever opened, so a flood of bogus tickets costs six constant-time
 comparisons and no heap traffic, enforced by this module's `//! HOT PATH` marker under
 `scripts/invariant-lints.sh`'s `hot-path-allocation` rule.
+
+## 0-RTT early data (`early-data-policy-and-replay-filter`, #121)
+
+*Status: `crate::early_data::evaluate` and `crate::replay::EarlyDataFilter` ship in
+`irontraffic-tls`, constructible and fully tested, but reachable from no caller yet. `enabled`
+defaults to `false` and `EarlyDataConfig::effective_max_early_data_size` is `0`, so nothing behaves
+differently until both the unpublished data-plane slug `early-data-request-wiring` and the
+listener-compilation call to `EarlyDataConfig::is_permitted_with` exist.*
+
+**Off by default.** A listener negotiates 0-RTT only when an operator explicitly sets
+`earlyData.enabled: true`, and even then `maxBytes` defaults to 16,384 bytes and is hard capped at
+65,536.
+
+**What an attacker who captures early data can do.** 0-RTT data has no forward secrecy and no
+replay protection at the TLS layer (RFC 8446 section 2.3 and appendix E.5): an attacker who
+recorded a client's 0-RTT `ClientHello` can resend it, and every node in the fleet that accepts
+0-RTT is a candidate target. What that buys the attacker is bounded by what this crate ever agrees
+to serve from early data at all: a `GET` or `HEAD` request with no declared body and, by default,
+no query string, on a route the operator explicitly marked idempotent and that the configuration
+compiler did not force back to `deny` for containing a mutating filter, a counter increment, or a
+stateful authorization decision. Replaying such a request is not an action whose meaning changes
+because it ran twice.
+
+**The idempotency restriction is the security boundary; the Bloom filter only reduces volume.** A
+single node's replay filter cannot see a ticket replayed to a different node before its own answer
+is known, and no per-process or best-effort cluster mechanism closes that window completely without
+adding a network round trip to the 0-RTT path, which would delete the entire latency benefit 0-RTT
+exists to provide. `crate::replay::EarlyDataFilter` is sized so a legitimate client's false-positive
+cost (one extra round trip) is rare, comfortably under 1 in 100,000 at the default capacity (measured
+under `1e-5`; the derived figure at the blocked layout's parameters is nearer `5e-7`), and an adversarial
+attempt to overfill the filter degrades it toward MORE rejections, never toward accepting a replay
+it would otherwise have caught: fail closed in both the ordinary and the adversarial case.
+
+**The window asymmetry between the filter (3 to 6 hours) and the ticket (12 to 18 hours).** The
+replay filter's two generations, rotating every `replayRotateSecs` (default 3 hours), remember a
+ticket for between one and two rotation periods. A ticket from
+`cluster-derived-session-ticketer` (#120) stays decryptable for three epochs, 12 to 18 hours at that
+ticketer's own default rotation. A replay presented after the filter has forgotten the ticket, but
+before the ticket itself has expired, is therefore possible by construction, not by accident.
+Widening the filter to cover the full ticket window would cost 3 to 6 times the memory and would
+still not close the cross-node case above, which is why the method restriction, not the filter, is
+what this section calls the security boundary.
+
+**Mutual TLS and early data are mutually exclusive.** A resumed TLS 1.3 handshake does not
+re-present or re-verify a client certificate, so early data on a listener that requests or requires
+one would be simultaneously authenticated (by the identity restored from the ticket) and
+replayable, the one combination this design refuses to create. `EarlyDataConfig::is_permitted_with`
+refuses that configuration at compile time once a later issue wires the call in, and
+`crate::early_data::evaluate` refuses it again at run time as defence in depth for as long as that
+call is not wired in yet.
+
+See `docs/tls/EARLY-DATA.md` for the operator-facing statement of all seven admission conditions,
+the two `Early-Data` header rules (including the deliberate deviation from RFC 8470 section 5.1),
+and the `425 Too Early` retry.
+
 ## gRPC health checking
 
 **What `health::grpc` and `health::grpc_mode` parse.** The gRPC length-prefixed frame and the
