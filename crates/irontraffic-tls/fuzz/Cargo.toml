@@ -32,6 +32,17 @@ irontraffic-tls = { path = ".." }
 # crates/irontraffic-tls/Cargo.toml's own dev-dependency on rcgen already makes, on top of the
 # workspace default rather than instead of it.
 rcgen = { version = "0.14.8", features = ["aws_lc_rs"] }
+# fuzz_ocsp_response's own dependencies, not shared by the other targets: closing #760
+# SHOULD_FIX 8 means building a real, validly signed OCSPResponse at runtime (the same fix
+# fuzz_crl_parse already applies to the identical "fresh key every process start, so no seed
+# corpus can ever verify" problem), which needs the same DER types and OIDs ocsp.rs's own
+# (private, so not reachable from this separate crate) test module uses. Pinned to the same
+# version lines the root workspace pins for irontraffic-tls's own dependency on each, so this
+# separate fuzz workspace's lock resolves the identical types.
+x509-ocsp = "0.2.1"
+x509-cert = "0.2"
+der = "0.7"
+sha1 = "0.10"
 
 [[bin]]
 name = "fuzz_sni_normalize"
