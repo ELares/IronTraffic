@@ -118,6 +118,7 @@ fn bench_publish_load(c: &mut Criterion) {
         certs,
         challenge,
         resolver,
+        listeners: Arc::from(Vec::new()),
         generation: 0,
     });
     let cell = TlsMaterialCell::new(material);

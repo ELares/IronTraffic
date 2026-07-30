@@ -258,6 +258,7 @@ fn reload_zero_drop_under_concurrent_handshakes() {
         certs,
         challenge,
         resolver,
+        listeners: Arc::from(Vec::new()),
         generation: 0,
     });
     let cell = Arc::new(TlsMaterialCell::new(initial));
