@@ -1,0 +1,409 @@
+#!/bin/sh
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# The user-facing verification: a user runs this to check a downloaded
+# release artifact with no account and no trust in this project beyond a
+# public transparency log. See docs/SUPPLY-CHAIN.md.
+#
+# Usage: scripts/release/verify.sh --artifact <file> [--sbom <file>]
+#            [--strict] [--allow-skipped]
+#
+#   --artifact FILE   the downloaded tarball to check (required)
+#   --sbom FILE       also verify this SBOM's signature and licence subset
+#   --strict          additionally require the provenance's commit be
+#                     reachable from a release tag, and fail on a dirty
+#                     artifact; scripts/install.sh always passes this
+#   --allow-skipped   the explicit downgrade: a check that could not be
+#                     performed (typically, no network) is printed and
+#                     counted, but does not turn the exit code nonzero
+#
+# THE ONE FAIL-OPEN IN THIS DESIGN, AND WHY IT IS THE OPPOSITE OF FAIL-OPEN:
+# this script exits NONZERO whenever a check it was asked to perform could
+# not be performed (no network, missing signature file, and so on), unless
+# --allow-skipped was passed. The obvious shape, "verify what you can,
+# report the rest as skipped, exit 0", is wrong here: the party best placed
+# to serve a modified artifact is usually also placed to make the
+# transparency log unreachable, so "the log was unreachable, continuing"
+# hands them exactly the outcome they wanted. --allow-skipped exists for a
+# genuinely air-gapped user who has only the checksum; it prints one named
+# line per skipped check so that user still sees exactly what was not
+# checked, rather than a bare "ok".
+set -eu
+
+REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
+# The directory verify.sh itself lives in, NOT $REPO_ROOT: this script is a
+# release asset a user downloads standalone (see docs/SUPPLY-CHAIN.md), with
+# no repository checkout around it, and sbom-licence-check.sh below is
+# looked up next to THIS file for exactly that reason.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+cd "$REPO_ROOT"
+
+# Overridable only for this script's own test suite, which cannot reach the
+# real GitHub host, mirroring scripts/install.sh's identical IT_RELEASE_BASE_URL
+# seam: a real invocation never sets this.
+: "${IT_RELEASE_BASE_URL:=https://github.com/ELares/IronTraffic/releases}"
+
+CERT_IDENTITY_REGEXP='^https://github\.com/ELares/IronTraffic/\.github/workflows/ci\.yml@refs/tags/v'
+CERT_OIDC_ISSUER='https://token.actions.githubusercontent.com'
+
+usage() {
+    cat <<'EOF' >&2
+usage: scripts/release/verify.sh --artifact FILE [--sbom FILE] [--strict] [--allow-skipped]
+EOF
+}
+
+preflight() {
+    missing=0
+    if ! command -v cosign >/dev/null 2>&1; then
+        echo "error: cosign is required to verify a signature or an attestation." >&2
+        echo "  Install: https://docs.sigstore.dev/cosign/system_config/installation/" >&2
+        missing=1
+    fi
+    if ! command -v jq >/dev/null 2>&1; then
+        echo "error: jq is required to read the provenance attestation and, with" >&2
+        echo "  --sbom, the SBOM's licence set. Install: https://jqlang.org/download/" >&2
+        missing=1
+    fi
+    if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
+        echo "error: neither sha256sum nor shasum is installed; refusing to verify" >&2
+        echo "  an artifact whose checksum cannot even be checked." >&2
+        missing=1
+    fi
+    if [ "$missing" -ne 0 ]; then
+        exit 1
+    fi
+}
+
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        shasum -a 256 "$1" | awk '{print $1}'
+    fi
+}
+
+# Same transport rule as scripts/install.sh, applied to every fetch this
+# script makes too (edge case 7b): a redirect cannot downgrade to plaintext
+# or leave the release host.
+fetch_to_file() {
+    url="$1"
+    dest="$2"
+    if command -v curl >/dev/null 2>&1; then
+        curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 10 --max-time 60 -o "$dest" "$url" 2>/dev/null
+    elif command -v wget >/dev/null 2>&1; then
+        wget --https-only -q -O "$dest" "$url" 2>/dev/null
+    else
+        return 1
+    fi
+}
+
+# Finds a companion file (SHA256SUMS, <artifact>.sig, <artifact>.pem,
+# <artifact>.intoto.jsonl) next to the artifact locally first, then falls
+# back to downloading it from the same release the artifact's own filename
+# names, mirroring scripts/install.sh's URL construction.
+locate_or_fetch() {
+    local_candidate="$1"
+    remote_name="$2"
+    dest="$3"
+    version="$4"
+    if [ -f "$local_candidate" ]; then
+        cp "$local_candidate" "$dest"
+        return 0
+    fi
+    url="$IT_RELEASE_BASE_URL/download/v$version/$remote_name"
+    fetch_to_file "$url" "$dest"
+}
+
+main() {
+    artifact=""
+    sbom=""
+    strict=0
+    allow_skipped=0
+
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --artifact)
+                [ "$#" -ge 2 ] || { echo "error: --artifact requires a value" >&2; exit 2; }
+                artifact="$2"; shift 2 ;;
+            --sbom)
+                [ "$#" -ge 2 ] || { echo "error: --sbom requires a value" >&2; exit 2; }
+                sbom="$2"; shift 2 ;;
+            --strict) strict=1; shift ;;
+            --allow-skipped) allow_skipped=1; shift ;;
+            --help|-h) usage; exit 0 ;;
+            *) echo "error: unrecognised argument \"$1\"" >&2; usage; exit 2 ;;
+        esac
+    done
+
+    if [ -z "$artifact" ]; then
+        usage
+        exit 2
+    fi
+    if [ ! -f "$artifact" ]; then
+        echo "error: no such file: $artifact" >&2
+        exit 1
+    fi
+
+    preflight
+
+    # Edge case 12: a malformed or oversized companion file is refused
+    # before it is parsed at all.
+    max_bytes=16777216
+
+    work="$(mktemp -d)"
+    trap 'rm -rf "$work"' EXIT INT TERM
+
+    checked=0
+    skipped=0
+    failed=0
+    skip_lines=""
+    fail_lines=""
+
+    note_skip() {
+        skipped=$((skipped + 1))
+        skip_lines="$skip_lines
+  skipped: $1 ($2)"
+        echo "skipped: $1 ($2)"
+    }
+    note_fail() {
+        failed=$((failed + 1))
+        fail_lines="$fail_lines
+  FAILED: $1"
+        echo "FAILED: $1" >&2
+    }
+
+    artifact_basename="$(basename "$artifact")"
+    # irontraffic-<version>-<target>.tar.gz. The version is between the
+    # first and the (target-triple-starting) second hyphen group; mirrors
+    # scripts/install.sh's own construction of this same filename in
+    # reverse, so both derive identically from the one Cargo version stamp.
+    version="$(printf '%s' "$artifact_basename" | sed -E 's/^irontraffic-([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?)-.*/\1/')"
+
+    # -------------------------------------------------------------------
+    # 1. Checksum. Fails LOUDLY and before anything else runs (test:
+    #    verify_fails_on_tampered_artifact asserts this ordering directly).
+    # -------------------------------------------------------------------
+    sums_file="$work/SHA256SUMS"
+    sums_dir="$(dirname "$artifact")"
+    if locate_or_fetch "$sums_dir/SHA256SUMS" "SHA256SUMS" "$sums_file" "$version"; then
+        this_line="$work/SHA256SUMS.this"
+        if grep -F "$artifact_basename" "$sums_file" | sed "s#$sums_dir/##" > "$this_line" 2>/dev/null \
+            && [ -s "$this_line" ]; then
+            checksum_ok=0
+            if command -v sha256sum >/dev/null 2>&1; then
+                ( cd "$(cd "$sums_dir" && pwd)" && sha256sum -c "$this_line" ) >"$work/checksum.log" 2>&1 || checksum_ok=1
+            else
+                ( cd "$(cd "$sums_dir" && pwd)" && shasum -a 256 -c "$this_line" ) >"$work/checksum.log" 2>&1 || checksum_ok=1
+            fi
+            if [ "$checksum_ok" -eq 0 ]; then
+                checked=$((checked + 1))
+                echo "checksum: done"
+            else
+                cat "$work/checksum.log" >&2
+                note_fail "checksum: $artifact_basename does not match SHA256SUMS"
+            fi
+        else
+            note_fail "checksum: $artifact_basename is not listed in SHA256SUMS"
+        fi
+    else
+        note_skip "checksum" "SHA256SUMS could not be located or downloaded"
+    fi
+
+    # A tampered artifact is a hard stop before any network call runs: no
+    # signature, provenance or SBOM check below executes once the checksum
+    # itself has failed.
+    if [ "$failed" -gt 0 ]; then
+        print_summary_and_exit "$checked" "$skipped" "$failed" "$skip_lines" "$fail_lines" "$allow_skipped"
+    fi
+
+    # -------------------------------------------------------------------
+    # 2. Signature. Pins BOTH the certificate identity and the OIDC
+    #    issuer: a verification that omits either accepts a signature from
+    #    anyone, the single most common mistake with this tooling.
+    # -------------------------------------------------------------------
+    sig_file="$work/artifact.sig"
+    pem_file="$work/artifact.pem"
+    have_sig="$(locate_or_fetch "$artifact.sig" "$artifact_basename.sig" "$sig_file" "$version" && echo yes || echo no)"
+    have_pem="$(locate_or_fetch "$artifact.pem" "$artifact_basename.pem" "$pem_file" "$version" && echo yes || echo no)"
+    if [ "$have_sig" = "yes" ] && [ "$have_pem" = "yes" ] \
+        && [ "$(wc -c < "$sig_file" | tr -d ' ')" -le "$max_bytes" ] \
+        && [ "$(wc -c < "$pem_file" | tr -d ' ')" -le "$max_bytes" ]; then
+        if cosign verify-blob \
+            --certificate "$pem_file" \
+            --signature "$sig_file" \
+            --certificate-identity-regexp "$CERT_IDENTITY_REGEXP" \
+            --certificate-oidc-issuer "$CERT_OIDC_ISSUER" \
+            "$artifact" >"$work/sig-verify.log" 2>&1; then
+            checked=$((checked + 1))
+            echo "signature: verified (identity matches $CERT_IDENTITY_REGEXP, issuer $CERT_OIDC_ISSUER)"
+        else
+            if grep -qi "certificate identity\|does not match" "$work/sig-verify.log"; then
+                note_fail "signature: certificate identity did not match $CERT_IDENTITY_REGEXP (see log below)"
+            else
+                note_fail "signature: cosign verify-blob failed (see log below)"
+            fi
+            cat "$work/sig-verify.log" >&2
+        fi
+    else
+        note_skip "signature" "could not locate or download $artifact_basename.sig / .pem"
+    fi
+
+    # -------------------------------------------------------------------
+    # 3. Provenance. The subject digest cosign embedded when the
+    #    attestation was produced must equal this artifact's own sha256
+    #    (invariant 7); this script recomputes the artifact's digest
+    #    independently rather than trusting the attestation's own claim.
+    # -------------------------------------------------------------------
+    intoto_file="$work/artifact.intoto.jsonl"
+    if locate_or_fetch "$artifact.intoto.jsonl" "$artifact_basename.intoto.jsonl" "$intoto_file" "$version" \
+        && [ "$(wc -c < "$intoto_file" | tr -d ' ')" -le "$max_bytes" ]; then
+        if cosign verify-blob-attestation \
+            --certificate "$pem_file" \
+            --signature "$intoto_file" \
+            --certificate-identity-regexp "$CERT_IDENTITY_REGEXP" \
+            --certificate-oidc-issuer "$CERT_OIDC_ISSUER" \
+            --type slsaprovenance \
+            "$artifact" >"$work/attest-verify.log" 2>&1; then
+            payload="$(jq -r '.payload' "$intoto_file" 2>/dev/null | base64 -d 2>/dev/null || true)"
+            subject_sha256="$(printf '%s' "$payload" | jq -r '.subject[0].digest.sha256 // empty' 2>/dev/null || true)"
+            actual_sha256="$(sha256_of "$artifact")"
+            commit="$(printf '%s' "$payload" | jq -r '.predicate.invocation.configSource.digest.sha1 // empty' 2>/dev/null || true)"
+            builder="$(printf '%s' "$payload" | jq -r '.predicate.builder.id // empty' 2>/dev/null || true)"
+            # The ref this build actually ran from, e.g.
+            # "git+https://github.com/ELares/IronTraffic@refs/tags/v1.2.3"
+            # -> "refs/tags/v1.2.3". Used by --strict below; extracted here,
+            # once, rather than re-parsing the payload again down there.
+            source_ref="$(printf '%s' "$payload" | jq -r '.predicate.invocation.configSource.uri // empty' 2>/dev/null | sed 's/^.*@//' || true)"
+            if [ -n "$subject_sha256" ] && [ "$subject_sha256" = "$actual_sha256" ]; then
+                checked=$((checked + 1))
+                echo "provenance: verified"
+                echo "  source commit: ${commit:-<unknown>}"
+                echo "  workflow:      ${builder:-<unknown>}"
+            else
+                note_fail "provenance: subject digest ($subject_sha256) does not match the artifact's own sha256 ($actual_sha256)"
+            fi
+            # Edge case 9, the non-strict half: a dirty artifact should
+            # never have been published, and a plain (non-strict) run warns
+            # rather than failing so a check specifically aimed at exactly
+            # this cannot be silently missed; --strict escalates it to a
+            # failure below.
+            dirty_flag="$(printf '%s' "$payload" | jq -r '.predicate.invocation.parameters.dirty // empty' 2>/dev/null || true)"
+            if [ "$dirty_flag" = "true" ]; then
+                echo "warning: this artifact's dirty flag is true (built from an uncommitted" >&2
+                echo "  worktree); it should never have been published. Pass --strict to" >&2
+                echo "  make this a hard failure." >&2
+            fi
+        else
+            note_fail "provenance: cosign verify-blob-attestation failed (see log below)"
+            cat "$work/attest-verify.log" >&2
+        fi
+    else
+        note_skip "provenance" "could not locate or download $artifact_basename.intoto.jsonl"
+    fi
+
+    # -------------------------------------------------------------------
+    # 4. SBOM, only if --sbom was given.
+    # -------------------------------------------------------------------
+    if [ -n "$sbom" ]; then
+        if [ ! -f "$sbom" ]; then
+            note_fail "sbom: no such file: $sbom"
+        else
+            sbom_sig="$work/sbom.sig"
+            sbom_pem="$work/sbom.pem"
+            sbom_basename="$(basename "$sbom")"
+            if locate_or_fetch "$sbom.sig" "$sbom_basename.sig" "$sbom_sig" "$version" \
+                && locate_or_fetch "$sbom.pem" "$sbom_basename.pem" "$sbom_pem" "$version"; then
+                if cosign verify-blob \
+                    --certificate "$sbom_pem" \
+                    --signature "$sbom_sig" \
+                    --certificate-identity-regexp "$CERT_IDENTITY_REGEXP" \
+                    --certificate-oidc-issuer "$CERT_OIDC_ISSUER" \
+                    "$sbom" >"$work/sbom-sig-verify.log" 2>&1; then
+                    checked=$((checked + 1))
+                    echo "sbom signature: verified"
+                else
+                    note_fail "sbom signature: cosign verify-blob failed (see log below)"
+                    cat "$work/sbom-sig-verify.log" >&2
+                fi
+            else
+                note_skip "sbom signature" "could not locate or download $sbom_basename.sig / .pem"
+            fi
+
+            if sh "$SCRIPT_DIR/sbom-licence-check.sh" "$sbom" >"$work/sbom-licence.log" 2>&1; then
+                checked=$((checked + 1))
+                echo "sbom licence: subset of the allowlist"
+            else
+                note_fail "sbom licence: not a subset of the allowlist (see below)"
+                cat "$work/sbom-licence.log" >&2
+            fi
+        fi
+    fi
+
+    # -------------------------------------------------------------------
+    # 5. --strict extras: dirty flag, and reachability from a release tag.
+    #
+    # WHY THIS DOES NOT WALK LOCAL GIT HISTORY, though "reachable from a
+    # signed tag" reads like it should: `verify.sh` runs from wherever
+    # `install.sh` downloaded it to (edge case: the documented
+    # `curl | sh` install has no `.git` directory anywhere on the machine
+    # at all), so a check that required one would make `--strict`, which
+    # `install.sh` always passes, fail every real install. This project
+    # also does not GPG- or gitsign-sign its git tag objects (only the
+    # ARTIFACTS are signed, keylessly, by cosign); a check that required
+    # that would fail every real install for a DIFFERENT, also-currently-
+    # true reason. What this checks instead needs neither: the provenance's
+    # own `invocation.configSource.uri` already names the ref the build ran
+    # from (extracted above as $source_ref), and that ref is exactly what
+    # the certificate-identity-regexp pin in step 2 already bound the
+    # signature to. Requiring `refs/tags/v*` here is therefore not a new,
+    # separate trust decision; it restates, from data already fetched and
+    # already cryptographically verified, that this build ran from an
+    # actual tagged release rather than a branch or pull-request ref. See
+    # docs/SUPPLY-CHAIN.md for the full reasoning and the literal
+    # GPG-tag-signing alternative this project deliberately does not build.
+    # -------------------------------------------------------------------
+    if [ "$strict" -eq 1 ]; then
+        if [ "${dirty_flag:-}" = "true" ]; then
+            note_fail "strict: the artifact's dirty flag is true; it should never have been published"
+        fi
+
+        case "${source_ref:-}" in
+            refs/tags/v*) : ;;
+            "")
+                note_fail "strict: no source ref was recovered from the provenance to check" ;;
+            *)
+                note_fail "strict: provenance's source ref is \"$source_ref\", naming the tag: not a refs/tags/v* release ref" ;;
+        esac
+    fi
+
+    print_summary_and_exit "$checked" "$skipped" "$failed" "$skip_lines" "$fail_lines" "$allow_skipped"
+}
+
+print_summary_and_exit() {
+    checked="$1"; skipped="$2"; failed="$3"; skip_lines="$4"; fail_lines="$5"; allow_skipped="$6"
+    echo
+    echo "verify.sh summary: $checked checked, $skipped skipped, $failed failed"
+    if [ -n "$skip_lines" ]; then
+        printf '%s\n' "$skip_lines"
+    fi
+    if [ -n "$fail_lines" ]; then
+        printf '%s\n' "$fail_lines"
+    fi
+    echo "to independently reproduce: check out the commit printed above, then run"
+    echo "  scripts/release/verify-repro.sh <target>"
+    echo "verification proves this project produced the artifact from that commit;"
+    echo "reproducing it proves that commit produces the artifact. Both matter."
+
+    if [ "$failed" -gt 0 ]; then
+        exit 1
+    fi
+    if [ "$skipped" -gt 0 ] && [ "$allow_skipped" -ne 1 ]; then
+        echo "error: $skipped check(s) were skipped and --allow-skipped was not given;" >&2
+        echo "  a skipped check is treated as a failure. Pass --allow-skipped only if" >&2
+        echo "  you understand what that check would otherwise have caught." >&2
+        exit 1
+    fi
+    exit 0
+}
+
+main "$@"
