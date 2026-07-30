@@ -4,11 +4,11 @@
 //! This crate is a development tool, not a runtime dependency: it is
 //! `publish = false` and nothing in `crates/irontraffic` may depend on it. It
 //! holds the sans-IO logic the whole M17 benchmark harness is built from: the
-//! cell model defined here, and (added by later issues in this milestone) the
-//! histogram recorder, the open-loop schedule, provenance capture, the
-//! validity guards, the load-generator adapters, the matrix and the report
-//! writer. `xtask`, created later, is a thin binary that spawns processes and
-//! calls into this library; putting the logic here rather than in `xtask`
+//! cell model and the [`LatencyRecorder`] histogram wrapper defined here, and
+//! (added by later issues in this milestone) the open-loop schedule,
+//! provenance capture, the validity guards, the load-generator adapters, the
+//! matrix and the report writer. `xtask`, created later, is a thin binary
+//! that spawns processes and calls into this library; putting the logic here rather than in `xtask`
 //! itself is what lets `cargo-fuzz` and unit tests reach the parsers that
 //! consume untrusted output from external load generators.
 //!
@@ -21,6 +21,7 @@
 
 mod cell;
 mod error;
+mod hist;
 mod provenance;
 
 pub use cell::{
@@ -28,6 +29,10 @@ pub use cell::{
     TlsMode,
 };
 pub use error::{BenchError, Detail, MAX_DETAIL_BYTES};
+pub use hist::{
+    HIGH_NS, LOW_NS, LatencyRecorder, MAX_HGRM_BYTES, MAX_HGRM_LINE_BYTES, MAX_HGRM_LINES,
+    MAX_HGRM_TOTAL_COUNT, Percentiles, SIGNIFICANT_DIGITS,
+};
 pub use provenance::{
     BURSTABLE_PREFIXES, BuildStamp, CaptureInputs, CpuInfoFields, LARGE_FILE_CAP, MAX_CPU_ENTRIES,
     PROBE_OUTPUT_CAP, PROBE_TIMEOUT_SECONDS, Provenance, SMALL_FILE_CAP, StampSource, ToolStamp,
