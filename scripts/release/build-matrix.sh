@@ -90,7 +90,6 @@ main() {
     cd "$repo_root"
 
     out_dir="${1:-$repo_root/dist}"
-    mkdir -p "$out_dir"
 
     version="$(cargo metadata --no-deps --format-version=1 | python3 -c '
 import json, sys
@@ -104,7 +103,23 @@ sys.exit("irontraffic package not found in cargo metadata")
 
     epoch="$(git log -1 --pretty=%ct 2>/dev/null || echo 0)"
 
-    checksums_file="$out_dir/SHA256SUMS"
+    # Every tarball and SHA256SUMS is assembled in a `mktemp -d` OUTSIDE the
+    # repository tree, and copied into `$out_dir` only after every target
+    # has built. `build.sh` runs its own `git status --porcelain` dirty gate
+    # on EVERY single invocation (once per target in the loop below), and
+    # this script used to `mkdir -p "$out_dir"` (defaulting to
+    # `$repo_root/dist`, which was not in `.gitignore`) before the first
+    # `build.sh` call: on a pristine tag checkout that made `git status`
+    # report `?? dist/`, so `build.sh` refused the very first target as
+    # dirty, and every target after it for the same reason, since the
+    # untracked directory persisted in the repo tree for the rest of the
+    # run. Never writing into the repo tree until every `build.sh` call is
+    # done removes the hazard regardless of whether `$out_dir` also happens
+    # to be gitignored (which it now additionally is, for a stale `dist/`
+    # left over from a previous local run: see `/dist` in `.gitignore`).
+    stage_out="$(mktemp -d)"
+    trap 'rm -rf "$stage_out"' EXIT INT TERM
+    checksums_file="$stage_out/SHA256SUMS"
     : > "$checksums_file"
 
     for target in $TARGETS; do
@@ -117,19 +132,27 @@ sys.exit("irontraffic package not found in cargo metadata")
         mkdir -p "$member_dir/docs"
         cp "$repo_root/target/$target/release/irontraffic" "$member_dir/irontraffic"
         cp "$repo_root/LICENSE" "$member_dir/LICENSE"
+        cp "$repo_root/LICENSE-APACHE" "$member_dir/LICENSE-APACHE"
+        cp "$repo_root/LICENSE-MIT" "$member_dir/LICENSE-MIT"
+        cp "$repo_root/NOTICE" "$member_dir/NOTICE"
         cp "$repo_root/README.md" "$member_dir/README.md"
         cp "$repo_root/docs/QUICKSTART.md" "$member_dir/docs/QUICKSTART.md"
 
-        tarball_path="$out_dir/$name.tar.gz"
+        tarball_path="$stage_out/$name.tar.gz"
         assemble_tarball "$stage_dir" "$name" "$tarball_path" "$epoch"
         rm -rf "$stage_dir"
 
-        ( cd "$out_dir" && sha256sum "$(basename "$tarball_path")" >> "SHA256SUMS" )
+        ( cd "$stage_out" && sha256sum "$(basename "$tarball_path")" >> "SHA256SUMS" )
         echo "wrote $tarball_path"
     done
 
     echo "wrote $checksums_file"
-    ( cd "$out_dir" && sha256sum -c SHA256SUMS )
+    ( cd "$stage_out" && sha256sum -c SHA256SUMS )
+
+    mkdir -p "$out_dir"
+    cp "$stage_out"/*.tar.gz "$out_dir/"
+    cp "$stage_out/SHA256SUMS" "$out_dir/SHA256SUMS"
+    echo "published to $out_dir"
 }
 
 main "$@"
