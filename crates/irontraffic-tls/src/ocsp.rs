@@ -654,13 +654,84 @@ fn ipv4_is_disallowed(addr: core::net::Ipv4Addr) -> bool {
 }
 
 /// Whether `addr` is loopback, unique-local (`fc00::/7`), unicast-link-local (`fe80::/10`),
-/// unspecified or multicast.
+/// unspecified or multicast. This alone does **not** decide whether a v6 literal is disallowed:
+/// an IPv4-mapped or IPv4-compatible address embeds a v4 address in the low 32 bits and is none
+/// of the above by construction, so the caller must also unmap and re-check with
+/// [`ipv4_embedded_in_v6`] and [`ipv4_is_disallowed`].
 fn ipv6_is_disallowed(addr: core::net::Ipv6Addr) -> bool {
     addr.is_loopback()
         || addr.is_unicast_link_local()
         || addr.is_unique_local()
         || addr.is_unspecified()
         || addr.is_multicast()
+}
+
+/// The IPv4 address embedded in `addr`, if `addr` is an IPv4-mapped address (`::ffff:a.b.c.d`,
+/// RFC 4291 section 2.5.5.2, the form every dual-stack socket produces for a v4 peer and the form
+/// a certificate's AIA host can carry to make `169.254.169.254` reach the cloud metadata service
+/// under a spelling `ipv6_is_disallowed` never inspects) or the deprecated IPv4-compatible address
+/// (`::a.b.c.d`, the same RFC section's older form). `Ipv6Addr::to_ipv4_mapped` alone only
+/// recognizes the first form; the second is checked by hand here. Both forms carry the embedded
+/// v4 address in the low 32 bits with every other bit zero, so `ipv4_is_disallowed` must be run
+/// against the returned address by every caller of this function, exactly as it already is
+/// against a v4 literal host.
+fn ipv4_embedded_in_v6(addr: core::net::Ipv6Addr) -> Option<core::net::Ipv4Addr> {
+    if let Some(v4) = addr.to_ipv4_mapped() {
+        return Some(v4);
+    }
+    let segments = addr.segments();
+    if segments[..6] == [0, 0, 0, 0, 0, 0] {
+        let [a, b] = segments[6].to_be_bytes();
+        let [c, d] = segments[7].to_be_bytes();
+        return Some(core::net::Ipv4Addr::new(a, b, c, d));
+    }
+    None
+}
+
+/// One dot-separated part of a legacy "numbers-and-dots" IPv4 host (decimal, `0x`/`0X`-prefixed
+/// hex, or a leading-zero octal octet). Returns `None` for anything that is not purely numeric in
+/// one of those three bases, which is the correct outcome for an ordinary DNS label: this
+/// function's only job is to recognize the numeric encodings `str::parse::<Ipv4Addr>` rejects,
+/// never to reinterpret a real hostname's label as a number.
+fn parse_legacy_ipv4_part(part: &str) -> Option<u32> {
+    if part.is_empty() {
+        return None;
+    }
+    if let Some(hex) = part.strip_prefix("0x").or_else(|| part.strip_prefix("0X")) {
+        return u32::from_str_radix(hex, 16).ok();
+    }
+    if part.len() > 1 && part.as_bytes().first() == Some(&b'0') {
+        return u32::from_str_radix(part, 8).ok();
+    }
+    part.parse().ok()
+}
+
+/// Parse the legacy "numbers-and-dots" IPv4 host syntax `inet_aton`, and historically many HTTP
+/// clients, accept alongside the canonical four-decimal-octet form: 1 to 4 dot-separated parts,
+/// each decimal, hex or octal per [`parse_legacy_ipv4_part`], combined the way `inet_aton`
+/// defines (a single part is the whole 32-bit value; two parts are the high 8 bits and the low
+/// 24; three parts are 8, 8 and 16; four parts are the four octets in order). Every host this
+/// recognizes resolves to the identical address the canonical spelling names, so
+/// `http://2852039166/`, `http://0x7f000001/`, `http://0177.0.0.1/` and `http://127.1/` must be
+/// judged by the same rule 4 as `http://169.254.169.254/` and `http://127.0.0.1/`, which is
+/// exactly what feeding the result into [`ipv4_is_disallowed`] does. A host with more than 4
+/// parts, or any non-numeric part, is not a legacy IPv4 host at all and returns `None`, leaving it
+/// to be judged as an ordinary DNS name instead.
+fn parse_legacy_ipv4(host: &str) -> Option<core::net::Ipv4Addr> {
+    let parts: Vec<u32> = host
+        .split('.')
+        .map(parse_legacy_ipv4_part)
+        .collect::<Option<_>>()?;
+    let combined: u32 = match *parts.as_slice() {
+        [a] => a,
+        [a, b] if a <= 0xFF && b <= 0x00FF_FFFF => (a << 24) | b,
+        [a, b, c] if a <= 0xFF && b <= 0xFF && c <= 0xFFFF => (a << 24) | (b << 16) | c,
+        [a, b, c, d] if a <= 0xFF && b <= 0xFF && c <= 0xFF && d <= 0xFF => {
+            (a << 24) | (b << 16) | (c << 8) | d
+        }
+        _ => return None,
+    };
+    Some(core::net::Ipv4Addr::from(combined))
 }
 
 /// Check that `url` is a URL we are willing to send a request to. See the five rules in Context.
@@ -694,14 +765,37 @@ pub fn validate_aia_url(url: &str, cfg: &OcspConfig) -> Result<(), OcspError> {
             .host
             .parse()
             .map_err(|_| OcspError::BadResponderUrl)?;
-        if !cfg.allow_private_responders && ipv6_is_disallowed(addr) {
+        if !cfg.allow_private_responders {
+            if ipv6_is_disallowed(addr) {
+                return Err(OcspError::PrivateResponderAddress);
+            }
+            // An IPv4-mapped or IPv4-compatible address is none of the things
+            // `ipv6_is_disallowed` checks by construction (it carries a v4 address in its low 32
+            // bits, not an IPv6 loopback/link-local/unique-local/unspecified/multicast pattern),
+            // so it must be unmapped and judged by the v4 rules the embedded address is actually
+            // subject to: this is what closes `http://[::ffff:169.254.169.254]/` reaching the
+            // exact address rule 4 exists to block.
+            if let Some(embedded) = ipv4_embedded_in_v6(addr)
+                && ipv4_is_disallowed(embedded)
+            {
+                return Err(OcspError::PrivateResponderAddress);
+            }
+        }
+    } else {
+        // The canonical four-decimal-octet form first, then the legacy decimal/hex/octal/short
+        // encodings `Ipv4Addr`'s own parser correctly rejects as non-canonical but that a
+        // certificate's AIA host can still spell to reach exactly the same blocked addresses.
+        let literal = parsed
+            .host
+            .parse::<core::net::Ipv4Addr>()
+            .ok()
+            .or_else(|| parse_legacy_ipv4(parsed.host));
+        if let Some(addr) = literal
+            && !cfg.allow_private_responders
+            && ipv4_is_disallowed(addr)
+        {
             return Err(OcspError::PrivateResponderAddress);
         }
-    } else if let Ok(addr) = parsed.host.parse::<core::net::Ipv4Addr>()
-        && !cfg.allow_private_responders
-        && ipv4_is_disallowed(addr)
-    {
-        return Err(OcspError::PrivateResponderAddress);
     }
 
     Ok(())
@@ -1180,6 +1274,72 @@ mod tests {
     }
 
     #[test]
+    fn build_request_produces_a_valid_ocsp_request() {
+        // No test decodes what build_request actually produces: validate_2 only exercises its
+        // NoIssuer error path. Replacing the whole encoding with garbage, or dropping the nonce
+        // extension outright, both leave every other test in this file green, because nothing
+        // checks that the bytes are a well-formed RFC 6960 OCSPRequest, that the CertID matches
+        // this credential, or that the nonce round-trips.
+        let fixture = build_fixture("build-request.example.com");
+        let nonce = [9u8; 16];
+        let der = super::build_request(&fixture.cred, Some(&nonce))
+            .expect("build_request must succeed for a valid chain");
+
+        let request: x509_ocsp::OcspRequest =
+            Decode::from_der(&der).expect("build_request must produce a valid DER OCSPRequest");
+        assert_eq!(
+            request.tbs_request.request_list.len(),
+            1,
+            "a single-certificate request must carry exactly one Request"
+        );
+        let req = &request.tbs_request.request_list[0];
+
+        // Independently recomputed here, not by calling build_cert_id (which build_request
+        // itself calls), so a bug shared between the function and this assertion cannot cancel
+        // out and hide behind a passing test.
+        let issuer =
+            x509_cert::Certificate::from_der(&fixture.issuer_der).expect("parse fixture issuer");
+        let expected_issuer_name_hash = sha1::Sha1::digest(fixture.cred.issuer_dn());
+        let expected_issuer_key_hash = sha1::Sha1::digest(
+            issuer
+                .tbs_certificate
+                .subject_public_key_info
+                .subject_public_key
+                .raw_bytes(),
+        );
+        assert_eq!(
+            req.req_cert.issuer_name_hash.as_bytes(),
+            expected_issuer_name_hash.as_slice(),
+            "issuerNameHash must be SHA1 of the issuer's subject Name"
+        );
+        assert_eq!(
+            req.req_cert.issuer_key_hash.as_bytes(),
+            expected_issuer_key_hash.as_slice(),
+            "issuerKeyHash must be SHA1 of the issuer's raw SPKI bit string contents"
+        );
+        assert_eq!(
+            req.req_cert.serial_number.as_bytes(),
+            fixture.cred.serial(),
+            "serialNumber must be the leaf's own serial"
+        );
+
+        // The nonce extension, id-pkix-ocsp-nonce (1.3.6.1.5.5.7.48.1.2), must round-trip the
+        // exact 16 bytes passed in.
+        let extensions = request
+            .tbs_request
+            .request_extensions
+            .as_deref()
+            .expect("a nonce was requested, so request_extensions must be present");
+        let ext = extensions
+            .iter()
+            .find(|e| e.extn_id == OID_OCSP_NONCE)
+            .expect("the nonce extension must be present");
+        let nonce_octet: der::asn1::OctetString = Decode::from_der(ext.extn_value.as_bytes())
+            .expect("the nonce extension value must decode as an OCTET STRING");
+        assert_eq!(nonce_octet.as_bytes(), &nonce);
+    }
+
+    #[test]
     fn validate_3() {
         let fixture = build_fixture("empty.example.com");
         let result = validate_staple(
@@ -1417,6 +1577,34 @@ mod tests {
             "a delegated responder signed by the issuer and carrying id-kp-OCSPSigning must be \
              accepted: {good_result:?}"
         );
+    }
+
+    #[test]
+    fn validate_response_signature_forged_for_named_issuer_rejected() {
+        // The central security property of this module: a response whose ResponderID names the
+        // real issuer directly, so step 5's authorization check passes outright with the issuer's
+        // own key selected as the verification key, must still be rejected if the bytes were not
+        // actually signed by that key. Unlike validate_7 (ResponderID names an unrelated
+        // certificate, so authorization itself fails) and validate_9's first half (ResponderID
+        // names a delegated responder that resolve_signer refuses), this response is authorized
+        // by every check except the one this test exists to pin: the signature. Neutering step 6
+        // (`verify_signature_der(...)?` weakened to `let _ = verify_signature_der(...)`) leaves
+        // every other field in this response correct, so it is accepted as `Ok(StapleInfo { .. })`
+        // with no other test in this file noticing.
+        let fixture = build_fixture("forged-signature.example.com");
+        let (_unrelated_der, unrelated_key) = build_unrelated_cert();
+        let mut spec = base_spec(&fixture);
+        spec.responder_id = issuer_responder_id(&fixture);
+        spec.signer = &unrelated_key;
+        let der = build_response_der(&spec);
+        let result = validate_staple(
+            &der,
+            &fixture.cred,
+            None,
+            UnixSeconds::new(NOW),
+            &OcspConfig::default(),
+        );
+        assert_eq!(result, Err(OcspError::BadSignature));
     }
 
     #[test]
@@ -1767,6 +1955,75 @@ mod tests {
             validate_aia_url(&url, &cfg),
             Err(OcspError::BadResponderUrl)
         );
+    }
+
+    #[test]
+    fn aia_url_ipv4_mapped_and_compatible_refused() {
+        let cfg = OcspConfig::default();
+        // Every one of these embeds a v4 address rule 4 already blocks in dotted-quad form, just
+        // spelled as an IPv6 literal: an IPv4-mapped address (`::ffff:a.b.c.d`, the form every
+        // dual-stack socket produces for a v4 peer), the same address with its embedded v4 part
+        // written as two hex groups instead of a dotted quad, and the deprecated IPv4-compatible
+        // form (`::a.b.c.d`). All five must be refused, or a certificate need only rewrite its
+        // AIA host in one of these spellings to reach the exact addresses this rule exists to
+        // block.
+        for url in [
+            "http://[::ffff:169.254.169.254]/",
+            "http://[::ffff:127.0.0.1]/",
+            "http://[::ffff:10.0.0.1]/",
+            "http://[::ffff:7f00:1]/",
+            "http://[::127.0.0.1]/",
+        ] {
+            assert_eq!(
+                validate_aia_url(url, &cfg),
+                Err(OcspError::PrivateResponderAddress),
+                "{url} embeds a blocked v4 address and must be refused"
+            );
+        }
+        // Controls, unaffected by the unmapping fix and re-asserted here so a regression that
+        // broke the ordinary IPv6 classifiers while fixing the mapped case would still be caught.
+        for url in ["http://[::1]/", "http://[fe80::1]/"] {
+            assert_eq!(
+                validate_aia_url(url, &cfg),
+                Err(OcspError::PrivateResponderAddress),
+                "{url} must still be refused"
+            );
+        }
+        // The accept side: an ordinary global-unicast IPv6 literal, embedding no v4 address at
+        // all, must not be caught by the new check.
+        assert_eq!(validate_aia_url("http://[2001:db8::1]/", &cfg), Ok(()));
+    }
+
+    #[test]
+    fn aia_url_legacy_ipv4_encodings_refused() {
+        let cfg = OcspConfig::default();
+        // The same blocked addresses rule 4 already refuses in canonical dotted-decimal form,
+        // spelled as a single decimal integer, as `0x`-prefixed hex, with a leading-zero octal
+        // octet, and in short "trailing part absorbs the rest" dotted form. A responder URL
+        // author who controls a certificate's AIA field controls the string bytes, not what a
+        // permissive host parser later decides they mean, so every one of these must resolve to
+        // the same verdict as the canonical spelling of the address it names.
+        for (url, meaning) in [
+            ("http://2852039166/", "decimal for 169.254.169.254"),
+            ("http://2130706433/", "decimal for 127.0.0.1"),
+            ("http://0x7f000001/", "hex for 127.0.0.1"),
+            ("http://0177.0.0.1/", "octal first octet for 127.0.0.1"),
+            ("http://127.1/", "short dotted form for 127.0.0.1"),
+        ] {
+            assert_eq!(
+                validate_aia_url(url, &cfg),
+                Err(OcspError::PrivateResponderAddress),
+                "{url} ({meaning}) must be refused"
+            );
+        }
+        // The accept side: a real hostname with numeric-looking labels, and one with MORE than
+        // four dot-separated labels (never a legal IPv4 host under any of the encodings above),
+        // must not be misparsed as an IP literal.
+        assert_eq!(
+            validate_aia_url("http://10.0.0.5.example.com/", &cfg),
+            Ok(())
+        );
+        assert_eq!(validate_aia_url("http://ocsp.example.com/", &cfg), Ok(()));
     }
 
     #[test]
