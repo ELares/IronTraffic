@@ -11,6 +11,7 @@
 #![deny(clippy::unwrap_used, clippy::expect_used, clippy::indexing_slicing)]
 
 pub mod crl;
+pub mod early_data;
 pub mod hkdf;
 pub mod listener;
 pub mod name;
@@ -18,6 +19,7 @@ pub mod ocsp;
 pub mod ocsp_update;
 pub mod policy;
 pub mod provider;
+pub mod replay;
 pub mod store;
 pub mod ticket;
 pub mod time;

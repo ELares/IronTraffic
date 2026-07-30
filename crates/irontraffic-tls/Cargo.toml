@@ -75,3 +75,7 @@ harness = false
 [[bench]]
 name = "ticket"
 harness = false
+
+[[bench]]
+name = "replay"
+harness = false
