@@ -110,6 +110,13 @@ pub struct CertIndex {
     /// `resolve_wildcard_branch_probes_wild_map_exactly_once` below, which reads this counter.
     #[cfg(test)]
     wild_probe_count: AtomicU64,
+    /// Test seam: how many times `resolve` has probed the `exact` map. Paired with
+    /// `wild_probe_count` so that a test can assert the TOTAL probe count per resolution is
+    /// independent of how many names the index holds, which is the real "flat across n"
+    /// property. A wall-clock version of that assertion measures the machine as much as the
+    /// code; see #750.
+    #[cfg(test)]
+    exact_probe_count: AtomicU64,
 }
 
 /// Counters for the certificate path. Monotone, relaxed, may lose an increment; never a balance.
@@ -696,6 +703,8 @@ impl CertIndexBuilder {
             stats: CertStats::default(),
             #[cfg(test)]
             wild_probe_count: AtomicU64::new(0),
+            #[cfg(test)]
+            exact_probe_count: AtomicU64::new(0),
         })
     }
 
@@ -746,6 +755,10 @@ impl CertIndex {
         };
 
         let key = self.hasher.hash(name);
+        // Test-only probe counter; see the field doc. This is the ONE place `resolve` probes
+        // `exact`.
+        #[cfg(test)]
+        self.exact_probe_count.fetch_add(1, Ordering::Relaxed);
         if let Some(&i) = self.exact.get(&key)
             && self.name_at(i) == name.as_bytes()
         {
@@ -966,6 +979,13 @@ impl CertIndex {
         self.wild_probe_count.load(Ordering::Relaxed)
     }
 
+    /// Test-only: number of times `resolve` has probed the `exact` map on `self`.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn exact_probe_count_for_test(&self) -> u64 {
+        self.exact_probe_count.load(Ordering::Relaxed)
+    }
+
     /// The stored name bytes for a group. `i` came out of one of the two maps, so it is in range
     /// by construction; the builder is the only writer of both.
     #[allow(
@@ -1037,7 +1057,6 @@ impl CertIndex {
 mod tests {
     use std::sync::atomic::Ordering;
     use std::sync::{Arc, Once, OnceLock};
-    use std::time::Instant;
 
     use proptest::prelude::*;
 
@@ -1387,9 +1406,28 @@ mod tests {
     )]
     #[test]
     fn resolve_flat_across_n() {
+        // The property: resolution cost does not grow with the number of names in the index.
+        //
+        // This used to be asserted with a wall-clock ratio, and it failed about one run in three
+        // under the full parallel suite (#750). The numbers showed why: medians came out
+        // `[2195, 1077, 735, 749]` ns/call with the SMALLEST index the slowest by 3x, which is
+        // not a scaling effect at all. It was the first measurement paying for cold caches and
+        // an unramped CPU clock, and `n = 1` is simply whichever measurement runs first.
+        // Warm-up and best-of-3 each cut the rate but neither removed it, because a wall-clock
+        // assertion inside a test binary running in parallel with 200 other tests is measuring
+        // the machine as much as the code.
+        //
+        // So it is asserted deterministically instead, on the quantity the timing was a proxy
+        // for: the number of hash-map probes per resolution. Two probes for a wildcard match,
+        // one for an exact hit, whatever `n` is. That is exactly #115's thesis ("exactly two
+        // hash probes ... exactly one wildcard probe", "Do NOT walk every suffix of the SNI"),
+        // it discriminates an O(k) suffix walk that returns the correct answer, and it cannot
+        // flake.
+        const CALLS: u64 = 1_000;
+
         let cred = cred_ecdsa_p256(&["example.com"]);
         let ns = [1usize, 100, 10_000, 100_000];
-        let mut medians = Vec::with_capacity(ns.len());
+        let mut per_resolution = Vec::with_capacity(ns.len());
         for &n in &ns {
             let mut builder = CertIndexBuilder::new([2u8; 16]);
             for i in 0..n {
@@ -1401,16 +1439,32 @@ mod tests {
             let index = builder.build().expect("build");
             let query = format!("host{}.example.com", n / 2);
 
-            let start = Instant::now();
-            for _ in 0..200_000 {
-                let _ = index.resolve(&query, ClientCaps::all());
+            for _ in 0..CALLS {
+                let hit = index.resolve(&query, ClientCaps::all());
+                assert!(
+                    hit.is_some(),
+                    "n={n}: the query must actually resolve, or this test \
+                                        would be counting probes on a miss path"
+                );
             }
-            let elapsed = start.elapsed();
-            medians.push(elapsed.as_nanos() / 200_000);
+            let probes = index.exact_probe_count_for_test() + index.wild_probe_count_for_test();
+            assert_eq!(
+                probes % CALLS,
+                0,
+                "n={n}: probe count {probes} is not a whole number \
+                                           per resolution over {CALLS} calls"
+            );
+            per_resolution.push(probes / CALLS);
         }
-        let fastest = *medians.iter().min().expect("at least one median");
-        let slowest = *medians.iter().max().expect("at least one median");
-        assert!(slowest < fastest * 2, "medians {medians:?}: not flat");
+
+        // Pinned against a LITERAL, not against `per_resolution[0]`: comparing the vector to its
+        // own first element is satisfied by any constant, including a constant that grew.
+        assert_eq!(
+            per_resolution,
+            vec![1u64, 1, 1, 1],
+            "an exact hit must cost exactly one probe at every n; anything else means \
+             resolution now scales with index size"
+        );
     }
 
     #[test]
