@@ -994,87 +994,52 @@ fn display_does_not_leak_the_wrapped_reject_reason() {
 /// The measurement #203's Benchmarks section requires: `parse` plus `accept_key` plus
 /// `verify`, over 100,000 iterations, against a 3 microsecond budget.
 ///
-/// #203 says "Not a criterion group. Report in the PR description, from a test-driven
-/// 100,000 iteration measurement". It was never taken, so the budget was unverified and
-/// no timing figure appeared anywhere in the diff. This runs it and asserts the budget,
-/// so the number cannot silently stop being true; the PR description carries the figure.
+/// **There is no wall clock assertion here any more, deliberately.** It asserted a 20
+/// microsecond ceiling and called that "the sign that something is allocating per handshake"
+/// (#203). Measured, it was not that sign: a per handshake allocation of 4 KiB, 64 KiB and 1 MiB
+/// each left it PASSING, against a 15.3 microsecond baseline. What it detected reliably was
+/// scheduler noise, failing CI at 20.051 microseconds and blocking three PRs that do not touch
+/// this crate (#762). Warm up and best of three rounds cut the rate about elevenfold, from 12 in
+/// 130 to 1 in 130 on an idle host, and did essentially nothing under sustained contention, where
+/// both variants failed 20 of 20: a round is about 1.5 seconds, so a disturbance longer than the
+/// three rounds hits all of them and taking the minimum launders nothing.
 ///
-/// The assertion is against the issue's own "something is allocating per handshake"
-/// ceiling of 20 microseconds rather than the 3 microsecond target, because a shared CI
-/// runner under load is not a quiet benchmark host and a tight bound here would be a
-/// flake generator. The measured figure is reported either way.
+/// The property it was standing in for is now asserted where it can actually fail, in
+/// `tests/alloc_gate_handshake.rs`. The same injected allocation fails that gate and passes this
+/// ceiling, which is the whole case for the move. A timing bound still has value as a guard
+/// against a gross regression, and its home is the serialized perf job tracked in #753 alongside
+/// #418, not a binary running in parallel with twenty six sibling tests.
+///
+/// What remains here is the functional half, and it is worth keeping: 100,000 real round trips
+/// asserting `parse`, `accept_key` and `verify` all keep succeeding at scale.
 #[test]
 fn handshake_round_trip_is_within_the_per_handshake_budget() {
     const ITERATIONS: u32 = 100_000;
-    const WARMUP: u32 = 10_000;
-    const ROUNDS: u32 = 3;
 
     let (req, tokens) = upgrade(BROWSER_UPGRADE).expect("test fixture must parse and canonicalize");
     let baseline = UpgradeRequest::parse(&req, tokens).unwrap().unwrap();
     let headers = accepting_response(&baseline).expect("test fixture response must be valid");
     let htokens = response_tokens(&headers);
 
-    // Warm up before timing, and take the best of ROUNDS.
-    //
-    // This assertion measured 20.051us against its own 20us ceiling on shared CI hardware, a 0.25
-    // percent overshoot, and blocked two unrelated PRs that do not touch this crate at all (#762).
-    // A wall clock reading taken inside a binary running in parallel with the rest of the suite
-    // measures the machine as much as the code. Interference can only ever ADD time, so the
-    // minimum across rounds is the noise free estimate of the real cost, and a warm up keeps the
-    // first round from paying for cold instruction cache and an unramped CPU clock.
-    //
-    // The ceiling itself is NOT relaxed. What changed is how the number is obtained.
-    //
-    // Be precise about what this ceiling does and does not establish, because the assertion
-    // message below claims more than the measurement supports. #203 calls 20us "the sign that
-    // something is allocating per handshake". It is not that sign. Measured on this corpus: the
-    // baseline is 15.3us, leaving 30 percent headroom, which is why ordinary CI contention trips
-    // it; and injecting a per handshake heap allocation of 4 KiB, 64 KiB and even 1 MiB left the
-    // assertion PASSING every time. A wall clock bound at this margin detects scheduler noise
-    // reliably and allocation not at all.
-    //
-    // What it is still worth keeping for is a coarse smoke bound against a gross regression, and
-    // that is the honest description. The allocation property #203 actually wants needs an
-    // allocation assertion; see #763.
-    let mut done: u32 = 0;
-    let run_once = || {
+    // `verified` counts SUCCESSFUL ROUND TRIPS, not loop trips. A counter incremented once per
+    // iteration regardless of what the body did would pass with `run_once` gutted, which a review
+    // demonstrated against the previous version of this test.
+    let mut verified: u32 = 0;
+    for _ in 0..ITERATIONS {
         let parsed = UpgradeRequest::parse(&req, tokens).unwrap().unwrap();
         let accept = accept_key(parsed.key_b64());
         std::hint::black_box(&accept);
-        let verified = UpgradeResponse::verify(&parsed, 101, &headers, htokens).unwrap();
-        std::hint::black_box(&verified);
-    };
-    for _ in 0..WARMUP {
-        run_once();
-    }
-    let mut per_iter = std::time::Duration::MAX;
-    for _ in 0..ROUNDS {
-        let start = std::time::Instant::now();
-        for _ in 0..ITERATIONS {
-            run_once();
-            done += 1;
+        if UpgradeResponse::verify(&parsed, 101, &headers, htokens).is_ok() {
+            verified += 1;
         }
-        per_iter = per_iter.min(start.elapsed() / ITERATIONS);
     }
 
-    // Pinned to a literal, not to ITERATIONS, so emptying the loop fails rather than
-    // dividing by a smaller number and passing. This is the tautology shape that has
-    // bitten this corpus repeatedly.
-    // Still pinned to a LITERAL, not to `ITERATIONS * ROUNDS`, so emptying either loop fails
-    // rather than dividing by a smaller number and passing. That tautology shape has bitten this
-    // corpus repeatedly.
+    // Pinned to a LITERAL, not to `ITERATIONS`, so emptying the loop fails rather than comparing
+    // a smaller number to itself and passing.
     assert_eq!(
-        done, 300_000,
-        "every iteration of every round must run; emptying either loop must FAIL this test"
-    );
-    // The corpus denies `println!` in tests, so the figure rides on the assertion
-    // message instead of a bare print: it is visible exactly when it matters.
-    assert!(
-        per_iter < std::time::Duration::from_micros(20),
-        "parse + accept_key + verify measured {per_iter:?} per handshake over \
-         {ITERATIONS} iterations across {ROUNDS} rounds, above the 20 microsecond smoke \
-         ceiling. This is a coarse bound against a gross regression, NOT the per handshake \
-         allocation detector #203 describes: see this test's own comment and #763"
+        verified, 100_000,
+        "every round trip must parse, derive an accept key and verify; emptying the loop or \
+         breaking any of the three must FAIL this test"
     );
 }
 
