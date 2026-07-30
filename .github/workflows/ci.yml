@@ -20,6 +20,11 @@ name: ci
 on:
   push:
     branches: [main]
+    # A tag push is what `release-artifacts` (below) is gated on. Every
+    # other job still runs too, unchanged: none of them is gated by `if:` on
+    # the ref, per this file's own stated rule that a lane with nothing to
+    # do yet still runs rather than reporting a skip that reads as a pass.
+    tags: ["v*"]
   pull_request:
 
 permissions:
@@ -950,3 +955,127 @@ jobs:
           cache-dependency-path: packages/dashboard/package-lock.json
       - run: ./scripts/dashboard-gate.sh --selftest
       - run: ./scripts/dashboard-gate.sh
+
+  # Created here exactly as specified in `bench-competitor-compare-script`
+  # (#425), which this repository does not have yet: no toolchain and no
+  # cache step, by that same specification, because this job's whole point
+  # is to be fast enough to block every pull request. A future issue adding
+  # its own `*-selftest.sh` adds one step here and changes nothing else,
+  # per the same instruction this row itself was added under.
+  shell-selftests:
+    name: shell-selftests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: sh scripts/release/release-selftest.sh
+
+  # Tag-triggered: builds the four-target release matrix, verifies
+  # reproducibility and the static/dynamic linkage invariants, and publishes
+  # the tarballs and SHA256SUMS as a GitHub release. See docs/RELEASE.md.
+  #
+  # No `ring-provider` matrix entry: the design this issue was written
+  # against assumes `crates/irontraffic` already selects a TLS crypto
+  # provider (an `aws-lc-rs` default and this `ring-provider` fallback
+  # feature). It does not; the crate has no `ring-provider` feature, no
+  # `tls` feature, and does not depend on `crates/irontraffic-tls` at all
+  # (see docs/RELEASE.md's "What this table does not yet say" section for
+  # the full accounting). Adding a CI step that passes
+  # `--no-default-features --features ring-provider` to a crate with no
+  # such feature fails every run; inventing an inert feature that toggles
+  # nothing would be exactly the kind of untested "we have a fallback"
+  # claim this issue's own Context section warns against. A future issue
+  # that wires TLS into this crate is what makes this matrix entry addable
+  # for real.
+  release-artifacts:
+    name: release artifacts
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install the cross toolchains the three non-native targets need
+        # x86_64-unknown-linux-gnu is this runner's own native target and
+        # needs nothing extra. The other three each need one thing:
+        # musl-tools gives x86_64-unknown-linux-musl its musl-gcc,
+        # gcc-aarch64-linux-gnu gives aarch64-unknown-linux-gnu a cross
+        # linker, and aarch64-unknown-linux-musl has no apt package on this
+        # runner at all, so its cross toolchain is downloaded prebuilt from
+        # musl.cc, the same community-maintained source most Rust release
+        # workflows targeting this exact combination use.
+        run: |
+          set -euo pipefail
+          rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
+            x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+          sudo apt-get update
+          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          curl --proto '=https' --tlsv1.2 -fsSL \
+            https://musl.cc/aarch64-linux-musl-cross.tgz -o /tmp/aarch64-linux-musl-cross.tgz
+          sudo tar -xzf /tmp/aarch64-linux-musl-cross.tgz -C /opt
+          echo "/opt/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc" >> "$GITHUB_ENV"
+      - name: Build the four-target matrix
+        run: sh scripts/release/build-matrix.sh dist
+      - name: Verify reproducibility (x86_64-unknown-linux-gnu)
+        run: sh scripts/release/verify-repro.sh x86_64-unknown-linux-gnu
+      - name: Verify the musl binaries are fully static
+        run: |
+          set -euo pipefail
+          for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            f="target/$t/release/irontraffic"
+            echo "== $t =="
+            file "$f"
+            # Classifying "no PT_INTERP program header" does not require
+            # actually EXECUTING the binary, unlike resolving a dynamic
+            # binary's dependencies does, so this is safe to run against
+            # aarch64-unknown-linux-musl on this x86_64 runner too.
+            if ldd "$f" 2>&1 | grep -vq 'not a dynamic executable'; then
+              echo "FAIL: $f is not static. A C dependency entered the tree."
+              ldd "$f" || true
+              exit 1
+            fi
+          done
+          echo "static: ok"
+      - name: Verify the gnu binaries link only the committed allowlist
+        run: |
+          set -euo pipefail
+          allow="scripts/release/gnu-ldd-allowlist.txt"
+          for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            f="target/$t/release/irontraffic"
+            echo "== $t =="
+            if [ "$t" = "x86_64-unknown-linux-gnu" ]; then
+              libs="$(ldd "$f" | awk '{print $1}')"
+            else
+              # A foreign-architecture DYNAMIC binary cannot be resolved by
+              # this runner's own ldd/ld.so (unlike the static case above),
+              # so its NEEDED entries are read straight out of the ELF
+              # dynamic section instead of executing anything.
+              libs="$(readelf -d "$f" | awk -F'[][]' '/\(NEEDED\)/{print $2}')"
+            fi
+            printf '%s\n' "$libs" | while IFS= read -r lib; do
+              [ -n "$lib" ] || continue
+              if ! grep -qxF "$lib" "$allow"; then
+                echo "FAIL: $t links $lib, which is not in $allow"
+                exit 1
+              fi
+            done
+          done
+          echo "allowlist: ok"
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/}"
+          gh release create "$tag" dist/*.tar.gz dist/SHA256SUMS \
+            --title "$tag" --generate-notes
