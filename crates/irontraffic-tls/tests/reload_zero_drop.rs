@@ -31,10 +31,10 @@
 )]
 
 use std::collections::HashSet;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Once};
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use irontraffic_tls::policy::TlsPolicy;
 use irontraffic_tls::store::{
@@ -51,6 +51,19 @@ use irontraffic_tls::time::UnixSeconds;
 /// benchmark in advance; the assertion itself, and the zero-handshake-failure requirement above
 /// it, are never weakened or removed.
 const MIN_TOTAL_SUCCESSES: u64 = 5_000;
+
+/// Hard upper bound on the worker window, after which the run stops regardless of how few
+/// handshakes have completed and the `MIN_TOTAL_SUCCESSES` assertion fails on its own terms.
+///
+/// This exists so the test reports a real throughput failure rather than hanging a CI job.
+const MAX_RUN: Duration = Duration::from_secs(120);
+
+/// Lower bound on the worker window, which is the "loops run for at least 2 seconds" the design
+/// specifies. The publisher's own budget is only about one second (100 publishes, 10 ms apart),
+/// and tying the workers' window to it is what made this test fail CI on all three crypto cells:
+/// a 2-core runner completed 1,092 to 3,513 handshakes in that window against a 5,000 floor that
+/// the design forbids lowering further. The floor is not the problem; the window was.
+const MIN_RUN: Duration = Duration::from_secs(2);
 
 fn ensure_provider_installed() {
     static INIT: Once = Once::new();
@@ -206,6 +219,17 @@ fn reload_zero_drop_under_concurrent_handshakes() {
             .collect(),
     );
 
+    // Generation N serves `creds[N]`: generation 0 is the credential the cell is built with, and
+    // the publisher installs `creds[1..=PUBLISHES]` in order, one per publish. Indexing this by
+    // the generation read from the same guard as the resolver is what makes the per-handshake
+    // assertion below discriminate a missing publish, which set membership cannot.
+    let leaf_by_generation: Arc<Vec<String>> = Arc::new(
+        creds
+            .iter()
+            .map(|c| hex16(blake3::hash(c.leaf_der()).as_bytes()))
+            .collect(),
+    );
+
     let mut roots = rustls::RootCertStore::empty();
     roots
         .add(rustls::pki_types::CertificateDer::from(ca_der.clone()))
@@ -240,21 +264,28 @@ fn reload_zero_drop_under_concurrent_handshakes() {
 
     let stop = Arc::new(AtomicBool::new(false));
 
+    // Live count of completed handshakes, so the publisher can hold the window open until the
+    // floor is actually reached instead of guessing how fast the runner is.
+    let completed = Arc::new(AtomicU64::new(0));
+
     let mut worker_handles = Vec::with_capacity(WORKERS);
     for _ in 0..WORKERS {
         let cell = Arc::clone(&cell);
         let stop = Arc::clone(&stop);
         let fingerprints = Arc::clone(&fingerprints);
         let client_cfg = Arc::clone(&client_cfg);
-        worker_handles.push(thread::spawn(move || -> Result<u64, String> {
+        let completed = Arc::clone(&completed);
+        let leaf_by_generation = Arc::clone(&leaf_by_generation);
+        worker_handles.push(thread::spawn(move || -> Result<(u64, u64), String> {
             let mut successes = 0u64;
+            let mut max_generation_seen = 0u64;
             while !stop.load(Ordering::Relaxed) {
-                let resolver = {
+                let (resolver, generation) = {
                     // The guard is held only long enough to clone the one `Arc` needed, exactly
                     // as `TlsMaterialCell::load`'s docs require: dropped before any handshake
                     // work runs, so it never pins a generation for the life of a connection.
                     let material = cell.load();
-                    Arc::clone(&material.resolver)
+                    (Arc::clone(&material.resolver), material.generation)
                 };
                 let server_cfg = rustls::ServerConfig::builder_with_protocol_versions(&[
                     &rustls::version::TLS13,
@@ -286,14 +317,37 @@ fn reload_zero_drop_under_concurrent_handshakes() {
                         "served leaf {served_hex} is not one of the 101 known credentials"
                     ));
                 }
+                // Set membership alone is far too weak: `creds[0]` is in that set, so it stays
+                // satisfied even if publication never happens at all. Deleting the `ArcSwap`
+                // store from `TlsMaterialCell::publish` left this whole test green, because
+                // every worker then served `creds[0]` forever while the publish and generation
+                // counters (separate statements) kept incrementing.
+                //
+                // The exact relation this design guarantees is that the leaf served by a
+                // resolver equals the credential installed at that resolver's OWN generation.
+                // `generation` is read from the same guard as `resolver`, so a publish landing
+                // mid-handshake cannot make this race: both name the same snapshot.
+                let index = usize::try_from(generation)
+                    .map_err(|_| format!("generation {generation} does not fit a usize"))?;
+                let expected = leaf_by_generation
+                    .get(index)
+                    .ok_or_else(|| format!("generation {generation} has no known credential"))?;
+                if &served_hex != expected {
+                    return Err(format!(
+                        "generation {generation} served leaf {served_hex}, expected {expected}"
+                    ));
+                }
                 successes += 1;
+                max_generation_seen = max_generation_seen.max(generation);
+                completed.fetch_add(1, Ordering::Relaxed);
             }
-            Ok(successes)
+            Ok((successes, max_generation_seen))
         }));
     }
 
     let publisher_cell = Arc::clone(&cell);
     let publisher_stop = Arc::clone(&stop);
+    let publisher_completed = Arc::clone(&completed);
     let publisher_creds = creds.clone();
     let publisher_handle = thread::spawn(move || {
         let time: Arc<dyn TimeView> = Arc::new(FixedClock(UnixSeconds::new(1_000)));
@@ -317,6 +371,23 @@ fn reload_zero_drop_under_concurrent_handshakes() {
                 .expect("every flush in this test must build and publish cleanly");
             thread::sleep(Duration::from_millis(10));
         }
+        // The publishes are done after about one second. Do NOT stop the workers here: that
+        // ties their entire window to the publisher's sleep budget, which is what failed CI on
+        // all three crypto cells. Hold the window open until the floor is actually reached, so
+        // the assertion measures whether handshakes SUCCEED rather than whether this particular
+        // runner is fast enough to reach a fixed count inside a fixed time.
+        //
+        // The concurrency this test exists to exercise all happens in the first second, while
+        // publishes are landing underneath live handshakes. The remaining time only accumulates
+        // count, and on any machine fast enough it is zero: the floor is already passed before
+        // the publish loop ends.
+        let started = Instant::now();
+        while started.elapsed() < MIN_RUN
+            || (publisher_completed.load(Ordering::Relaxed) < MIN_TOTAL_SUCCESSES
+                && started.elapsed() < MAX_RUN)
+        {
+            thread::sleep(Duration::from_millis(10));
+        }
         publisher_stop.store(true, Ordering::Relaxed);
     });
 
@@ -325,12 +396,37 @@ fn reload_zero_drop_under_concurrent_handshakes() {
         .expect("the publisher thread must not panic");
 
     let mut total_successes: u64 = 0;
+    let mut max_generation_seen: u64 = 0;
     for handle in worker_handles {
         match handle.join().expect("a worker thread must not panic") {
-            Ok(n) => total_successes += n,
+            Ok((n, gen_seen)) => {
+                total_successes += n;
+                max_generation_seen = max_generation_seen.max(gen_seen);
+            }
             Err(e) => panic!("a worker thread reported an error: {e}"),
         }
     }
+
+    // The publication actually reached the cell, and READERS saw it.
+    //
+    // Both of these are needed, and neither the per-handshake check above nor the counter
+    // assertions below can stand in for them. Deleting `self.inner.store(material)` from
+    // `TlsMaterialCell::publish` leaves every other assertion in this test satisfied: the
+    // publish and generation STATS are separate statements that keep incrementing, and the
+    // per-handshake check stays self-consistent because a reader then sees generation 0 and is
+    // correctly served `creds[0]`, which agree with each other. Only asking what the cell now
+    // holds, and what the highest generation any reader actually observed was, discriminates a
+    // swap that never happened.
+    assert_eq!(
+        cell.load().generation,
+        PUBLISHES as u64,
+        "the cell must hold the last published material, not merely count the publishes"
+    );
+    assert_eq!(
+        max_generation_seen, PUBLISHES as u64,
+        "no reader ever observed the final generation, so publication was not visible through \
+         the swap even if the counters advanced"
+    );
 
     assert!(
         total_successes >= MIN_TOTAL_SUCCESSES,
