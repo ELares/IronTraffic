@@ -23,6 +23,7 @@ pub mod replay;
 pub mod store;
 pub mod ticket;
 pub mod time;
+pub mod verify_client;
 
 pub use listener::{
     AcceptStep, AcceptedHello, ClientAuthKind, DEFAULT_MAX_CLIENT_HELLO_BYTES, HandshakeLimits,
@@ -39,3 +40,4 @@ pub use store::{
     CertIndex, CertIndexBuilder, ChallengeCerts, ChallengeCertsBuilder, ClientCaps, IronResolver,
 };
 pub use ticket::{ClusterTicketer, TicketRoot};
+pub use verify_client::{ClientAuth, TrustAnchors};

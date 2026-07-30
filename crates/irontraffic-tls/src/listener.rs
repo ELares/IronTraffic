@@ -137,36 +137,25 @@ impl core::fmt::Debug for TlsServerConfig {
     }
 }
 
-/// A `TimeView` fixed at the epoch, for [`TlsServerConfig::test_stub`]'s empty resolver.
-#[cfg(test)]
-struct ZeroClock;
-
-#[cfg(test)]
-impl crate::store::TimeView for ZeroClock {
-    fn unix_seconds(&self) -> crate::time::UnixSeconds {
-        crate::time::UnixSeconds::new(0)
-    }
-}
-
 impl TlsServerConfig {
-    /// Compile a policy plus a certificate resolver into a rustls `ServerConfig`.
+    /// Compile a policy plus a certificate resolver into a rustls `ServerConfig` with no client
+    /// authentication.
     ///
-    /// This is the only constructor that produces a configuration a peer can actually reach.
-    ///
-    /// Note `with_no_client_auth()` and the hard-coded [`ClientAuthKind::None`]: this issue cannot
-    /// build a client-certificate verifier, because the verifier comes from
-    /// `mtls-client-auth-fail-closed` (#124), which is blocked by this issue and therefore lands
-    /// after it. #124 adds the sibling constructor `compile_with_client_auth` and is the issue
-    /// that can produce `Optional` and `Required` values. A stub verifier here, or a
-    /// `ClientAuthKind` argument the configuration does not actually enforce, would be a label
-    /// claiming an authentication that never runs, which is the whole bug class this module
-    /// exists to close.
+    /// `ticketer` is the cluster-derived session ticketer to install, if any
+    /// (`cluster-derived-session-ticketer`, #120). Its context MUST be 16 zero bytes: this
+    /// constructor's `ClientAuthKind` is always `None`, and a ticketer built with any other
+    /// context reproduces CVE-2025-68121 (a ticket surviving a change of trust bundle) the moment
+    /// it is installed here. The caller constructs at most one `ClusterTicketer` per distinct
+    /// context and shares the `Arc`; this function does not construct one itself. `None` leaves
+    /// rustls's `NeverProducesTickets` in place and therefore no resumption at all, exactly as
+    /// `tls-protocol-cipher-group-alpn-policy` (#116) intends.
     ///
     /// # Errors
     /// [`ListenerError::ProviderNotInstalled`] when `install_process_provider` has not run.
     pub fn compile(
         policy: Arc<TlsPolicy>,
         resolver: Arc<IronResolver>,
+        ticketer: Option<Arc<crate::ticket::ClusterTicketer>>,
     ) -> Result<Self, ListenerError> {
         let provider = crate::policy::provider_for(policy.post_quantum())
             .ok_or(ListenerError::ProviderNotInstalled)?;
@@ -176,6 +165,11 @@ impl TlsServerConfig {
             .with_no_client_auth()
             .with_cert_resolver(resolver);
         crate::policy::apply_common(&policy, &mut cfg);
+        if let Some(t) = ticketer {
+            cfg.ticketer = t; // it-allow: hot-path-allocation reason: an Arc field assignment, not an allocation; runs once per listener configuration compile
+            cfg.send_tls13_tickets =
+                usize::try_from(crate::ticket::ClusterTicketer::tickets_to_send()).unwrap_or(2);
+        }
         Ok(Self {
             inner: Arc::new(cfg), // it-allow: hot-path-allocation reason: compiles once per listener configuration, not once per resolved name
             client_auth: ClientAuthKind::None,
@@ -183,36 +177,85 @@ impl TlsServerConfig {
         })
     }
 
-    /// A configuration that reports an arbitrary [`ClientAuthKind`] label while actually enforcing
-    /// none.
+    /// Compile a policy plus a certificate resolver into a rustls `ServerConfig` with client
+    /// certificate authentication, the sibling of [`Self::compile`].
     ///
-    /// Exists so the divergence lint, which reasons purely about the labels, can be tested before
-    /// #124 provides real verifiers. It is `#[cfg(test)]` precisely so that nothing outside this
-    /// crate's tests can obtain a configuration whose label overstates what it enforces.
-    #[cfg(test)]
-    pub(crate) fn test_stub(client_auth: ClientAuthKind) -> Self {
-        let policy = Arc::new(TlsPolicy::default_https());
+    /// Identical to [`Self::compile`] except that it installs `auth`'s verifier (built by
+    /// [`crate::verify_client::IronClientVerifier::new`]) instead of calling
+    /// `with_no_client_auth()`, and records `auth.kind()` as the configuration's
+    /// [`ClientAuthKind`] instead of hard-coding `None`. When `auth` is
+    /// [`crate::verify_client::ClientAuth::None`] this delegates to [`Self::compile`] verbatim,
+    /// passing `ticketer` through unchanged: a listener with no client authentication installs no
+    /// verifier at all, never a permissive one.
+    ///
+    /// `allow_unknown_revocation` and `revocation` are the two operator knobs
+    /// `crate::verify_client::ClientAuthConfig` carries; they are threaded through here as plain
+    /// arguments rather than derived from `auth` because `ClientAuth` deliberately does not carry
+    /// them (only the trust anchors do), for the identical reason `crls`, `crl_cfg` and `time`
+    /// are also separate arguments here: none of the five can be recovered from `auth` alone.
+    ///
+    /// `ticketer`'s context MUST be `auth.anchors().map(TrustAnchors::id)`, falling back to 16
+    /// zero bytes when `auth` is `ClientAuth::None`: see [`Self::compile`]'s doc for why an
+    /// ill-contexted ticketer reproduces CVE-2025-68121.
+    ///
+    /// # Errors
+    /// [`ListenerError::ProviderNotInstalled`] when `install_process_provider` has not run, or
+    /// [`ListenerError::ClientAuth`] wrapping anything
+    /// [`crate::verify_client::IronClientVerifier::new`] returns.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "each of these nine is an independent input IronClientVerifier::new itself \
+                  requires (auth, crls, crl_cfg, allow_unknown_revocation, revocation, time), \
+                  plus the three this constructor's own job adds (policy, resolver, ticketer); \
+                  none can be recovered from another, so grouping them into a struct would only \
+                  rename this same list rather than shrink it, and ClientAuthConfig itself is not \
+                  available here because it is not passed to this constructor (see this method's \
+                  own doc for why: ClientAuth deliberately does not carry allow_unknown_revocation \
+                  or revocation)"
+    )]
+    pub fn compile_with_client_auth(
+        policy: Arc<TlsPolicy>,
+        resolver: Arc<IronResolver>,
+        auth: &crate::verify_client::ClientAuth,
+        crls: Arc<crate::crl::CrlSet>,
+        crl_cfg: crate::crl::CrlConfig,
+        allow_unknown_revocation: bool,
+        revocation: crate::verify_client::RevocationMode,
+        time: Arc<dyn crate::store::TimeView>,
+        ticketer: Option<Arc<crate::ticket::ClusterTicketer>>,
+    ) -> Result<Self, ListenerError> {
+        let verifier = crate::verify_client::IronClientVerifier::new(
+            auth,
+            crls,
+            crl_cfg,
+            allow_unknown_revocation,
+            revocation,
+            time,
+        )
+        .map_err(ListenerError::ClientAuth)?;
+        let Some(verifier) = verifier else {
+            // `ClientAuth::None`: no verifier to install.
+            return Self::compile(policy, resolver, ticketer);
+        };
+
         let provider = crate::policy::provider_for(policy.post_quantum())
-            .expect("the process provider must be installed by the test harness"); // it-allow: no-panic reason: test-only constructor; a missing provider is a harness bug that must be loud, and this function is never compiled into a non-test build.
-        let cfg = rustls::ServerConfig::builder_with_provider(provider)
+            .ok_or(ListenerError::ProviderNotInstalled)?;
+        let mut cfg = rustls::ServerConfig::builder_with_provider(provider)
             .with_protocol_versions(crate::policy::versions(policy.profile()))
-            .expect("the modern and intermediate version sets are always supported") // it-allow: no-panic reason: test-only constructor; the version list is a crate constant, not input.
-            .with_no_client_auth()
-            .with_cert_resolver(Arc::new(crate::store::IronResolver::new(
-                Arc::new(
-                    crate::store::CertIndexBuilder::new([0u8; 16])
-                        .build()
-                        .expect("an empty index always builds"), // it-allow: no-panic reason: test-only constructor over a fixed empty input, not peer data.
-                ),
-                Arc::new(crate::store::ChallengeCerts::empty([0u8; 16])),
-                Arc::clone(&policy),
-                Arc::new(ZeroClock),
-            )));
-        Self {
-            inner: Arc::new(cfg),
-            client_auth,
-            policy,
+            .map_err(|_| ListenerError::ProviderNotInstalled)?
+            .with_client_cert_verifier(Arc::new(verifier)) // it-allow: hot-path-allocation reason: wraps the verifier once per listener configuration compile, not once per resolved name
+            .with_cert_resolver(resolver);
+        crate::policy::apply_common(&policy, &mut cfg);
+        if let Some(t) = ticketer {
+            cfg.ticketer = t; // it-allow: hot-path-allocation reason: an Arc field assignment, not an allocation; runs once per listener configuration compile
+            cfg.send_tls13_tickets =
+                usize::try_from(crate::ticket::ClusterTicketer::tickets_to_send()).unwrap_or(2);
         }
+        Ok(Self {
+            inner: Arc::new(cfg), // it-allow: hot-path-allocation reason: compiles once per listener configuration, not once per resolved name
+            client_auth: auth.kind(),
+            policy,
+        })
     }
 
     /// The one permitted place a rustls type crosses this crate's facade. The connection layer
@@ -344,6 +387,10 @@ pub enum ListenerError {
     Wildcard(WildcardError),
     /// `install_process_provider` has not run, so no `ServerConfig` can be built.
     ProviderNotInstalled,
+    /// [`TlsServerConfig::compile_with_client_auth`] could not build a client-certificate
+    /// verifier. Carries the reason from `mtls-client-auth-fail-closed` (#124), which includes
+    /// the fail-closed CVE-2026-27586 refusal and the enforced-revocation-without-CRLs refusal.
+    ClientAuth(crate::verify_client::ClientAuthError),
 }
 
 impl core::fmt::Display for ListenerError {
@@ -392,6 +439,7 @@ impl core::fmt::Display for ListenerError {
             ListenerError::ProviderNotInstalled => f.write_str(
                 "no crypto provider is installed; install_process_provider must run first",
             ),
+            ListenerError::ClientAuth(e) => write!(f, "client authentication: {e}"),
         }
     }
 }
@@ -1755,7 +1803,7 @@ mod acceptor_tests {
     reason = "test-only fixtures over inputs the test itself constructs"
 )]
 pub(crate) mod tests_support {
-    use std::sync::{Arc, Once};
+    use std::sync::{Arc, Once, OnceLock};
 
     use super::{ClientAuthKind, ListenerTls, ListenerTlsBuilder, TlsServerConfig};
 
@@ -1768,9 +1816,86 @@ pub(crate) mod tests_support {
         });
     }
 
+    /// A `TimeView` fixed at the epoch, for [`stub`]'s empty resolver and, for `Optional`/
+    /// `Required`, [`crate::verify_client::IronClientVerifier`]'s freshness clock (irrelevant
+    /// here since revocation is disabled below).
+    struct ZeroClock;
+    impl crate::store::TimeView for ZeroClock {
+        fn unix_seconds(&self) -> crate::time::UnixSeconds {
+            crate::time::UnixSeconds::new(0)
+        }
+    }
+
+    /// A real, once-generated CA, shared across every `Optional`/`Required` [`stub`] this module
+    /// builds. Real rather than a label-only placeholder: this is the fix for the divergence
+    /// lint's own reviewed gap, that it previously had only ONE label (`None`) it could obtain a
+    /// real, compilable configuration for, so `ClientAuthDivergence` and
+    /// `FallbackWeakerThanBinding`/`NoSniWeakerThanBinding` were only ever exercised with fake
+    /// `Optional`/`Required` values that enforced nothing.
+    fn trust_anchors_fixture() -> crate::verify_client::TrustAnchors {
+        static DER: OnceLock<Vec<u8>> = OnceLock::new();
+        let der = DER.get_or_init(|| {
+            ensure_provider_installed();
+            let key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256)
+                .expect("keypair generation");
+            let mut params = rcgen::CertificateParams::new(vec!["Listener Test CA".to_owned()])
+                .expect("valid SAN");
+            params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+            params.key_usages = vec![
+                rcgen::KeyUsagePurpose::KeyCertSign,
+                rcgen::KeyUsagePurpose::CrlSign,
+            ];
+            params.self_signed(&key).expect("self sign").der().to_vec()
+        });
+        crate::verify_client::TrustAnchors::from_der_bundle(&[der])
+            .expect("a single real CA must build")
+    }
+
+    /// A real, compiled configuration reporting `kind`. `None` compiles through
+    /// [`TlsServerConfig::compile`]; `Optional` and `Required` compile through
+    /// [`TlsServerConfig::compile_with_client_auth`] against [`trust_anchors_fixture`], with
+    /// revocation disabled so these lint fixtures need no CRL of their own. Every value this
+    /// returns genuinely enforces the client authentication its `ClientAuthKind` label claims.
     pub(crate) fn stub(kind: ClientAuthKind) -> Arc<TlsServerConfig> {
         ensure_provider_installed();
-        Arc::new(TlsServerConfig::test_stub(kind))
+        let policy = Arc::new(crate::policy::TlsPolicy::default_https());
+        let resolver = Arc::new(crate::store::IronResolver::new(
+            Arc::new(
+                crate::store::CertIndexBuilder::new([0u8; 16])
+                    .build()
+                    .expect("an empty index always builds"), // it-allow: no-panic reason: test-only constructor over a fixed empty input, not peer data.
+            ),
+            Arc::new(crate::store::ChallengeCerts::empty([0u8; 16])),
+            Arc::clone(&policy),
+            Arc::new(ZeroClock),
+        ));
+        match kind {
+            ClientAuthKind::None => Arc::new(
+                TlsServerConfig::compile(policy, resolver, None).expect("provider installed"),
+            ),
+            ClientAuthKind::Optional | ClientAuthKind::Required => {
+                let anchors = trust_anchors_fixture();
+                let auth = if kind == ClientAuthKind::Optional {
+                    crate::verify_client::ClientAuth::Optional(anchors)
+                } else {
+                    crate::verify_client::ClientAuth::Required(anchors)
+                };
+                Arc::new(
+                    TlsServerConfig::compile_with_client_auth(
+                        policy,
+                        resolver,
+                        &auth,
+                        Arc::new(crate::crl::CrlSet::empty()),
+                        crate::crl::CrlConfig::default(),
+                        false,
+                        crate::verify_client::RevocationMode::Disabled,
+                        Arc::new(ZeroClock),
+                        None,
+                    )
+                    .expect("a real trust anchor with revocation disabled must compile"),
+                )
+            }
+        }
     }
 
     /// One exact binding, one wildcard binding, no fallback, no no-SNI policy.
@@ -1833,7 +1958,7 @@ mod agreement_property {
 
     use proptest::prelude::*;
 
-    use super::tests_support::{SEED, ensure_provider_installed};
+    use super::tests_support::{SEED, ensure_provider_installed, stub};
     use super::*;
     use crate::store::{CertIndexBuilder, ChainInterner, ClientCaps, Credentials};
 
@@ -1862,7 +1987,7 @@ mod agreement_property {
                     Credentials::load(&[cert.der()], &key.serialize_der(), &mut interner)
                         .expect("valid leaf and key"),
                 ));
-                cfgs.push(Arc::new(TlsServerConfig::test_stub(ClientAuthKind::None)));
+                cfgs.push(stub(ClientAuthKind::None));
             }
             (creds, cfgs)
         })

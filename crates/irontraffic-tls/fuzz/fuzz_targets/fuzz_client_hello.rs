@@ -103,7 +103,7 @@ fn config_for(name: &str) -> Arc<TlsServerConfig> {
         Arc::clone(&policy),
         Arc::new(FixedClock),
     ));
-    Arc::new(TlsServerConfig::compile(policy, resolver).expect("provider installed")) // it-allow: no-panic reason: fuzz harness one-time fixture setup over fixed, constant inputs that are never fuzzer-controlled; a panic here is a libFuzzer finding about this binary's own fixture, never a request-path failure mode, and this file is never linked into the server binary.
+    Arc::new(TlsServerConfig::compile(policy, resolver, None).expect("provider installed")) // it-allow: no-panic reason: fuzz harness one-time fixture setup over fixed, constant inputs that are never fuzzer-controlled; a panic here is a libFuzzer finding about this binary's own fixture, never a request-path failure mode, and this file is never linked into the server binary.
 }
 
 /// One exact binding, one wildcard binding, a no-SNI policy, and no fallback.
