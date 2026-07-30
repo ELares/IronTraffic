@@ -1825,3 +1825,58 @@ full contents of a large trust bundle to an unauthenticated peer and turns a few
 handshake message into a multi-kilobyte one, a bandwidth amplification factor obtainable by opening
 connections and never authenticating. At most 32 trust anchor subject names are ever disclosed to an
 unauthenticated peer, regardless of how large the configured bundle is.
+
+## Benchmark origin (`it-origin`)
+
+**This binary adds two network listeners and a hand-written HTTP head parser to the repository,
+and it is a benchmark fixture, not a production surface.** `it-origin` exists so that a proxy
+benchmark's own upstream has a known, constant, allocation-free per-request cost and a measured
+throughput ceiling, per `science/benchmarking.md`'s D3. That is its entire job. It has no
+authentication of any kind, on either listener, and it must never be reachable from an untrusted
+network: it is deployed only on a private benchmark link, co-located with the gateway under test
+and the load generator, and an operator who exposes it to anything else has taken it out of the
+threat model this document covers.
+
+**What each listener accepts.** The main listener (`--listen`, default `127.0.0.1:8081`, up to
+8 addresses) answers every request identically with a preallocated response, regardless of method
+or path: the path is never parsed, which is what makes its cost constant rather than
+request-dependent. `--stats-listen` (default off) is a second, structurally identical listener: it
+answers exactly `GET /stats` with a JSON counter snapshot and everything else with a preallocated
+404. Both listeners run the same hand-written head scan (`scan_head`), so there is one parser in
+this crate, not two, and one review surface rather than a review surface per listener.
+
+**The four bounds, their defaults, and their behaviour at the bound.** A benchmark fixture is
+deliberately driven to scales (100,000 concurrent connections is a published matrix cell) where an
+unbounded per-connection allocation is gigabytes of read buffers, and a fixture that runs out of
+memory or spins at 100 percent CPU invalidates every cell it appears in, silently. The bound
+existing, and being recorded, matters far more than the bound being tight; these defaults are
+generous because this is a fixture on a private link.
+
+| Bound | Flag | Default | Behaviour at the bound |
+| --- | --- | --- | --- |
+| Concurrent connections | `--max-connections` | 200,000 (1..=1,000,000) | A connection over the bound is accepted and immediately closed, and the reject counter rises. `accept` is never stopped: a full kernel backlog reads to the client as a connect timeout, which is indistinguishable from a proxy stall and would be misattributed to the system under test. |
+| Head delivery | `--head-timeout-ms` | 10,000 ms (1..=600,000) | A connection that has not delivered a complete request head, and then its declared body, by the deadline is closed with no response written and nothing logged. |
+| Idle keepalive | `--idle-timeout-ms` | 60,000 ms (1..=3,600,000) | A keepalive connection with no new request by the deadline is closed. |
+| Request head size | fixed | 16,384 bytes | A head that has not delivered the `\r\n\r\n` terminator within 16 KiB is refused with 431 and the connection is closed. The terminator search resumes from where the previous read left off rather than restarting at byte 0, which is what keeps a client that trickles the head in one byte at a time linear work instead of the quadratic work an implementation that rescans from the start would hand it. |
+
+Every one of these is a flag, not a constant, specifically so an operator running the
+100,000-connection matrix cell (which needs on the order of 1.6 GiB of read buffers at that
+concurrency) can say so explicitly, and so that the same binary stays usable on a laptop at its
+defaults.
+
+**The declared body it never inspects is still bounded and still time-boxed.** A `Content-Length`
+value is capped at 16,777,216 bytes before this fixture ever tries to read that many bytes from the
+socket, and the whole read (head plus declared body) runs under the single head-timeout deadline: a
+client that declares 16 MiB and sends one byte is closed on expiry rather than held open
+indefinitely. A request carrying both `Content-Length` and `Transfer-Encoding` is refused with 400
+rather than resolved by preferring either header, because that combination is the classic
+request-smuggling desync pair, and a fixture that picks a side teaches the proxy under test that
+the ambiguity is survivable.
+
+**Structural control.** The response path is a `write_all` of a preallocated slice with no
+per-request allocation (asserted under a counting allocator, not merely claimed), so `it-origin`'s
+own cost is knowable rather than incidental; the per-request delay (`--delay-us`,
+`X-Origin-Delay-Us`) is an absolute-instant timer registration, never a blocking sleep, so one
+slow-by-request-header connection cannot stall any other connection's response; and the connection
+admission gate and the two listeners' shared bounds are exactly what keep a fixture whose only job
+is to be a known cost from becoming an unbounded one.

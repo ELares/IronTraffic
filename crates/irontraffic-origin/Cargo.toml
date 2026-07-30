@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "irontraffic-origin"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "it-origin: a trivial HTTP/1.1 upstream whose per-request cost is known, constant and allocation-free."
+publish = false
+build = "build.rs"
+
+[lints]
+workspace = true
+
+[lib]
+name = "irontraffic_origin"
+path = "src/lib.rs"
+
+[[bin]]
+name = "it-origin"
+path = "src/main.rs"
+
+[dependencies]
+# The runtime. The connection loop, the accept loop, and the delay scheduler
+# all run on it; the inherited feature set already carries rt, rt-multi-thread,
+# net, io-util, time, sync, macros.
+tokio = { workspace = true }
+# SIMD-accelerated search for the request head terminator (`\r\n\r\n`), scanned
+# incrementally rather than restarted, per the Design section.
+memchr = { workspace = true }
+# Typed error enums for `ArgError` and `ScanError`, without hand-written `Display`.
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# Benchmarks: the `scan_head` criterion target.
+criterion = { workspace = true }
+# Property test: `scan_head_is_total`.
+proptest = { workspace = true }
+# `RLIMIT_NOFILE` manipulation in test 15 (`accept_emfile_does_not_spin`).
+rustix = { workspace = true, features = ["process"] }
+
+[[bench]]
+name = "scan"
+harness = false
