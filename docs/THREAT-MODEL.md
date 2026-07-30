@@ -1928,7 +1928,17 @@ a real gap in the guarantee itself: `BenchError::Io`'s derived `Display` interpo
 `std::io::Error`, needed unsanitised as a `#[source]` link for error-chain walking) directly, so an
 `io::Error` built from foreign bytes rendered raw, unlike `path`. The fix routes `source` through
 `Detail::new` at render time in the `Display` format string itself, so the property holds for
-everything the variant ever prints, not only for the field that happened to be typed as `Detail`.
+the variant's OWN `Display`, not only for the field that happened to be typed as `Detail`.
+
+It does NOT hold for a caller that walks the error chain. The variant deliberately keeps
+`#[source] source: std::io::Error` so callers can inspect the cause, and the usual
+`while let Some(e) = err.source()` render prints that io error's own `Display`, which the format
+string never touches. Measured: a source carrying `ESC [ 2J ... CR LF` renders with zero
+non-printable bytes through the variant's `Display` and with four (`27 27 13 10`) through a chain
+walk. So a caller that walks the chain must sanitise, and this is stated here rather than implied,
+because invariant 5 is absolute and a reader who took the earlier wording at face value would have
+skipped that step. Nothing constructs this variant yet, so there is no live exposure; it becomes one
+when a load generator's stderr is wrapped.
 
 **`BenchCell::validate` is advisory, not structural, and callers must know that.** Unlike `CellId`,
 `BenchCell` derives `Deserialize` on public fields with no `#[serde(try_from)]`, so a result file can
@@ -1937,6 +1947,6 @@ and so on): the type does not make an invalid `BenchCell` unrepresentable the wa
 `CellId` unrepresentable. This is a deliberate, documented design choice (the alternative, routing
 every field through a fallible constructor, was rejected in #404 because the registry uniqueness check
 that matters is deferred to a later issue), not a defect, but it means every future reader of a result
-file (the driver binary, `{{bench-xtask-cli-and-run-sh}}`, and the matrix registry) must call
+file (the driver binary, the bench xtask CLI and run script, and the matrix registry) must call
 `validate()` itself after deserialising rather than trusting the wire format to have enforced it
 already.

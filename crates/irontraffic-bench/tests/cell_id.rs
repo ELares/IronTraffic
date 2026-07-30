@@ -455,10 +455,34 @@ fn bench_error_io_display_sanitises_the_source() {
     assert!(err.to_string().bytes().all(|b| (0x20..=0x7E).contains(&b)));
 }
 
+/// The printable class's UPPER boundary, in the content-destroying direction.
+///
+/// `detail_preserves_printable_content_byte_for_byte` pins content, but its fixtures only cover
+/// lowercase letters, digits, space and a few punctuation marks, so narrowing the accepted class at
+/// the top end destroys bytes those fixtures never contain and nothing notices: a review measured
+/// that `0x20..=0x7E` narrowed to `0x20..=0x7D`, and to `0x20..=0x7A`, both survive the whole suite
+/// AND 200,000 fuzz runs. The fuzz target structurally cannot catch this direction, because its
+/// assertion is a superset test that a NARROWER output still satisfies.
+///
+/// Every byte from 0x20 through 0x7E inclusive must survive verbatim.
+#[test]
+fn detail_preserves_the_whole_printable_class_including_its_upper_boundary() {
+    let all_printable: String = (0x20u8..=0x7E).map(char::from).collect();
+    let kept = Detail::new(&all_printable);
+    assert_eq!(
+        kept.as_str(),
+        all_printable,
+        "every byte in 0x20..=0x7E must survive verbatim; narrowing the class silently replaces \
+         the top of it with '?'"
+    );
+    // Pinned against a literal, not against `all_printable.len()`, so an empty fixture fails.
+    assert_eq!(kept.as_str().len(), 95, "0x20..=0x7E is 95 bytes");
+}
+
 // The issue specifies `string_regex(".{0,140}")` (arbitrary Unicode of
 // realistic length) as the generator. Measured directly (100,000 draws): that
-// generator produces an `Ok` parse only 0.08% of the time and an `Ok` parse
-// containing '/' only 0.018% of the time, so at proptest's default 256 cases
+// generator produces an `Ok` parse only 0.0710% of the time against the SHIPPED
+// parser, so at proptest's default 256 cases
 // per run the EXPECTED number of runs that ever exercise the property's real
 // content (a separator surviving into a validated id) is under 0.05: a
 // property test that almost never reaches the branch it exists to check,
@@ -466,11 +490,18 @@ fn bench_error_io_display_sanitises_the_source() {
 // before. `[a-z0-9_./\\]{0,20}` draws from the same alphabet the parser
 // actually branches on (valid characters plus the separators under test) at a
 // short length, so a large fraction of draws are close to the validity
-// boundary. Measured the same way: 15.7% `Ok`, 2.9% `Ok` containing '/', which
-// puts several dozen real hits in a default 256 case run. Confirmed this
-// generator's shape actually catches a mutation that widens the character
-// class to accept '/' (see the PR description); the literal generator from
-// the issue did not.
+// boundary. Measured the same way against the SHIPPED parser: 12.8310% `Ok`,
+// which puts several dozen real hits in a default 256 case run.
+//
+// BE PRECISE ABOUT WHICH PARSER EACH FIGURE COMES FROM, because an earlier
+// version of this comment was not and a review caught it. The shipped parser
+// rejects '/' outright, so `Ok` containing '/' is 0.0000% for BOTH generators
+// and is not a meaningful discriminator on its own. The figures that DO
+// separate them, 2.9530% against 0.0190%, are measured against the parser
+// mutated to accept '/', which is the mutation this generator exists to catch.
+// Quoting those as though they described the shipped parser would lead the next
+// reader to re-derive them, find they do not reproduce, and "correct" the
+// generator back to the issue's literal one, which is the vacuous choice.
 proptest::proptest! {
     #[test]
     fn parse_never_yields_a_separator(s in proptest::string::string_regex("[a-z0-9_./\\\\]{0,20}").unwrap()) {
