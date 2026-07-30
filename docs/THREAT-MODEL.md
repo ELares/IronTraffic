@@ -1425,8 +1425,14 @@ nonce as the AEAD nonce itself); rustls's own `ProducesTickets` documentation re
 lifetime "must be implemented by key rolling and erasure, not by storing a lifetime in the
 ticket"). Key-name comparison against all six candidates (2 roots x 3 epochs) runs in constant time
 with `subtle::ConstantTimeEq` and no early exit, so an attacker cannot use timing to probe a key
-name byte by byte; `ticket/decrypt_unknown_key_near_miss`, benchmarked at within roughly 1% of
-`ticket/decrypt_unknown_key`, is the measurement that this is not merely a code-review claim.
+name byte by byte. `ticket/decrypt_unknown_key_near_miss` and `ticket/decrypt_unknown_key` are
+benchmarked against each other for exactly this reason, but the binding property is the code
+review of step 4 finding no `break` and no `==`, not a single quantitative ratio: across repeated
+runs on non-isolated development hardware the two ids tracked each other within about 10%,
+sometimes with the near miss id measuring higher and sometimes lower, which is consistent with
+comparing two structurally identical code paths under ordinary measurement noise rather than with
+a timing side channel. The recorded medians and the per-run ratio are in the PR body that shipped
+this section, not restated here as a single number this file cannot keep current.
 `decrypt` allocates nothing on the unknown-key path (the path an attacker drives): key selection
 happens before the AEAD is ever opened, so a flood of bogus tickets costs six constant-time
 comparisons and no heap traffic, enforced by this module's `//! HOT PATH` marker under
