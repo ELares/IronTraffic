@@ -234,7 +234,14 @@ main() {
     # none of them, rather than running "download and extract" without
     # "verify". This is the single most important line in the file.
     work_dir="$(mktemp -d)"
-    trap 'rm -rf "$work_dir"' EXIT INT TERM
+    # staged_path is declared here, empty, so the trap below can reference it
+    # unconditionally from the moment it is registered: it is only ever given
+    # a real value right before the final install (edge case 15), and the
+    # trap removes it on every exit path from that point on, including one
+    # interrupted between staging the new binary under $bin_dir and renaming
+    # it into place.
+    staged_path=""
+    trap 'rm -rf "$work_dir"; [ -n "$staged_path" ] && rm -f "$staged_path"' EXIT INT TERM
 
     echo "downloading $asset_name"
     fetch_to_file "$tarball_url" "$work_dir/$asset_name" || {
@@ -293,19 +300,46 @@ main() {
     fi
 
     installed_path="$bin_dir/irontraffic"
+    # Staged under $bin_dir itself, NOT left under $work_dir (a `mktemp -d`
+    # under $TMPDIR, which on a typical Linux desktop is tmpfs `/tmp`) before
+    # the rename: `mv` is only atomic when its source and destination are on
+    # the SAME filesystem, and $bin_dir (e.g. $HOME/.local/bin) is ordinarily
+    # on the root filesystem, a different one from tmpfs. A cross-filesystem
+    # `mv` silently degrades to copy-then-unlink, which is not atomic and can
+    # leave a truncated executable on PATH if interrupted mid-copy, exactly
+    # what this design is supposed to make impossible. Staging the copy
+    # inside $bin_dir guarantees the final `mv` below renames within one
+    # filesystem, so it is a real atomic rename regardless of where $TMPDIR
+    # happens to live.
+    staged_path="$bin_dir/.irontraffic.tmp.$$"
+    if ! cp "$extracted_bin" "$staged_path"; then
+        echo "error: failed to stage the new binary under $bin_dir" >&2
+        rm -f "$staged_path"
+        exit 1
+    fi
+    # `cp` alone does not guarantee the executable bit survives umask, unlike
+    # a rename of the already-`chmod`ed extracted_bin would: chmod again,
+    # explicitly, so invariant 11 (0755 regardless of umask) holds for the
+    # staged copy too, not just the extracted one.
+    chmod 0755 "$staged_path"
+
     # Edge case 11: an existing binary is kept as `<name>.previous` rather
     # than overwritten outright, so a bad upgrade is one `mv` from recovery.
+    # Both `mv`s below are checked: a failed rename here must not be reported
+    # as a successful install, unlike the unchecked version of this script
+    # that printed "installed:" and exited 0 regardless of whether either
+    # `mv` actually succeeded.
     if [ -e "$installed_path" ]; then
-        mv -f "$installed_path" "$installed_path.previous"
+        if ! mv -f "$installed_path" "$installed_path.previous"; then
+            echo "error: failed to back up the existing $installed_path" >&2
+            rm -f "$staged_path"
+            exit 1
+        fi
     fi
-    # Atomic rename, and both paths are on the same filesystem (the
-    # extraction directory is under $work_dir, a `mktemp -d` under the
-    # system temp directory; if that temp directory and $bin_dir are on
-    # different filesystems, `mv` falls back to a copy, which is no longer
-    # atomic. That is a limitation of `mv` portably done in `sh`, not
-    # something this script silently hides: a failed `mv` here still exits
-    # nonzero rather than reporting success.
-    mv "$extracted_bin" "$installed_path"
+    if ! mv "$staged_path" "$installed_path"; then
+        echo "error: failed to move the new binary into place at $installed_path" >&2
+        exit 1
+    fi
 
     echo "installed: $installed_path"
     case ":$PATH:" in
