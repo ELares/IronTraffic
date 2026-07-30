@@ -641,6 +641,7 @@ mod tests {
     use std::sync::mpsc;
 
     use proptest::prelude::*;
+    use rustls::server::ProducesTickets;
 
     use super::{ClusterTicketer, NonceSource, RootSel, TicketRoot, TimeView};
     use crate::time::UnixSeconds;
@@ -1118,6 +1119,102 @@ mod tests {
         let ct = a.encrypt(b"context probe").expect("entropy never fails");
         assert_eq!(b.decrypt(&ct), None);
         assert_eq!(b.stats().decrypt_unknown_key.load(Ordering::Relaxed), 1);
+    }
+
+    /// This is the CVE-2025-68121 correction stated as a property test rather than a comment,
+    /// pinning BOTH mechanisms the correction rests on rather than only the one
+    /// `different_context_never_decrypts` happens to observe.
+    ///
+    /// Two ticketers share a root but not a context. That must change the derived AEAD KEY, not
+    /// only the derived key NAME: dropping `self.context` from the key info while leaving it in
+    /// the name info (so the name stays context bound but the underlying key silently stops
+    /// being context bound) leaves `different_context_never_decrypts` passing, because that test
+    /// only ever observes the name half through `decrypt`'s key selection step, never the key
+    /// itself.
+    #[test]
+    fn context_binds_both_key_and_name() {
+        let clock = TestClock::new(1_000_000_000);
+        let a = test_ticketer([0x1B; 32], [0u8; 16], 21_600, Arc::clone(&clock));
+        let b = test_ticketer([0x1B; 32], [1u8; 16], 21_600, Arc::clone(&clock));
+
+        let e = a.epoch_now();
+        let ka = a
+            .epoch_key(RootSel::Primary, e)
+            .expect("primary root always yields an epoch key");
+        let kb = b
+            .epoch_key(RootSel::Primary, e)
+            .expect("primary root always yields an epoch key");
+
+        assert_ne!(
+            ka.name, kb.name,
+            "two contexts sharing a root must derive different key NAMEs"
+        );
+        assert_ne!(
+            ka.key.as_slice(),
+            kb.key.as_slice(),
+            "two contexts sharing a root must derive different AEAD KEYs, not only different names"
+        );
+    }
+
+    /// Reproduces the exact CVE-2025-68121 shape rather than only comparing derived material in
+    /// isolation: an attacker takes a ticket minted under one trust bundle's context and splices
+    /// in a key name that is live under a DIFFERENT bundle's context, so that the second
+    /// ticketer's key-selection step picks its own key for that name and attempts to open the
+    /// first ticketer's ciphertext under it.
+    ///
+    /// Neither mechanism alone lets this succeed: with the name still bound as AEAD associated
+    /// data, ticketer B's key selection finds a key whose name matches the splice, but decrypting
+    /// authenticates against the SPLICED name, not the name ticketer A actually used as AAD, so
+    /// the tag check fails even if `context_binds_both_key_and_name` above were somehow broken.
+    /// Deleting BOTH the context-in-key-derivation binding AND the name-as-AAD binding together
+    /// is what turns this into a working cross-context plaintext recovery.
+    #[test]
+    fn cross_context_name_splice_never_decrypts() {
+        let clock = TestClock::new(1_000_000_000);
+        let a = test_ticketer([0x1C; 32], [0u8; 16], 21_600, Arc::clone(&clock));
+        let b = test_ticketer([0x1C; 32], [1u8; 16], 21_600, Arc::clone(&clock));
+
+        let ticket_a = a
+            .encrypt(b"peer identity from bundle A")
+            .expect("entropy never fails");
+
+        // Splice B's OWN live key name onto A's nonce and ciphertext, so B's key-selection step
+        // finds a match in its own ring rather than failing at name lookup.
+        let e = b.epoch_now();
+        let kb = b
+            .epoch_key(RootSel::Primary, e)
+            .expect("primary root always yields an epoch key");
+        let mut spliced = kb.name.to_vec();
+        spliced.extend_from_slice(ticket_a.get(16..).expect("at least 16 bytes"));
+
+        assert_eq!(
+            b.decrypt(&spliced),
+            None,
+            "ticketer B must not recover ticketer A's plaintext via a cross-context key-name \
+             splice, even though the spliced name matches a live key of B's own"
+        );
+    }
+
+    /// The rustls `ProducesTickets` trait impl is the only surface rustls itself ever calls; a
+    /// forwarding shim that nothing exercises through the trait object is unverified on the one
+    /// path production actually runs. Binds `t` as `&dyn ProducesTickets` and round-trips through
+    /// the trait's own methods, not the inherent ones every other test in this module calls.
+    #[test]
+    fn producestickets_trait_round_trips() {
+        let clock = TestClock::new(1_700_000_000);
+        let t = test_ticketer([0x1A; 32], [0u8; 16], 21_600, clock);
+        let via_trait: &dyn ProducesTickets = &t;
+
+        assert!(via_trait.enabled());
+        assert_eq!(via_trait.lifetime(), 21_600);
+
+        let ct = via_trait
+            .encrypt(b"trait round trip")
+            .expect("entropy never fails");
+        let pt = via_trait
+            .decrypt(&ct)
+            .expect("must decrypt through the trait object, not only through the inherent method");
+        assert_eq!(pt, b"trait round trip");
     }
 
     #[test]
