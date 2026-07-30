@@ -370,7 +370,10 @@ impl OcspUpdater {
         // Step 2: a must-staple credential whose live staple went stale falls through to another
         // credential for the same name if one exists, otherwise fails the handshake, both
         // implemented by removing the credential so the index's normal resolution does the
-        // falling through.
+        // falling through. `current_next_update` doubles as the latch: clearing it here, not just
+        // setting `state = Failed`, is what stops this from re-firing (and re-emitting `Remove`)
+        // on every later tick, since `state != Stapled` alone stays true forever for a `Failed`
+        // entry that never recovers.
         for t in &mut self.tracked {
             if t.must_staple
                 && t.state != TrackedState::Stapled
@@ -381,6 +384,7 @@ impl OcspUpdater {
                     < now.get()
             {
                 t.state = TrackedState::Failed;
+                t.current_next_update = None;
                 updates.push(CertUpdate::Remove {
                     names: t.names.to_vec(),
                 });
@@ -678,6 +682,21 @@ mod tests {
                 "failure {} must fetch exactly once",
                 i + 1
             );
+            // Two-sided, matching success_schedules_before_next_update's shape: ticking one
+            // second before the scheduled retry must NOT fetch again. A one-sided "has it fetched
+            // by now + delay" check (the previous shape of this test) cannot tell a delay that is
+            // exactly right from one that is shorter than expected, or zero: an entry due earlier
+            // than `now + delay` is still due, and therefore still gets fetched, by the time the
+            // loop reaches that later instant, so a truncated shift or a `backoff()` replaced
+            // outright by a constant both left the one-sided version of this test green.
+            let before_scheduled = now.saturating_add_secs(delay.saturating_sub(1));
+            let _ = updater.tick(before_scheduled, &mut ConstRng(0));
+            assert_eq!(
+                fetcher.call_count(),
+                before + 1,
+                "failure {} must not retry before its exact scheduled delay of {delay}s",
+                i + 1
+            );
             now = now.saturating_add_secs(delay);
         }
     }
@@ -723,6 +742,7 @@ mod tests {
         let this_update = 1_000_000u64;
         let next_update = this_update + 10_000; // well inside max_interval_secs
         let response = build_good_response(&fixture, this_update, Some(next_update));
+        let response_der = response.clone();
         let fetcher = Arc::new(TestFetcher::new(Ok(response)));
         let time: Arc<dyn TimeView> = Arc::new(FixedClock(UnixSeconds::new(0)));
         let cfg = OcspConfig {
@@ -736,7 +756,21 @@ mod tests {
 
         let emitted = updater.tick(UnixSeconds::new(this_update), &mut ConstRng(0));
         assert_eq!(emitted.len(), 1);
-        assert!(matches!(emitted[0], CertUpdate::Replace { .. }));
+        match &emitted[0] {
+            CertUpdate::Replace { cred, .. } => {
+                // Invariant 8: the staple installed is the exact bytes received, never
+                // re-encoded and never dropped. `matches!(.., CertUpdate::Replace { .. })` alone
+                // (the previous shape of this assertion) never looks past the enum variant, so
+                // attaching no staple at all, or a truncated one, both left this test green.
+                assert_eq!(
+                    cred.staple(),
+                    Some(response_der.as_slice()),
+                    "the credential in the emitted Replace must carry the exact validated \
+                     response bytes as its staple"
+                );
+            }
+            other => panic!("expected CertUpdate::Replace, got {other:?}"),
+        }
         assert_eq!(
             updater.state_of(fixture.cred.fingerprint()),
             Some(TrackedState::Stapled)
@@ -1021,6 +1055,58 @@ mod tests {
             }
             other => panic!("expected CertUpdate::Remove, got {other:?}"),
         }
+
+        // The sweep must latch: once a must-staple entry has been removed for going stale, every
+        // later tick must emit nothing more for it. Without a latch, `state != Stapled` stays
+        // true and `current_next_update` stays populated forever, so the same stale entry would
+        // re-emit `CertUpdate::Remove` on every single tick from here on, each one driving a
+        // fresh certificate-index rebuild for a credential that already left the index once.
+        for i in 0..5 {
+            let repeat_now = stale_now.saturating_add_secs(1_000 * (i + 1));
+            let emitted_repeat = updater.tick(repeat_now, &mut ConstRng(0));
+            assert!(
+                emitted_repeat.is_empty(),
+                "repeat sweep tick {i}: must emit nothing once already removed for staleness, \
+                 got {emitted_repeat:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn tick_refuses_disallowed_aia_url_without_fetching() {
+        // Edge case 24: an AIA URL that `validate_aia_url` refuses (here, the exact cloud
+        // metadata address the SSRF gate exists to block) must never reach the fetcher, and the
+        // tracked entry must go to `Failed` with no retry loop, invariant 10 in the module doc.
+        // The six `aia_url_*` tests in `ocsp.rs` exercise the pure function alone; this is the
+        // only test that exercises the call site inside `tick`, so a mutation that unwired the
+        // gate from its one caller (`if ocsp::validate_aia_url(...).is_err()` short-circuited to
+        // always `false`) would otherwise leave every test in this file green.
+        let fixture = build_fixture("metadata-aia.example.com");
+        let fetcher = Arc::new(TestFetcher::new(Err("must not be called".to_owned())));
+        let time: Arc<dyn TimeView> = Arc::new(FixedClock(UnixSeconds::new(0)));
+        let cfg = OcspConfig {
+            min_interval_secs: 1,
+            ..OcspConfig::default()
+        };
+        let mut updater = OcspUpdater::new(as_dyn_fetcher(&fetcher), time, cfg);
+        updater.track(&fixture.cred, Some("http://169.254.169.254/meta-data/"));
+
+        for i in 0..10u64 {
+            let emitted = updater.tick(UnixSeconds::new(i), &mut ConstRng(0));
+            assert!(emitted.is_empty());
+        }
+
+        assert_eq!(
+            fetcher.call_count(),
+            0,
+            "no request may ever be sent to a URL that has not passed validate_aia_url"
+        );
+        assert_eq!(
+            updater.state_of(fixture.cred.fingerprint()),
+            Some(TrackedState::Failed)
+        );
+        assert_eq!(updater.stats().fetches.load(Ordering::Relaxed), 0);
+        assert_eq!(updater.stats().validate_errors.load(Ordering::Relaxed), 1);
     }
 
     #[test]
