@@ -97,8 +97,8 @@ fetch_to_file() {
     fi
 }
 
-# Finds a companion file (SHA256SUMS, <artifact>.sig, <artifact>.pem,
-# <artifact>.intoto.jsonl) next to the artifact locally first, then falls
+# Finds a companion file (SHA256SUMS, <artifact>.bundle,
+# <artifact>.intoto.bundle) next to the artifact locally first, then falls
 # back to downloading it from the same release the artifact's own filename
 # names, mirroring scripts/install.sh's URL construction.
 locate_or_fetch() {
@@ -221,16 +221,13 @@ main() {
     #    issuer: a verification that omits either accepts a signature from
     #    anyone, the single most common mistake with this tooling.
     # -------------------------------------------------------------------
-    sig_file="$work/artifact.sig"
-    pem_file="$work/artifact.pem"
-    have_sig="$(locate_or_fetch "$artifact.sig" "$artifact_basename.sig" "$sig_file" "$version" && echo yes || echo no)"
-    have_pem="$(locate_or_fetch "$artifact.pem" "$artifact_basename.pem" "$pem_file" "$version" && echo yes || echo no)"
-    if [ "$have_sig" = "yes" ] && [ "$have_pem" = "yes" ] \
-        && [ "$(wc -c < "$sig_file" | tr -d ' ')" -le "$max_bytes" ] \
-        && [ "$(wc -c < "$pem_file" | tr -d ' ')" -le "$max_bytes" ]; then
+    sig_file="$work/artifact.bundle"
+    have_sig="$(locate_or_fetch "$artifact.bundle" "$artifact_basename.bundle" "$sig_file" "$version" && echo yes || echo no)"
+    if [ "$have_sig" = "yes" ] \
+        && [ "$(wc -c < "$sig_file" | tr -d ' ')" -le "$max_bytes" ]; then
         if cosign verify-blob \
-            --certificate "$pem_file" \
-            --signature "$sig_file" \
+            --bundle "$sig_file" \
+            --new-bundle-format \
             --certificate-identity-regexp "$CERT_IDENTITY_REGEXP" \
             --certificate-oidc-issuer "$CERT_OIDC_ISSUER" \
             "$artifact" >"$work/sig-verify.log" 2>&1; then
@@ -245,7 +242,7 @@ main() {
             cat "$work/sig-verify.log" >&2
         fi
     else
-        note_skip "signature" "could not locate or download $artifact_basename.sig / .pem"
+        note_skip "signature" "could not locate or download $artifact_basename.bundle"
     fi
 
     # -------------------------------------------------------------------
@@ -253,18 +250,26 @@ main() {
     #    attestation was produced must equal this artifact's own sha256
     #    (invariant 7); this script recomputes the artifact's digest
     #    independently rather than trusting the attestation's own claim.
+    #
+    # Verified from a Sigstore bundle (--bundle), not a bare DSSE envelope
+    # plus a separate `cosign verify-blob-attestation` Rekor SEARCH call:
+    # the search path was tried first and failed against this project's own
+    # real signing identity with a Rekor API error this project does not
+    # control ("proposedContent.proposedContent.verifiers in body is
+    # required"); the bundle embeds the same inclusion proof the search
+    # would have looked up, so verification needs no live search at all.
     # -------------------------------------------------------------------
-    intoto_file="$work/artifact.intoto.jsonl"
-    if locate_or_fetch "$artifact.intoto.jsonl" "$artifact_basename.intoto.jsonl" "$intoto_file" "$version" \
+    intoto_file="$work/artifact.intoto.bundle"
+    if locate_or_fetch "$artifact.intoto.bundle" "$artifact_basename.intoto.bundle" "$intoto_file" "$version" \
         && [ "$(wc -c < "$intoto_file" | tr -d ' ')" -le "$max_bytes" ]; then
         if cosign verify-blob-attestation \
-            --certificate "$pem_file" \
-            --signature "$intoto_file" \
+            --bundle "$intoto_file" \
+            --new-bundle-format \
             --certificate-identity-regexp "$CERT_IDENTITY_REGEXP" \
             --certificate-oidc-issuer "$CERT_OIDC_ISSUER" \
             --type slsaprovenance \
             "$artifact" >"$work/attest-verify.log" 2>&1; then
-            payload="$(jq -r '.payload' "$intoto_file" 2>/dev/null | base64 -d 2>/dev/null || true)"
+            payload="$(jq -r '.dsseEnvelope.payload' "$intoto_file" 2>/dev/null | base64 -d 2>/dev/null || true)"
             subject_sha256="$(printf '%s' "$payload" | jq -r '.subject[0].digest.sha256 // empty' 2>/dev/null || true)"
             actual_sha256="$(sha256_of "$artifact")"
             commit="$(printf '%s' "$payload" | jq -r '.predicate.invocation.configSource.digest.sha1 // empty' 2>/dev/null || true)"
@@ -298,7 +303,7 @@ main() {
             cat "$work/attest-verify.log" >&2
         fi
     else
-        note_skip "provenance" "could not locate or download $artifact_basename.intoto.jsonl"
+        note_skip "provenance" "could not locate or download $artifact_basename.intoto.bundle"
     fi
 
     # -------------------------------------------------------------------
@@ -308,14 +313,12 @@ main() {
         if [ ! -f "$sbom" ]; then
             note_fail "sbom: no such file: $sbom"
         else
-            sbom_sig="$work/sbom.sig"
-            sbom_pem="$work/sbom.pem"
+            sbom_sig="$work/sbom.bundle"
             sbom_basename="$(basename "$sbom")"
-            if locate_or_fetch "$sbom.sig" "$sbom_basename.sig" "$sbom_sig" "$version" \
-                && locate_or_fetch "$sbom.pem" "$sbom_basename.pem" "$sbom_pem" "$version"; then
+            if locate_or_fetch "$sbom.bundle" "$sbom_basename.bundle" "$sbom_sig" "$version"; then
                 if cosign verify-blob \
-                    --certificate "$sbom_pem" \
-                    --signature "$sbom_sig" \
+                    --bundle "$sbom_sig" \
+                    --new-bundle-format \
                     --certificate-identity-regexp "$CERT_IDENTITY_REGEXP" \
                     --certificate-oidc-issuer "$CERT_OIDC_ISSUER" \
                     "$sbom" >"$work/sbom-sig-verify.log" 2>&1; then
@@ -326,7 +329,7 @@ main() {
                     cat "$work/sbom-sig-verify.log" >&2
                 fi
             else
-                note_skip "sbom signature" "could not locate or download $sbom_basename.sig / .pem"
+                note_skip "sbom signature" "could not locate or download $sbom_basename.bundle"
             fi
 
             if sh "$SCRIPT_DIR/sbom-licence-check.sh" "$sbom" >"$work/sbom-licence.log" 2>&1; then

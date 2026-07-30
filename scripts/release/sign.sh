@@ -7,11 +7,18 @@
 #
 # Usage: scripts/release/sign.sh <file> [<file> ...]
 #
-# Produces, per file: <file>.sig (the base64 signature) and <file>.pem (the
-# short-lived Fulcio certificate binding that signature to the release
-# workflow's identity); signing SHA256SUMS in addition to each individual
-# tarball and SBOM means a user who only wants to make one check has one to
-# make.
+# Produces, per file: <file>.bundle, a Sigstore "new bundle format" object
+# (cosign's --new-bundle-format) holding the signature, the short-lived
+# Fulcio certificate, and the Rekor inclusion proof together, so
+# verification is self-contained and does not need a live Rekor SEARCH call
+# by artifact digest. That search-based path is what this script used
+# before: `cosign verify-blob-attestation` without --bundle, verified
+# against this project's own real signing identity on a real pull request,
+# failed with a Rekor API error ("proposedContent.proposedContent.verifiers
+# in body is required") this project does not control and cannot fix;
+# --bundle sidesteps it by embedding the same proof the search would have
+# looked up. Signing SHA256SUMS in addition to each individual tarball and
+# SBOM means a user who only wants to make one check has one to make.
 #
 # WHY THIS SCRIPT REFUSES TO RUN OUTSIDE THE RELEASE WORKFLOW: keyless
 # signing binds a short-lived certificate to WHATEVER identity requests it.
@@ -114,8 +121,8 @@ sign_one_with_retry() {
         # that forgot to grant the permission.
         if cosign sign-blob --yes \
             --oidc-provider=github-actions \
-            --output-signature "$file.sig" \
-            --output-certificate "$file.pem" \
+            --bundle "$file.bundle" \
+            --new-bundle-format \
             "$file" >"$file.sign.log" 2>&1; then
             rm -f "$file.sign.log"
             return 0
@@ -154,7 +161,7 @@ main() {
             failed=1
             continue
         fi
-        echo "signed: $file.sig $file.pem"
+        echo "signed: $file.bundle"
     done
 
     if [ "$failed" -ne 0 ]; then

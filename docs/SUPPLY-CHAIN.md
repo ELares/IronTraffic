@@ -13,9 +13,13 @@ Every release publishes, per tag:
 - **Four CycloneDX 1.6 SBOMs**, one per tarball, each describing exactly that artifact's resolved
   dependency closure for its own target and feature set.
 - **One `SHA256SUMS`**, one line per tarball.
-- **Nine signatures**: one over each of the four tarballs, one over each of the four SBOMs, and one
-  over `SHA256SUMS` itself, so a user who only wants to make one check has one to make.
-- **Four in-toto build provenance attestations**, one per tarball.
+- **Nine signatures**, one over each of the four tarballs, one over each of the four SBOMs, and one
+  over `SHA256SUMS` itself, so a user who only wants to make one check has one to make. Each is a
+  `<file>.bundle`: cosign's "new bundle format", a self-contained Sigstore bundle holding the
+  signature, the short-lived Fulcio certificate, and an embedded Rekor inclusion proof together, so
+  verification needs no live transparency-log search by artifact digest.
+- **Four in-toto build provenance attestations**, one per tarball, as `<file>.intoto.bundle` (the
+  identical bundle format, holding the DSSE-enveloped statement instead of a plain signature).
 
 `scripts/install.sh` and `scripts/release/verify.sh` are themselves published release assets too
 (alongside the tarballs), so `verify.sh` can be downloaded and run standalone, with no repository
@@ -62,20 +66,27 @@ Or, to reproduce exactly the checks `cosign` itself performs, without `verify.sh
 
 ```sh
 cosign verify-blob \
-    --certificate irontraffic-<version>-<target>.tar.gz.pem \
-    --signature irontraffic-<version>-<target>.tar.gz.sig \
+    --bundle irontraffic-<version>-<target>.tar.gz.bundle \
+    --new-bundle-format \
     --certificate-identity-regexp '^https://github\.com/ELares/IronTraffic/\.github/workflows/ci\.yml@refs/tags/v' \
     --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
     irontraffic-<version>-<target>.tar.gz
 
 cosign verify-blob-attestation \
-    --certificate irontraffic-<version>-<target>.tar.gz.pem \
-    --signature irontraffic-<version>-<target>.tar.gz.intoto.jsonl \
+    --bundle irontraffic-<version>-<target>.tar.gz.intoto.bundle \
+    --new-bundle-format \
     --certificate-identity-regexp '^https://github\.com/ELares/IronTraffic/\.github/workflows/ci\.yml@refs/tags/v' \
     --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
     --type slsaprovenance \
     irontraffic-<version>-<target>.tar.gz
 ```
+
+Verification is from a self-contained `.bundle` (signature, certificate, and an embedded Rekor
+inclusion proof together), not a bare signature plus a live transparency-log search: that search-based
+path was the first one this project shipped, and it failed against this project's own real signing
+identity with a Rekor API error outside this project's control
+(`proposedContent.proposedContent.verifiers in body is required`); the bundle format embeds the same
+proof the search would otherwise look up over the network.
 
 `scripts/install.sh` runs the first form (`verify.sh --strict`) automatically, on every install,
 before anything is placed on `PATH`. The opt-out is explicit and prints a warning naming what is
@@ -135,7 +146,7 @@ into the release binary itself.
 | Checksum mismatch | The download is corrupted, or the artifact was tampered with in transit | Re-download; if it recurs, do not run the binary |
 | "certificate identity did not match" | Either the artifact was not produced by this project's release workflow, **or you omitted a pin** | Check your `cosign` command carries both `--certificate-identity-regexp` and `--certificate-oidc-issuer`; if it does and this still fails, treat the artifact as untrusted |
 | Provenance subject digest mismatch | The attestation does not describe this exact file | Re-download both the artifact and its attestation together; do not mix files from different versions |
-| A check was skipped and `verify.sh` exited nonzero | No network reached the transparency log, or a companion file (`.sig`/`.pem`/`.intoto.jsonl`) could not be found | This is the correct, safe default; re-run with network access, or pass `--allow-skipped` only if you understand what that check would have caught (see `docs/THREAT-MODEL.md`) |
+| A check was skipped and `verify.sh` exited nonzero | No network reached the transparency log, or a companion file (`.bundle`/`.intoto.bundle`) could not be found | This is the correct, safe default; re-run with network access, or pass `--allow-skipped` only if you understand what that check would have caught (see `docs/THREAT-MODEL.md`) |
 | SBOM licence check names a component | A dependency's declared licence, or a compound expression's disjunct, is not on the `deny.toml` allowlist | This should not happen in a published release; report it |
 | `install.sh` refuses | Any of the above, or verification was simply unavailable | Investigate before passing `--no-verify-signature`; that flag is a deliberate downgrade, not a workaround |
 

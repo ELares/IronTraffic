@@ -1217,7 +1217,7 @@ jobs:
           missing=0
           for f in dist/*.tar.gz dist/*.sbom.json dist/SHA256SUMS; do
             sig_count=0
-            [ -f "$f.sig" ] && sig_count=$((sig_count + 1))
+            [ -f "$f.bundle" ] && sig_count=$((sig_count + 1))
             if [ "$sig_count" -ne 1 ]; then
               echo "FAIL: $f has $sig_count signature(s), want exactly 1" >&2
               missing=1
@@ -1359,11 +1359,20 @@ jobs:
           # `scripts/install.sh` downloads and runs verify.sh from this same
           # release, and docs/SUPPLY-CHAIN.md documents downloading and
           # running it standalone, neither of which works unless it is
-          # itself a release asset. The SBOMs, signatures (`.sig`/`.pem`
-          # per file) and provenance attestations (`.intoto.jsonl`) glob in
+          # itself a release asset. The SBOMs, signatures (`.bundle` per
+          # file, a self-contained Sigstore bundle: signature, certificate
+          # and Rekor inclusion proof together, chosen over a bare
+          # signature plus a live Rekor search; see sign.sh's own comment)
+          # and provenance attestations (`.intoto.bundle`) glob in
           # alongside the tarballs and SHA256SUMS they cover.
+          # `dist/*.bundle` is NOT used here on its own: it would also
+          # match every `*.intoto.bundle` (a glob's `*` matches dots), which
+          # made `gh release create` see the same attestation file twice,
+          # once per pattern. Each glob below is specific enough to match
+          # exactly the file kind it names and no other.
           gh release create "$tag" \
             dist/*.tar.gz dist/*.sbom.json dist/SHA256SUMS \
-            dist/*.sig dist/*.pem dist/*.intoto.jsonl \
+            dist/*.tar.gz.bundle dist/*.sbom.json.bundle dist/SHA256SUMS.bundle \
+            dist/*.intoto.bundle \
             scripts/install.sh scripts/release/verify.sh scripts/release/sbom-licence-check.sh \
             --title "$tag" --generate-notes

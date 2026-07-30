@@ -486,7 +486,7 @@ test_install_verifies_by_default() {
     # anything that is not https, so the fixture must genuinely speak TLS,
     # the same reason release-selftest.sh's own install.sh fixture does)
     # serves a tarball with a CORRECT checksum and a REAL copy of
-    # verify.sh, but no .sig / .pem at all: this stands in for "the
+    # verify.sh, but no .bundle at all: this stands in for "the
     # signature does not check out" (the closest this offline test gets to
     # a literally tampered signature, since a real Fulcio-issued
     # certificate cannot be forged here; see this file's header) and
@@ -700,8 +700,8 @@ test_verify_prints_source_commit() {
     identity_regexp="$(cat "$REAL_FIXTURE_REGEXP_FILE")"
     expected_commit="$(git rev-parse HEAD)"
     if ! cosign verify-blob-attestation \
-        --certificate "$artifact.pem" \
-        --signature "$artifact.intoto.jsonl" \
+        --bundle "$artifact.intoto.bundle" \
+        --new-bundle-format \
         --certificate-identity-regexp "$identity_regexp" \
         --certificate-oidc-issuer 'https://token.actions.githubusercontent.com' \
         --type slsaprovenance \
@@ -709,7 +709,7 @@ test_verify_prints_source_commit() {
         fail "verify_prints_source_commit" "cosign verify-blob-attestation against this run's own real signature failed: $(cat "$WORK/real-verify-attest.log")"
         return
     fi
-    payload="$(jq -r '.payload' "$artifact.intoto.jsonl" 2>/dev/null | base64 -d 2>/dev/null || true)"
+    payload="$(jq -r '.dsseEnvelope.payload' "$artifact.intoto.bundle" 2>/dev/null | base64 -d 2>/dev/null || true)"
     commit="$(printf '%s' "$payload" | jq -r '.predicate.invocation.configSource.digest.sha1 // empty' 2>/dev/null || true)"
     if [ "$commit" = "$expected_commit" ]; then
         pass "verify_prints_source_commit"
@@ -725,12 +725,12 @@ test_provenance_subject_matches_digest() {
     fi
     artifact="$(cat "$REAL_FIXTURE_PATH_FILE")"
     actual_sha256="$(sha256_of "$artifact")"
-    intoto_file="$artifact.intoto.jsonl"
+    intoto_file="$artifact.intoto.bundle"
     if [ ! -s "$intoto_file" ]; then
-        fail "provenance_subject_matches_digest" "no (or empty) .intoto.jsonl produced alongside $artifact"
+        fail "provenance_subject_matches_digest" "no (or empty) .intoto.bundle produced alongside $artifact"
         return
     fi
-    payload="$(jq -r '.payload' "$intoto_file" 2>/dev/null | base64 -d 2>/dev/null || true)"
+    payload="$(jq -r '.dsseEnvelope.payload' "$intoto_file" 2>/dev/null | base64 -d 2>/dev/null || true)"
     if [ -z "$payload" ]; then
         fail "provenance_subject_matches_digest" "could not decode the DSSE payload in $intoto_file"
         return

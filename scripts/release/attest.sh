@@ -8,10 +8,13 @@
 #
 # Usage: scripts/release/attest.sh <artifact-file> <target> <features>
 #
-# Produces <artifact-file>.intoto.jsonl (cosign's own DSSE-enveloped
-# in-toto statement). The statement's subject is {name, digest: {sha256}},
-# computed by cosign itself from <artifact-file>; this script only supplies
-# the PREDICATE, whose fields are:
+# Produces <artifact-file>.intoto.bundle, a Sigstore "new bundle format"
+# object (the DSSE-enveloped in-toto statement, the signing certificate,
+# and an embedded Rekor inclusion proof together; see sign.sh's own comment
+# on why this project verifies from a bundle rather than a bare DSSE
+# envelope plus a live Rekor search). The statement's subject is
+# {name, digest: {sha256}}, computed by cosign itself from <artifact-file>;
+# this script only supplies the PREDICATE, whose fields are:
 #   builder.id            this workflow's identity (matches the identity
 #                          verify.sh's certificate-identity-regexp pins)
 #   buildType              the workflow file's own URL
@@ -190,12 +193,13 @@ main() {
           }
         }' > "$predicate_file"
 
-    attestation_out="$artifact.intoto.jsonl"
+    attestation_out="$artifact.intoto.bundle"
     if ! cosign attest-blob --yes \
         --oidc-provider=github-actions \
         --predicate "$predicate_file" \
         --type slsaprovenance \
-        --output-attestation "$attestation_out" \
+        --bundle "$attestation_out" \
+        --new-bundle-format \
         "$artifact"; then
         echo "error: producing the provenance attestation for $artifact failed." >&2
         exit 1
