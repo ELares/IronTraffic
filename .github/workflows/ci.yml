@@ -1148,13 +1148,40 @@ jobs:
               # dynamic section instead of executing anything.
               libs="$(readelf -d "$f" | awk -F'[][]' '/\(NEEDED\)/{print $2}')"
             fi
-            printf '%s\n' "$libs" | while IFS= read -r lib; do
+            # Compare SONAMEs, not paths, and report EVERY violation.
+            #
+            # `ldd` prints the program interpreter as a bare absolute path with
+            # no `=>` (`/lib64/ld-linux-x86-64.so.2`), while every other line
+            # starts with a SONAME. Taking `$1` verbatim therefore produced a
+            # path for exactly one line, which matched nothing in an allowlist
+            # written in SONAMEs, and the first pull request run of this job
+            # failed on it:
+            #
+            #   FAIL: x86_64-unknown-linux-gnu links /lib64/ld-linux-x86-64.so.2
+            #
+            # The allowlist already contained `ld-linux-x86-64.so.2`. Adding the
+            # absolute path instead would have pinned this runner's own
+            # multiarch layout, which differs across distributions, so the
+            # basename is what is compared.
+            #
+            # Violations are also collected rather than exited on, because the
+            # previous form died inside a pipeline subshell on the first one and
+            # so could only ever name a single library per run.
+            bad=""
+            for lib in $libs; do
               [ -n "$lib" ] || continue
-              if ! grep -qxF "$lib" "$allow"; then
-                echo "FAIL: $t links $lib, which is not in $allow"
-                exit 1
+              base="${lib##*/}"
+              if ! grep -qxF "$base" "$allow"; then
+                bad="$bad $t:$base"
               fi
             done
+            if [ -n "$bad" ]; then
+              echo "FAIL: not in $allow:"
+              for entry in $bad; do echo "  $entry"; done
+              echo "full ldd/readelf output for $t:"
+              printf '%s\n' "$libs"
+              exit 1
+            fi
           done
           echo "allowlist: ok"
       - name: Create the GitHub release
