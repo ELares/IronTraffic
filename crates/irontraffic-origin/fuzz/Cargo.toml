@@ -1,0 +1,31 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# Not a workspace member: the empty [workspace] table below is required so
+# that Cargo treats this manifest as its own independent workspace root
+# instead of trying to join the ancestor workspace at the repository root.
+# This is the standard cargo-fuzz layout, matching every other fuzz crate in
+# this tree (`crates/irontraffic-config/fuzz`, `crates/irontraffic-router/fuzz`,
+# `crates/irontraffic-tls/fuzz`, `crates/irontraffic-upgrade/fuzz`): a
+# cargo-fuzz project pins its own toolchain-sensitive edition and is built
+# with `cargo fuzz`, never `cargo build --workspace`.
+[package]
+name = "irontraffic-origin-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[workspace]
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+irontraffic-origin = { path = ".." }
+
+[[bin]]
+name = "fuzz_scan_head"
+path = "fuzz_targets/fuzz_scan_head.rs"
+test = false
+doc = false
+bench = false
