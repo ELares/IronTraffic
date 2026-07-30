@@ -134,6 +134,31 @@ base64ct = "1.6"
 # the third allowlisted site in the whole workspace; see decision-ledger
 # entry 42's amendment and `scripts/allowlist-arcswap-store.txt`.
 arc-swap = "1.9.2"
+# HMAC-SHA384, the primitive `irontraffic-tls`'s hand-rolled RFC 5869
+# HKDF-Extract/Expand (`hkdf.rs`) runs over for the cluster-derived TLS session
+# ticket key schedule (`cluster-derived-session-ticketer`, #120). Only
+# `irontraffic-tls` names it.
+hmac = "0.12"
+# SHA-384, the hash the HKDF above is built on (`cluster-derived-session-ticketer`,
+# #120).
+sha2 = "0.10"
+# XChaCha20-Poly1305 for TLS session ticket encryption (`cluster-derived-session-ticketer`,
+# #120), a deliberate deviation from the design note's AES-256-GCM: a 192-bit
+# random nonce needs no per-key nonce-collision analysis the way a 96-bit
+# AES-GCM nonce would, and this AEAD is sourced from this crate rather than from
+# a `rustls::crypto` provider, so the ticket format is byte-identical on
+# `crypto-aws-lc-rs` and `crypto-ring` builds.
+chacha20poly1305 = "0.10"
+# Zeroizes the cluster ticket root, its HKDF pseudorandom key, and every derived
+# epoch key on drop (`cluster-derived-session-ticketer`, #120). The root is the
+# highest-value secret in the product; it must never linger in freed memory.
+zeroize = { version = "1.8", features = ["zeroize_derive"] }
+# dev-only: cross-checks `irontraffic-tls`'s hand-rolled HKDF-SHA384 against
+# `aws_lc_rs::hkdf` in `hkdf_matches_aws_lc_rs` (`cluster-derived-session-ticketer`,
+# #120). `aws-lc-rs` is already a transitive dependency of `rustls`'s
+# `crypto-aws-lc-rs` feature; this adds a direct dev-dependency entry so the
+# differential test can name it in a `use`.
+aws-lc-rs = "1"
 
 [workspace.lints.rust]
 # A proxy parses attacker-controlled bytes on every request. There is no

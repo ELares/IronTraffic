@@ -60,3 +60,10 @@ path = "fuzz_targets/fuzz_client_hello.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_ticket_decrypt"
+path = "fuzz_targets/fuzz_ticket_decrypt.rs"
+test = false
+doc = false
+bench = false

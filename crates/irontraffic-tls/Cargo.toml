@@ -35,7 +35,11 @@ schemars = { workspace = true, optional = true }
 # TlsMaterialCell's wait-free publication of a rebuilt certificate index; see
 # the workspace Cargo.toml comment on this dependency and issue #118.
 arc-swap = { workspace = true }
-
+hmac = { workspace = true }
+sha2 = { workspace = true }
+chacha20poly1305 = { workspace = true }
+subtle = { workspace = true }
+zeroize = { workspace = true }
 [dev-dependencies]
 proptest = { workspace = true }
 criterion = { workspace = true }
@@ -47,7 +51,7 @@ criterion = { workspace = true }
 # already a resolved dependency of this crate's own default `crypto-aws-lc-rs` feature, so this
 # does not add a new crate to the tree.
 rcgen = { workspace = true, features = ["aws_lc_rs"] }
-
+aws-lc-rs = { workspace = true }
 [[bench]]
 name = "name"
 harness = false
@@ -62,4 +66,8 @@ harness = false
 
 [[bench]]
 name = "index_build"
+harness = false
+
+[[bench]]
+name = "ticket"
 harness = false
