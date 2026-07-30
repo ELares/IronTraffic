@@ -106,7 +106,17 @@ pub enum BenchError {
     /// This variant's shape is defined here, but `BenchError::io` below is the
     /// only place in this crate that ever builds one: `path` reaches this
     /// struct literal only as `Detail::new(...)`'s return value.
-    #[error("benchmark io at {path}: {source}")]
+    ///
+    /// `source` is a bare `std::io::Error`, not a `Detail`, because `#[source]`
+    /// is what lets a caller walk the error chain with `std::error::Error::source`,
+    /// and `Detail` is not `std::error::Error`. That means `source`'s own
+    /// `Display` is NOT sanitised by construction the way `path` is, so the
+    /// format string below routes it through `Detail::new` at render time
+    /// instead: see #776 finding 4, where the derived `{source}` form printed
+    /// an `std::io::Error` built from foreign bytes (for example a load
+    /// generator's stderr wrapped in `std::io::Error::other`) unsanitised,
+    /// defeating this variant's own terminal-safety guarantee.
+    #[error("benchmark io at {path}: {}", Detail::new(&source.to_string()))]
     Io {
         /// The path being read or written, clipped and sanitised.
         path: Detail,
