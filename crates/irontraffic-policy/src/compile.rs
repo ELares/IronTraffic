@@ -109,35 +109,40 @@ fn build_hole_before(ast: &Ast, n: usize) -> Vec<Option<HoleKind>> {
 }
 
 /// Marks every node id whose own code emission is folded away by a parent
-/// instead of emitted directly: the elements of a list literal (folded into
-/// `Const::List`/`Const::Int` by the `List` and `.size()` cases below) and
-/// the pattern argument of a `matches` call (folded into the regex table,
-/// never pushed onto the operand stack).
+/// instead of emitted directly: a LITERAL element of a list literal (folded
+/// into `Const::List`/`Const::Int` by the `List` and `.size()` cases below)
+/// and the pattern argument of a `matches` call (folded into the regex
+/// table, never pushed onto the operand stack).
 ///
-/// This ALSO suppresses a list element that is a bare attribute reference
-/// (`Ident`/`Field`/`Index`) rather than a literal. The type checker
+/// **Only a literal (`Bool`/`Int`/`Str`/`Null`) list element is suppressed.**
+/// A list element that is a bare attribute reference (`Ident`/`Field`/
+/// `Index`), or any other non-literal expression, is deliberately left
+/// UNSUPPRESSED, so the forward sweep emits its `LoadAttr` (or whatever code
+/// it has) exactly as it would for any other node. The type checker
 /// (`{{itpl-attribute-schema-and-typecheck}}`, #270, frozen; not touched by
 /// this issue) constrains a list literal's elements by TYPE only
 /// (`check_list`), not by "is this a literal", so `[request.method, "GET"]`
 /// type checks even though `Const::List` has no representation for a value
-/// that is not known until request time. Suppressing such an element's own
-/// `LoadAttr` keeps this compiler total (no dangling, unpopped stack value),
-/// and `const_of_leaf` below folds it to `Const::Null`, a known, documented
-/// gap between the checker and this compiler. A list element that is itself
-/// a COMPOUND expression (`a && b`, `x.startsWith("y")`, a nested ternary) is
-/// NOT handled by this pass: its own child nodes are not direct list
-/// elements, so they are not suppressed, and the result is a stack-imbalanced
-/// program that fails `verify`, surfacing as `CompileError::Verify`. That is
-/// a fail-closed outcome (admission is refused) rather than a silently wrong
-/// one, and closing it fully is out of this issue's scope; see the PR for
-/// #271 for the full account.
+/// that is not known until request time. Emitting that element's `LoadAttr`
+/// anyway leaves a dangling, un-popped value on the operand stack (the
+/// `List` node itself pushes nothing, and nothing downstream consumes it),
+/// which `verify` catches as `StackNotSingleton` and turns into
+/// `CompileError::Verify`: admission is refused, uniformly with how a
+/// COMPOUND list element (`a && b`, `x.startsWith("y")`, a nested ternary)
+/// already fails today, rather than the element silently degrading to
+/// `Const::Null` and changing what an admitted policy means. This crate must
+/// never admit a policy whose compiled meaning differs from its source; see
+/// the PR for #271 / issue #758 finding 3 for the full account of why the
+/// previous, suppress-everything behaviour was wrong.
 fn build_suppressed(ast: &Ast, n: usize) -> Vec<bool> {
     let mut suppressed = vec![false; n];
     for node in &ast.nodes {
         match *node {
             Node::List { from, len } => {
                 for &elem in ast.args_of(from, len) {
-                    mark_bool(&mut suppressed, elem.index());
+                    if is_literal_node(ast, elem) {
+                        mark_bool(&mut suppressed, elem.index());
+                    }
                 }
             }
             Node::Call {
@@ -154,6 +159,17 @@ fn build_suppressed(ast: &Ast, n: usize) -> Vec<bool> {
         }
     }
     suppressed
+}
+
+/// Whether `id` is one of the four literal node kinds `const_of_leaf` can
+/// fold without loss: exactly the shapes a list element must be for
+/// suppressing its own code emission to be safe. See `build_suppressed`'s
+/// doc comment for why every other node kind must NOT be suppressed.
+fn is_literal_node(ast: &Ast, id: NodeId) -> bool {
+    matches!(
+        ast.node(id),
+        Some(Node::Bool(_) | Node::Int(_) | Node::Str(_) | Node::Null)
+    )
 }
 
 /// Resolves a `(from, len)` byte range, or an empty slice when it is invalid.
@@ -197,11 +213,18 @@ fn elems_of(buf: &[Const], from: u32, len: u32) -> &[Const] {
     buf.get(start..end).unwrap_or(&[])
 }
 
-/// Converts a list element node directly to the `Const` it folds to. Only
-/// `Bool`/`Int`/`Str` literal nodes are the INTENDED shape; `Null` and any
-/// other node kind (a non-literal element; see `build_suppressed`'s doc
-/// comment) degrade to `Const::Null`, a total, documented fallback rather
-/// than a panic.
+/// Converts a list element node directly to the `Const` it folds to.
+/// `Bool`/`Int`/`Str`/`Null` are the only shapes reachable here in a program
+/// that goes on to compile `Ok`: every other node kind is a non-literal list
+/// element (see `build_suppressed`'s doc comment), which is now left
+/// UNSUPPRESSED, so its own dangling code always trips `verify`'s
+/// `StackNotSingleton` before `Ok` is ever returned. The `_ => Const::Null`
+/// arm below therefore only ever contributes to a `list_elems` array that a
+/// FAILED `compile` call throws away; it stays as a total, panic-free
+/// fallback (this function has no `Result` to report through, and a bogus
+/// intermediate value is harmless when the program that would carry it is
+/// never admitted) rather than because a real, successfully compiled program
+/// can still reach it.
 fn const_of_leaf(ast: &Ast, id: NodeId) -> Const {
     match ast.node(id) {
         Some(Node::Bool(b)) => Const::Bool(b),
@@ -553,6 +576,15 @@ pub fn compile(checked: &Checked, limits: &PolicyLimits) -> Result<Program, Comp
     )
     .map_err(CompileError::Verify)?;
 
+    // This clone is the one that is structurally unavoidable: `compile` takes
+    // `checked: &Checked` (a borrow, per this issue's own `## Public API`),
+    // so it cannot move `checked.strings` out of its caller's value without
+    // either an owned parameter (which the issue's signature forecloses) or
+    // an `Rc`/`Arc` (a representation change to `Checked` itself, which is
+    // #270's frozen file). `check`'s own clone was the avoidable one and was
+    // removed with `mem::take`; this second copy pays for `Program` becoming
+    // the long-lived, independently owned artifact every worker shares
+    // through the configuration snapshot, once per admitted policy.
     Ok(Program::new(
         compiler.code.into_boxed_slice(),
         compiler.consts.into_boxed_slice(),
@@ -569,7 +601,6 @@ pub fn compile(checked: &Checked, limits: &PolicyLimits) -> Result<Program, Comp
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::attrs::Ty;
     use crate::check::check;
     use crate::lex::lex;
     use crate::parse::parse;
@@ -925,6 +956,20 @@ mod tests {
         // meaningful (the haystack is uniform `z` bytes and shares no
         // substring with any `patternNNN` branch, so it cannot match), not
         // merely "did not panic".
+        //
+        // HONEST LIMIT (issue #758 finding 7): this test does NOT, and
+        // cannot, observably distinguish the configured `dfa_size_limit`
+        // from `usize::MAX` through any purely functional assertion.
+        // Whether the lazy DFA falls back to the slower engine early (small
+        // limit) or keeps growing (no limit) changes performance, never the
+        // match OUTCOME: the `regex` crate's byte-mode search is correct
+        // either way. A mutation that replaces `.dfa_size_limit(size_limit)`
+        // with `.dfa_size_limit(usize::MAX)` therefore survives this test,
+        // and every other test in this file, and that is disclosed here
+        // rather than hidden behind a name that implies otherwise. Closing
+        // this for real would need a timing assertion tight enough to be
+        // flaky on shared CI hardware, which this crate's own house rules
+        // on unmeasured assumptions counsel against.
         let mut alternatives = Vec::with_capacity(200);
         for i in 0..200 {
             alternatives.push(format!("pattern{i:03}"));
@@ -984,6 +1029,19 @@ mod tests {
         let regex = program.regex(0).expect("one compiled regex");
         assert!(regex.is_match(&[0xFF]));
         assert!(!regex.is_match(b"a"));
+    }
+
+    #[test]
+    fn regex_is_case_sensitive() {
+        // Pins `.case_insensitive(false)` (issue #758 finding 7): flipping it
+        // to `true` silently changes what every operator-supplied pattern
+        // matches (`^/ADMIN` would start matching `/admin`), and it survived
+        // every other test before this one existed.
+        let program =
+            compile_src(br#"request.path.matches("^/ADMIN")"#, Phase::RequestHeaders).unwrap();
+        let regex = program.regex(0).expect("one compiled regex");
+        assert!(regex.is_match(b"/ADMIN"));
+        assert!(!regex.is_match(b"/admin"));
     }
 
     #[test]
@@ -1106,48 +1164,386 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // Opcode lowering table: one exact-instruction-sequence test per
+    // operator (issue #758 finding 2). Every arm of `comparison_op` and
+    // `method_op`, plus `Not`, `InSet` and `RegexMatch`, is pinned here
+    // against a literal expected sequence, the same shape as `and_lowering`.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn ne_lowering() {
+        let program = compile_src(br#"request.method != "GET""#, Phase::RequestHeaders).unwrap();
+        assert_eq!(
+            program.ops(),
+            &[Op::LoadAttr(0), Op::LoadConst(0), Op::Ne, Op::Ret]
+        );
+    }
+
+    #[test]
+    fn lt_lowering() {
+        let program = compile_src(b"request.port < 80", Phase::RequestHeaders).unwrap();
+        assert_eq!(
+            program.ops(),
+            &[Op::LoadAttr(0), Op::LoadConst(0), Op::Lt, Op::Ret]
+        );
+    }
+
+    #[test]
+    fn le_lowering() {
+        let program = compile_src(b"request.port <= 80", Phase::RequestHeaders).unwrap();
+        assert_eq!(
+            program.ops(),
+            &[Op::LoadAttr(0), Op::LoadConst(0), Op::Le, Op::Ret]
+        );
+    }
+
+    #[test]
+    fn gt_lowering() {
+        let program = compile_src(b"request.port > 80", Phase::RequestHeaders).unwrap();
+        assert_eq!(
+            program.ops(),
+            &[Op::LoadAttr(0), Op::LoadConst(0), Op::Gt, Op::Ret]
+        );
+    }
+
+    #[test]
+    fn ge_lowering() {
+        let program = compile_src(b"request.port >= 80", Phase::RequestHeaders).unwrap();
+        assert_eq!(
+            program.ops(),
+            &[Op::LoadAttr(0), Op::LoadConst(0), Op::Ge, Op::Ret]
+        );
+    }
+
+    #[test]
+    fn starts_with_lowering() {
+        let program = compile_src(
+            br#"request.path.startsWith("/admin")"#,
+            Phase::RequestHeaders,
+        )
+        .unwrap();
+        assert_eq!(
+            program.ops(),
+            &[Op::LoadAttr(0), Op::LoadConst(0), Op::StartsWith, Op::Ret]
+        );
+    }
+
+    #[test]
+    fn ends_with_lowering() {
+        let program =
+            compile_src(br#"request.path.endsWith("/admin")"#, Phase::RequestHeaders).unwrap();
+        assert_eq!(
+            program.ops(),
+            &[Op::LoadAttr(0), Op::LoadConst(0), Op::EndsWith, Op::Ret]
+        );
+    }
+
+    #[test]
+    fn contains_lowering() {
+        let program =
+            compile_src(br#"request.path.contains("/admin")"#, Phase::RequestHeaders).unwrap();
+        assert_eq!(
+            program.ops(),
+            &[Op::LoadAttr(0), Op::LoadConst(0), Op::Contains, Op::Ret]
+        );
+    }
+
+    #[test]
+    fn equals_ignore_case_lowering() {
+        let program = compile_src(
+            br#"request.method.equalsIgnoreCase("get")"#,
+            Phase::RequestHeaders,
+        )
+        .unwrap();
+        assert_eq!(
+            program.ops(),
+            &[Op::LoadAttr(0), Op::LoadConst(0), Op::EqIgnoreCase, Op::Ret]
+        );
+    }
+
+    #[test]
+    fn starts_with_ignore_case_lowering() {
+        let program = compile_src(
+            br#"request.path.startsWithIgnoreCase("/Admin")"#,
+            Phase::RequestHeaders,
+        )
+        .unwrap();
+        assert_eq!(
+            program.ops(),
+            &[
+                Op::LoadAttr(0),
+                Op::LoadConst(0),
+                Op::StartsWithIgnoreCase,
+                Op::Ret
+            ]
+        );
+    }
+
+    #[test]
+    fn not_lowering() {
+        // `!x` must lower to `Op::Not`, never `Op::Size` (both are unary,
+        // pop-one-push-one, which is exactly why this mutation survived
+        // every other test in the suite: see issue #758 finding 2).
+        let program = compile_src(b"!connection.tls", Phase::RequestHeaders).unwrap();
+        assert_eq!(program.ops(), &[Op::LoadAttr(0), Op::Not, Op::Ret]);
+    }
+
+    #[test]
+    fn in_set_operand_is_not_zero() {
+        // `in_set_over_a_populated_list` above only ever exercises `InSet(0)`
+        // (the fixture's one and only interned list happens to land at index
+        // 0), which is exactly why hardcoding the `InSet` operand to 0
+        // survived (#758 finding 2). Here the list is the SECOND constant
+        // interned (index 0 is `1`, the int literal from the left clause),
+        // so a correct compile must emit `InSet(1)`.
+        let program = compile_src(
+            br#"request.port == 1 && request.method in ["GET", "HEAD"]"#,
+            Phase::RequestHeaders,
+        )
+        .unwrap();
+        assert_eq!(
+            program.ops(),
+            &[
+                Op::LoadAttr(0),
+                Op::LoadConst(0),
+                Op::Eq,
+                Op::JumpIfFalse(6),
+                Op::LoadAttr(1),
+                Op::InSet(1),
+                Op::Ret,
+            ]
+        );
+        assert_eq!(program.consts().first(), Some(&Const::Int(1)));
+        let elems = program
+            .list_of(1)
+            .expect("InSet(1) must name a Const::List at index 1");
+        assert_eq!(program.const_str(&elems[0]), b"GET");
+        assert_eq!(program.const_str(&elems[1]), b"HEAD");
+    }
+
+    #[test]
+    fn regex_match_index_is_not_zero() {
+        // `regex_bomb_is_linear`, `regex_dfa_cache_fallback_completes` and
+        // `regex_byte_mode_matches_non_utf8` each compile exactly ONE regex,
+        // so every existing test's only `RegexMatch` names index 0, which is
+        // exactly why hardcoding the operand to 0 survived (#758 finding 2).
+        // Two DISTINCT patterns here must intern to two DISTINCT indices.
+        let program = compile_src(
+            br#"request.path.matches("^/a") || request.path.matches("^/b")"#,
+            Phase::RequestHeaders,
+        )
+        .unwrap();
+        assert_eq!(
+            program.ops(),
+            &[
+                Op::LoadAttr(0),
+                Op::RegexMatch(0),
+                Op::JumpIfTrue(5),
+                Op::LoadAttr(0),
+                Op::RegexMatch(1),
+                Op::Ret,
+            ]
+        );
+        assert_eq!(program.regex_count(), 2);
+        let first = program.regex(0).expect("regex 0");
+        let second = program.regex(1).expect("regex 1");
+        assert!(first.is_match(b"/a"));
+        assert!(!first.is_match(b"/b"));
+        assert!(second.is_match(b"/b"));
+        assert!(!second.is_match(b"/a"));
+    }
+
+    #[test]
+    fn list_int_elements_are_not_folded_to_null() {
+        // Pins `const_of_leaf`'s `Some(Node::Int(v)) => Const::Int(v)` arm:
+        // mutating it to `Const::Null` survived every other test (#758
+        // finding 2) because `in_set_over_a_populated_list` and
+        // `edge_case_25_in_set_variants` only ever build `Str` list elements.
+        let program = compile_src(b"request.size in [1, 2, 3]", Phase::RequestHeaders).unwrap();
+        let c = match program.ops().get(1) {
+            Some(Op::InSet(n)) => *n,
+            other => panic!("expected InSet as the second op, got {other:?}"),
+        };
+        let elems = program.list_of(c).expect("InSet must name a Const::List");
+        assert_eq!(
+            elems,
+            &[Const::Int(1), Const::Int(2), Const::Int(3)],
+            "list elements must be the real Int constants, not Const::Null"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // A list element naming an attribute must be rejected, not silently
+    // compiled to `Const::Null` (issue #758 finding 3, BLOCKING).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn list_element_naming_an_attribute_is_rejected() {
+        // `request.path` inside the list must not silently degrade to
+        // `Const::Null` (which would admit a policy meaning
+        // `request.method in [null, "GET"]`, not what its source says).
+        // Consistent with a COMPOUND list element (already fail-closed),
+        // this must be refused at compile time.
+        let limits = default_limits();
+        let err = compile_src_with_limits(
+            br#"request.method in [request.path, "GET"]"#,
+            Phase::RequestHeaders,
+            limits,
+        )
+        .expect_err("a list element naming an attribute must be rejected");
+        assert!(
+            matches!(
+                err,
+                CompileError::Verify(VerifyError::StackNotSingleton { .. })
+            ),
+            "expected CompileError::Verify(StackNotSingleton), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn two_distinct_attribute_naming_lists_do_not_silently_collide() {
+        // Companion to the test above: before the fix, two source-distinct
+        // lists that each named a different attribute both degraded to a
+        // list of `Const::Null`s and interned onto ONE shared `Const::List`
+        // slot (issue #758 finding 3's interning-collision evidence). With
+        // the fix, the first offending list is rejected before any
+        // constant is even interned, so there is nothing left to collide.
+        let err = compile_src(
+            br#"request.method in [request.path, "GET"] && request.method in [request.query, "GET"]"#,
+            Phase::RequestHeaders,
+        )
+        .expect_err("must be rejected, not silently compiled with colliding constants");
+        assert!(
+            err.contains("StackNotSingleton"),
+            "expected a StackNotSingleton failure, got: {err}"
+        );
+    }
+
+    // ------------------------------------------------------------------
     // Property tests.
     // ------------------------------------------------------------------
 
-    /// One schema leaf the generator can pick, mirroring
-    /// `check::tests::GenAttr`: a scalar attribute path with its static type,
-    /// so the generator builds type-correct comparisons that reach `check`'s
-    /// `Ok` path and, from there, `compile`.
+    // Widened per issue #758 finding 2: the ORIGINAL generator rendered
+    // every leaf as `({path} == {rhs})`, which reached only 9 of the 22
+    // `Op` variants over 256 draws (measured; see the PR for #271 for the
+    // instrumented run) and is exactly why the opcode lowering table had no
+    // property-test coverage behind it. Every leaf kind below draws a
+    // DIFFERENT operator, so the combined generator can reach all 22.
+    // `prop_generator_opcode_reach` below measures and reports the real
+    // number rather than assuming it.
+
+    /// The six relational comparison operators, all rendered by their own
+    /// source symbol so the generator draws every one of them, not just `==`.
     #[derive(Clone, Copy, Debug)]
-    enum GenAttr {
-        Scalar(&'static str, Ty),
+    enum CmpOp {
+        Eq,
+        Ne,
+        Lt,
+        Le,
+        Gt,
+        Ge,
     }
 
-    const GEN_ATTRS: &[GenAttr] = &[
-        GenAttr::Scalar("request.method", Ty::Str),
-        GenAttr::Scalar("request.path", Ty::Str),
-        GenAttr::Scalar("request.port", Ty::Int),
-        GenAttr::Scalar("request.size", Ty::Int),
-        GenAttr::Scalar("connection.tls", Ty::Bool),
-    ];
+    impl CmpOp {
+        fn symbol(self) -> &'static str {
+            match self {
+                CmpOp::Eq => "==",
+                CmpOp::Ne => "!=",
+                CmpOp::Lt => "<",
+                CmpOp::Le => "<=",
+                CmpOp::Gt => ">",
+                CmpOp::Ge => ">=",
+            }
+        }
+    }
+
+    /// The five string methods that lower directly through `method_op`.
+    /// `Matches` and `Size` are drawn separately below because they each
+    /// have their own dedicated render shape (a regex pattern, a numeric
+    /// comparison).
+    #[derive(Clone, Copy, Debug)]
+    enum StrMethod {
+        StartsWith,
+        EndsWith,
+        Contains,
+        EqualsIgnoreCase,
+        StartsWithIgnoreCase,
+    }
+
+    impl StrMethod {
+        fn name(self) -> &'static str {
+            match self {
+                StrMethod::StartsWith => "startsWith",
+                StrMethod::EndsWith => "endsWith",
+                StrMethod::Contains => "contains",
+                StrMethod::EqualsIgnoreCase => "equalsIgnoreCase",
+                StrMethod::StartsWithIgnoreCase => "startsWithIgnoreCase",
+            }
+        }
+    }
+
+    const STR_ATTRS: &[&str] = &["request.method", "request.path"];
+    const INT_ATTRS: &[&str] = &["request.port", "request.size"];
+    const BOOL_ATTRS: &[&str] = &["connection.tls"];
+    const STR_LITERALS: &[&str] = &["GET", "POST", "HEAD"];
+    const REGEX_LITERALS: &[&str] = &["^/a", "^/b", "x+"];
 
     #[derive(Clone, Debug)]
     enum GenExpr {
-        Cmp(GenAttr, bool),
+        IntCmp(&'static str, CmpOp, i64),
+        StrCmp(&'static str, CmpOp, &'static str),
+        BoolCmp(&'static str, CmpOp, bool),
+        StrMethodCall(&'static str, StrMethod, &'static str),
+        Matches(&'static str, &'static str),
+        SizeCmp(&'static str, i64),
+        InSetStr(&'static str, Vec<&'static str>),
+        InSetInt(&'static str, Vec<i64>),
+        Not(Box<GenExpr>),
         And(Box<GenExpr>, Box<GenExpr>),
         Or(Box<GenExpr>, Box<GenExpr>),
-        Not(Box<GenExpr>),
         Ternary(Box<GenExpr>, Box<GenExpr>, Box<GenExpr>),
     }
 
     fn render(e: &GenExpr, out: &mut String) {
         use std::fmt::Write as _;
         match *e {
-            GenExpr::Cmp(GenAttr::Scalar(path, ty), matched) => {
-                let rhs = match (ty, matched) {
-                    (Ty::Str, true) => "\"GET\"".to_owned(),
-                    (Ty::Str, false) => "\"nope\"".to_owned(),
-                    (Ty::Int, true) => "80".to_owned(),
-                    (Ty::Int, false) => "1".to_owned(),
-                    (Ty::Bool, _) => "true".to_owned(),
-                    _ => "null".to_owned(),
-                };
-                let _ = write!(out, "({path} == {rhs})");
+            GenExpr::IntCmp(attr, op, v) => {
+                let _ = write!(out, "({attr} {} {v})", op.symbol());
+            }
+            GenExpr::StrCmp(attr, op, s) => {
+                let _ = write!(out, "({attr} {} \"{s}\")", op.symbol());
+            }
+            GenExpr::BoolCmp(attr, op, b) => {
+                let _ = write!(out, "({attr} {} {b})", op.symbol());
+            }
+            GenExpr::StrMethodCall(attr, m, s) => {
+                let _ = write!(out, "({attr}.{}(\"{s}\"))", m.name());
+            }
+            GenExpr::Matches(attr, pat) => {
+                let _ = write!(out, "({attr}.matches(\"{pat}\"))");
+            }
+            GenExpr::SizeCmp(attr, n) => {
+                let _ = write!(out, "({attr}.size() == {n})");
+            }
+            GenExpr::InSetStr(attr, ref vals) => {
+                let list = vals
+                    .iter()
+                    .map(|v| format!("\"{v}\""))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let _ = write!(out, "({attr} in [{list}])");
+            }
+            GenExpr::InSetInt(attr, ref vals) => {
+                let list = vals
+                    .iter()
+                    .map(i64::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let _ = write!(out, "({attr} in [{list}])");
+            }
+            GenExpr::Not(ref inner) => {
+                out.push('!');
+                render(inner, out);
             }
             GenExpr::And(ref l, ref r) => {
                 out.push('(');
@@ -1163,10 +1559,6 @@ mod tests {
                 render(r, out);
                 out.push(')');
             }
-            GenExpr::Not(ref inner) => {
-                out.push('!');
-                render(inner, out);
-            }
             GenExpr::Ternary(ref cond, ref then_, ref else_) => {
                 out.push('(');
                 render(cond, out);
@@ -1179,14 +1571,105 @@ mod tests {
         }
     }
 
-    fn arb_attr() -> impl Strategy<Value = GenAttr> {
-        (0..GEN_ATTRS.len()).prop_map(|i| GEN_ATTRS[i])
+    fn pick(pool: &'static [&'static str]) -> impl Strategy<Value = &'static str> {
+        (0..pool.len()).prop_map(move |i| pool[i])
+    }
+
+    fn arb_int_cmp() -> BoxedStrategy<GenExpr> {
+        (
+            pick(INT_ATTRS),
+            prop_oneof![
+                Just(CmpOp::Eq),
+                Just(CmpOp::Ne),
+                Just(CmpOp::Lt),
+                Just(CmpOp::Le),
+                Just(CmpOp::Gt),
+                Just(CmpOp::Ge),
+            ],
+            0i64..1000,
+        )
+            .prop_map(|(attr, op, v)| GenExpr::IntCmp(attr, op, v))
+            .boxed()
+    }
+
+    fn arb_str_cmp() -> BoxedStrategy<GenExpr> {
+        (
+            pick(STR_ATTRS),
+            prop_oneof![Just(CmpOp::Eq), Just(CmpOp::Ne)],
+            pick(STR_LITERALS),
+        )
+            .prop_map(|(attr, op, s)| GenExpr::StrCmp(attr, op, s))
+            .boxed()
+    }
+
+    fn arb_bool_cmp() -> BoxedStrategy<GenExpr> {
+        (
+            pick(BOOL_ATTRS),
+            prop_oneof![Just(CmpOp::Eq), Just(CmpOp::Ne)],
+            any::<bool>(),
+        )
+            .prop_map(|(attr, op, b)| GenExpr::BoolCmp(attr, op, b))
+            .boxed()
+    }
+
+    fn arb_str_method() -> BoxedStrategy<GenExpr> {
+        (
+            pick(STR_ATTRS),
+            prop_oneof![
+                Just(StrMethod::StartsWith),
+                Just(StrMethod::EndsWith),
+                Just(StrMethod::Contains),
+                Just(StrMethod::EqualsIgnoreCase),
+                Just(StrMethod::StartsWithIgnoreCase),
+            ],
+            pick(STR_LITERALS),
+        )
+            .prop_map(|(attr, m, s)| GenExpr::StrMethodCall(attr, m, s))
+            .boxed()
+    }
+
+    fn arb_matches() -> BoxedStrategy<GenExpr> {
+        (pick(STR_ATTRS), pick(REGEX_LITERALS))
+            .prop_map(|(attr, pat)| GenExpr::Matches(attr, pat))
+            .boxed()
+    }
+
+    fn arb_size_cmp() -> BoxedStrategy<GenExpr> {
+        (pick(STR_ATTRS), 0i64..100)
+            .prop_map(|(attr, n)| GenExpr::SizeCmp(attr, n))
+            .boxed()
+    }
+
+    fn arb_in_set_str() -> BoxedStrategy<GenExpr> {
+        (
+            pick(STR_ATTRS),
+            proptest::collection::vec(pick(STR_LITERALS), 1..=3),
+        )
+            .prop_map(|(attr, vals)| GenExpr::InSetStr(attr, vals))
+            .boxed()
+    }
+
+    fn arb_in_set_int() -> BoxedStrategy<GenExpr> {
+        (
+            pick(INT_ATTRS),
+            proptest::collection::vec(0i64..1000, 1..=3),
+        )
+            .prop_map(|(attr, vals)| GenExpr::InSetInt(attr, vals))
+            .boxed()
     }
 
     fn arb_leaf() -> BoxedStrategy<GenExpr> {
-        (arb_attr(), any::<bool>())
-            .prop_map(|(a, m)| GenExpr::Cmp(a, m))
-            .boxed()
+        prop_oneof![
+            arb_int_cmp(),
+            arb_str_cmp(),
+            arb_bool_cmp(),
+            arb_str_method(),
+            arb_matches(),
+            arb_size_cmp(),
+            arb_in_set_str(),
+            arb_in_set_int(),
+        ]
+        .boxed()
     }
 
     fn arb_expr(budget: u32) -> BoxedStrategy<GenExpr> {
@@ -1196,12 +1679,12 @@ mod tests {
         }
         let next = budget - 1;
         prop_oneof![
-            3 => leaf,
+            4 => leaf,
             2 => (arb_expr(next), arb_expr(next))
                 .prop_map(|(l, r)| GenExpr::And(Box::new(l), Box::new(r))),
             2 => (arb_expr(next), arb_expr(next))
                 .prop_map(|(l, r)| GenExpr::Or(Box::new(l), Box::new(r))),
-            1 => arb_expr(next).prop_map(|e| GenExpr::Not(Box::new(e))),
+            2 => arb_expr(next).prop_map(|e| GenExpr::Not(Box::new(e))),
             1 => (arb_expr(next), arb_expr(next), arb_expr(next))
                 .prop_map(|(c, t, e)| GenExpr::Ternary(Box::new(c), Box::new(t), Box::new(e))),
         ]
@@ -1310,6 +1793,76 @@ mod tests {
         assert!(
             compiled_ok * 4 >= total * 3,
             "expected at least 75% of generated programs to compile, got {compiled_ok}/{total}"
+        );
+    }
+
+    fn opcode_tag(op: Op) -> &'static str {
+        match op {
+            Op::LoadAttr(_) => "LoadAttr",
+            Op::LoadConst(_) => "LoadConst",
+            Op::Eq => "Eq",
+            Op::Ne => "Ne",
+            Op::Lt => "Lt",
+            Op::Le => "Le",
+            Op::Gt => "Gt",
+            Op::Ge => "Ge",
+            Op::InSet(_) => "InSet",
+            Op::StartsWith => "StartsWith",
+            Op::EndsWith => "EndsWith",
+            Op::Contains => "Contains",
+            Op::EqIgnoreCase => "EqIgnoreCase",
+            Op::StartsWithIgnoreCase => "StartsWithIgnoreCase",
+            Op::RegexMatch(_) => "RegexMatch",
+            Op::Size => "Size",
+            Op::Not => "Not",
+            Op::JumpIfFalse(_) => "JumpIfFalse",
+            Op::JumpIfTrue(_) => "JumpIfTrue",
+            Op::BranchIfFalse(_) => "BranchIfFalse",
+            Op::Jump(_) => "Jump",
+            Op::Ret => "Ret",
+        }
+    }
+
+    /// Measures how many of the 22 `Op` variants the widened generator
+    /// reaches over 256 draws (issue #758 finding 2's own house lesson: a
+    /// property test's generator reach must be measured, never assumed).
+    /// MEASURED (this exact loop, run directly, reported in the PR for
+    /// #271): 22 of 22 opcodes reached. The floor below is set comfortably
+    /// below that measured value, per this file's own convention for a
+    /// floor assertion (see `prop_generator_reaches_compile_ok` just above).
+    #[test]
+    fn prop_generator_opcode_reach() {
+        use proptest::strategy::ValueTree as _;
+        use std::collections::HashSet;
+
+        let mut limits = default_limits();
+        limits.max_tokens = 4096;
+        let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig::with_cases(256));
+        let strategy = arb_itpl_src();
+        let mut reached: HashSet<&'static str> = HashSet::new();
+        for _ in 0..256 {
+            let Ok(tree) = strategy.new_tree(&mut runner) else {
+                continue;
+            };
+            let src = tree.current();
+            if let Ok(toks) = lex(&src, &limits)
+                && let Ok(ast) = parse(&toks, &src, &limits)
+            {
+                let mut strings = toks.strings;
+                if let Ok(checked) = check(ast, &mut strings, &src, Phase::RequestHeaders, &limits)
+                    && let Ok(program) = compile(&checked, &limits)
+                {
+                    for &op in program.ops() {
+                        reached.insert(opcode_tag(op));
+                    }
+                }
+            }
+        }
+        assert!(
+            reached.len() >= 20,
+            "expected at least 20 of 22 opcodes reached by the widened generator, \
+             got {}/22: {reached:?}",
+            reached.len()
         );
     }
 }
