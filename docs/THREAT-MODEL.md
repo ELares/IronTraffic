@@ -1826,6 +1826,57 @@ handshake message into a multi-kilobyte one, a bandwidth amplification factor ob
 connections and never authenticating. At most 32 trust anchor subject names are ever disclosed to an
 unauthenticated peer, regardless of how large the configured bundle is.
 
+## Upstream TLS (`upstream-tls-verification-and-identity`, #125)
+
+**Verified by default, and the escape hatch costs two keys, a warning and a counter.** An upstream
+connection is verified unless `insecureSkipVerify` and `iAcceptTheRisk` are both `true`.
+`insecureSkipVerify` alone is a configuration error naming exactly what is missing, not a silent
+default; the acknowledgement alone changes nothing. This is the outbound mirror of
+`mtls-client-auth-fail-closed` (#124), correcting the same failure mode Caddy shipped as
+CVE-2026-27586: an upstream TLS configuration that would accept any peer is not a state this
+software can compile into, only a state an operator can request explicitly and see the cost of
+afterward. Every connection on a verification-disabled upstream increments
+`tls_upstream_unverified_connections_total`, the number the dashboard renders as a red banner, and
+a warning line is logged for the first connection after compile and at most once every 60 seconds
+after that: the counter carries the true volume so a peer that forces reconnects cannot turn the
+warning into a log flood that costs disk and buries everything else.
+
+**Identity matching is byte-exact for URI SANs and never falls back to the common name.** Gateway
+API `BackendTLSPolicy` separates `hostname`, the SNI sent, from `subjectAltNames`, the identity
+accepted, precisely because a SPIFFE identity (`spiffe://trust-domain/workload-path`) is not a
+valid DNS name and cannot be expressed as a `ServerName`. When `subjectAltNames` is configured,
+matching a URI entry is compared byte for byte against the peer's `uniformResourceIdentifier`
+subject alternative name: no case folding, no trailing slash tolerance, no normalization of any
+kind, because an opaque identifier that is "almost equal" is not equal. A certificate presenting
+no subject alternative name at all is rejected outright; there is no code path that consults the
+subject common name for identity, which keeps a certificate issued under a legacy CN-only
+convention from silently satisfying an identity check it was never meant to.
+
+**Chain verification always runs, even when identity matching replaces the hostname check.**
+`UpstreamVerifier` cannot use rustls's own `WebPkiServerVerifier` for identity mode, because that
+verifier always checks the name it is given; it instead calls rustls-webpki's path verification
+directly, which is the one place the specification separates "does this chain verify" from "is
+this the name I expect." There is no path through this verifier that reaches identity matching on
+a chain that failed, and no path that skips chain verification because an identity happened to
+match. Upstream **server** certificates are not revocation-checked in this milestone: no CRL, no
+OCSP, no stapled-response validation runs alongside the chain check. That is bounded by
+certificate lifetime and mitigated by configuring explicit `subjectAltNames` (so a revoked
+certificate for a different identity cannot be substituted), and it is an accepted risk stated in
+`docs/tls/UPSTREAM-TLS.md`, not a gap discovered later from a `None` argument to a revocation
+parameter. Adding it is a separate, later issue that reuses `crl-revocation-index` (#123) on the
+client side.
+
+**The pool key includes every security-relevant field, so two clusters with different trust
+settings can never share a pooled connection.** Pingora keys its connection pool on a peer identity
+that omits fields like the accepted SAN set and the verification mode; in a multi-tenant gateway
+where upstream clusters vary by SNI, trust anchors, accepted identity and client certificate, that
+omission is cross-tenant request leakage, not a performance detail. `UpstreamTls::pool_key_component`
+is a BLAKE3 hash over exactly the fields that affect what a pooled connection is allowed to be used
+for: the SNI, the ALPN set, the trust-anchor identity, the verify mode, the accepted SAN set, the
+client-certificate identity, and the post-quantum mode. It deliberately excludes timeouts, retry
+policy, weights and metric labels, because folding those in would mean every configuration reload
+that changes a timeout destroys every pool and produces an upstream handshake storm.
+
 ## Benchmark origin (`it-origin`)
 
 **This binary adds two network listeners and a hand-written HTTP head parser to the repository,
