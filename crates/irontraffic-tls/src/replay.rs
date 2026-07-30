@@ -507,7 +507,10 @@ mod tests {
         let f = EarlyDataFilter::new(&cfg, [21u8; 16], UnixSeconds::new(t0));
         let key = [0xDDu8; 16];
 
-        assert!(!f.check_and_insert(&key), "first presentation must not be a replay");
+        assert!(
+            !f.check_and_insert(&key),
+            "first presentation must not be a replay"
+        );
 
         // One rotation: the original entry moves from current to other, still remembered.
         f.rotate_if_due(UnixSeconds::new(t0 + u64::from(rotate_secs)));
@@ -739,7 +742,10 @@ mod tests {
         );
 
         let key = [0x42u8; 16];
-        assert!(!f.check_and_insert(&key), "first presentation must not be a replay");
+        assert!(
+            !f.check_and_insert(&key),
+            "first presentation must not be a replay"
+        );
         assert!(
             f.check_and_insert(&key),
             "second presentation must be caught even at replay_capacity: 0"

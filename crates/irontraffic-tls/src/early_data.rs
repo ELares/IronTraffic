@@ -619,7 +619,10 @@ mod tests {
         ticket_a.extend_from_slice(&[0xAAu8; 24]);
         let mut ticket_b = shared_name_e.to_vec();
         ticket_b.extend_from_slice(&[0xBBu8; 24]);
-        assert_ne!(ticket_a, ticket_b, "the fixture must actually differ after the shared prefix");
+        assert_ne!(
+            ticket_a, ticket_b,
+            "the fixture must actually differ after the shared prefix"
+        );
 
         let facts_a = compliant_facts(&ticket_a);
         assert_eq!(
@@ -729,7 +732,10 @@ mod tests {
         let de =
             serde::de::value::MapDeserializer::<_, serde::de::value::Error>::new(pairs.into_iter());
         let result = EarlyDataConfig::deserialize(de);
-        assert!(result.is_err(), "a misspelled field name must be rejected, not ignored");
+        assert!(
+            result.is_err(),
+            "a misspelled field name must be rejected, not ignored"
+        );
     }
 
     #[test]
