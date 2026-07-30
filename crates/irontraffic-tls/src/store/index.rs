@@ -117,6 +117,15 @@ pub struct CertIndex {
     /// code; see #750.
     #[cfg(test)]
     exact_probe_count: AtomicU64,
+    /// Test seam: how many stored names `resolve` has read for byte comparison. This is the
+    /// n-SENSITIVE counter, and it is the one that makes the `n` sweep in
+    /// `resolve_flat_across_n` load-bearing: a correct lookup confirms exactly one
+    /// candidate name whatever the index holds, whereas any implementation that searches names to
+    /// find the answer (a suffix walk, a linear scan, a probe chain that memcmps as it goes)
+    /// examines more of them as the index grows. Probe counts alone cannot see that: they are
+    /// fully determined at n = 1.
+    #[cfg(test)]
+    names_examined: AtomicU64,
 }
 
 /// Counters for the certificate path. Monotone, relaxed, may lose an increment; never a balance.
@@ -705,6 +714,8 @@ impl CertIndexBuilder {
             wild_probe_count: AtomicU64::new(0),
             #[cfg(test)]
             exact_probe_count: AtomicU64::new(0),
+            #[cfg(test)]
+            names_examined: AtomicU64::new(0),
         })
     }
 
@@ -986,6 +997,13 @@ impl CertIndex {
         self.exact_probe_count.load(Ordering::Relaxed)
     }
 
+    /// Test-only: stored names read for byte comparison. See the field doc.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn names_examined_for_test(&self) -> u64 {
+        self.names_examined.load(Ordering::Relaxed)
+    }
+
     /// The stored name bytes for a group. `i` came out of one of the two maps, so it is in range
     /// by construction; the builder is the only writer of both.
     #[allow(
@@ -994,6 +1012,10 @@ impl CertIndex {
                   builder is the only writer of both"
     )]
     fn name_at(&self, i: CredSetIdx) -> &[u8] {
+        // Test-only; see the field doc. Every byte comparison against a stored name goes through
+        // here, so this counts candidates examined per resolution.
+        #[cfg(test)]
+        self.names_examined.fetch_add(1, Ordering::Relaxed);
         let r = &self.name_refs[i.0 as usize];
         &self.names[r.offset as usize..r.offset as usize + r.len as usize]
     }
@@ -1404,30 +1426,38 @@ mod tests {
         clippy::integer_division,
         reason = "timing median: coarse-grained nanosecond-per-call average from total elapsed"
     )]
+    /// Resolution cost does not grow with the number of names in the index.
+    ///
+    /// Asserted deterministically, on work counted rather than on a clock, because a wall-clock
+    /// version of this ran in parallel with two hundred other tests and failed intermittently,
+    /// blocking `gate-fast` at random (#750). But the counter has to be the RIGHT one, and the
+    /// first attempt at this fix got that wrong in an instructive way, so both are asserted here:
+    ///
+    /// * `names_examined` is the n-SENSITIVE quantity and is what makes the `n` sweep below
+    ///   load-bearing. A correct lookup confirms exactly ONE candidate name whatever the index
+    ///   holds. Any implementation that searches names to find the answer, which is what an O(n)
+    ///   regression looks like in practice, examines more of them as `n` grows.
+    /// * the probe counts are the STRUCTURAL quantity: one `exact` probe, and for an exact hit no
+    ///   `wild` probe at all. That is #115's "exactly two hash probes ... exactly one wildcard
+    ///   probe" and "Do NOT walk every suffix of the SNI", and it discriminates an Envoy-style
+    ///   suffix walk that returns the correct credential while probing a different number of
+    ///   times. Probe counts alone, however, are fully determined at `n = 1` and can NOT see
+    ///   n-scaling; asserting only those was the first fix's mistake.
+    ///
+    /// Honest limit, stated because the next reader will otherwise assume more: these count
+    /// instrumented work. Cost added on a path that touches neither the maps nor a stored name is
+    /// invisible here, and no assertion in this suite would catch it. The wall-clock check that
+    /// could is tracked in #753 for a serialized perf job. Parking it as a skipped test was not
+    /// an option: a test that does not run in CI guarantees nothing, and this repo has an
+    /// invariant lint that says exactly that.
     #[test]
     fn resolve_flat_across_n() {
-        // The property: resolution cost does not grow with the number of names in the index.
-        //
-        // This used to be asserted with a wall-clock ratio, and it failed about one run in three
-        // under the full parallel suite (#750). The numbers showed why: medians came out
-        // `[2195, 1077, 735, 749]` ns/call with the SMALLEST index the slowest by 3x, which is
-        // not a scaling effect at all. It was the first measurement paying for cold caches and
-        // an unramped CPU clock, and `n = 1` is simply whichever measurement runs first.
-        // Warm-up and best-of-3 each cut the rate but neither removed it, because a wall-clock
-        // assertion inside a test binary running in parallel with 200 other tests is measuring
-        // the machine as much as the code.
-        //
-        // So it is asserted deterministically instead, on the quantity the timing was a proxy
-        // for: the number of hash-map probes per resolution. Two probes for a wildcard match,
-        // one for an exact hit, whatever `n` is. That is exactly #115's thesis ("exactly two
-        // hash probes ... exactly one wildcard probe", "Do NOT walk every suffix of the SNI"),
-        // it discriminates an O(k) suffix walk that returns the correct answer, and it cannot
-        // flake.
         const CALLS: u64 = 1_000;
 
         let cred = cred_ecdsa_p256(&["example.com"]);
         let ns = [1usize, 100, 10_000, 100_000];
-        let mut per_resolution = Vec::with_capacity(ns.len());
+        let mut examined_per_call = Vec::with_capacity(ns.len());
+        let mut exact_probes_per_call = Vec::with_capacity(ns.len());
         for &n in &ns {
             let mut builder = CertIndexBuilder::new([2u8; 16]);
             for i in 0..n {
@@ -1440,30 +1470,32 @@ mod tests {
             let query = format!("host{}.example.com", n / 2);
 
             for _ in 0..CALLS {
-                let hit = index.resolve(&query, ClientCaps::all());
                 assert!(
-                    hit.is_some(),
-                    "n={n}: the query must actually resolve, or this test \
-                                        would be counting probes on a miss path"
+                    index.resolve(&query, ClientCaps::all()).is_some(),
+                    "n={n}: the query must actually resolve, or this counts work on the miss path"
                 );
             }
-            let probes = index.exact_probe_count_for_test() + index.wild_probe_count_for_test();
             assert_eq!(
-                probes % CALLS,
+                index.wild_probe_count_for_test(),
                 0,
-                "n={n}: probe count {probes} is not a whole number \
-                                           per resolution over {CALLS} calls"
+                "n={n}: an exact hit must never probe the wildcard map"
             );
-            per_resolution.push(probes / CALLS);
+            examined_per_call.push(index.names_examined_for_test() / CALLS);
+            exact_probes_per_call.push(index.exact_probe_count_for_test() / CALLS);
         }
 
-        // Pinned against a LITERAL, not against `per_resolution[0]`: comparing the vector to its
-        // own first element is satisfied by any constant, including a constant that grew.
+        // Pinned against LITERALS, not against the vectors' own first elements: comparing a
+        // vector to its own head is satisfied by any constant, including a constant that grew.
         assert_eq!(
-            per_resolution,
+            examined_per_call,
             vec![1u64, 1, 1, 1],
-            "an exact hit must cost exactly one probe at every n; anything else means \
-             resolution now scales with index size"
+            "one candidate name confirmed per resolution at every n; anything else means \
+             resolution now searches names and therefore scales with index size"
+        );
+        assert_eq!(
+            exact_probes_per_call,
+            vec![1u64, 1, 1, 1],
+            "exactly one exact-map probe per resolution at every n"
         );
     }
 
