@@ -26,6 +26,16 @@ irontraffic-filter = { path = "../irontraffic-filter", version = "0.1.0" }
 # bytes; `unicode` stays enabled at the crate level for correctness of the parser but
 # every compiled pattern sets `unicode(false)`.
 regex = "1"
+# `memchr::memmem::find` is the evaluator's `Contains` operator (the `.contains()`
+# method): a two-way search with an O(n + m) bound and no input that degrades it. The
+# haystack is an attribute value a peer controls (up to `max_field_line_bytes`) and the
+# needle is a program constant an operator controls (up to `max_string_bytes`); a naive
+# nested scan is O(n * m), which turns one long header into milliseconds of CPU an
+# unauthenticated peer chose. Added as a direct dependency rather than relied on
+# transitively through `regex` (which also depends on it): a transitive dependency is
+# not an API promise. Workspace-pinned version, already vetted for the musl static
+# build by `irontraffic-http`, which uses it the same way for header and line scanning.
+memchr = { workspace = true }
 
 [features]
 # Exposes `Program::from_parts`, the unchecked constructor `verify`'s unit tests and
