@@ -20,6 +20,11 @@ name: ci
 on:
   push:
     branches: [main]
+    # A tag push is what `release-artifacts` (below) is gated on. Every
+    # other job still runs too, unchanged: none of them is gated by `if:` on
+    # the ref, per this file's own stated rule that a lane with nothing to
+    # do yet still runs rather than reporting a skip that reads as a pass.
+    tags: ["v*"]
   pull_request:
 
 permissions:
@@ -950,3 +955,254 @@ jobs:
           cache-dependency-path: packages/dashboard/package-lock.json
       - run: ./scripts/dashboard-gate.sh --selftest
       - run: ./scripts/dashboard-gate.sh
+
+  # Created here exactly as specified in `bench-competitor-compare-script`
+  # (#425), which this repository does not have yet: no toolchain and no
+  # cache step, by that same specification, because this job's whole point
+  # is to be fast enough to block every pull request. A future issue adding
+  # its own `*-selftest.sh` adds one step here and changes nothing else,
+  # per the same instruction this row itself was added under.
+  shell-selftests:
+    name: shell-selftests
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: sh scripts/release/release-selftest.sh
+
+  # Tag-triggered: builds the four-target release matrix, verifies
+  # reproducibility and the static/dynamic linkage invariants, and publishes
+  # the tarballs and SHA256SUMS as a GitHub release. See docs/RELEASE.md.
+  #
+  # No `ring-provider` matrix entry: the design this issue was written
+  # against assumes `crates/irontraffic` already selects a TLS crypto
+  # provider (an `aws-lc-rs` default and this `ring-provider` fallback
+  # feature). It does not; the crate has no `ring-provider` feature, no
+  # `tls` feature, and does not depend on `crates/irontraffic-tls` at all
+  # (see docs/RELEASE.md's "What this table does not yet say" section for
+  # the full accounting). Adding a CI step that passes
+  # `--no-default-features --features ring-provider` to a crate with no
+  # such feature fails every run; inventing an inert feature that toggles
+  # nothing would be exactly the kind of untested "we have a fallback"
+  # claim this issue's own Context section warns against. A future issue
+  # that wires TLS into this crate is what makes this matrix entry addable
+  # for real.
+  release-artifacts:
+    name: release artifacts
+    # Runs on tags AND on pull requests, deliberately.
+    #
+    # Gating the whole job on a tag meant the four target build, the
+    # reproducibility check, the static-linking checks and the allowlist check
+    # were never executed by any run a reviewer could see, so `merge-guard`
+    # refused the PR: a skipped required check is as unmet as a failing one. It
+    # also meant a defect in this job could only surface while cutting a real
+    # release. That is exactly what happened: a review found `build-matrix.sh`
+    # dirtied the worktree before the first build, poisoning the git-dirty stamp
+    # on every artifact, and the repair for it would have gone unexercised until
+    # the next tag.
+    #
+    # Only PUBLISHING is tag-gated now; everything that can fail without a
+    # release existing runs on every pull request.
+    if: startsWith(github.ref, 'refs/tags/v') || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+          # This job holds `contents: write` (needed by the `gh release
+          # create` step below) and, unlike its sibling `shell-selftests`
+          # job, downloads and extracts a third-party archive with `sudo`
+          # before that step runs. A compromised tarball executing in a
+          # context that also holds a repo-rewriting, release-publishing
+          # credential is exactly the shape a supply-chain issue like this
+          # one exists to close off. The `gh release create` step
+          # authenticates via the `GH_TOKEN` environment variable it sets
+          # explicitly, not via a git-credential-helper token this checkout
+          # would otherwise persist, so turning persistence off here costs
+          # that step nothing.
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install the cross toolchains the three non-native targets need
+        # x86_64-unknown-linux-gnu is this runner's own native target and
+        # needs nothing extra. The other three each need one thing:
+        # musl-tools gives x86_64-unknown-linux-musl its musl-gcc,
+        # gcc-aarch64-linux-gnu gives aarch64-unknown-linux-gnu a cross
+        # linker, and aarch64-unknown-linux-musl has no apt package on this
+        # runner at all, so its cross toolchain is downloaded prebuilt from
+        # musl.cc, the same community-maintained source most Rust release
+        # workflows targeting this exact combination use. That download is
+        # pinned by checksum and verified BEFORE anything extracts or
+        # executes it, unlike every other input to this release (the
+        # rustc toolchain via `rust-toolchain.toml`, every crate via
+        # `Cargo.lock`): musl.cc serves no signature and this project
+        # controls no mirror of it, so a content hash, checked here, is the
+        # floor for a build input this pipeline cannot otherwise pin. The
+        # hash below was computed by downloading the real, current asset
+        # directly (`curl ... | sha256sum`) rather than copied from
+        # anywhere claiming to already be a checksum for it; bumping the
+        # pin (musl.cc updating the file) is a reviewed change, the same
+        # posture `rust-toolchain.toml` takes for the compiler.
+        run: |
+          set -euo pipefail
+          rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
+            x86_64-unknown-linux-musl aarch64-unknown-linux-musl
+          sudo apt-get update
+          sudo apt-get install -y musl-tools gcc-aarch64-linux-gnu
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          # Two sources, one checksum.
+          #
+          # musl.cc is a community host with no SLA and no mirror, and it is
+          # demonstrably not reachable from this runner: the first pull request
+          # run of this job (after it stopped being tag gated) failed with
+          # `curl: (28) Failed to connect to musl.cc port 443 after 135045 ms`,
+          # while the same URL answered in 0.33 seconds from a developer
+          # machine. So it is blocked or rate limited from Actions rather than
+          # briefly down, and retrying it alone would fail every release the
+          # same way. Had this job stayed tag gated, that failure would have
+          # landed while cutting a version.
+          #
+          # The fallback is an asset this project controls. The sha256 pin
+          # below gates BOTH paths and is checked before anything extracts or
+          # executes, so a mirror cannot substitute different bytes: the worst a
+          # compromised mirror achieves is failing the build.
+          tb=/tmp/aarch64-linux-musl-cross.tgz
+          sum="c909817856d6ceda86aa510894fa3527eac7989f0ef6e87b5721c58737a06c38"
+          if ! curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 20 --max-time 300 \
+                 --retry 5 --retry-all-errors \
+                 https://musl.cc/aarch64-linux-musl-cross.tgz -o "$tb"; then
+            echo "musl.cc unreachable; falling back to this project's pinned mirror"
+            curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 20 --max-time 300 \
+              --retry 5 --retry-all-errors \
+              "https://github.com/${GITHUB_REPOSITORY}/releases/download/toolchains/aarch64-linux-musl-cross.tgz" \
+              -o "$tb"
+          fi
+          echo "$sum  $tb" | sha256sum -c -
+          sudo tar -xzf "$tb" -C /opt
+          echo "/opt/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
+          echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc" >> "$GITHUB_ENV"
+      - name: Build the four-target matrix
+        run: sh scripts/release/build-matrix.sh dist
+      - name: Verify reproducibility (x86_64-unknown-linux-gnu)
+        run: sh scripts/release/verify-repro.sh x86_64-unknown-linux-gnu
+      - name: Verify the musl binaries are fully static
+        run: |
+          set -euo pipefail
+          for t in x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+            f="target/$t/release/irontraffic"
+            echo "== $t =="
+            file "$f"
+            if [ "$t" = "x86_64-unknown-linux-musl" ]; then
+              # Native architecture: this runner's `ldd` genuinely invokes
+              # the dynamic loader against the file, so its verdict is
+              # meaningful here. The pattern matches this repository's own
+              # proven, green `musl` job above verbatim (not the narrower
+              # one this job shipped with): glibc's `ldd` classifies a
+              # static-PIE binary (this project's actual shape; `file`
+              # reports "static-pie linked") as "statically linked", not
+              # "not a dynamic executable", and the narrower pattern would
+              # abort a genuinely static artifact on exactly that wording.
+              if ldd "$f" 2>&1 | grep -vq 'not a dynamic executable\|statically linked'; then
+                echo "FAIL: $f is not static. A C dependency entered the tree."
+                ldd "$f" || true
+                exit 1
+              fi
+            else
+              # Foreign architecture: unlike the native case above, `ldd`
+              # here does not merely read headers, it works by trying to
+              # resolve and invoke the aarch64 dynamic loader, which this
+              # x86_64 runner cannot actually do; its output is therefore
+              # not a reliable verdict at all, and was untested by this
+              # repository until this job's own first tagged run. The
+              # PT_INTERP program header is what a dynamic linker needs to
+              # run a binary in the first place, and its absence is
+              # classifiable by reading the ELF program headers alone,
+              # which needs no execution and no architecture match.
+              if readelf -lW "$f" | grep -q 'INTERP'; then
+                echo "FAIL: $f has a PT_INTERP program header; it is dynamically linked."
+                readelf -lW "$f" || true
+                exit 1
+              fi
+            fi
+          done
+          echo "static: ok"
+      - name: Verify the gnu binaries link only the committed allowlist
+        run: |
+          set -euo pipefail
+          allow="scripts/release/gnu-ldd-allowlist.txt"
+          for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu; do
+            f="target/$t/release/irontraffic"
+            echo "== $t =="
+            if [ "$t" = "x86_64-unknown-linux-gnu" ]; then
+              libs="$(ldd "$f" | awk '{print $1}')"
+            else
+              # A foreign-architecture DYNAMIC binary cannot be resolved by
+              # this runner's own ldd/ld.so (unlike the static case above),
+              # so its NEEDED entries are read straight out of the ELF
+              # dynamic section instead of executing anything.
+              libs="$(readelf -d "$f" | awk -F'[][]' '/\(NEEDED\)/{print $2}')"
+            fi
+            # Compare SONAMEs, not paths, and report EVERY violation.
+            #
+            # `ldd` prints the program interpreter as a bare absolute path with
+            # no `=>` (`/lib64/ld-linux-x86-64.so.2`), while every other line
+            # starts with a SONAME. Taking `$1` verbatim therefore produced a
+            # path for exactly one line, which matched nothing in an allowlist
+            # written in SONAMEs, and the first pull request run of this job
+            # failed on it:
+            #
+            #   FAIL: x86_64-unknown-linux-gnu links /lib64/ld-linux-x86-64.so.2
+            #
+            # The allowlist already contained `ld-linux-x86-64.so.2`. Adding the
+            # absolute path instead would have pinned this runner's own
+            # multiarch layout, which differs across distributions, so the
+            # basename is what is compared.
+            #
+            # Violations are also collected rather than exited on, because the
+            # previous form died inside a pipeline subshell on the first one and
+            # so could only ever name a single library per run.
+            bad=""
+            for lib in $libs; do
+              [ -n "$lib" ] || continue
+              base="${lib##*/}"
+              if ! grep -qxF "$base" "$allow"; then
+                bad="$bad $t:$base"
+              fi
+            done
+            if [ -n "$bad" ]; then
+              echo "FAIL: not in $allow:"
+              for entry in $bad; do echo "  $entry"; done
+              echo "full ldd/readelf output for $t:"
+              printf '%s\n' "$libs"
+              exit 1
+            fi
+          done
+          echo "allowlist: ok"
+      - name: Create the GitHub release
+        # Tag only. On a pull request every step above has already run, so the
+        # artifacts are built and checked; there is simply no release to attach
+        # them to, and this job holds `contents: write`, which a pull request
+        # must never exercise.
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF#refs/tags/}"
+          # scripts/install.sh is uploaded here too, not only the tarballs and
+          # the checksum manifest: docs/QUICKSTART.md (itself shipped inside
+          # every tarball), docs/RELEASE.md, and install.sh's own header
+          # comment all advertise
+          # ".../releases/latest/download/install.sh" as the one-line
+          # install command, and that URL 404s unless install.sh is itself a
+          # release asset. `gh release create` uploads an asset under its
+          # base filename by default, so `scripts/install.sh` here lands at
+          # exactly the advertised path.
+          gh release create "$tag" dist/*.tar.gz dist/SHA256SUMS scripts/install.sh \
+            --title "$tag" --generate-notes

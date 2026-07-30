@@ -5,6 +5,16 @@
 # 1.85, but the pinned Kubernetes client (kube 4.2.0) requires rustc 1.89.0,
 # and that is the binding constraint now. CI runs a separate job against 1.89
 # to prove the floor still holds.
+#
+# `channel` is an EXACT version, never `stable`, which is also a reproducible
+# build requirement (see docs/RELEASE.md): a different rustc emits different
+# bytes for the identical source, so two builds six weeks apart under a
+# moving `stable` channel would never match no matter how carefully every
+# other source of nondeterminism is controlled. scripts/release/verify-repro.sh
+# compares `rustc -vV` between its two builds and fails naming the toolchain
+# if they differ, which this exact pin is what makes possible to keep true.
+# Bumping this version is a reviewed change that invalidates prior release
+# artifacts by construction; that is the intended, honest behavior.
 [toolchain]
 channel = "1.97.0"
 components = ["rustfmt", "clippy"]

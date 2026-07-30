@@ -1950,3 +1950,82 @@ that matters is deferred to a later issue), not a defect, but it means every fut
 file (the driver binary, the bench xtask CLI and run script, and the matrix registry) must call
 `validate()` itself after deserialising rather than trusting the wire format to have enforced it
 already.
+
+## Installation and release artifacts
+
+`scripts/install.sh` is a `curl | sh` channel: it places an executable file on a user's machine and
+runs it, which is the highest-consequence version of the "download and run" pattern this document's
+other sections analyze for inbound network input. This section states plainly what it does and does
+not verify, so a reader is never left inferring authenticity from the mere fact that a checksum step
+exists.
+
+**A checksum fetched from the same origin as the artifact proves integrity of the transfer, and
+nothing about the identity of who produced the artifact.** `SHA256SUMS` is served from the identical
+release host as the tarball it accompanies. Anyone able to serve a modified tarball is equally able
+to serve a `SHA256SUMS` that matches it, so a passing checksum rules out corruption in transit and
+rules out nothing about provenance. `scripts/install.sh` prints exactly the sentence `checksum
+verified (integrity only; signature verification lands in the next release)` rather than the bare
+word "verified", and `docs/RELEASE.md` records the same thing. Signature verification is added by
+`{{release-sbom-signing-and-provenance}}` and becomes the installer's default there; until it lands,
+this checksum is the floor, not the ceiling.
+
+**The five things a piped shell script must do, and why each, restated from `docs/RELEASE.md` because
+this is where the resulting risk is analyzed rather than where the mechanism is described:**
+
+1. **Truncation.** A connection cut mid-download runs whatever prefix of the script `sh` has already
+   received. `scripts/install.sh`'s entire body is shell functions, and the last line of the file is
+   `main "$@"`, so a truncated transfer defines some functions and calls none of them, rather than
+   running "download and extract" without ever reaching "verify".
+2. **Transport downgrade and an open-ended redirect.** Every fetch uses
+   `curl --proto '=https' --tlsv1.2 -fsSL` (or the `wget --https-only` equivalent), so a redirect
+   cannot be followed to plain `http://` and a connection cannot be negotiated below TLS 1.2,
+   regardless of which host a redirect ultimately points at. `-L` alone, with no `--proto`
+   restriction, follows a redirect anywhere, including off the release host entirely.
+3. **An interpolated version string.** `IT_VERSION` (and the value this script itself resolves from
+   the release host's "latest" redirect, which is validated identically before use) is substituted
+   into a download URL, so both are checked against `^v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?$`
+   before any URL is built. Without that check, `IT_VERSION=../../evil` would fetch an arbitrary path
+   on the host, and a value containing `://` could leave the host entirely.
+4. **Cleanup.** The working directory is created with `mktemp -d` and removed by a `trap` on `EXIT`,
+   `INT`, and `TERM`, so an interrupted install leaves no unverified binary sitting in a temporary
+   directory. Verified directly: interrupting a run with `SIGINT` mid-download removed the temporary
+   directory before the process exited.
+5. **File modes.** `umask 022` is set at the very top of the script, so the installed binary is
+   `0755` regardless of the invoking shell's umask. Verified directly under both `umask 077` and
+   `umask 000`: the installed file was `0755` either way. A group-writable executable landed on
+   `PATH` is a local privilege-escalation primitive on a shared machine.
+
+The refusal to run as root unless `IT_ALLOW_ROOT=1` is the sixth, and it exists for the same reason
+item 5 does at a larger scale: a piped shell script running as root is the highest-consequence version
+of this whole pattern, and the script must not make that the default.
+
+**Redirect and truncation rules apply to the script's own self-resolution of "latest" too.** Before
+any tarball is downloaded, `scripts/install.sh` resolves an unset `IT_VERSION` by reading the
+`Location` header of the release host's own `.../releases/latest` redirect (a single, non-followed
+HEAD-style request, not an open-ended `-L` chain), and validates the resolved tag against the same
+version pattern as an explicit `IT_VERSION` before using it in any further URL. A version this script
+discovered on its own is not exempt from the interpolation check merely because a human did not type
+it.
+
+**Concurrent installs and retries are not a hazard.** Every invocation uses its own `mktemp -d`
+working directory and installs by atomic rename, so two installs racing on the same machine each
+complete cleanly (the last rename wins) rather than producing a torn, partially written binary on
+`PATH`; and a re-run after a partial failure re-downloads and re-verifies from nothing, rather than
+trusting anything left over from the failed attempt. `mv` is only atomic when its source and
+destination share a filesystem, and `mktemp -d`'s working directory is commonly tmpfs on Linux while
+an install prefix such as `$HOME/.local/bin` is ordinarily on the root filesystem; a naive rename
+straight from the working directory would silently degrade to copy-then-unlink whenever the two
+differ, which is not atomic and can leave a truncated executable on `PATH` if interrupted mid-copy.
+`scripts/install.sh` avoids this by staging the new binary under the install prefix's own `bin`
+directory (a hidden, PID-suffixed name) before the final rename, so the rename is always
+same-filesystem regardless of where the platform's temporary directory happens to live, and that
+staged file is removed on every exit path, including an interrupted one, by the same cleanup `trap`
+that removes the working directory.
+
+**What a reader is explicitly NOT protected against by this script alone:** a compromise of the
+release host itself (which could serve a matching tarball and `SHA256SUMS` pair for a malicious
+binary, the exact limit the first paragraph states), and a compromise of the build environment that
+produced a tarball before it was ever uploaded. `scripts/release/verify-repro.sh` existing at all is
+what makes the second one, in principle, independently checkable by a third party; a signature over
+the resulting artifact, from `{{release-sbom-signing-and-provenance}}`, is what closes the first one,
+and this project does not yet ship one.
