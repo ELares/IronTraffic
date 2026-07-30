@@ -361,6 +361,21 @@ impl ClusterTicketer {
         self.rotation_secs
     }
 
+    /// The 16-byte client-authentication context this ticketer was constructed with. See
+    /// [`Self::new`]'s doc for what belongs here: 16 zero bytes for a configuration with no
+    /// client authentication, `TrustAnchors::id()` otherwise.
+    ///
+    /// Added for `mtls-client-auth-fail-closed` (#124) so `TlsServerConfig::compile` and
+    /// `TlsServerConfig::compile_with_client_auth` can refuse to install a ticketer whose context
+    /// does not match the configuration it is about to be installed into, rather than relying on
+    /// every caller deriving the context correctly by convention. Before this accessor existed,
+    /// invariant 13 of #124 ("there is no path that installs a context-free one") was documentation
+    /// only: nothing could read `context` back out to check it.
+    #[must_use]
+    pub fn context(&self) -> [u8; 16] {
+        self.context
+    }
+
     /// Counters.
     #[must_use]
     pub fn stats(&self) -> &TicketStats {

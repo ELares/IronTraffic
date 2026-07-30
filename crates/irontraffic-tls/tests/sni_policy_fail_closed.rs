@@ -7,9 +7,10 @@
 //! permissive default when resolution missed. A test that only checked the happy path would pass
 //! against every one of those CVEs.
 //!
-//! `mtls_name_requires_client_cert_while_sibling_does_not` is deliberately NOT here: building a
-//! `Required` configuration needs a real client-certificate verifier, which is
-//! `mtls-client-auth-fail-closed` (#124). It writes that test into this file when it lands.
+//! `mtls_name_requires_client_cert_while_sibling_does_not`, at the bottom of this file, is the
+//! test `sni-server-config-selection` (#119) specified but could not implement: building a
+//! `Required` configuration needs a real client-certificate verifier, which
+//! `mtls-client-auth-fail-closed` (#124) provides. It is the only test that issue adds here.
 
 #![allow(
     clippy::expect_used,
@@ -20,6 +21,7 @@
 
 use std::sync::{Arc, Once};
 
+use irontraffic_tls::crl::{CrlConfig, CrlSet};
 use irontraffic_tls::listener::{
     AcceptStep, ListenerTls, ListenerTlsBuilder, RejectReason, TlsServerConfig,
 };
@@ -28,6 +30,9 @@ use irontraffic_tls::store::{
     CertIndexBuilder, ChainInterner, ChallengeCerts, Credentials, IronResolver, TimeView,
 };
 use irontraffic_tls::time::UnixSeconds;
+use irontraffic_tls::verify_client::{
+    ClientAuth, ClientAuthConfig, ClientAuthMode, RevocationMode, TrustAnchors,
+};
 
 const SEED: [u8; 16] = [11u8; 16];
 
@@ -86,7 +91,7 @@ fn real_config_inner(name: &str, san: &str, as_default: bool) -> Arc<TlsServerCo
         Arc::clone(&policy),
         time,
     ));
-    Arc::new(TlsServerConfig::compile(policy, resolver).expect("provider installed"))
+    Arc::new(TlsServerConfig::compile(policy, resolver, None).expect("provider installed"))
 }
 
 /// Real `ClientHello` bytes. `None` produces a hello with NO server-name extension.
@@ -205,6 +210,14 @@ fn no_sni_with_policy_uses_it() {
 // `lint_rejects_client_auth_divergence`, with the same four field values #119 names: `exact ==
 // "secure.example.com"`, `wildcard == "example.com"`, `exact_auth == Required`, `wildcard_auth ==
 // None`, and no listener produced.
+//
+// `mtls-client-auth-fail-closed` (#124) removed `TlsServerConfig::test_stub` entirely and made
+// `TrustAnchors`, `ClientAuth::Required` and `TlsServerConfig::compile_with_client_auth` all
+// public, so a real (not label-only) `ClientAuthDivergence` fixture IS now constructible from a
+// file under `tests/`. Adding `cve_2026_48491_domain_fronting_config_is_refused` here anyway is
+// still out of THIS issue's scope: its own acceptance criterion pins this file at exactly 7
+// tests (the 6 above plus `mtls_name_requires_client_cert_while_sibling_does_not`), so a genuine
+// follow-up issue, not this comment, is the place to add it.
 
 #[test]
 fn fragmented_client_hello_resolves_same_policy() {
@@ -445,4 +458,283 @@ fn truncated_client_hello_is_an_error_not_no_sni() {
         !matches!(acc.feed(truncated), AcceptStep::Ready { .. }),
         "a truncated ClientHello must NOT resolve to the no-SNI policy"
     );
+}
+
+/// Drives two in-memory TLS endpoints through a full handshake, returning the first error either
+/// side reports, `None` if both complete, or `Some` synthetic error if the 16-round-trip budget is
+/// exhausted while either side is STILL handshaking: without that third outcome, a stalled
+/// handshake that never errors and never finishes is indistinguishable from a completed one, and a
+/// caller asserting `is_none()` to mean "succeeded" would pass on a connection that never actually
+/// exchanged the bytes a completed handshake requires. Same shape as `policy.rs`'s and
+/// `handshake_resolver.rs`'s own `pump_handshake`, duplicated rather than shared because each of
+/// those lives in a module or crate this file cannot see (see this crate's other test files for
+/// the identical note next to their own copies). Needed here, and not by any test above, because
+/// every test above only exercises the sans-IO `SniAcceptor`'s hello-to-`Ready` transition; this
+/// one needs a real client-certificate exchange to complete or fail, which means driving the
+/// handshake all the way through.
+fn pump_handshake(
+    client: &mut rustls::ClientConnection,
+    server: &mut rustls::ServerConnection,
+) -> Option<std::io::Error> {
+    for _ in 0..16 {
+        let mut buf = Vec::new();
+        if client.write_tls(&mut buf).is_ok()
+            && !buf.is_empty()
+            && let Err(e) = server
+                .read_tls(&mut buf.as_slice())
+                .map(|_| ())
+                .and_then(|()| {
+                    server
+                        .process_new_packets()
+                        .map(|_| ())
+                        .map_err(std::io::Error::other)
+                })
+        {
+            return Some(e);
+        }
+        let mut buf = Vec::new();
+        if server.write_tls(&mut buf).is_ok()
+            && !buf.is_empty()
+            && let Err(e) = client
+                .read_tls(&mut buf.as_slice())
+                .map(|_| ())
+                .and_then(|()| {
+                    client
+                        .process_new_packets()
+                        .map(|_| ())
+                        .map_err(std::io::Error::other)
+                })
+        {
+            return Some(e);
+        }
+        if !client.is_handshaking() && !server.is_handshaking() {
+            return None;
+        }
+    }
+    Some(std::io::Error::other(
+        "handshake did not complete within the 16-round-trip budget",
+    ))
+}
+
+/// A client with no client certificate, trusting `trust` (server certificate DERs).
+fn plain_client(server_name: &'static str, trust: &[&[u8]]) -> rustls::ClientConnection {
+    ensure_provider_installed();
+    let mut roots = rustls::RootCertStore::empty();
+    for der in trust {
+        roots
+            .add(rustls::pki_types::CertificateDer::from((*der).to_vec()))
+            .expect("valid trust anchor");
+    }
+    let client_cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    rustls::ClientConnection::new(
+        Arc::new(client_cfg),
+        server_name.try_into().expect("valid server name"),
+    )
+    .expect("client connection")
+}
+
+/// A client presenting `(leaf_der, key_der)` as its own certificate, trusting `trust`.
+fn client_with_cert(
+    server_name: &'static str,
+    trust: &[&[u8]],
+    leaf_der: &[u8],
+    key_der: &[u8],
+) -> rustls::ClientConnection {
+    ensure_provider_installed();
+    let mut roots = rustls::RootCertStore::empty();
+    for der in trust {
+        roots
+            .add(rustls::pki_types::CertificateDer::from((*der).to_vec()))
+            .expect("valid trust anchor");
+    }
+    let key = rustls::pki_types::PrivateKeyDer::try_from(key_der)
+        .expect("valid key")
+        .clone_key();
+    let client_cfg = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_client_auth_cert(
+            vec![rustls::pki_types::CertificateDer::from(leaf_der.to_vec())],
+            key,
+        )
+        .expect("valid client cert and key");
+    rustls::ClientConnection::new(
+        Arc::new(client_cfg),
+        server_name.try_into().expect("valid server name"),
+    )
+    .expect("client connection")
+}
+
+/// A real configuration serving `san` for `name`, self-signed, plus that leaf's own DER so a test
+/// client can be built to trust it. `real_config` (used by every other test in this file) does
+/// not expose the leaf DER it generates internally, so it cannot be reused here: this test drives
+/// a FULL handshake to completion, which needs the client to actually verify the server's
+/// certificate, not merely observe that a `ClientHello` resolves to a config.
+fn real_config_and_der(name: &str, san: &str) -> (Arc<TlsServerConfig>, Vec<u8>) {
+    ensure_provider_installed();
+    let mut b = CertIndexBuilder::new(SEED);
+    let cred = gen_cred(san);
+    let leaf_der = cred.leaf_der().to_vec();
+    b.upsert_exact(name, cred).expect("valid");
+    let certs = Arc::new(b.build().expect("build"));
+    let challenge = Arc::new(ChallengeCerts::empty([3u8; 16]));
+    let policy = Arc::new(TlsPolicy::default_https());
+    let time: Arc<dyn TimeView> = Arc::new(FixedClock(UnixSeconds::new(1_000)));
+    let resolver = Arc::new(IronResolver::new(
+        certs,
+        challenge,
+        Arc::clone(&policy),
+        time,
+    ));
+    let cfg =
+        Arc::new(TlsServerConfig::compile(policy, resolver, None).expect("provider installed"));
+    (cfg, leaf_der)
+}
+
+/// The same, but with client authentication `Required` against `ca_der`. Revocation is disabled:
+/// this test is about the client-auth REQUIREMENT, not revocation, and `crl-revocation-index`
+/// (#123)'s own tests already cover revocation on its own.
+fn real_config_required_and_der(
+    name: &str,
+    san: &str,
+    ca_der: &[u8],
+) -> (Arc<TlsServerConfig>, Vec<u8>) {
+    ensure_provider_installed();
+    let mut b = CertIndexBuilder::new(SEED);
+    let cred = gen_cred(san);
+    let leaf_der = cred.leaf_der().to_vec();
+    b.upsert_exact(name, cred).expect("valid");
+    let certs = Arc::new(b.build().expect("build"));
+    let challenge = Arc::new(ChallengeCerts::empty([3u8; 16]));
+    let policy = Arc::new(TlsPolicy::default_https());
+    let time: Arc<dyn TimeView> = Arc::new(FixedClock(UnixSeconds::new(1_000)));
+    let resolver = Arc::new(IronResolver::new(
+        certs,
+        challenge,
+        Arc::clone(&policy),
+        Arc::clone(&time),
+    ));
+    let anchors = TrustAnchors::from_der_bundle(&[ca_der]).expect("a real CA must build");
+    let auth = ClientAuth::Required(anchors);
+    let auth_cfg = ClientAuthConfig {
+        mode: ClientAuthMode::Required,
+        allow_unknown_revocation_status: false,
+        revocation: RevocationMode::Disabled,
+    };
+    let cfg = Arc::new(
+        TlsServerConfig::compile_with_client_auth(
+            policy,
+            resolver,
+            &auth,
+            Arc::new(CrlSet::empty()),
+            CrlConfig::default(),
+            &auth_cfg,
+            time,
+            None,
+        )
+        .expect("a real trust anchor with revocation disabled must compile"),
+    );
+    (cfg, leaf_der)
+}
+
+#[test]
+fn mtls_name_requires_client_cert_while_sibling_does_not() {
+    // `sni-server-config-selection` (#119) specified this test and could not write it: building
+    // a `Required` configuration needs a real client-certificate verifier, which
+    // `mtls-client-auth-fail-closed` (#124) provides. One listener, two bindings, disjoint names
+    // so the divergence lint (invariant 2) passes, one `Required` and one `None`.
+    let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("CA keypair");
+    let mut ca_params =
+        rcgen::CertificateParams::new(vec!["mTLS Sibling Test CA".to_owned()]).expect("valid SAN");
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![
+        rcgen::KeyUsagePurpose::KeyCertSign,
+        rcgen::KeyUsagePurpose::CrlSign,
+    ];
+    let ca_cert = ca_params.self_signed(&ca_key).expect("CA self sign");
+    let ca_der = ca_cert.der().to_vec();
+
+    let (secure, secure_leaf_der) =
+        real_config_required_and_der("secure.example.com", "secure.example.com", &ca_der);
+    let (public, public_leaf_der) = real_config_and_der("public.example.com", "public.example.com");
+
+    let mut b = ListenerTlsBuilder::new(SEED);
+    b.bind_exact("secure.example.com", Arc::clone(&secure))
+        .expect("valid");
+    b.bind_exact("public.example.com", Arc::clone(&public))
+        .expect("valid");
+    let l = Arc::new(
+        b.build()
+            .expect("disjoint names carry no divergence to reject"),
+    );
+
+    let secure_cfg = l
+        .resolve_by_name("secure.example.com")
+        .expect("bound")
+        .as_rustls()
+        .clone();
+    let public_cfg = l
+        .resolve_by_name("public.example.com")
+        .expect("bound")
+        .as_rustls()
+        .clone();
+
+    // A client with no certificate completes the handshake to `public` ...
+    {
+        let mut server = rustls::ServerConnection::new(Arc::clone(&public_cfg)).expect("server");
+        let mut client = plain_client("public.example.com", &[&public_leaf_der]);
+        assert!(
+            pump_handshake(&mut client, &mut server).is_none(),
+            "the sibling public binding must not require a client certificate"
+        );
+    }
+    // ... and fails to `secure`.
+    {
+        let mut server = rustls::ServerConnection::new(Arc::clone(&secure_cfg)).expect("server");
+        let mut client = plain_client("secure.example.com", &[&secure_leaf_der]);
+        assert!(
+            pump_handshake(&mut client, &mut server).is_some(),
+            "the secure binding must refuse a client that presents no certificate"
+        );
+    }
+
+    // A client presenting a certificate signed by the configured anchor completes BOTH.
+    let client_key =
+        rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).expect("client keypair");
+    let client_params = rcgen::CertificateParams::new(vec!["mtls-sibling-test-client".to_owned()])
+        .expect("valid SAN");
+    let issuer = rcgen::Issuer::from_params(&ca_params, &ca_key);
+    let client_cert = client_params
+        .signed_by(&client_key, &issuer)
+        .expect("sign by CA");
+    let client_leaf_der = client_cert.der().to_vec();
+    let client_key_der = client_key.serialize_der();
+
+    {
+        let mut server = rustls::ServerConnection::new(Arc::clone(&public_cfg)).expect("server");
+        let mut client = client_with_cert(
+            "public.example.com",
+            &[&public_leaf_der],
+            &client_leaf_der,
+            &client_key_der,
+        );
+        assert!(
+            pump_handshake(&mut client, &mut server).is_none(),
+            "presenting a certificate must still work against the public binding"
+        );
+    }
+    {
+        let mut server = rustls::ServerConnection::new(Arc::clone(&secure_cfg)).expect("server");
+        let mut client = client_with_cert(
+            "secure.example.com",
+            &[&secure_leaf_der],
+            &client_leaf_der,
+            &client_key_der,
+        );
+        assert!(
+            pump_handshake(&mut client, &mut server).is_none(),
+            "a certificate signed by the configured anchor must complete the secure binding"
+        );
+    }
 }

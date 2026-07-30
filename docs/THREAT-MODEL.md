@@ -1404,6 +1404,15 @@ zero bytes for `ClientAuthKind::None` and `TrustAnchors::id()` otherwise, so a t
 resumes across a client-certificate trust-bundle change. The failure mode when the context does not
 match is `decrypt_unknown_key`, which falls back to a full handshake, not an error: a client that
 cannot resume simply re-authenticates from scratch, and the client-certificate verifier runs again.
+That covers a ticket that outlives a live bundle rotation; it is a separate belt from a second one
+added by `mtls-client-auth-fail-closed` (#124)'s own PR review (#773 BLOCKING 1): both
+`TlsServerConfig::compile` and `TlsServerConfig::compile_with_client_auth` compare the ticketer they
+were handed against the context the CONFIGURATION they are compiling actually calls for (16 zero
+bytes, or `auth.anchors().map(TrustAnchors::id)`), and refuse to compile at all
+(`ListenerError::TicketerContextMismatch`) on a mismatch, via `ClusterTicketer::context()`. That
+catches a caller wiring the wrong ticketer to the wrong listener at configuration time, before any
+handshake and before any ticket is ever minted, which is a different failure than a
+previously-issued ticket surviving a later bundle rotation.
 
 **Residual risk: resumption skips certificate re-validation, so a ticket can outlive a
 certificate.** A resumed TLS 1.3 handshake sends no certificate, so a client that resumes does not
@@ -1767,3 +1776,52 @@ abort every later flush behind it, freezing the whole store at its last good gen
 `nextUpdate` plus clock skew, with no successful refresh) as a reason to remove the credential from
 the index, so a name with another credential falls through to it and a name with none fails the
 handshake instead of serving a certificate the extension says must never appear without a staple.
+
+## Client authentication (`mtls-client-auth-fail-closed`, #124)
+
+**What a peer reaches before any identity exists.** A `ClientHello` is unauthenticated by
+construction: the `CertificateRequest` a client-authentication listener sends back, and the identity
+of every trust anchor named in it, are both produced before the peer has proven anything at all.
+Everything downstream of that first message, chain validation and revocation, only ever runs against
+bytes an attacker chose.
+
+**The fail-closed construction.** Caddy shipped CVE-2026-27586: mTLS silently failed open when the CA
+certificate file was missing or malformed, because the type an implementation typically reaches for
+here, an optional root store plus a boolean "require a certificate", can represent the broken state
+"require authentication but trust nothing" with no error. Here that state is not representable.
+`TrustAnchors` cannot be constructed empty: its constructor returns a `Result`, and an empty,
+missing, or unparseable bundle is an `Err` at configuration compile time, not a runtime surprise on
+the first connection. `ClientAuth::Required` and `ClientAuth::Optional` each hold a `TrustAnchors` by
+value, so "required but no anchors" cannot be expressed at all, structurally, independent of any
+runtime check. A listener whose client-authentication configuration fails to compile never binds,
+and a listener that never binds certainly never binds and admits unverified peers.
+
+**The two knobs that can weaken the check, what each costs, and that both are explicit.**
+Revocation is checked by walking the whole certificate chain against a compiled revocation index, not
+only the presented leaf, matching the underlying verifier's own `RevocationCheckDepth::Chain`
+default. Two configuration fields, and only these two, can weaken what that buys:
+
+- `allowUnknownRevocationStatus` (default `false`): when `true`, a certificate whose revocation
+  status could not be determined, no coverage for its issuer, or coverage that has gone stale past
+  its grace period, is accepted rather than refused. The cost: a revoked certificate whose
+  revocation list you failed to load or refresh is admitted exactly as if it were still valid.
+- `revocation` (default `enforced`): when set to `disabled`, no revocation check runs for any
+  certificate at all. The cost: a revoked certificate is accepted outright. This is the explicit,
+  all-the-way-off statement; the default `enforced` additionally refuses to compile a listener
+  whose revocation index holds no coverage for any issuer whatsoever, because binding such a
+  listener would mean every client certificate gets refused with an opaque alert the moment the
+  first one connects, and driving an operator who hits that toward the fail-open knob is a worse
+  outcome than either honest option on its own.
+
+Both are operator-facing configuration fields an implementer must set deliberately; neither is a side
+effect of an absent resource or a default an operator has to go read the source to discover.
+
+**Root hint disclosure and the amplification bound.** The `CertificateRequest` a client-authentication
+listener sends carries the subject name of every trust anchor in its bundle, sent to every connecting
+peer before that peer has proven anything. Below 32 anchors this is sent as configured, because it
+genuinely helps a client with several certificates choose the one this listener accepts. At 33
+anchors and above, the hint list is cleared instead of sent: past that point it both discloses the
+full contents of a large trust bundle to an unauthenticated peer and turns a few-hundred-byte
+handshake message into a multi-kilobyte one, a bandwidth amplification factor obtainable by opening
+connections and never authenticating. At most 32 trust anchor subject names are ever disclosed to an
+unauthenticated peer, regardless of how large the configured bundle is.
