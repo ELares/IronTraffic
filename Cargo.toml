@@ -13,7 +13,7 @@
 
 [workspace]
 resolver = "3"
-members = ["crates/irontraffic", "crates/irontraffic-config", "crates/irontraffic-conn", "crates/irontraffic-dataplane", "crates/irontraffic-filter", "crates/irontraffic-http", "crates/irontraffic-io", "crates/irontraffic-k8s", "crates/irontraffic-limits", "crates/irontraffic-obs", "crates/irontraffic-policy", "crates/irontraffic-quota", "crates/irontraffic-rand", "crates/irontraffic-resilience", "crates/irontraffic-router", "crates/irontraffic-runtime", "crates/irontraffic-time", "crates/irontraffic-tls", "crates/irontraffic-upgrade", "crates/irontraffic-upstream", "crates/irontraffic-ws"]
+members = ["crates/irontraffic", "crates/irontraffic-bench", "crates/irontraffic-config", "crates/irontraffic-conn", "crates/irontraffic-dataplane", "crates/irontraffic-filter", "crates/irontraffic-http", "crates/irontraffic-io", "crates/irontraffic-k8s", "crates/irontraffic-limits", "crates/irontraffic-obs", "crates/irontraffic-policy", "crates/irontraffic-quota", "crates/irontraffic-rand", "crates/irontraffic-resilience", "crates/irontraffic-router", "crates/irontraffic-runtime", "crates/irontraffic-time", "crates/irontraffic-tls", "crates/irontraffic-upgrade", "crates/irontraffic-upstream", "crates/irontraffic-ws"]
 # The fuzz crate is intentionally not a workspace member: cargo-fuzz projects
 # The fuzz crates are intentionally not workspace members: cargo-fuzz projects
 # The fuzz crate is intentionally not a workspace member: cargo-fuzz projects
@@ -75,6 +75,15 @@ tracing-subscriber = { version = "0.3.23", features = ["fmt", "env-filter"] }
 proptest = { version = "1.5" }
 # Benchmarks.
 criterion = { version = "0.8" }
+# HDR histogram for percentile recording. Neither of its two consumers,
+# gradient-adaptive-concurrency (#106) and this milestone's own
+# bench-histogram-and-percentiles, has landed yet, so bench-crate-and-cell-model
+# (#404) pins it here first: the key was genuinely absent, and a second
+# hdrhistogram key with a different version string would stop the workspace
+# resolving for every crate. Version and default-features = false match #106's
+# own stated pin exactly, so whichever of the two lands next takes it via
+# workspace = true instead of redeclaring it.
+hdrhistogram = { version = "7", default-features = false }
 # Calendar arithmetic with a bundled IANA tzdb. Used by `irontraffic-quota`.
 jiff = { version = "0.2.34" }
 # Kubernetes client. Only in the control-plane crate.

@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# Not a workspace member: the empty [workspace] table below is required so
+# that Cargo treats this manifest as its own independent workspace root
+# instead of trying to join the ancestor workspace at the repository root.
+# This is the standard cargo-fuzz layout: a cargo-fuzz project pins its own
+# toolchain-sensitive edition and is built with `cargo fuzz`, never `cargo
+# build --workspace`.
+[package]
+name = "irontraffic-bench-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[workspace]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+irontraffic-bench = { path = ".." }
+
+[[bin]]
+name = "fuzz_cell_id"
+path = "fuzz_targets/fuzz_cell_id.rs"
+test = false
+doc = false
+bench = false

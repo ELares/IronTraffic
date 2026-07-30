@@ -1,0 +1,29 @@
+// SPDX-License-Identifier: MIT OR Apache-2.0
+//! Sans-IO vocabulary for the IronTraffic benchmark harness.
+//!
+//! This crate is a development tool, not a runtime dependency: it is
+//! `publish = false` and nothing in `crates/irontraffic` may depend on it. It
+//! holds the sans-IO logic the whole M17 benchmark harness is built from: the
+//! cell model defined here, and (added by later issues in this milestone) the
+//! histogram recorder, the open-loop schedule, provenance capture, the
+//! validity guards, the load-generator adapters, the matrix and the report
+//! writer. `xtask`, created later, is a thin binary that spawns processes and
+//! calls into this library; putting the logic here rather than in `xtask`
+//! itself is what lets `cargo-fuzz` and unit tests reach the parsers that
+//! consume untrusted output from external load generators.
+//!
+//! The published benchmark matrix has eleven dimensions: protocol, TLS mode,
+//! payload size, route table size, path corpus, connection count, upstream
+//! count, filter chain depth, cache mode, keepalive mode and rate mode. A
+//! [`BenchCell`] carries all eleven; [`CellId`] is the stable identifier that
+//! doubles as the cell's result filename stem.
+#![deny(missing_docs)]
+
+mod cell;
+mod error;
+
+pub use cell::{
+    BenchCell, CacheMode, CellId, KeepaliveMode, PathCorpus, Protocol, RESERVED_STEMS, RateMode,
+    TlsMode,
+};
+pub use error::{BenchError, Detail, MAX_DETAIL_BYTES};

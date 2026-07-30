@@ -1067,6 +1067,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "irontraffic-bench"
+version = "0.1.0"
+dependencies = [
+ "proptest",
+ "serde",
+ "serde_json",
+ "thiserror",
+]
+
+[[package]]
 name = "irontraffic-config"
 version = "0.1.0"
 dependencies = [
