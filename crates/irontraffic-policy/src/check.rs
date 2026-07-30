@@ -71,9 +71,16 @@ pub struct Checked {
     /// other way to reach them: `Checked` is the only handle it is given.
     ///
     /// `check`'s own signature still takes `strings` by mutable reference,
-    /// unchanged, for its existing callers; this field is a copy of that
-    /// buffer's final content, not a second owner of the same allocation.
-    /// #271's Files table does not list this file, and this field is the one
+    /// unchanged, for its existing callers. This field is the SAME
+    /// allocation moved out of that buffer with `mem::take`, not a clone of
+    /// it: nothing in this crate reads the caller's `strings` argument again
+    /// after a successful `check`, so there is no second owner to keep
+    /// synchronized, and paying for a full-arena copy on every admitted
+    /// policy would be pure waste. The caller's own `Vec` is left empty
+    /// (`mem::take`'s documented swap-with-`Default`), which is a real,
+    /// visible change to what `strings` holds after the call returns; every
+    /// caller in this crate already discards it immediately afterward. #271's
+    /// Files table does not list this file, and this field is the one
     /// minimal addition that issue needed to compile at all; see its PR for
     /// the full explanation.
     pub strings: Vec<u8>,
@@ -827,7 +834,13 @@ pub fn check(
         });
     }
 
-    let strings_copy = chk.strings.clone();
+    // Moves the decoded, lowercased buffer directly into `Checked` instead of
+    // cloning it: `chk.strings` is `&mut Vec<u8>` borrowed from the caller, and
+    // `mem::take` swaps it for an empty `Vec` while returning the original
+    // content by value, so `Checked::strings` becomes the sole owner of the
+    // one allocation rather than a second copy of it. See `Checked::strings`'s
+    // own doc comment for why no caller needs the buffer to stay populated.
+    let strings_owned = std::mem::take(chk.strings);
 
     let Checker {
         types,
@@ -843,7 +856,7 @@ pub fn check(
         node_slot,
         phase,
         result: root_ty,
-        strings: strings_copy,
+        strings: strings_owned,
     })
 }
 
