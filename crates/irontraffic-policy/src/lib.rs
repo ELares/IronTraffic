@@ -48,6 +48,8 @@ pub mod limits;
 pub mod parse;
 pub mod program;
 pub mod token;
+pub mod value;
+pub mod vm;
 
 pub use ast::{Ast, BinOp, Method, Node, NodeId};
 pub use attrs::{ATTRS, AttrEntry, AttrId, MAX_PATH_BYTES, MapId, NAMESPACES, Ty, resolve_path};
@@ -57,3 +59,7 @@ pub use limits::PolicyLimits;
 pub use parse::{ParseError, parse, parse_expr_at};
 pub use program::{Const, Op, Program, VerifyError, verify};
 pub use token::{LexError, Span, Spanned, Tok, TokenStream};
+pub use value::Value;
+pub use vm::{
+    AttrSource, Env, EvalError, FieldOutcome, duplicate_header_count, eval, record_duplicate_header,
+};
