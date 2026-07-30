@@ -260,6 +260,164 @@ fn fragmented_client_hello_resolves_same_policy() {
     );
 }
 
+/// Calls that can allocate on the heap, textually. The identical vocabulary
+/// `tests/alloc_gate.rs` uses for `CertIndex::resolve`'s call graph in this same crate, kept as a
+/// separate copy here rather than a shared `mod` because that file lives in the same `tests/`
+/// directory but is outside this issue's Files table.
+const ALLOCATING_CALLS: [&str; 14] = [
+    "format!",
+    ".to_string()",
+    ".to_owned()",
+    ".to_vec()",
+    "vec![",
+    "Vec::new()",
+    "String::new()",
+    "String::from(",
+    "Box::new(",
+    "HashMap::new()",
+    ".collect::<Vec",
+    ".collect::<String",
+    ".collect::<HashMap",
+    ".clone()",
+];
+
+/// Returns the source text of the function whose signature contains `signature`, from its opening
+/// brace through its matching closing brace, or `None` if not found. A plain brace-depth text
+/// scan, not a Rust parser; mirrors `tests/alloc_gate.rs::extract_fn_body` exactly.
+fn extract_fn_body<'a>(source: &'a str, signature: &str) -> Option<&'a str> {
+    let start = source.find(signature)?;
+    let open = source[start..].find('{').map(|offset| start + offset)?;
+    let mut depth = 0usize;
+    let mut end = open;
+    for (offset, ch) in source[open..].char_indices() {
+        match ch {
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    end = open + offset + 1;
+                    break;
+                }
+            }
+            _ => {}
+        }
+    }
+    if end > open {
+        Some(&source[open..end])
+    } else {
+        None
+    }
+}
+
+/// Issue #119's acceptance criterion for invariant 8 ("`resolve_by_name` performs zero heap
+/// allocations"), implemented honestly rather than as originally specified.
+///
+/// THE ORIGINAL DESIGN, AND WHY IT IS NOT HERE. The issue calls for this file to declare a
+/// counting `#[global_allocator]` with a thread-local counter, "exactly the shape in
+/// `sni-name-normalization` (#113)'s `no_allocations_in_normalize`". That shape does not exist in
+/// this tree: `crates/irontraffic-tls/src/name.rs`'s own `no_allocations_in_normalize` test
+/// carries a long comment explaining that a counting `#[global_allocator]` needs the keyword this
+/// repository denies, because `GlobalAlloc` is declared as an unsafe trait, which
+/// `scripts/invariant-lints.sh`'s `no-unsafe` rule forbids outright, with no
+/// exception an implementer may self-grant (the root `Cargo.toml`'s `unsafe_code = "deny"` is a
+/// POLICY line, not a missing override). #113 reached the same wall this issue's acceptance
+/// criterion did not know about when it was written, and settled on the substitute
+/// `tests/alloc_gate.rs` in THIS SAME CRATE already documents at length for `CertIndex::resolve`:
+/// a per-function text scan for a fixed list of allocating call spellings, stated plainly as a
+/// best-effort net rather than a proof, plus a functional test that exercises the shape the issue
+/// actually asks for (hits, wildcard hits, and misses) so the counted behaviour is at least
+/// checked for correctness even though allocation itself cannot be counted.
+///
+/// WHAT THIS TEST ACTUALLY DOES. `resolve_by_name` calls `lookup` and `binding_at`; `lookup` calls
+/// `name::normalize`, `name::parent` and `self.hasher.hash`, all of which are already covered by
+/// `name.rs`'s own `//! HOT PATH` marker and by `tests/alloc_gate.rs`'s scan of the identical
+/// functions `CertIndex::resolve` shares with this one. So this test scans `resolve_by_name`,
+/// `client_auth_for_name`, `lookup` and `binding_at` themselves, the four functions new to
+/// `listener.rs`, then performs the 10,000 calls across hits, wildcard hits and misses the issue's
+/// acceptance criterion names, asserting the FUNCTIONAL outcome of each rather than a byte count no
+/// safe mechanism in this tree can produce.
+#[test]
+fn resolve_by_name_allocates_nothing() {
+    let source = include_str!("../src/listener.rs");
+    let signatures = [
+        (
+            "resolve_by_name",
+            "pub fn resolve_by_name(&self, sni: &str) -> Option<&Arc<TlsServerConfig>> {",
+        ),
+        (
+            "client_auth_for_name",
+            "pub fn client_auth_for_name(&self, authority: &str) -> ClientAuthKind {",
+        ),
+        (
+            "lookup",
+            "fn lookup(&self, sni: &str, count: bool) -> Result<Option<u32>, ()> {",
+        ),
+        (
+            "binding_at",
+            "fn binding_at(&self, i: u32) -> Option<&Binding> {",
+        ),
+    ];
+    for (name, signature) in signatures {
+        let body = extract_fn_body(source, signature).unwrap_or_else(|| {
+            panic!(
+                "`fn {name}` not found via `{signature}`; has it moved, been renamed, or been \
+                 reformatted onto a different single-line signature?"
+            )
+        });
+        for call in ALLOCATING_CALLS {
+            assert!(
+                !body.contains(call),
+                "{name}'s body contains `{call}`, which can allocate; resolve_by_name's whole \
+                 call graph is documented to perform zero heap allocations per lookup"
+            );
+        }
+    }
+
+    // Without this marker line, scripts/invariant-lints.sh's hot-path-allocation rule does not
+    // scan listener.rs at all, and the text scan above becomes the ONLY thing checking this
+    // file, ever, rather than the belt to CI's suspenders it is meant to be. Mirrors
+    // `name.rs`'s own `no_allocations_in_normalize` test, which guards the identical marker line
+    // for the identical reason.
+    assert!(
+        source.lines().any(|line| line == "//! HOT PATH"),
+        "crates/irontraffic-tls/src/listener.rs must carry a line that is exactly `//! HOT PATH` \
+         so scripts/invariant-lints.sh's hot-path-allocation rule scans this module at all"
+    );
+
+    // The functional shape the issue's acceptance criterion names: 10,000 calls across hits,
+    // wildcard hits and misses.
+    let bound = real_config("a.example.com", "a.example.com");
+    let wild = real_config("wild.example.com", "wild.example.com");
+    let mut b = ListenerTlsBuilder::new(SEED);
+    b.bind_exact("a.example.com", Arc::clone(&bound))
+        .expect("valid");
+    b.bind_wildcard("*.wild.example.com", Arc::clone(&wild))
+        .expect("valid");
+    let l = b.build().expect("disjoint names, no divergence");
+
+    let mut exact_hits = 0u32;
+    let mut wildcard_hits = 0u32;
+    let mut misses = 0u32;
+    for i in 0..10_000u32 {
+        match i % 3 {
+            0 => {
+                assert!(l.resolve_by_name("a.example.com").is_some());
+                exact_hits += 1;
+            }
+            1 => {
+                assert!(l.resolve_by_name("sub.wild.example.com").is_some());
+                wildcard_hits += 1;
+            }
+            _ => {
+                assert!(l.resolve_by_name("nope.example.com").is_none());
+                misses += 1;
+            }
+        }
+    }
+    assert_eq!(exact_hits + wildcard_hits + misses, 10_000);
+    assert!(exact_hits > 0 && wildcard_hits > 0 && misses > 0);
+}
+
 #[test]
 fn truncated_client_hello_is_an_error_not_no_sni() {
     // The other half of CVE-2026-32305: a ClientHello that never completes must never be treated

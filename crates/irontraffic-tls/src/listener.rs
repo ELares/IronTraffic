@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 
+//! HOT PATH
+//!
 //! Per-SNI TLS configuration selection, fail closed.
 //!
 //! A listener may bind several TLS policies to different server names, and the policy for a
@@ -21,6 +23,20 @@
 //! support. That configuration is bypassable by anyone who can send a `Host` header, and the
 //! answer is [`ListenerTls::client_auth_for_name`], which the HTTP layer MUST call on every
 //! request. See `docs/tls/SNI-POLICY.md`.
+//!
+//! **The `HOT PATH` marker above.** It puts this whole file, every function in it, under
+//! `scripts/invariant-lints.sh`'s `hot-path-allocation` and `hot-path-lock` rules, the same
+//! convention `name.rs`, `store/index.rs`, `store/resolver.rs` and `store/challenge.rs` already
+//! use. Read what that buys accurately (`name.rs`'s module doc states the same caveat at length):
+//! this is a text scan for a fixed list of call spellings, a best-effort net and not a proof that
+//! [`ListenerTls::resolve_by_name`] allocates zero times. What actually makes `resolve_by_name`
+//! allocation-free is its signature and its body: it writes into a caller-owned stack buffer and
+//! returns a borrow, never an owned value. Everything in this file that is NOT on that path
+//! (`ListenerTlsBuilder::build`, `TlsServerConfig::compile`, the reject path's alert buffer) does
+//! allocate, runs at most once per configuration compile or once per rejected handshake rather
+//! than once per resolved name, and is marked `// it-allow: hot-path-allocation reason: ...` at
+//! each call site so the lint's coverage of the true hot functions is not diluted by exceptions
+//! nobody can find.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -69,6 +85,19 @@ impl core::hash::Hasher for NameKeyHasher {
         self.0
     }
 }
+
+/// Compiled-in two-label public suffixes for which a wildcard binding would be absurdly broad.
+///
+/// Mirrors `store::index::SUFFIX_DENY` exactly. That list is private to `store::index`, and
+/// `store/mod.rs` is outside this issue's Files table for the same reason
+/// `NameKeyHashBuilder` above is a second copy rather than a shared export: re-exporting it would
+/// require touching a file this issue does not authorize touching. If a later issue exports the
+/// original, delete this and use it: the two lists must not be allowed to drift apart, which is
+/// the exact hazard `store::index::validate_wildcard_parent`'s own doc comment names.
+const SUFFIX_DENY: &[&str] = &[
+    "co.uk", "org.uk", "ac.uk", "gov.uk", "co.jp", "or.jp", "ne.jp", "com.au", "net.au", "org.au",
+    "co.nz", "com.br", "com.cn", "com.mx", "co.za", "co.in",
+];
 
 /// Maximum bindings on one listener.
 pub const MAX_BINDINGS: usize = 4096;
@@ -148,7 +177,7 @@ impl TlsServerConfig {
             .with_cert_resolver(resolver);
         crate::policy::apply_common(&policy, &mut cfg);
         Ok(Self {
-            inner: Arc::new(cfg),
+            inner: Arc::new(cfg), // it-allow: hot-path-allocation reason: compiles once per listener configuration, not once per resolved name
             client_auth: ClientAuthKind::None,
             policy,
         })
@@ -297,6 +326,16 @@ pub enum ListenerError {
         /// The name.
         name: Box<str>,
     },
+    /// A wildcard binding's parent has fewer than two labels, or is a compiled-in public suffix.
+    /// Mirrors `store::index::CertError::WildcardTooBroad`: the certificate index refuses a
+    /// certificate at this scope, so a policy binding here could never be served by a real
+    /// certificate, and would silently widen the client-auth surface for every name under the
+    /// suffix. Not in issue #119's original Public API for `bind_wildcard`; see the PR body's
+    /// deviation list.
+    WildcardTooBroad {
+        /// The wildcard's parent domain.
+        parent: Box<str>,
+    },
     /// More than [`MAX_BINDINGS`].
     TooManyBindings,
     /// A binding name failed validation.
@@ -340,6 +379,11 @@ impl core::fmt::Display for ListenerError {
             ListenerError::DuplicateBinding { name } => {
                 write!(f, "two bindings for the same name: {name}")
             }
+            ListenerError::WildcardTooBroad { parent } => write!(
+                f,
+                "wildcard binding *.{parent} is too broad: fewer than two labels or a compiled-in \
+                 public suffix, so the certificate index would refuse a certificate at this scope"
+            ),
             ListenerError::TooManyBindings => {
                 f.write_str("a listener may declare at most 4096 name bindings")
             }
@@ -586,7 +630,7 @@ impl ListenerTlsBuilder {
     pub fn new(seed: [u8; 16]) -> Self {
         Self {
             seed,
-            bindings: Vec::new(),
+            bindings: Vec::new(), // it-allow: hot-path-allocation reason: builder path, not resolve_by_name; one allocation per listener configuration build
             no_sni: None,
             fallback: None,
             max_client_hello_bytes: DEFAULT_MAX_CLIENT_HELLO_BYTES,
@@ -616,7 +660,8 @@ impl ListenerTlsBuilder {
     /// Bind `config` to a wildcard name written `*.parent`.
     ///
     /// # Errors
-    /// [`ListenerError::Wildcard`], [`ListenerError::Name`], or [`ListenerError::TooManyBindings`].
+    /// [`ListenerError::Wildcard`], [`ListenerError::Name`],
+    /// [`ListenerError::WildcardTooBroad`], or [`ListenerError::TooManyBindings`].
     pub fn bind_wildcard(
         &mut self,
         raw: &str,
@@ -625,6 +670,15 @@ impl ListenerTlsBuilder {
         let parent = name::wildcard_parent(raw)?;
         let mut buf = [0u8; MAX_NAME_LEN];
         let normalized = name::normalize(parent, &mut buf)?;
+        // Mirrors `store::index::validate_wildcard_parent`: a parent with fewer than two labels,
+        // or a compiled-in public suffix, is a scope the certificate index refuses a certificate
+        // for. Binding a policy there anyway would silently widen the client-auth surface for
+        // every name under the suffix while never actually being served by a real certificate.
+        if name::label_count(normalized) < 2 || SUFFIX_DENY.contains(&normalized) {
+            return Err(ListenerError::WildcardTooBroad {
+                parent: normalized.into(),
+            });
+        }
         self.push(Binding {
             name: normalized.into(),
             is_wildcard: true,
@@ -689,7 +743,7 @@ impl ListenerTlsBuilder {
                 };
                 if a.name == b.name && a.is_wildcard == b.is_wildcard {
                     return Err(ListenerError::DuplicateBinding {
-                        name: a.name.clone(),
+                        name: a.name.clone(), // it-allow: hot-path-allocation reason: builder path, not resolve_by_name; the config-compile-time error path, not the request path
                     });
                 }
             }
@@ -707,7 +761,7 @@ impl ListenerTlsBuilder {
                 && w.config.client_auth() != e.config.client_auth()
             {
                 return Err(ListenerError::ClientAuthDivergence {
-                    exact: e.name.clone(),
+                    exact: e.name.clone(), // it-allow: hot-path-allocation reason: builder path, not resolve_by_name; the config-compile-time error path, not the request path
                     wildcard: p.into(),
                     exact_auth: e.config.client_auth(),
                     wildcard_auth: w.config.client_auth(),
@@ -761,7 +815,7 @@ impl ListenerTlsBuilder {
             hasher,
             exact,
             wild,
-            bindings: self.bindings.into_boxed_slice(),
+            bindings: self.bindings.into_boxed_slice(), // it-allow: hot-path-allocation reason: builder path, not resolve_by_name; converts the already-built Vec into the immutable listener storage, once per configuration build
             no_sni: self.no_sni,
             fallback: self.fallback,
             max_client_hello_bytes: self.max_client_hello_bytes,
@@ -846,7 +900,7 @@ impl core::fmt::Debug for AcceptStep {
 /// Writing into a `Vec` cannot fail, and a failure here must not mask the rejection, so an error
 /// yields an empty alert rather than a panic.
 fn drain_alert(a: &mut rustls::server::AcceptedAlert) -> Vec<u8> {
-    let mut out = Vec::new();
+    let mut out = Vec::new(); // it-allow: hot-path-allocation reason: reject path, not resolve_by_name; runs once per rejected handshake, never per resolved name
     if a.write_all(&mut out).is_err() {
         out.clear();
     }
@@ -882,7 +936,7 @@ impl SniAcceptor {
                 .stats
                 .client_hello_too_large
                 .fetch_add(1, Ordering::Relaxed);
-            return self.reject(RejectReason::ClientHelloTooLarge, Vec::new());
+            return self.reject(RejectReason::ClientHelloTooLarge, Vec::new()); // it-allow: hot-path-allocation reason: reject path, not resolve_by_name; an empty, never-grown Vec per rejected handshake
         }
 
         // `read_tls` consumes ONE TLS record at a time and returns how many bytes it took, so a
@@ -895,7 +949,7 @@ impl SniAcceptor {
                 Ok(_) => {}
                 // The record layer rejected the bytes. This is `MalformedClientHello`, never
                 // "no SNI": treating a truncated ClientHello as "no SNI" is CVE-2026-32305.
-                Err(_) => return self.reject(RejectReason::MalformedClientHello, Vec::new()),
+                Err(_) => return self.reject(RejectReason::MalformedClientHello, Vec::new()), // it-allow: hot-path-allocation reason: reject path, not resolve_by_name; an empty, never-grown Vec per rejected handshake
             }
             if let Some(step) = self.try_accept() {
                 return step;
@@ -936,7 +990,7 @@ impl SniAcceptor {
                     } else {
                         RejectReason::NoPolicyForName
                     };
-                    self.reject(reason, Vec::new())
+                    self.reject(reason, Vec::new()) // it-allow: hot-path-allocation reason: reject path, not resolve_by_name; an empty, never-grown Vec per rejected handshake
                 }
             }
         } else {
@@ -946,7 +1000,7 @@ impl SniAcceptor {
                     config: Arc::clone(c),
                     accepted: AcceptedHello { inner: accepted },
                 },
-                None => self.reject(RejectReason::NoSniPolicy, Vec::new()),
+                None => self.reject(RejectReason::NoSniPolicy, Vec::new()), // it-allow: hot-path-allocation reason: reject path, not resolve_by_name; an empty, never-grown Vec per rejected handshake
             }
         };
         Some(step)
@@ -966,6 +1020,37 @@ pub struct AcceptedHello {
 }
 
 impl AcceptedHello {
+    /// The presented `ClientHello`'s SNI, if any, copied out.
+    ///
+    /// Exists so a caller that already holds a chosen [`AcceptStep::Ready`] can find out which
+    /// name actually selected it, without reaching for the underlying `rustls::server::Accepted`
+    /// outside this crate's enumerated facade crossings. The fuzz target uses this to compare the
+    /// chosen configuration against the requirement the presented name selects, rather than
+    /// against the listener's weakest configuration overall.
+    ///
+    /// Returned owned rather than borrowed: `rustls::server::Accepted::client_hello()` returns a
+    /// `ClientHello<'_>` VALUE borrowed from `&self`, not a reference into `Accepted` itself, so
+    /// `.server_name()` on it cannot outlive that temporary. Storing the `ClientHello` alongside
+    /// `Accepted` in this struct to borrow from it later would be self-referential, which this
+    /// crate does not build without `unsafe`. This runs at most once per accepted connection, not
+    /// once per resolved name, so the one allocation is nothing invariant 8 is about.
+    #[must_use]
+    #[allow(
+        clippy::redundant_closure_for_method_calls,
+        reason = "clippy's suggested fix is the fully qualified call shape \
+                  scripts/invariant-lints.sh's hot-path-allocation rule cannot see, because that \
+                  rule only matches the ordinary dot method-call spelling; keeping the closure \
+                  keeps this line visible to that scan's it-allow annotation below, rather than \
+                  silently routing around it the way this repository's own comments elsewhere \
+                  warn against"
+    )]
+    pub fn server_name(&self) -> Option<String> {
+        self.inner
+            .client_hello()
+            .server_name()
+            .map(|s| s.to_owned()) // it-allow: hot-path-allocation reason: runs once per accepted connection, not once per resolved name; see this method's own doc for why it must be owned
+    }
+
     /// Start a TLS connection with `config`.
     ///
     /// This is one of the crate's enumerated facade crossings.
@@ -1114,6 +1199,33 @@ mod tests {
     }
 
     #[test]
+    fn lint_rejects_client_auth_divergence_reverse() {
+        // The direction `lint_rejects_client_auth_divergence` does not cover: an EXACT binding
+        // WEAKER than its covering wildcard. `resolve_by_name` gives the exact binding priority,
+        // so an operator who writes `*.example.com => Required` and `secure.example.com => None`
+        // gets served `None` on `secure.example.com` while believing the wildcard protects it.
+        // Without this test, weakening the divergence check's `!=` to a one-directional `<` (only
+        // flagging the wildcard-weaker-than-exact direction) survives the whole suite.
+        let mut b = ListenerTlsBuilder::new(SEED);
+        b.bind_exact("secure.example.com", stub(ClientAuthKind::None))
+            .unwrap();
+        b.bind_wildcard("*.example.com", stub(ClientAuthKind::Required))
+            .unwrap();
+        let err = b
+            .build()
+            .expect_err("two ways to the same authority, the other direction");
+        assert_eq!(
+            err,
+            ListenerError::ClientAuthDivergence {
+                exact: "secure.example.com".into(),
+                wildcard: "example.com".into(),
+                exact_auth: ClientAuthKind::None,
+                wildcard_auth: ClientAuthKind::Required,
+            }
+        );
+    }
+
+    #[test]
     fn lint_allows_disjoint_names() {
         // The mixed public-and-mTLS listener this design exists to support. The lint MUST allow
         // it; the cross-name hole it leaves is closed by `client_auth_for_name`, not by the lint.
@@ -1129,8 +1241,14 @@ mod tests {
 
     #[test]
     fn lint_rejects_weaker_fallback() {
+        // TWO bindings, one Required and one None, so `max` and `min` over the strength order
+        // disagree: `.max() == Required`, `.min() == None`. A single-binding fixture cannot
+        // distinguish "strongest binding" from "min binding" and would survive that mutation
+        // silently. This is also the mixed public-and-mTLS shape lint rule 3 exists to protect.
         let mut b = ListenerTlsBuilder::new(SEED);
-        b.bind_exact("a.example.com", stub(ClientAuthKind::Required))
+        b.bind_exact("secure.example.com", stub(ClientAuthKind::Required))
+            .unwrap();
+        b.bind_exact("public.example.com", stub(ClientAuthKind::None))
             .unwrap();
         b.set_fallback(stub(ClientAuthKind::None));
         assert_eq!(
@@ -1144,8 +1262,12 @@ mod tests {
 
     #[test]
     fn lint_rejects_weaker_no_sni() {
+        // Same reasoning as `lint_rejects_weaker_fallback`: two bindings so `max` and `min` over
+        // the strength order disagree, which a single-binding fixture cannot distinguish.
         let mut b = ListenerTlsBuilder::new(SEED);
-        b.bind_exact("a.example.com", stub(ClientAuthKind::Required))
+        b.bind_exact("secure.example.com", stub(ClientAuthKind::Required))
+            .unwrap();
+        b.bind_exact("public.example.com", stub(ClientAuthKind::None))
             .unwrap();
         b.set_no_sni(stub(ClientAuthKind::Optional));
         assert_eq!(
@@ -1211,6 +1333,47 @@ mod tests {
     }
 
     #[test]
+    fn bind_wildcard_refuses_public_suffix() {
+        // `CertIndexBuilder::upsert_wildcard` refuses `*.co.uk` as `WildcardTooBroad` (a
+        // compiled-in two-label public suffix): a certificate can never legitimately cover it.
+        // Before this check, `bind_wildcard` accepted it, so the listener's own policy-matching
+        // maps disagreed with what the certificate index could ever serve.
+        let mut b = ListenerTlsBuilder::new(SEED);
+        let err = b
+            .bind_wildcard("*.co.uk", stub(ClientAuthKind::None))
+            .expect_err("a two-label public suffix must be refused");
+        assert_eq!(
+            err,
+            ListenerError::WildcardTooBroad {
+                parent: "co.uk".into()
+            }
+        );
+    }
+
+    #[test]
+    fn bind_wildcard_refuses_single_label_parent() {
+        // `*.a` has a one-label parent; the certificate index's `validate_wildcard_parent`
+        // refuses anything under two labels the same way.
+        let mut b = ListenerTlsBuilder::new(SEED);
+        let err = b
+            .bind_wildcard("*.a", stub(ClientAuthKind::None))
+            .expect_err("a single-label wildcard parent must be refused");
+        assert_eq!(err, ListenerError::WildcardTooBroad { parent: "a".into() });
+    }
+
+    #[test]
+    fn bind_wildcard_still_accepts_ordinary_parents() {
+        // The check above must not become over-broad itself: an ordinary two-label,
+        // non-suffix-listed parent still binds.
+        let mut b = ListenerTlsBuilder::new(SEED);
+        assert_eq!(
+            b.bind_wildcard("*.example.com", stub(ClientAuthKind::None)),
+            Ok(()),
+            "an ordinary wildcard parent must still be accepted"
+        );
+    }
+
+    #[test]
     fn client_auth_for_name_matches_resolve_by_name() {
         // `*.other.example.com`, not `*.example.com`: the latter would make `secure.example.com`
         // an exact binding under a `None` wildcard parent, which the lint refuses by design.
@@ -1231,6 +1394,51 @@ mod tests {
             l.client_auth_for_name("public.example.com"),
             ClientAuthKind::None
         );
+    }
+
+    #[test]
+    fn client_auth_for_name_matches_resolve_by_name_across_inputs() {
+        // The test above pins `client_auth_for_name` against two hard-coded `ClientAuthKind`
+        // literals and never calls `resolve_by_name` at all, which is the constant-vs-constant
+        // vacuity shape: `client_auth_for_name` and `resolve_by_name` have separate, duplicated
+        // post-`lookup` match arms (only the `Ok(Some)` / `Ok(None) | Err(())` split is shared),
+        // and a mutation that splits the `Err(())` arm to return `None` instead of the fallback
+        // survives every other test in this file. This test compares the two functions to EACH
+        // OTHER, directly, which is what invariant 9 actually claims, across a name that is
+        // exact-bound, one that is wildcard-bound, one that is unbound with no fallback, one
+        // that is unbound with a fallback, and several that fail normalization outright (an
+        // empty string, a bare label, consecutive dots, a leading hyphen) so the INVALID-NAME
+        // arm is exercised too, not only the two valid-name arms the literal-pinned test above
+        // covers.
+        let mut b = ListenerTlsBuilder::new(SEED);
+        b.bind_exact("secure.example.com", stub(ClientAuthKind::Required))
+            .unwrap();
+        b.bind_wildcard("*.other.example.com", stub(ClientAuthKind::None))
+            .unwrap();
+        b.set_fallback(stub(ClientAuthKind::Required));
+        let l = b.build().expect("the lint accepts this configuration");
+
+        let inputs = [
+            "secure.example.com",    // exact hit
+            "A.Secure.Example.COM.", // exact hit, case and trailing dot
+            "sub.other.example.com", // wildcard hit
+            "unbound.example.com",   // miss, falls back
+            "",                      // fails normalization: empty
+            "single",                // valid single label, miss
+            "a..b",                  // fails normalization: empty label
+            "-bad.example.com",      // fails normalization: leading hyphen
+        ];
+        for name in inputs {
+            let expected = l
+                .resolve_by_name(name)
+                .map_or(ClientAuthKind::None, |c| c.client_auth());
+            assert_eq!(
+                l.client_auth_for_name(name),
+                expected,
+                "invariant 9 violated for {name:?}: client_auth_for_name and resolve_by_name \
+                 disagree on which binding this name selects"
+            );
+        }
     }
 
     #[test]
@@ -1266,6 +1474,28 @@ mod tests {
         assert_eq!(l.stats().exact_hits.load(Ordering::Relaxed), 0);
         assert_eq!(l.stats().policy_miss.load(Ordering::Relaxed), 0);
         assert_eq!(l.stats().invalid_sni.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn max_client_hello_bytes_is_clamped() {
+        // The only two call sites in this crate's own test suite that pass a value to
+        // `set_max_client_hello_bytes` both pass 4_096, which is the floor: a clamped and an
+        // unclamped implementation are indistinguishable there. This test passes both an
+        // out-of-range low value and an out-of-range high value and checks the CLAMPED result,
+        // which an implementation that dropped the clamp entirely cannot produce.
+        let mut low = ListenerTlsBuilder::new(SEED);
+        low.bind_exact("a.example.com", stub(ClientAuthKind::None))
+            .unwrap();
+        low.set_max_client_hello_bytes(0);
+        let l_low = low.build().expect("valid listener");
+        assert_eq!(l_low.max_client_hello_bytes(), 4_096);
+
+        let mut high = ListenerTlsBuilder::new(SEED);
+        high.bind_exact("a.example.com", stub(ClientAuthKind::None))
+            .unwrap();
+        high.set_max_client_hello_bytes(usize::MAX);
+        let l_high = high.build().expect("valid listener");
+        assert_eq!(l_high.max_client_hello_bytes(), 65_536);
     }
 
     #[test]
@@ -1490,6 +1720,31 @@ mod acceptor_tests {
         };
         assert_eq!(reason, RejectReason::NoPolicyForName);
     }
+
+    #[test]
+    fn no_sni_does_not_inherit_fallback() {
+        // Invariant 3: no SNI must reject unless a no-SNI policy is EXPLICITLY configured, even
+        // when a fallback exists for a different purpose (serving an unmatched-but-present SNI).
+        // The other no-SNI fixtures in this crate all omit the fallback too, so none of them can
+        // tell `self.listener.no_sni` apart from `self.listener.no_sni.or(self.listener.fallback)`
+        // (Traefik's inherit-a-laxer-default shape). This one sets a fallback and leaves no_sni
+        // unset, which is the one configuration that can.
+        let mut b = ListenerTlsBuilder::new(SEED);
+        b.bind_exact("a.example.com", stub(ClientAuthKind::None))
+            .unwrap();
+        b.set_fallback(stub(ClientAuthKind::None));
+        let l = Arc::new(b.build().expect("fallback alone is a valid configuration"));
+
+        let hello = client_hello_bytes(None);
+        let step = l.acceptor().feed(&hello);
+        let AcceptStep::Reject { reason, .. } = step else {
+            panic!(
+                "no SNI must not inherit the fallback policy even though one is configured, got \
+                 {step:?}"
+            );
+        };
+        assert_eq!(reason, RejectReason::NoSniPolicy);
+    }
 }
 
 /// Fixtures shared by the acceptor tests and the property test.
@@ -1647,7 +1902,10 @@ mod agreement_property {
     }
 
     proptest! {
-        #![proptest_config(ProptestConfig::with_cases(64))]
+        // Issue #119's own acceptance criteria require at least 256 cases for this property; it
+        // is the headline invariant-1 proof for four CVEs. Measured: 64 cases ran in 0.10s, so
+        // 256 costs about 0.4s, which is not a reason to under-run the mandated budget.
+        #![proptest_config(ProptestConfig::with_cases(256))]
 
         #[test]
         fn prop_policy_and_cert_resolution_agree(
