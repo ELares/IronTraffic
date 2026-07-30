@@ -795,6 +795,27 @@ mod tests {
     }
 
     #[test]
+    fn verify_rejects_jump_to_exactly_len() {
+        // Issue #758 finding 6: the exact boundary `target == ops.len()` was
+        // never exercised by any test (`verify_rejects_out_of_range_jump`
+        // above uses `Jump(5)` against `len == 2`, well past the boundary,
+        // so it is caught the same way by both `target >= len` and the
+        // off-by-one `target > len`). `Jump(2)` in this two-op program names
+        // a target equal to `len`, which is one past the last valid index
+        // (index 1, `Ret`) and must be rejected.
+        let ops = vec![Op::Jump(2), Op::Ret];
+        let err = verify(&ops, &[], &empty_slots(), 0, &limits()).unwrap_err();
+        assert_eq!(
+            err,
+            VerifyError::JumpOutOfRange {
+                at: 0,
+                target: 2,
+                len: 2
+            }
+        );
+    }
+
+    #[test]
     fn verify_rejects_missing_ret() {
         // Test 20 / edge case 18: the array does not end with `Ret`.
         let ops = vec![Op::LoadConst(0), Op::LoadConst(0), Op::Eq];
@@ -976,8 +997,21 @@ mod tests {
     /// below actually exercises `verify`'s accept path, not just its
     /// total-function guarantee. Chains 1 to 4 comparisons with `&&`, mirroring
     /// `crate::compile`'s own `and_chain_lowering` shape.
+    ///
+    /// Half the draws (`with_dead_code`) prepend an UNREACHABLE island: an
+    /// unconditional forward `Jump` that skips over a `Jump` targeting index
+    /// 0, a genuine backward jump by any textual definition. This is issue
+    /// #758 finding 4's fix: the generator used to be structurally incapable
+    /// of expressing the one shape edge case 22 exists for (unreachable code
+    /// containing what would be a totality violation if it ever ran), which
+    /// is exactly why `prop_verified_programs_have_only_forward_jumps` below
+    /// could never fail for any implementation of `verify`, correct or not.
+    /// `verify` must still return `Ok` for the whole program (the dead
+    /// island is never reached, so none of its instructions are checked at
+    /// all, backward jump included), and the restated property below is
+    /// scoped to REACHABLE jumps for exactly that reason.
     fn arb_and_chain() -> impl Strategy<Value = Vec<Op>> {
-        (1usize..=4).prop_map(|n| {
+        ((1usize..=4), any::<bool>()).prop_map(|(n, with_dead_code)| {
             let mut code = Vec::new();
             let mut holes = Vec::new();
             for k in 0..n {
@@ -996,8 +1030,56 @@ mod tests {
                     *t = ret_at;
                 }
             }
-            code
+            if with_dead_code {
+                let mut prefixed = vec![Op::Jump(2), Op::Jump(0)];
+                prefixed.extend(code.into_iter().map(|op| shift_target(op, 2)));
+                prefixed
+            } else {
+                code
+            }
         })
+    }
+
+    /// Adds `by` to a jump op's target, unchanged otherwise. Used only to
+    /// re-base `arb_and_chain`'s hand-built chain after prepending a fixed
+    /// number of instructions ahead of it.
+    fn shift_target(op: Op, by: u16) -> Op {
+        match op {
+            Op::Jump(t) => Op::Jump(t.saturating_add(by)),
+            Op::JumpIfFalse(t) => Op::JumpIfFalse(t.saturating_add(by)),
+            Op::JumpIfTrue(t) => Op::JumpIfTrue(t.saturating_add(by)),
+            Op::BranchIfFalse(t) => Op::BranchIfFalse(t.saturating_add(by)),
+            other => other,
+        }
+    }
+
+    /// The set of instruction indices reachable from index 0 by the same
+    /// control-flow rules `verify` itself follows (forward fall-through for
+    /// every non-jump op and for a conditional jump's fall-through side;
+    /// the target for every jump; no fall-through past an unconditional
+    /// `Jump` or a `Ret`). Independent of `verify`'s own implementation: it
+    /// exists so `prop_verified_programs_have_only_forward_jumps` can state
+    /// the totality property over the same "reachable" the verifier's
+    /// unreachable-code skip (edge case 22) is defined against, without
+    /// asserting anything by calling back into the function under test.
+    fn reachable_indices(ops: &[Op]) -> std::collections::HashSet<usize> {
+        let mut reachable = std::collections::HashSet::new();
+        let mut frontier = vec![0usize];
+        while let Some(i) = frontier.pop() {
+            if i >= ops.len() || !reachable.insert(i) {
+                continue;
+            }
+            match ops[i] {
+                Op::Jump(t) => frontier.push(usize::from(t)),
+                Op::JumpIfFalse(t) | Op::JumpIfTrue(t) | Op::BranchIfFalse(t) => {
+                    frontier.push(usize::from(t));
+                    frontier.push(i + 1);
+                }
+                Op::Ret => {}
+                _ => frontier.push(i + 1),
+            }
+        }
+        reachable
     }
 
     proptest! {
@@ -1009,6 +1091,9 @@ mod tests {
             // no dependency on `crate::compile`, so it cannot call `compile`
             // itself; `compile.rs`'s own `prop_compiler_output_always_verifies`
             // is the one that feeds real compiler output through `verify`).
+            // This must hold for BOTH shapes `arb_and_chain` now draws: the
+            // dead-code island is unreachable, so `verify` must accept it
+            // exactly as `verify_allows_unreachable_code` does by hand.
             let consts = vec![Const::Bool(true)];
             let slots = vec![AttrRef::Scalar(AttrId::RequestPort)];
             let result = verify(&ops, &consts, &slots, 0, &limits());
@@ -1017,14 +1102,25 @@ mod tests {
 
         #[test]
         fn prop_verified_programs_have_only_forward_jumps(ops in arb_and_chain()) {
-            // Test 30: the totality property stated directly. Every jump `verify`
-            // accepted must target strictly past its own index.
+            // Test 30, restated over REACHABLE jumps only (issue #758 finding
+            // 4): the totality argument is about instructions that can ever
+            // execute, and `verify` itself never checks an unreachable one
+            // (edge case 22). Stated over EVERY jump regardless of
+            // reachability, this property is false of the shipped
+            // implementation (a hand-built `[Jump(2), Jump(0), LoadConst(0),
+            // Ret]` verifies `Ok` and contains a backward jump at an
+            // unreachable index), and until `arb_and_chain` could draw dead
+            // code at all, no generator ever surfaced that.
             let consts = vec![Const::Bool(true)];
             let slots = vec![AttrRef::Scalar(AttrId::RequestPort)];
             if verify(&ops, &consts, &slots, 0, &limits()).is_ok() {
+                let reachable = reachable_indices(&ops);
                 for (i, op) in ops.iter().enumerate() {
+                    if !reachable.contains(&i) {
+                        continue;
+                    }
                     if let Op::Jump(t) | Op::JumpIfFalse(t) | Op::JumpIfTrue(t) | Op::BranchIfFalse(t) = *op {
-                        prop_assert!(usize::from(t) > i, "jump at {i} targets {t}, not strictly forward");
+                        prop_assert!(usize::from(t) > i, "reachable jump at {i} targets {t}, not strictly forward");
                     }
                 }
             }
@@ -1032,7 +1128,7 @@ mod tests {
 
         #[test]
         fn prop_verify_never_panics(
-            ops in proptest::collection::vec(arb_op(), 0..24),
+            ops in arb_ops_ending_in_ret(),
             n_consts in 0usize..6,
             n_slots in 0usize..4,
             n_regexes in 0usize..3,
@@ -1078,58 +1174,101 @@ mod tests {
         ]
     }
 
+    /// `arb_op`'s corpus with a mandatory trailing `Op::Ret` (issue #758
+    /// finding 5). Before this fix, `prop_verify_never_panics` drew a fully
+    /// uniform `Vec<Op>` and 243 of 256 draws (measured) were rejected by
+    /// `verify`'s VERY FIRST check, `ops.last() != Some(&Op::Ret)`, before a
+    /// single instruction was examined: the property's own guard
+    /// (`prop_generator_reaches_verify_ok`) asserted a floor on the REJECTED
+    /// fraction, which that 95%-die-at-`MissingRet` outcome trivially
+    /// satisfies while proving nothing about whether the corpus ever reaches
+    /// `check_operand`, `effect`, or `merge`. Appending `Ret` unconditionally
+    /// gets every draw past `MissingRet` by construction, so the remaining
+    /// (still mostly-invalid) content is what `verify`'s instruction loop
+    /// actually evaluates.
+    fn arb_ops_ending_in_ret() -> impl Strategy<Value = Vec<Op>> {
+        proptest::collection::vec(arb_op(), 0..24).prop_map(|mut ops| {
+            ops.push(Op::Ret);
+            ops
+        })
+    }
+
     /// Measures how `prop_verify_never_panics`'s generator lands, per this
     /// crate's own house lesson (#268/#269) that a property test's generator
     /// reach must be measured, never assumed.
     ///
-    /// MEASURED (this exact loop, run directly): 0 of 256 draws verify `Ok`.
-    /// That is expected, not a defect, and it is the reason
-    /// `prop_verify_never_panics` and this measurement are a DIFFERENT
-    /// property from `prop_compiler_output_always_verifies` /
-    /// `prop_verified_programs_have_only_forward_jumps` above: a fully
-    /// uniform `Vec<Op>` of length 0 to 24 has to satisfy several
-    /// independent, narrow conditions at once to verify (end in `Ret`,
-    /// roughly a 1-in-22 chance on its own, AND have every jump op's target
-    /// land strictly forward and in range), so the compound probability is
-    /// small enough that 256 draws routinely see zero. That is FINE here:
-    /// property 31 is "never panics", which every one of those 256 rejected
-    /// draws already exercises by returning `Err` cleanly rather than
-    /// panicking, and it does not depend on ever reaching `Ok`. The
-    /// generator that DOES need, and has, a measured high accept rate for
-    /// the accept-path properties is `arb_and_chain` above, at 100% (traced
-    /// and asserted by `prop_compiler_output_always_verifies`, which uses
-    /// only well-formed output). Asserting `err` stays high (rather than an
-    /// `ok` floor this generator cannot meet) is what would catch this
-    /// specific generator drifting to produce mostly `Ok`s instead, which
-    /// would be the mirror-image regression: a "never panics" fuzz property
-    /// silently degrading into a second, redundant, and less honest copy of
-    /// the accept-path property.
+    /// This replaces the PREVIOUS version of this measurement (issue #758
+    /// finding 5), which asserted a floor on the fraction of draws `verify`
+    /// REJECTED. That assertion was satisfied at 256/256 by draws dying at
+    /// `MissingRet` before the instruction loop ever ran, so it reported
+    /// "the generator is healthy" while measuring nothing about how deep
+    /// into `verify` the corpus penetrates: a generator that regressed to
+    /// producing only empty vectors would have scored the same 100%.
+    ///
+    /// `arb_ops_ending_in_ret` guarantees every draw is past `MissingRet`, so
+    /// "reaches the instruction loop" is now trivially 100% by construction:
+    /// even the degenerate `[Ret]` array enters `verify`'s `for` loop, for
+    /// one iteration. Asserting a floor on THAT would repeat the exact
+    /// mistake this fix closes (a floor on a fixture-guaranteed quantity), so
+    /// what this measures and asserts a floor on instead is the next real
+    /// threshold: the fraction of draws whose BODY (everything before the
+    /// mandatory trailing `Ret`) is non-empty, i.e. that give the loop more
+    /// than the single trivial `Ret` instruction to run `check_operand`,
+    /// `effect` and `merge` against. It also reports, as a loose ceiling
+    /// rather than the old floor-on-reject framing, how many still reach a
+    /// full `Ok` (still expected to stay rare even now the corpus reaches
+    /// the loop: every jump op's target also has to land strictly forward
+    /// and in range against tables this small). MEASURED (this exact loop,
+    /// run directly, several times): 256/256 draws have a non-empty body,
+    /// 0/256 reach `Ok`.
     #[test]
-    fn prop_generator_reaches_verify_ok() {
+    fn prop_generator_reaches_verify_loop_body() {
         use proptest::strategy::ValueTree as _;
 
         let mut runner = proptest::test_runner::TestRunner::new(ProptestConfig::with_cases(256));
-        let strategy = proptest::collection::vec(arb_op(), 0..24);
+        let strategy = arb_ops_ending_in_ret();
+        let mut ends_in_ret = 0u32;
+        let mut reached_loop_body = 0u32;
         let mut ok = 0u32;
-        let mut err = 0u32;
+        let mut total = 0u32;
         for _ in 0..256 {
             let Ok(tree) = strategy.new_tree(&mut runner) else {
                 continue;
             };
             let ops = tree.current();
+            total += 1;
+            if ops.last() == Some(&Op::Ret) {
+                ends_in_ret += 1;
+            }
+            if ops.len() > 1 {
+                reached_loop_body += 1;
+            }
             let consts = vec![Const::Bool(true); 4];
             let slots = vec![AttrRef::Scalar(AttrId::RequestPort); 2];
-            match verify(&ops, &consts, &slots, 2, &limits()) {
-                Ok(_) => ok += 1,
-                Err(_) => err += 1,
+            if verify(&ops, &consts, &slots, 2, &limits()).is_ok() {
+                ok += 1;
             }
         }
-        assert_eq!(ok + err, 256);
+        assert_eq!(total, 256);
+        // Guaranteed by construction, not merely measured: confirms the fix
+        // is actually in place. A tautological check like this earns its
+        // keep as a smoke assertion precisely because the property it
+        // guards (`prop_verify_never_panics`'s generator reaching the loop
+        // at all) depends on it holding.
+        assert_eq!(
+            ends_in_ret, 256,
+            "arb_ops_ending_in_ret must always end in Ret"
+        );
         assert!(
-            err * 4 >= 256 * 3,
-            "expected the large majority of fully arbitrary programs to be \
-             rejected (measured 256/256 in development), got {err}/256 \
-             rejected ({ok} accepted)"
+            reached_loop_body * 10 >= total * 9,
+            "expected at least 90% of draws to present verify's instruction \
+             loop with a non-empty body, got {reached_loop_body}/{total}"
+        );
+        assert!(
+            ok * 20 <= total,
+            "expected fewer than 5% of arbitrary programs to verify Ok even \
+             once past MissingRet (measured 0/256 in development), got \
+             {ok}/{total}"
         );
     }
 
@@ -1255,6 +1394,192 @@ mod tests {
             first_get.content_hash(),
             second_get.content_hash(),
             "two different (from, len) ranges naming the same bytes must hash the same"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // content_hash: one isolating test per specified input (issue #758
+    // finding 8). `content_hash_discriminates` in `compile.rs` only ever
+    // varies a string constant, so it cannot tell "the hash reads this
+    // field" apart from "the two programs would have differed anyway" for
+    // any of the five inputs below; each test here holds every OTHER field
+    // identical between two `Program`s and varies exactly one.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn content_hash_reads_op_operands() {
+        // Isolates `encode_op`'s operand encoding: both programs share the
+        // IDENTICAL const table `[Int(1), Int(2)]` and differ only in which
+        // index their one `LoadConst` names. A mutant that drops the
+        // operand from `encode_op` (down to `[tag, 0, 0, 0]`) makes
+        // `LoadConst(0)` and `LoadConst(1)` hash identically, and every
+        // other field here already matches, so only that mutation could
+        // make this assertion fail.
+        let consts = vec![Const::Int(1), Const::Int(2)];
+        let program_a = Program::from_parts(
+            vec![Op::LoadConst(0), Op::Ret],
+            consts.clone(),
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            Ty::Bool,
+            Phase::RequestHeaders,
+            1,
+        );
+        let program_b = Program::from_parts(
+            vec![Op::LoadConst(1), Op::Ret],
+            consts,
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            Ty::Bool,
+            Phase::RequestHeaders,
+            1,
+        );
+        assert_ne!(
+            program_a.content_hash(),
+            program_b.content_hash(),
+            "two LoadConst operands naming different constants must hash differently"
+        );
+    }
+
+    #[test]
+    fn content_hash_reads_regex_patterns() {
+        // Isolates the `regexes` feed: identical ops/slots/consts/strings,
+        // differing only in the compiled regex's PATTERN text. The pattern
+        // lives only in the regex table (never as a `Const`), so this is
+        // the field content_hash_discriminates's own string-constant
+        // isolation cannot reach.
+        let regex_a = regex::bytes::Regex::new("^/a").expect("valid pattern");
+        let regex_b = regex::bytes::Regex::new("^/b").expect("valid pattern");
+        let program_a = Program::from_parts(
+            vec![Op::LoadAttr(0), Op::RegexMatch(0), Op::Ret],
+            vec![],
+            vec![],
+            vec![],
+            vec![AttrRef::Scalar(AttrId::RequestPath)],
+            vec![regex_a],
+            Ty::Bool,
+            Phase::RequestHeaders,
+            1,
+        );
+        let program_b = Program::from_parts(
+            vec![Op::LoadAttr(0), Op::RegexMatch(0), Op::Ret],
+            vec![],
+            vec![],
+            vec![],
+            vec![AttrRef::Scalar(AttrId::RequestPath)],
+            vec![regex_b],
+            Ty::Bool,
+            Phase::RequestHeaders,
+            1,
+        );
+        assert_ne!(
+            program_a.content_hash(),
+            program_b.content_hash(),
+            "two regex tables differing only in pattern text must hash differently"
+        );
+    }
+
+    #[test]
+    fn content_hash_reads_slots() {
+        // Isolates the `slots` feed: identical ops/consts/strings/regexes,
+        // differing only in which attribute the one slot names. Both
+        // programs' `ops()` are byte-identical (`LoadAttr(0)`), which is
+        // exactly the case the PR's own probe found: two policies whose
+        // bytecode is identical and differ ONLY in slots.
+        let program_a = Program::from_parts(
+            vec![Op::LoadAttr(0), Op::Ret],
+            vec![],
+            vec![],
+            vec![],
+            vec![AttrRef::Scalar(AttrId::RequestMethod)],
+            vec![],
+            Ty::Bool,
+            Phase::RequestHeaders,
+            1,
+        );
+        let program_b = Program::from_parts(
+            vec![Op::LoadAttr(0), Op::Ret],
+            vec![],
+            vec![],
+            vec![],
+            vec![AttrRef::Scalar(AttrId::RequestPath)],
+            vec![],
+            Ty::Bool,
+            Phase::RequestHeaders,
+            1,
+        );
+        assert_ne!(
+            program_a.content_hash(),
+            program_b.content_hash(),
+            "two slot tables naming different attributes must hash differently"
+        );
+    }
+
+    #[test]
+    fn content_hash_reads_phase() {
+        // Isolates `phase`: identical ops/consts/slots/strings/regexes.
+        let program_a = Program::from_parts(
+            vec![Op::Ret],
+            vec![Const::Bool(true)],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            Ty::Bool,
+            Phase::RequestHeaders,
+            0,
+        );
+        let program_b = Program::from_parts(
+            vec![Op::Ret],
+            vec![Const::Bool(true)],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            Ty::Bool,
+            Phase::Log,
+            0,
+        );
+        assert_ne!(
+            program_a.content_hash(),
+            program_b.content_hash(),
+            "two programs differing only in phase must hash differently"
+        );
+    }
+
+    #[test]
+    fn content_hash_reads_result_ty() {
+        // Isolates `result`: identical ops/consts/slots/strings/regexes.
+        let program_a = Program::from_parts(
+            vec![Op::Ret],
+            vec![Const::Bool(true)],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            Ty::Bool,
+            Phase::RequestHeaders,
+            0,
+        );
+        let program_b = Program::from_parts(
+            vec![Op::Ret],
+            vec![Const::Bool(true)],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            Ty::Int,
+            Phase::RequestHeaders,
+            0,
+        );
+        assert_ne!(
+            program_a.content_hash(),
+            program_b.content_hash(),
+            "two programs differing only in result type must hash differently"
         );
     }
 }
