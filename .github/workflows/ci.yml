@@ -1002,6 +1002,18 @@ jobs:
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          # This job holds `contents: write` (needed by the `gh release
+          # create` step below) and, unlike its sibling `shell-selftests`
+          # job, downloads and extracts a third-party archive with `sudo`
+          # before that step runs. A compromised tarball executing in a
+          # context that also holds a repo-rewriting, release-publishing
+          # credential is exactly the shape a supply-chain issue like this
+          # one exists to close off. The `gh release create` step
+          # authenticates via the `GH_TOKEN` environment variable it sets
+          # explicitly, not via a git-credential-helper token this checkout
+          # would otherwise persist, so turning persistence off here costs
+          # that step nothing.
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - name: Install the cross toolchains the three non-native targets need
         # x86_64-unknown-linux-gnu is this runner's own native target and
@@ -1011,7 +1023,18 @@ jobs:
         # linker, and aarch64-unknown-linux-musl has no apt package on this
         # runner at all, so its cross toolchain is downloaded prebuilt from
         # musl.cc, the same community-maintained source most Rust release
-        # workflows targeting this exact combination use.
+        # workflows targeting this exact combination use. That download is
+        # pinned by checksum and verified BEFORE anything extracts or
+        # executes it, unlike every other input to this release (the
+        # rustc toolchain via `rust-toolchain.toml`, every crate via
+        # `Cargo.lock`): musl.cc serves no signature and this project
+        # controls no mirror of it, so a content hash, checked here, is the
+        # floor for a build input this pipeline cannot otherwise pin. The
+        # hash below was computed by downloading the real, current asset
+        # directly (`curl ... | sha256sum`) rather than copied from
+        # anywhere claiming to already be a checksum for it; bumping the
+        # pin (musl.cc updating the file) is a reviewed change, the same
+        # posture `rust-toolchain.toml` takes for the compiler.
         run: |
           set -euo pipefail
           rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu \
@@ -1021,6 +1044,8 @@ jobs:
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
           curl --proto '=https' --tlsv1.2 -fsSL \
             https://musl.cc/aarch64-linux-musl-cross.tgz -o /tmp/aarch64-linux-musl-cross.tgz
+          echo "c909817856d6ceda86aa510894fa3527eac7989f0ef6e87b5721c58737a06c38  /tmp/aarch64-linux-musl-cross.tgz" \
+            | sha256sum -c -
           sudo tar -xzf /tmp/aarch64-linux-musl-cross.tgz -C /opt
           echo "/opt/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc" >> "$GITHUB_ENV"
@@ -1035,14 +1060,37 @@ jobs:
             f="target/$t/release/irontraffic"
             echo "== $t =="
             file "$f"
-            # Classifying "no PT_INTERP program header" does not require
-            # actually EXECUTING the binary, unlike resolving a dynamic
-            # binary's dependencies does, so this is safe to run against
-            # aarch64-unknown-linux-musl on this x86_64 runner too.
-            if ldd "$f" 2>&1 | grep -vq 'not a dynamic executable'; then
-              echo "FAIL: $f is not static. A C dependency entered the tree."
-              ldd "$f" || true
-              exit 1
+            if [ "$t" = "x86_64-unknown-linux-musl" ]; then
+              # Native architecture: this runner's `ldd` genuinely invokes
+              # the dynamic loader against the file, so its verdict is
+              # meaningful here. The pattern matches this repository's own
+              # proven, green `musl` job above verbatim (not the narrower
+              # one this job shipped with): glibc's `ldd` classifies a
+              # static-PIE binary (this project's actual shape; `file`
+              # reports "static-pie linked") as "statically linked", not
+              # "not a dynamic executable", and the narrower pattern would
+              # abort a genuinely static artifact on exactly that wording.
+              if ldd "$f" 2>&1 | grep -vq 'not a dynamic executable\|statically linked'; then
+                echo "FAIL: $f is not static. A C dependency entered the tree."
+                ldd "$f" || true
+                exit 1
+              fi
+            else
+              # Foreign architecture: unlike the native case above, `ldd`
+              # here does not merely read headers, it works by trying to
+              # resolve and invoke the aarch64 dynamic loader, which this
+              # x86_64 runner cannot actually do; its output is therefore
+              # not a reliable verdict at all, and was untested by this
+              # repository until this job's own first tagged run. The
+              # PT_INTERP program header is what a dynamic linker needs to
+              # run a binary in the first place, and its absence is
+              # classifiable by reading the ELF program headers alone,
+              # which needs no execution and no architecture match.
+              if readelf -lW "$f" | grep -q 'INTERP'; then
+                echo "FAIL: $f has a PT_INTERP program header; it is dynamically linked."
+                readelf -lW "$f" || true
+                exit 1
+              fi
             fi
           done
           echo "static: ok"
@@ -1077,5 +1125,14 @@ jobs:
         run: |
           set -euo pipefail
           tag="${GITHUB_REF#refs/tags/}"
-          gh release create "$tag" dist/*.tar.gz dist/SHA256SUMS \
+          # scripts/install.sh is uploaded here too, not only the tarballs and
+          # the checksum manifest: docs/QUICKSTART.md (itself shipped inside
+          # every tarball), docs/RELEASE.md, and install.sh's own header
+          # comment all advertise
+          # ".../releases/latest/download/install.sh" as the one-line
+          # install command, and that URL 404s unless install.sh is itself a
+          # release asset. `gh release create` uploads an asset under its
+          # base filename by default, so `scripts/install.sh` here lands at
+          # exactly the advertised path.
+          gh release create "$tag" dist/*.tar.gz dist/SHA256SUMS scripts/install.sh \
             --title "$tag" --generate-notes
