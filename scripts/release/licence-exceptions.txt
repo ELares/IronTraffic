@@ -1,0 +1,45 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+#
+# Committed exceptions to scripts/release/sbom-licence-check.sh's compound
+# licence rule (edge case 2). That rule requires EVERY disjunct of a
+# compound SPDX expression, e.g. "MIT OR Apache-2.0", to be on deny.toml's
+# allowlist for the component to pass, which is stricter than necessary: a
+# crate genuinely licensed under one clause deny.toml's own SPDX-aware
+# evaluation would accept (cargo-deny passes it as soon as ONE disjunct is
+# allowed) fails this stricter, purely lexical reading. That is the safe
+# direction, and a component that legitimately needs the looser reading gets
+# an explicit entry here instead of silently passing.
+#
+# Format: one exception per line, tab-separated:
+#
+#   <purl>\t<reason of at least 20 characters>
+#
+# <purl> is unversioned (e.g. "pkg:cargo/memchr", never
+# "pkg:cargo/memchr@2.8.3"): an exception is a statement about the CRATE and
+# its declared licence choice, not about one release of it, and requiring an
+# edit here on every patch bump would make the exceptions file churn on
+# events that carry no licence-relevant information. sbom-licence-check.sh
+# matches on this basis.
+#
+# Said plainly, because it is a real scope limit rather than an oversight:
+# matching by crate name, not by the exact expression an entry was written
+# against, means a crate that RELICENSES to something this project would
+# never otherwise allow (e.g. to a copyleft licence) still passes silently
+# until a human notices and tightens or removes the entry; it is not
+# re-checked against the reason each time. Reviewing this file on every
+# dependency bump that touches a listed crate is the mitigation, not a
+# mechanism this script enforces for you.
+#
+# A line with no reason, or a reason shorter than 20 characters, is a parse
+# failure naming the line: an exception without a written reason is a
+# silent acceptance of a looser licence reading, not a reviewed one. Blank
+# lines and lines starting with # are ignored.
+#
+# The three entries below were found by running sbom.sh against this
+# workspace's own real, current dependency closure (control-plane features,
+# the irontraffic binary's real default) and validating the result against
+# deny.toml's allowlist: all three are genuinely reachable from the shipped
+# binary today, not hypothetical.
+pkg:cargo/aho-corasick	Unlicense disjunct is a public-domain dedication; the MIT disjunct alone already satisfies our allowlist
+pkg:cargo/memchr	Unlicense disjunct is a public-domain dedication; the MIT disjunct alone already satisfies our allowlist
+pkg:cargo/ryu	BSL-1.0 disjunct (Boost Software License) is permissive but not yet reviewed; the Apache-2.0 disjunct alone satisfies our allowlist
