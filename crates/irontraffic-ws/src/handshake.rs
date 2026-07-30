@@ -1,6 +1,15 @@
 // SPDX-License-Identifier: MIT OR Apache-2.0
 //! The RFC 6455 HTTP/1.1 handshake.
 //!
+//! HOT PATH
+//!
+//! Marked so `scripts/invariant-lints.sh`'s `hot-path-allocation` rule scans this file. That rule
+//! carries a far wider vocabulary than any hand written gate here could: `with_capacity`,
+//! `Box::pin`, `into_owned`, `to_lowercase`, `push_str`, `repeat`, `join`, `into_boxed_slice`,
+//! `Arc::new` and collect without a turbofish, among others. A review of PR 764 landed sixteen
+//! allocation injections here, and seven of them were caught by nothing in the crate; this marker
+//! is what closes that gap, and it is a stronger mechanism than the one that PR originally added.
+//!
 //! A connection becomes a tunnel only when BOTH directions validate. After a `101`
 //! there is no HTTP framing left, so if the two endpoints did not actually agree that
 //! the framing changed, one of them is parsing WebSocket frames as HTTP requests and an
@@ -247,7 +256,7 @@ pub enum HandshakeError {
     /// NOT `#[from]`: [`irontraffic_http::section::DuplicateField`] deliberately carries
     /// no `Display` or `std::error::Error` impl, matching `RejectReason`'s own D3 rule
     /// in `irontraffic-http/src/error.rs` ("a `Display` impl would put it in reach of
-    /// `format!("{err}")` in a responder"). `thiserror`'s `#[from]` needs the source
+    /// `format!("{err}")` in a responder"). `thiserror`'s `#[from]` needs the source // it-allow: hot-path-allocation reason: prose, not a call. This line NAMES `format!` inside a doc comment explaining why the error type deliberately withholds a Display impl, precisely so no responder can reach for it. The rule is a text scan and cannot tell a mention from an invocation.
     /// type to implement `std::error::Error` to generate `source()`, so that attribute
     /// cannot be used here; the plain [`From`] impl below this enum gives every `?` on
     /// a `get_unique` call the same one-line conversion without it.
@@ -332,7 +341,7 @@ impl core::fmt::Display for HandshakeError {
             HandshakeError::Duplicate(_) => write!(f, "field appeared more than once"),
             // Deliberately does NOT render `reason`. `RejectReason`'s own doc states the
             // rule: it implements neither `Display` nor `std::error::Error` because "a
-            // `Display` impl would put it in reach of `format!(\"{err}\")` in a responder,
+            // `Display` impl would put it in reach of `format!(\"{err}\")` in a responder, // it-allow: hot-path-allocation reason: prose, not a call. This line NAMES `format!` inside a doc comment explaining why the error type deliberately withholds a Display impl, precisely so no responder can reach for it. The rule is a text scan and cannot tell a mention from an invocation.
             // handing an attacker the exact branch that refused their message". This type
             // DOES implement `Display`, and every `HandshakeError` carries a status the
             // caller answers the downstream client with, so it is precisely the value a

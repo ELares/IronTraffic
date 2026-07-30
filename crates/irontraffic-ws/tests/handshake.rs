@@ -994,15 +994,32 @@ fn display_does_not_leak_the_wrapped_reject_reason() {
 /// The measurement #203's Benchmarks section requires: `parse` plus `accept_key` plus
 /// `verify`, over 100,000 iterations, against a 3 microsecond budget.
 ///
-/// #203 says "Not a criterion group. Report in the PR description, from a test-driven
-/// 100,000 iteration measurement". It was never taken, so the budget was unverified and
-/// no timing figure appeared anywhere in the diff. This runs it and asserts the budget,
-/// so the number cannot silently stop being true; the PR description carries the figure.
+/// **There is no wall clock assertion here any more, deliberately.** It asserted a 20
+/// microsecond ceiling and called that "the sign that something is allocating per handshake"
+/// (#203). Measured, it was not that sign: a per handshake allocation of 4 KiB, 64 KiB and 1 MiB
+/// each left it PASSING, against a 15.3 microsecond baseline. What it detected reliably was
+/// scheduler noise, failing CI at 20.051 microseconds and blocking three PRs that do not touch
+/// this crate (#762). Warm up and best of three rounds cut the rate about elevenfold, from 12 in
+/// 130 to 1 in 130 on an idle host, and did essentially nothing under sustained contention, where
+/// both variants failed 20 of 20: a round is about 1.5 seconds, so a disturbance longer than the
+/// three rounds hits all of them and taking the minimum launders nothing.
 ///
-/// The assertion is against the issue's own "something is allocating per handshake"
-/// ceiling of 20 microseconds rather than the 3 microsecond target, because a shared CI
-/// runner under load is not a quiet benchmark host and a tight bound here would be a
-/// flake generator. The measured figure is reported either way.
+/// The property it was standing in for is now asserted where it can actually fail, in
+/// `tests/alloc_gate_handshake.rs`. The same injected allocation fails that gate and passes this
+/// ceiling, which is the whole case for the move. A timing bound still has value as a guard
+/// against a gross regression, and its home is the serialized perf job tracked in #753 alongside
+/// #418, not a binary running in parallel with twenty six sibling tests.
+///
+/// What remains here is the functional half: 100,000 real round trips asserting `parse` and
+/// `verify` keep succeeding at scale.
+///
+/// It does NOT assert `accept_key`, and saying otherwise was a false claim in an earlier version of
+/// this comment. `verify` recomputes `accept_key` internally and compares it against a fixture
+/// header that `accepting_response` also built with `accept_key`, so both sides of the comparison
+/// move together and any deterministic mutation stays self consistent. That is exactly the trap
+/// `accept_key`'s own production doc names: "the bug survives any test that uses the same
+/// implementation on both sides". `rfc_6455_accept_vector` is what actually pins it, against the
+/// RFC 6455 literal.
 #[test]
 fn handshake_round_trip_is_within_the_per_handshake_budget() {
     const ITERATIONS: u32 = 100_000;
@@ -1012,32 +1029,27 @@ fn handshake_round_trip_is_within_the_per_handshake_budget() {
     let headers = accepting_response(&baseline).expect("test fixture response must be valid");
     let htokens = response_tokens(&headers);
 
-    let start = std::time::Instant::now();
-    let mut done: u32 = 0;
+    // `verified` counts SUCCESSFUL ROUND TRIPS, not loop trips. A counter incremented once per
+    // iteration regardless of what the body did would pass with `run_once` gutted, which a review
+    // demonstrated against the previous version of this test.
+    let mut verified: u32 = 0;
     for _ in 0..ITERATIONS {
         let parsed = UpgradeRequest::parse(&req, tokens).unwrap().unwrap();
         let accept = accept_key(parsed.key_b64());
         std::hint::black_box(&accept);
-        let verified = UpgradeResponse::verify(&parsed, 101, &headers, htokens).unwrap();
-        std::hint::black_box(&verified);
-        done += 1;
+        if UpgradeResponse::verify(&parsed, 101, &headers, htokens).is_ok() {
+            verified += 1;
+        }
     }
-    let per_iter = start.elapsed() / ITERATIONS;
 
-    // Pinned to a literal, not to ITERATIONS, so emptying the loop fails rather than
-    // dividing by a smaller number and passing. This is the tautology shape that has
-    // bitten this corpus repeatedly.
+    // Pinned to a LITERAL, not to `ITERATIONS`, so emptying the loop fails rather than comparing
+    // a smaller number to itself and passing.
     assert_eq!(
-        done, 100_000,
-        "every iteration must run; emptying the loop must FAIL this test"
-    );
-    // The corpus denies `println!` in tests, so the figure rides on the assertion
-    // message instead of a bare print: it is visible exactly when it matters.
-    assert!(
-        per_iter < std::time::Duration::from_micros(20),
-        "parse + accept_key + verify measured {per_iter:?} per handshake over \
-         {ITERATIONS} iterations, above the 20 microsecond ceiling #203 calls the \
-         sign that something is allocating per handshake"
+        verified, 100_000,
+        "every round trip must parse and verify; emptying the loop or breaking either must FAIL \
+         this test. NOT accept_key: verify recomputes it and compares against a fixture built the \
+         same way, so both sides move together. rfc_6455_accept_vector pins that against the RFC \
+         literal"
     );
 }
 
