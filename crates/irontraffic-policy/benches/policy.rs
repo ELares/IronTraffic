@@ -9,8 +9,10 @@ use criterion::{Criterion, Throughput, criterion_group, criterion_main};
 use irontraffic_filter::Phase;
 use irontraffic_policy::PolicyLimits;
 use irontraffic_policy::check::check;
+use irontraffic_policy::compile::compile;
 use irontraffic_policy::lex::lex;
 use irontraffic_policy::parse::parse;
+use irontraffic_policy::program::verify;
 
 fn bench_two_clause_predicate(c: &mut Criterion) {
     let src = b"request.path.startsWith(\"/v1/\") && request.method == \"GET\"";
@@ -138,6 +140,100 @@ fn bench_check_64_clause_predicate(c: &mut Criterion) {
     });
 }
 
+fn bench_compile_two_clause_predicate(c: &mut Criterion) {
+    // Config-plane budget: under 5 microseconds, against `cel`'s measured
+    // 12,185.5 ns to compile the same predicate.
+    let src = b"request.path.startsWith(\"/v1/\") && request.method == \"GET\"";
+    let limits = PolicyLimits::defaults();
+    let Ok(toks) = lex(src, &limits) else {
+        return;
+    };
+    let Ok(ast) = parse(&toks, src, &limits) else {
+        return;
+    };
+    let Ok(checked) = check(
+        ast,
+        &mut toks.strings.clone(),
+        src,
+        Phase::RequestHeaders,
+        &limits,
+    ) else {
+        return;
+    };
+    c.bench_function("compile/two_clause_predicate", |b| {
+        b.iter(|| {
+            let _ = compile(&checked, &limits);
+        });
+    });
+}
+
+fn bench_compile_with_one_regex(c: &mut Criterion) {
+    // Config-plane budget: under 500 microseconds, dominated by `regex`.
+    let src = br#"request.path.matches("^/v[0-9]+/[a-zA-Z0-9_-]+$")"#;
+    let limits = PolicyLimits::defaults();
+    let Ok(toks) = lex(src, &limits) else {
+        return;
+    };
+    let Ok(ast) = parse(&toks, src, &limits) else {
+        return;
+    };
+    let Ok(checked) = check(
+        ast,
+        &mut toks.strings.clone(),
+        src,
+        Phase::RequestHeaders,
+        &limits,
+    ) else {
+        return;
+    };
+    c.bench_function("compile/with_one_regex", |b| {
+        b.iter(|| {
+            let _ = compile(&checked, &limits);
+        });
+    });
+}
+
+fn bench_verify_256_ops(c: &mut Criterion) {
+    // Config-plane budget: under 10 microseconds. 64 `&&`-joined comparisons
+    // over the same attribute, which compiles to exactly the default
+    // `max_ops` of 256 (64 clauses of `LoadAttr, LoadConst, Eq` plus 63
+    // `JumpIfFalse` plus `Ret`).
+    let mut clauses = Vec::with_capacity(64);
+    for i in 0..64 {
+        clauses.push(format!("request.size == {i}"));
+    }
+    let src = clauses.join(" && ");
+    let mut limits = PolicyLimits::defaults();
+    limits.max_tokens = 2048;
+    let Ok(toks) = lex(src.as_bytes(), &limits) else {
+        return;
+    };
+    let Ok(ast) = parse(&toks, src.as_bytes(), &limits) else {
+        return;
+    };
+    let Ok(checked) = check(
+        ast,
+        &mut toks.strings.clone(),
+        src.as_bytes(),
+        Phase::RequestHeaders,
+        &limits,
+    ) else {
+        return;
+    };
+    let Ok(program) = compile(&checked, &limits) else {
+        return;
+    };
+    let ops = program.ops().to_vec();
+    let consts = program.consts().to_vec();
+    let slots = program.slots().to_vec();
+    let regex_count = program.regex_count();
+    c.bench_function("verify/256_ops", |b| {
+        b.iter(|| {
+            let _ = verify(&ops, &consts, &slots, regex_count, &limits);
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_two_clause_predicate,
@@ -145,6 +241,9 @@ criterion_group!(
     bench_parse_two_clause_predicate,
     bench_parse_64_clause_predicate,
     bench_check_two_clause_predicate,
-    bench_check_64_clause_predicate
+    bench_check_64_clause_predicate,
+    bench_compile_two_clause_predicate,
+    bench_compile_with_one_regex,
+    bench_verify_256_ops
 );
 criterion_main!(benches);
