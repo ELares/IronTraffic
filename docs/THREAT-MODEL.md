@@ -2057,10 +2057,44 @@ nothing about the identity of who produced the artifact.** `SHA256SUMS` is serve
 release host as the tarball it accompanies. Anyone able to serve a modified tarball is equally able
 to serve a `SHA256SUMS` that matches it, so a passing checksum rules out corruption in transit and
 rules out nothing about provenance. `scripts/install.sh` prints exactly the sentence `checksum
-verified (integrity only; signature verification lands in the next release)` rather than the bare
-word "verified", and `docs/RELEASE.md` records the same thing. Signature verification is added by
-`{{release-sbom-signing-and-provenance}}` and becomes the installer's default there; until it lands,
-this checksum is the floor, not the ceiling.
+verified (integrity only)` rather than the bare word "verified", and `docs/RELEASE.md` records the
+same thing. The checksum is the floor; what closes the provenance gap is the signature and
+attestation below, which `scripts/install.sh` verifies by default as of
+`{{release-sbom-signing-and-provenance}}`.
+
+**What a keyless signature proves, and what it does not.** A `cosign verify-blob` check against a
+pinned `--certificate-identity-regexp` and `--certificate-oidc-issuer` proves that a short-lived
+Fulcio certificate, issued to the specific identity `ci.yml@refs/tags/v*` running as this
+repository, signed these exact bytes, and that the signature is recorded in a public transparency
+log. It proves this project's own release workflow produced the artifact; it does not, by itself,
+prove which commit, which inputs, or which dependency graph that workflow used. **A verification that
+omits either pin accepts a signature from anyone**: dropping `--certificate-identity-regexp` accepts
+a certificate issued to any identity at all, and dropping `--certificate-oidc-issuer` accepts a
+certificate from any OIDC issuer Fulcio trusts, not only GitHub's. This is documented as the single
+most common mistake with this tooling and is asserted directly by a negative test
+(`scripts/release/supply-chain-selftest.sh`'s `verify_fails_without_identity_pin`).
+
+**What an in-toto build provenance attestation proves, and what it does not.** `cosign
+verify-blob-attestation` checks a DSSE-enveloped statement whose subject is the artifact's own sha256
+digest and whose predicate names the source commit, the workflow file's own digest, the builder
+identity, the build's invocation parameters (target, feature set, `SOURCE_DATE_EPOCH`), and the
+resolved dependency digest (`sha256(Cargo.lock)`). It proves which commit and which inputs a
+CI-produced artifact claims to come from; it does not, by itself, prove that commit actually produces
+these bytes. `scripts/release/verify-repro.sh` is what makes that second claim independently
+checkable, by rebuilding the named commit and comparing digests: provenance names a commit,
+reproduction proves the commit produces the artifact, and these are two different claims of two
+different strengths. See `docs/SUPPLY-CHAIN.md`.
+
+**A skipped check is a failure, not a pass.** `scripts/release/verify.sh` exits nonzero whenever a
+check it was asked to perform (checksum, signature, provenance by default) could not be performed at
+all, for instance because the transparency log was unreachable, rather than reporting it as skipped
+and exiting 0. The obvious alternative, "verify what you can and report the rest as skipped", is
+rejected deliberately: the party best placed to serve a modified artifact is usually also placed to
+make the transparency log unreachable, so treating an unreachable check as a pass hands that party
+exactly the outcome it wants. `--allow-skipped` is the explicit, printed downgrade for a genuinely
+air-gapped user with only a checksum to go on; `scripts/install.sh` never passes it, and always
+invokes `verify.sh --strict`, so an install with a check it cannot perform is refused, not warned
+about and allowed through.
 
 **The five things a piped shell script must do, and why each, restated from `docs/RELEASE.md` because
 this is where the resulting risk is analyzed rather than where the mechanism is described:**
@@ -2115,10 +2149,14 @@ same-filesystem regardless of where the platform's temporary directory happens t
 staged file is removed on every exit path, including an interrupted one, by the same cleanup `trap`
 that removes the working directory.
 
-**What a reader is explicitly NOT protected against by this script alone:** a compromise of the
-release host itself (which could serve a matching tarball and `SHA256SUMS` pair for a malicious
-binary, the exact limit the first paragraph states), and a compromise of the build environment that
-produced a tarball before it was ever uploaded. `scripts/release/verify-repro.sh` existing at all is
-what makes the second one, in principle, independently checkable by a third party; a signature over
-the resulting artifact, from `{{release-sbom-signing-and-provenance}}`, is what closes the first one,
-and this project does not yet ship one.
+**What a reader is explicitly NOT protected against, even with signature verification on:** a
+compromise of the Sigstore public-good transparency log's own root of trust (out of this project's
+control by design; keyless signing exists precisely so this project holds no long-lived key an
+attacker could instead steal), a build environment compromised WHILE this project's own release
+workflow is running with a real, legitimately-issued certificate (the certificate proves the identity
+that ran, not that the identity was not itself compromised at that moment), and a compromise that
+happens before a commit is ever pushed (the attestation names a commit faithfully; it says nothing
+about whether that commit's own source is trustworthy). `scripts/release/verify-repro.sh` is what
+makes the build environment's own output independently re-derivable by a third party, which is the
+remaining, complementary check: verification proves this project produced the artifact from a stated
+commit, and reproduction proves that commit produces the artifact.

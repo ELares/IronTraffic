@@ -142,9 +142,12 @@ carry the output path's basename into the compressed bytes.
 `SHA256SUMS` is fetched from the same origin as the tarball it accompanies. Anyone who can serve a
 modified tarball can serve a matching `SHA256SUMS`, so it proves the transfer was not corrupted and
 proves nothing about who produced the artifact. `scripts/install.sh` prints exactly that sentence,
-`checksum verified (integrity only; signature verification lands in the next release)`, rather than
-the word "verified" alone, and `docs/THREAT-MODEL.md` records the same thing. Signature verification
-arrives with `{{release-sbom-signing-and-provenance}}` and becomes the default there.
+`checksum verified (integrity only)`, rather than the word "verified" alone, and
+`docs/THREAT-MODEL.md` records the same thing. What closes the provenance gap is the signature and
+build provenance attestation `docs/SUPPLY-CHAIN.md` documents in full: a CycloneDX SBOM per artifact,
+a keyless `cosign` signature over every published file, an in-toto attestation naming the source
+commit and builder, and `scripts/release/verify.sh`, which `scripts/install.sh` now runs by default
+before installing anything.
 
 ## Installing
 
@@ -153,9 +156,28 @@ curl -fsSL https://github.com/ELares/IronTraffic/releases/latest/download/instal
 ```
 
 detects the platform, refuses anything outside the four-target matrix by name, downloads the tarball
-and `SHA256SUMS` over TLS 1.2+, verifies the checksum, runs the extracted binary's `--version` before
-moving anything into place, and installs to `$HOME/.local/bin` by default (`--prefix` to override).
-It refuses to run as root unless `IT_ALLOW_ROOT=1`. See `scripts/install.sh --help`.
+and `SHA256SUMS` over TLS 1.2+, verifies the checksum, downloads and runs `scripts/release/verify.sh
+--strict` (signature and build provenance, on by default; see `docs/SUPPLY-CHAIN.md`), runs the
+extracted binary's `--version` before moving anything into place, and installs to `$HOME/.local/bin`
+by default (`--prefix` to override). It refuses to run as root unless `IT_ALLOW_ROOT=1`, and refuses
+to install at all if signature verification fails or could not be performed, unless the explicit,
+warned `--no-verify-signature` opt-out is passed. See `scripts/install.sh --help`.
+
+## Rebuilding and comparing
+
+A signature and a provenance attestation say this project produced an artifact from a stated commit;
+they do not, by themselves, say that commit produces the artifact. `scripts/release/verify-repro.sh`
+is the complementary, stronger check:
+
+```sh
+git checkout <commit named by verify.sh>
+sh scripts/release/verify-repro.sh <target>
+```
+
+It builds the named commit twice, at two different absolute paths, and asserts the two binaries are
+byte-for-byte identical, closing the loop from "we said we built this" to "anyone can rebuild this and
+get the same bytes." See `docs/SUPPLY-CHAIN.md` section 4 for the full command sequence starting from
+a downloaded artifact.
 
 ## What was actually verified, and how
 
