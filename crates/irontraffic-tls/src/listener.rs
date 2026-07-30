@@ -1528,7 +1528,7 @@ pub(crate) mod tests_support {
         b.build().expect("the lint accepts disjoint names")
     }
 
-    /// Real ClientHello bytes. `None` produces a hello with NO server-name extension, which
+    /// Real `ClientHello` bytes. `None` produces a hello with NO server-name extension, which
     /// rustls does for an IP-address server name.
     pub(crate) fn client_hello_bytes(sni: Option<&str>) -> Vec<u8> {
         use std::io::Write as _;
@@ -1587,9 +1587,11 @@ mod agreement_property {
     /// One credential and one configuration per slot, generated once. Keygen is far too slow to
     /// run per proptest case, and the identity of each is what lets the test recover WHICH name
     /// matched on each side.
-    fn pools() -> &'static (Vec<Arc<Credentials>>, Vec<Arc<TlsServerConfig>>) {
-        static POOLS: OnceLock<(Vec<Arc<Credentials>>, Vec<Arc<TlsServerConfig>>)> =
-            OnceLock::new();
+    /// One credential and one configuration per slot.
+    type Pools = (Vec<Arc<Credentials>>, Vec<Arc<TlsServerConfig>>);
+
+    fn pools() -> &'static Pools {
+        static POOLS: OnceLock<Pools> = OnceLock::new();
         POOLS.get_or_init(|| {
             ensure_provider_installed();
             let mut creds = Vec::with_capacity(MAX_NAMES);
