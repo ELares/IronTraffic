@@ -96,6 +96,14 @@ probes per key, the filter is 5,000,000 bytes per generation and 10,000,000 byte
 measured false-positive rate at that sizing is comfortably under 1 in 100,000: a false positive
 costs a legitimate client one extra round trip, nothing more.
 
+**The filter key is the whole PSK identity, not a fixed-length prefix.** `cluster-derived-session-
+ticketer`'s (#120) ticket format is `name_e (16 bytes) || nonce (24 bytes) || ciphertext`, and
+`name_e` is a per-epoch HKDF-derived constant identical for every ticket issued fleet-wide during
+that epoch. Hashing only the first 16 bytes of a PSK identity would therefore key the filter on the
+epoch, not on the individual ticket, denying 0-RTT to nearly every legitimate client after the
+epoch's first request. The filter hashes the entire identity; a minimum-length check on the first
+16 bytes only guards against an identity too short to be a real ticket.
+
 **The memory window is deliberately shorter than the ticket window.** Two generations rotating
 every `replayRotateSecs` (default 3 hours) remember tickets for between one and two rotation
 periods: 3 to 6 hours at the default. A ticket issued by

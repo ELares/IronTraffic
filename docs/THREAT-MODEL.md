@@ -1465,7 +1465,8 @@ single node's replay filter cannot see a ticket replayed to a different node bef
 is known, and no per-process or best-effort cluster mechanism closes that window completely without
 adding a network round trip to the 0-RTT path, which would delete the entire latency benefit 0-RTT
 exists to provide. `crate::replay::EarlyDataFilter` is sized so a legitimate client's false-positive
-cost (one extra round trip) is rare, about 1 in 100,000 at the default capacity, and an adversarial
+cost (one extra round trip) is rare, comfortably under 1 in 100,000 at the default capacity (measured
+under `1e-5`; the derived figure at the blocked layout's parameters is nearer `5e-7`), and an adversarial
 attempt to overfill the filter degrades it toward MORE rejections, never toward accepting a replay
 it would otherwise have caught: fail closed in both the ordinary and the adversarial case.
 
