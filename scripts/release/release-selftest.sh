@@ -200,6 +200,9 @@ stage_fixture_member() {
     mkdir -p "$member_dir/docs"
     cp "$RUST_WORK/target/debug/irontraffic" "$member_dir/irontraffic"
     cp LICENSE "$member_dir/LICENSE"
+    cp LICENSE-APACHE "$member_dir/LICENSE-APACHE"
+    cp LICENSE-MIT "$member_dir/LICENSE-MIT"
+    cp NOTICE "$member_dir/NOTICE"
     cp README.md "$member_dir/README.md"
     cp docs/QUICKSTART.md "$member_dir/docs/QUICKSTART.md"
 }
@@ -297,6 +300,14 @@ RELEASES_DIR="$WORK/releases"
 FIXTURE_VERSION="9.9.9"
 FIXTURE_TARGET="x86_64-unknown-linux-gnu"
 FIXTURE_ASSET="irontraffic-$FIXTURE_VERSION-$FIXTURE_TARGET.tar.gz"
+# Test 9e's own knob: when this file exists, the server sleeps before
+# answering a request for $FIXTURE_ASSET specifically (never for the
+# "latest" redirect or SHA256SUMS), so main() is genuinely in the middle of
+# `fetch_to_file "$tarball_url" ...` (work_dir already created, the trap
+# already registered) when the interrupt arrives, rather than never having
+# entered `main` at all.
+SLOW_ASSET_MARKER="$WORK/slow-asset-marker"
+SLOW_ASSET_DELAY_SECONDS=6
 
 start_test_server() {
     mkdir -p "$CERT_DIR" "$RELEASES_DIR"
@@ -327,6 +338,9 @@ exit 1
 EOF
     chmod +x "$stage/$member/irontraffic"
     cp LICENSE "$stage/$member/LICENSE"
+    cp LICENSE-APACHE "$stage/$member/LICENSE-APACHE"
+    cp LICENSE-MIT "$stage/$member/LICENSE-MIT"
+    cp NOTICE "$stage/$member/NOTICE"
     cp README.md "$stage/$member/README.md"
     cp docs/QUICKSTART.md "$stage/$member/docs/QUICKSTART.md"
 
@@ -337,15 +351,24 @@ EOF
     ( cd "$RELEASES_DIR" && sha256_of "$FIXTURE_ASSET" | awk -v f="$FIXTURE_ASSET" '{print $1"  "f}' > SHA256SUMS )
 
     cat > "$WORK/server.py" <<PYEOF
-import http.server, ssl, sys, os
+import http.server, ssl, sys, os, time
 RELEASES_DIR = "$RELEASES_DIR"
 VERSION = "$FIXTURE_VERSION"
+FIXTURE_ASSET = "$FIXTURE_ASSET"
+SLOW_ASSET_MARKER = "$SLOW_ASSET_MARKER"
+SLOW_ASSET_DELAY_SECONDS = $SLOW_ASSET_DELAY_SECONDS
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def _serve(self, path):
         full = os.path.join(RELEASES_DIR, path)
         if not os.path.isfile(full):
             self.send_response(404); self.end_headers(); return
+        # Test 9e's hook: sleeps before answering, but only for the tarball
+        # asset itself and only while the marker file exists, so every other
+        # request (the "latest" redirect, SHA256SUMS, every other test in
+        # this file) is unaffected.
+        if os.path.basename(path) == FIXTURE_ASSET and os.path.exists(SLOW_ASSET_MARKER):
+            time.sleep(SLOW_ASSET_DELAY_SECONDS)
         data = open(full, "rb").read()
         self.send_response(200)
         self.send_header("Content-Length", str(len(data)))
@@ -466,14 +489,31 @@ echo 0
 EOF
     chmod +x "$fake_id_bin/id"
     set +e
-    out8="$(PATH="$fake_id_bin:$PATH" sh scripts/install.sh --prefix "$WORK/prefix8" 2>&1)"
+    # The no-override arm is pointed at the fixture server too, exactly like
+    # the override arm below it: without a reachable release host, deleting
+    # the root check entirely still leaves this arm exiting nonzero (it
+    # proceeds past the missing check into `resolve_latest_version`, which
+    # fails against the real github.com host for a completely unrelated
+    # reason), so `[ "$status8" -ne 0 ]` alone passed whether or not root was
+    # ever actually refused. Pointing this arm at the fixture too means a
+    # deleted root check now runs the REST of main() successfully against a
+    # server that answers, so it would exit 0 and install a binary, and this
+    # test additionally greps for the refusal message and asserts nothing
+    # was installed, rather than trusting "exited nonzero" to mean "refused
+    # root" on its own.
+    out8="$(PATH="$fake_id_bin:$PATH" CURL_CA_BUNDLE="$CERT_DIR/cert.pem" \
+        IT_RELEASE_BASE_URL="https://localhost:$SERVER_PORT/releases" \
+        sh scripts/install.sh --prefix "$WORK/prefix8" 2>&1)"
     status8=$?
     out8b="$(PATH="$fake_id_bin:$PATH" IT_ALLOW_ROOT=1 CURL_CA_BUNDLE="$CERT_DIR/cert.pem" \
         IT_RELEASE_BASE_URL="https://localhost:$SERVER_PORT/releases" \
         sh scripts/install.sh --prefix "$WORK/prefix8b" 2>&1)"
     status8b=$?
     set -e
-    if [ "$status8" -ne 0 ] && [ "$status8b" -eq 0 ] && [ -e "$WORK/prefix8b/bin/irontraffic" ]; then
+    if [ "$status8" -ne 0 ] \
+        && printf '%s' "$out8" | grep -q "refusing to install as root" \
+        && [ ! -e "$WORK/prefix8/bin/irontraffic" ] \
+        && [ "$status8b" -eq 0 ] && [ -e "$WORK/prefix8b/bin/irontraffic" ]; then
         pass "install_refuses_root"
     else
         fail "install_refuses_root" "no-override exit=$status8 override exit=$status8b: $out8 / $out8b"
@@ -546,8 +586,47 @@ EOF
         prefixU="$WORK/prefix9c-$um"
         rm -rf "$prefixU"
         ( umask "$um"; install_with_server --prefix "$prefixU" >/dev/null 2>&1 )
-        mode="$(stat -f '%Lp' "$prefixU/bin/irontraffic" 2>/dev/null || stat -c '%a' "$prefixU/bin/irontraffic" 2>/dev/null)"
-        [ "$mode" = "755" ] || mode_ok=1
+        # GNU coreutils `stat` first, BSD/macOS `stat -f` second: the reverse
+        # order (BSD form first) is what shipped originally, and on GNU
+        # coreutils `stat -f` means `--file-system` (a different mode
+        # entirely) where `%L` is an unrecognized directive that the default
+        # case in coreutils' own print_statfs prints as a literal `?` WITHOUT
+        # setting the failure flag, so the command exits 0 with output like
+        # "?p" instead of running the `||` fallback at all. On GNU coreutils
+        # (the only platform this project ships for and the only one CI runs
+        # this on) that made this the sole check of invariant 11 fail on a
+        # file that genuinely was 0755. `stat -c` is not a recognized BSD
+        # `stat` option at all (it errors and exits nonzero there), so
+        # leading with it here still falls through to the `-f` form on macOS.
+        # The `case` guard additionally refuses to accept anything that is
+        # not exactly three digits, rather than comparing a possibly-garbled
+        # reading against "755" and trusting a coincidental non-match to mean
+        # "not 755": an empty or non-numeric reading is a broken probe, not
+        # evidence about the file's real mode, and must not silently read as
+        # a passing OR a failing comparison either way without being named.
+        # `|| true` on each probe, unconditionally: this file runs under
+        # `set -eu`, and a bare `x="$(cmd)"` whose `cmd` exits nonzero (which
+        # `stat -c` genuinely does on macOS, an unrecognized option there)
+        # aborts the ENTIRE self-test right here rather than falling through
+        # to try the other form, the same `set -e` hazard this file's own
+        # `fail()` and the SIGINT check above already guard against. Found
+        # the same way: running this file for real on macOS stopped dead at
+        # exactly this line before this guard was added.
+        mode="$(stat -c '%a' "$prefixU/bin/irontraffic" 2>/dev/null || true)"
+        if [ -z "$mode" ]; then
+            mode="$(stat -f '%Lp' "$prefixU/bin/irontraffic" 2>/dev/null || true)"
+        fi
+        case "$mode" in
+            755) : ;;
+            [0-7][0-7][0-7])
+                mode_ok=1
+                printf '       umask %s: mode was %s, not 755\n' "$um" "$mode" >&2
+                ;;
+            *)
+                mode_ok=1
+                printf '       umask %s: stat probe produced no usable mode (got %s)\n' "$um" "$mode" >&2
+                ;;
+        esac
     done
     if [ "$mode_ok" -eq 0 ]; then
         pass "install_sets_mode_regardless_of_umask"
@@ -558,30 +637,135 @@ EOF
     # ------------------------------------------------------------------
     # Test 9e: install_cleans_up_on_interrupt
     # ------------------------------------------------------------------
-    slow_copy="$WORK/install-slow.sh"
-    awk '{print} /^main "\$@"$/{exit}' scripts/install.sh | \
-        sed '$d' > "$slow_copy"
-    { cat "$slow_copy"; echo 'sleep 5 &'; echo 'wait $!'; echo 'main "$@"'; } > "$slow_copy.tmp"
-    mv "$slow_copy.tmp" "$slow_copy"
+    # The previous version of this test appended `sleep 5 &; wait $!` BEFORE
+    # `main "$@"` to a copy of install.sh, so the injected delay ran before
+    # `main` was ever entered: no temporary directory was created, no
+    # download started, and `[ ! -e "$prefixI/bin/irontraffic" ]` held
+    # trivially regardless of whether the trap does anything at all. It also
+    # sent SIGINT to a single PID, not a process group: verified directly
+    # (a `sleep` standing in for `curl`, signaled the same way) that sending
+    # SIGINT to only the shell running a synchronous foreground child leaves
+    # that child running to completion and defers the trap until the child
+    # exits on its own, which is indistinguishable from "the trap never
+    # ran" at the timescale this test checks on.
+    #
+    # Fixed two ways: the delay now lives INSIDE the real download path (the
+    # fixture server, when SLOW_ASSET_MARKER exists, sleeps
+    # SLOW_ASSET_DELAY_SECONDS before answering a request for the tarball
+    # asset specifically), so `main` is genuinely mid-`fetch_to_file`
+    # (`work_dir` already created by `mktemp -d`, the trap already
+    # registered) when the interrupt arrives; and the interrupt is delivered
+    # to the WHOLE process group (`os.killpg`, via a `start_new_session=True`
+    # child), the way an interactive terminal's Ctrl-C reaches the shell and
+    # its foreground child at once, rather than to install.sh's own PID
+    # alone. `mktemp -d` (install.sh's own, argument-less call) is
+    # redirected into an isolated, otherwise-empty directory via a PATH
+    # stub, so "no temporary directory survives" (invariant 12) is checked
+    # by listing it afterward, rather than inferred from "no binary
+    # appeared" alone.
+    #
+    # The stub exists because plain `$TMPDIR` alone is not portable enough
+    # to trust here, verified directly on this development machine: GNU
+    # coreutils' argument-less `mktemp -d` honors `$TMPDIR`, but BSD/macOS's
+    # argument-less form behaves as `-t tmp`, which prefers
+    # `_CS_DARWIN_USER_TEMP_DIR` over `$TMPDIR` and so ignores an exported
+    # `$TMPDIR` entirely (confirmed: `TMPDIR=/tmp/x mktemp -d` still created
+    # its directory under `/var/folders/.../T`, not `/tmp/x`). That would
+    # make a `$TMPDIR`-only isolation directory silently empty regardless of
+    # whether install.sh's cleanup trap runs at all on macOS specifically,
+    # which is exactly the kind of platform-dependent vacuousness this round
+    # is about not shipping again. An explicit `mktemp -d DIR/tmp.XXXXXXXXXX`
+    # template is honored identically by both implementations, which is what
+    # the stub gives install.sh regardless of which `mktemp` is really on
+    # the underlying system.
+    tmp_root_9e="$WORK/tmpdir9e"
+    mkdir -p "$tmp_root_9e"
+    mktemp_stub_bin="$WORK/mktemp-stub-9e"
+    mkdir -p "$mktemp_stub_bin"
+    real_mktemp="$(command -v mktemp)"
+    cat > "$mktemp_stub_bin/mktemp" <<STUBEOF
+#!/bin/sh
+if [ "\$#" -eq 1 ] && [ "\$1" = "-d" ]; then
+    exec "$real_mktemp" -d "\${FORCE_MKTEMP_DIR:?FORCE_MKTEMP_DIR not set}/tmp.XXXXXXXXXX"
+fi
+exec "$real_mktemp" "\$@"
+STUBEOF
+    chmod +x "$mktemp_stub_bin/mktemp"
     prefixI="$WORK/prefix9e"
-    ( CURL_CA_BUNDLE="$CERT_DIR/cert.pem" IT_RELEASE_BASE_URL="https://localhost:$SERVER_PORT/releases" \
-        sh "$slow_copy" --prefix "$prefixI" >"$WORK/9e.log" 2>&1 & echo "$!" > "$WORK/9e.pid" )
-    sleep 1
-    kill -INT "$(cat "$WORK/9e.pid")" 2>/dev/null || true
-    sleep 1
-    survived=0
-    # `if`, not `[ cond ] && survived=1`: under `set -e` a bare `&&` whose
-    # condition is FALSE (the expected, wanted outcome here: no binary was
-    # installed) makes the whole statement's exit status 1 and aborts the
-    # script right here, exactly the `fail()` bug above, just for the
-    # opposite (usually-false) direction. Found the same way.
-    if [ -e "$prefixI/bin/irontraffic" ]; then
-        survived=1
+    : > "$SLOW_ASSET_MARKER"
+
+    # Written to a file with a plain (non-substitution) heredoc, rather than
+    # `... <<'PYEOF'` piped straight into a `$(...)` capture: a multi-line
+    # Python call whose opening paren is not matched by a closing one on the
+    # SAME line (`subprocess.Popen(` below is exactly that) desyncs dash's
+    # and bash's own paren counting for the ENCLOSING `$(...)` boundary when
+    # the heredoc lives inside one, because that counting does not skip
+    # heredoc bodies. Found by bisection: this file failed `sh -n` with
+    # "unexpected EOF while looking for matching" until the heredoc was
+    # pulled out of the substitution entirely. A single-line-balanced-parens
+    # heredoc (this file's own `tar_report="$(python3 ... <<'PYEOF'` above)
+    # does not trip it; a cross-line one does.
+    interrupt_helper="$WORK/interrupt-helper.py"
+    cat > "$interrupt_helper" <<'PYEOF'
+import os
+import signal
+import subprocess
+import sys
+import time
+
+prefix = sys.argv[1]
+proc = subprocess.Popen(
+    ["sh", "scripts/install.sh", "--prefix", prefix],
+    stdout=subprocess.DEVNULL,
+    stderr=subprocess.DEVNULL,
+    start_new_session=True,
+)
+# Long enough to be well past target detection, version resolution, and the
+# start of the tarball fetch (all near-instant against a local fixture), and
+# well short of the fixture server's own artificial delay, so "the process
+# happened to finish on its own before we checked" cannot be mistaken for
+# "the interrupt worked".
+time.sleep(1)
+os.killpg(os.getpgid(proc.pid), signal.SIGINT)
+deadline = time.time() + 3
+exited = False
+while time.time() < deadline:
+    if proc.poll() is not None:
+        exited = True
+        break
+    time.sleep(0.1)
+if not exited:
+    os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+    proc.wait()
+print("exited" if exited else "still_alive")
+PYEOF
+
+    set +e
+    interrupt_report="$(PATH="$mktemp_stub_bin:$PATH" FORCE_MKTEMP_DIR="$tmp_root_9e" \
+        CURL_CA_BUNDLE="$CERT_DIR/cert.pem" \
+        IT_RELEASE_BASE_URL="https://localhost:$SERVER_PORT/releases" \
+        python3 "$interrupt_helper" "$prefixI")"
+    set -e
+    rm -f "$SLOW_ASSET_MARKER"
+
+    interrupt_ok=1
+    if [ "$interrupt_report" != "exited" ]; then
+        interrupt_ok=0
+        printf '       process group did not exit within 3s of SIGINT (report: %s)\n' "$interrupt_report" >&2
     fi
-    if [ "$survived" -eq 0 ]; then
+    if [ -e "$prefixI/bin/irontraffic" ]; then
+        interrupt_ok=0
+        printf '       a binary was installed despite the interrupt\n' >&2
+    fi
+    leftover_9e="$(ls -A "$tmp_root_9e" 2>/dev/null || true)"
+    if [ -n "$leftover_9e" ]; then
+        interrupt_ok=0
+        printf '       a temporary directory survived under FORCE_MKTEMP_DIR: %s\n' "$leftover_9e" >&2
+    fi
+    if [ "$interrupt_ok" -eq 1 ]; then
         pass "install_cleans_up_on_interrupt"
     else
-        fail "install_cleans_up_on_interrupt" "a binary was installed despite the interrupt"
+        fail "install_cleans_up_on_interrupt" "see above"
     fi
 else
     fail "install_rejects_bad_checksum (SKIPPED: no openssl)" ""
