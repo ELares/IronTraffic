@@ -6,6 +6,7 @@ use irontraffic_bench::{
     BenchCell, BenchError, CacheMode, CellId, Detail, KeepaliveMode, PathCorpus, Protocol,
     RESERVED_STEMS, RateMode, TlsMode,
 };
+use std::io;
 
 /// A minimal, individually valid `BenchCell`. Every field is inside its own
 /// valid range so a test that overrides exactly one field exercises only that
@@ -139,8 +140,14 @@ fn round_trips_through_serde() {
 fn bench_cell_validate_rejects_zero_rate() {
     let mut cell = base_cell();
 
+    // Pin the exact static string, not just the variant: see #776 finding 7,
+    // where a swapped message ("zero rate" -> "payload too large") passed
+    // this test when it only asserted `Err(BenchError::Cell(_))`.
     cell.rate = RateMode::Fixed(0);
-    assert!(matches!(cell.validate(), Err(BenchError::Cell(_))));
+    assert!(matches!(
+        cell.validate(),
+        Err(BenchError::Cell("zero rate"))
+    ));
 
     cell.rate = RateMode::Fixed(1);
     assert!(cell.validate().is_ok());
@@ -149,12 +156,41 @@ fn bench_cell_validate_rejects_zero_rate() {
     assert!(cell.validate().is_ok());
 
     cell.rate = RateMode::Fixed(50_000_001);
-    assert!(matches!(cell.validate(), Err(BenchError::Cell(_))));
+    assert!(matches!(
+        cell.validate(),
+        Err(BenchError::Cell("rate too high"))
+    ));
 }
 
 #[test]
 fn bench_cell_validate_bounds_the_count_fields() {
     let mut cell = base_cell();
+
+    // Zero is rejected for every count field. #776 finding 1: `base_cell()`
+    // already sets `routes`, `connections` and `upstreams` to 1, and the
+    // upper-bound checks below only ever move a field UPWARD, so until now
+    // nothing in this suite ever set one of these fields to 0 and the whole
+    // `== 0` guard for each could be deleted with every test still green.
+    cell.routes = 0;
+    assert!(matches!(
+        cell.validate(),
+        Err(BenchError::Cell("zero routes"))
+    ));
+    cell.routes = 1;
+
+    cell.connections = 0;
+    assert!(matches!(
+        cell.validate(),
+        Err(BenchError::Cell("zero connections"))
+    ));
+    cell.connections = 1;
+
+    cell.upstreams = 0;
+    assert!(matches!(
+        cell.validate(),
+        Err(BenchError::Cell("zero upstreams"))
+    ));
+    cell.upstreams = 1;
 
     cell.routes = u32::MAX;
     assert!(matches!(
@@ -194,6 +230,41 @@ fn bench_cell_validate_bounds_the_count_fields() {
 }
 
 #[test]
+fn bench_cell_validate_bounds_payload_bytes() {
+    // #776 finding 1: `base_cell()` sets `payload_bytes: 0`, and until now no
+    // test ever raised it above 65536, so the entire
+    // `payload_bytes > 16_777_216` guard (cell.rs:246) could be deleted with
+    // the suite still green.
+    let mut cell = base_cell();
+
+    cell.payload_bytes = 16_777_216;
+    assert!(cell.validate().is_ok());
+
+    cell.payload_bytes = 16_777_217;
+    assert!(matches!(
+        cell.validate(),
+        Err(BenchError::Cell("payload too large"))
+    ));
+}
+
+#[test]
+fn bench_cell_validate_bounds_filter_depth() {
+    // #776 finding 1: `base_cell()` sets `filter_depth: 0`, and until now no
+    // test ever raised it above 4, so the entire `filter_depth > 64` guard
+    // (cell.rs:267) could be deleted with the suite still green.
+    let mut cell = base_cell();
+
+    cell.filter_depth = 64;
+    assert!(cell.validate().is_ok());
+
+    cell.filter_depth = 65;
+    assert!(matches!(
+        cell.validate(),
+        Err(BenchError::Cell("filter depth too large"))
+    ));
+}
+
+#[test]
 fn bench_cell_round_trips_through_serde() {
     let cell = BenchCell {
         id: CellId::parse("routes.100000.worst.h2").expect("valid cell id"),
@@ -222,15 +293,44 @@ fn bench_cell_round_trips_through_serde() {
 
 #[test]
 fn rejects_reserved_stems() {
-    for stem in RESERVED_STEMS {
-        let err = CellId::parse(stem).expect_err("reserved stems must be rejected");
-        assert!(
-            err.to_string().contains("reserved"),
-            "error message {err} should mention \"reserved\""
-        );
-    }
+    // Pin the LITERAL set first. #776 finding 3: the previous version of this
+    // test was `for stem in RESERVED_STEMS { ... }`, which derives its own
+    // expectation from the very constant it is meant to pin, so shrinking
+    // `RESERVED_STEMS` (for example dropping "readme") still left every
+    // iteration of the loop green: there would simply be one fewer iteration.
+    // The fuzz target has the identical shape for the identical reason and
+    // cannot be fixed the same way (it draws from arbitrary bytes, not a
+    // literal list), so this array pin plus the five named checks below are
+    // the one place the full, current set is actually verified.
+    assert_eq!(
+        RESERVED_STEMS,
+        ["manifest", "index", "summary", "provenance", "readme"],
+        "RESERVED_STEMS changed; update the five named checks below to match"
+    );
+
+    let err = CellId::parse("manifest").expect_err("\"manifest\" must be rejected");
+    assert!(err.to_string().contains("reserved"));
+    let err = CellId::parse("index").expect_err("\"index\" must be rejected");
+    assert!(err.to_string().contains("reserved"));
+    let err = CellId::parse("summary").expect_err("\"summary\" must be rejected");
+    assert!(err.to_string().contains("reserved"));
+    let err = CellId::parse("provenance").expect_err("\"provenance\" must be rejected");
+    assert!(err.to_string().contains("reserved"));
+    let err = CellId::parse("readme").expect_err("\"readme\" must be rejected");
+    assert!(err.to_string().contains("reserved"));
+
     assert!(CellId::parse("manifest.h2").is_ok());
     assert!(CellId::parse("manifest_base").is_ok());
+}
+
+#[test]
+fn rejects_hyphen() {
+    // #776 finding 5: the issue's Do NOT section forbids widening the
+    // character class to accept '-' (it is the separator in the results
+    // directory name `<utc-date>-<hw-id>`, and allowing it in a cell id makes
+    // the two ambiguous when joined), but nothing named this byte before.
+    assert!(CellId::parse("a-b").is_err());
+    assert!(CellId::parse("-").is_err());
 }
 
 #[test]
@@ -284,6 +384,34 @@ fn detail_strips_control_and_escape_bytes() {
 }
 
 #[test]
+fn detail_preserves_printable_content_byte_for_byte() {
+    // #776 finding 2: every assertion in `detail_strips_control_and_escape_bytes`
+    // and in the fuzz target is negative (no ESC, no CR, no LF, no NUL) plus a
+    // length check and a printable-range check, and an implementation that
+    // replaces EVERY byte with '?' (`let printable = false;` instead of the
+    // real range test) satisfies all of them: an all-'?' string contains no
+    // ESC/CR/LF/NUL, has the same length as the input, and every byte in it
+    // (0x3F) is in 0x20..=0x7E. Pin actual literal output so that mutation is
+    // caught: this is what the finding calls "no assertion anywhere in the
+    // crate that `Detail::new(...)` returns the string it was given".
+    assert_eq!(
+        Detail::new("wrk: unable to connect").as_str(),
+        "wrk: unable to connect"
+    );
+    assert_eq!(
+        Detail::new("connection refused (os error 111)").as_str(),
+        "connection refused (os error 111)"
+    );
+
+    // Also pin the replacement byte itself ('?', 0x3F), not merely "some
+    // printable byte": a sanitiser that replaces non-printable bytes with a
+    // space instead of '?' passes every OTHER assertion in this file and in
+    // the fuzz target too.
+    assert_eq!(Detail::new("a\x1bb").as_str(), "a?b");
+    assert_eq!(Detail::new("a\rb\nc\u{0}d").as_str(), "a?b?c?d");
+}
+
+#[test]
 fn detail_clips_on_a_character_boundary() {
     let input = "\u{4e2d}".repeat(300);
     assert_eq!(
@@ -308,10 +436,53 @@ fn detail_clips_on_a_character_boundary() {
     assert!(std::str::from_utf8(detail.as_str().as_bytes()).is_ok());
 }
 
+#[test]
+fn bench_error_io_display_sanitises_the_source() {
+    // #776 finding 4: `BenchError::Io`'s `#[error(...)]` format string used to
+    // interpolate `source` (a bare `std::io::Error`) directly, so an
+    // `io::Error` built from a load generator's stderr, exactly the case
+    // `BenchError::io` exists to handle safely, rendered its escape
+    // sequences, CR and LF straight through, defeating the terminal-safety
+    // guarantee the module doc promises. Pin the rendered `Display` output
+    // literally, not merely "it doesn't panic", so a regression back to the
+    // raw `{source}` form fails here.
+    let source = io::Error::other("\x1b[2J\x1b[1;1Hall benchmarks passed\r\nforged");
+    let err = BenchError::io("/tmp/out.json", source);
+    assert_eq!(
+        err.to_string(),
+        "benchmark io at /tmp/out.json: ?[2J?[1;1Hall benchmarks passed??forged"
+    );
+    assert!(err.to_string().bytes().all(|b| (0x20..=0x7E).contains(&b)));
+}
+
+/// The printable class's UPPER boundary, in the content-destroying direction.
+///
+/// `detail_preserves_printable_content_byte_for_byte` pins content, but its fixtures only cover
+/// lowercase letters, digits, space and a few punctuation marks, so narrowing the accepted class at
+/// the top end destroys bytes those fixtures never contain and nothing notices: a review measured
+/// that `0x20..=0x7E` narrowed to `0x20..=0x7D`, and to `0x20..=0x7A`, both survive the whole suite
+/// AND 200,000 fuzz runs. The fuzz target structurally cannot catch this direction, because its
+/// assertion is a superset test that a NARROWER output still satisfies.
+///
+/// Every byte from 0x20 through 0x7E inclusive must survive verbatim.
+#[test]
+fn detail_preserves_the_whole_printable_class_including_its_upper_boundary() {
+    let all_printable: String = (0x20u8..=0x7E).map(char::from).collect();
+    let kept = Detail::new(&all_printable);
+    assert_eq!(
+        kept.as_str(),
+        all_printable,
+        "every byte in 0x20..=0x7E must survive verbatim; narrowing the class silently replaces \
+         the top of it with '?'"
+    );
+    // Pinned against a literal, not against `all_printable.len()`, so an empty fixture fails.
+    assert_eq!(kept.as_str().len(), 95, "0x20..=0x7E is 95 bytes");
+}
+
 // The issue specifies `string_regex(".{0,140}")` (arbitrary Unicode of
 // realistic length) as the generator. Measured directly (100,000 draws): that
-// generator produces an `Ok` parse only 0.08% of the time and an `Ok` parse
-// containing '/' only 0.018% of the time, so at proptest's default 256 cases
+// generator produces an `Ok` parse only 0.0710% of the time against the SHIPPED
+// parser, so at proptest's default 256 cases
 // per run the EXPECTED number of runs that ever exercise the property's real
 // content (a separator surviving into a validated id) is under 0.05: a
 // property test that almost never reaches the branch it exists to check,
@@ -319,11 +490,18 @@ fn detail_clips_on_a_character_boundary() {
 // before. `[a-z0-9_./\\]{0,20}` draws from the same alphabet the parser
 // actually branches on (valid characters plus the separators under test) at a
 // short length, so a large fraction of draws are close to the validity
-// boundary. Measured the same way: 15.7% `Ok`, 2.9% `Ok` containing '/', which
-// puts several dozen real hits in a default 256 case run. Confirmed this
-// generator's shape actually catches a mutation that widens the character
-// class to accept '/' (see the PR description); the literal generator from
-// the issue did not.
+// boundary. Measured the same way against the SHIPPED parser: 12.8310% `Ok`,
+// which puts several dozen real hits in a default 256 case run.
+//
+// BE PRECISE ABOUT WHICH PARSER EACH FIGURE COMES FROM, because an earlier
+// version of this comment was not and a review caught it. The shipped parser
+// rejects '/' outright, so `Ok` containing '/' is 0.0000% for BOTH generators
+// and is not a meaningful discriminator on its own. The figures that DO
+// separate them, 2.9530% against 0.0190%, are measured against the parser
+// mutated to accept '/', which is the mutation this generator exists to catch.
+// Quoting those as though they described the shipped parser would lead the next
+// reader to re-derive them, find they do not reproduce, and "correct" the
+// generator back to the issue's literal one, which is the vacuous choice.
 proptest::proptest! {
     #[test]
     fn parse_never_yields_a_separator(s in proptest::string::string_regex("[a-z0-9_./\\\\]{0,20}").unwrap()) {

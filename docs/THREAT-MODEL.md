@@ -1880,3 +1880,73 @@ own cost is knowable rather than incidental; the per-request delay (`--delay-us`
 slow-by-request-header connection cannot stall any other connection's response; and the connection
 admission gate and the two listeners' shared bounds are exactly what keep a fixture whose only job
 is to be a known cost from becoming an unbounded one.
+
+## The benchmark harness's vocabulary (`irontraffic-bench`, #404, hardened #776)
+
+*Status: `CellId`, `Detail` and `BenchError` ship in `irontraffic-bench`, a `publish = false`
+development tool that nothing in `crates/irontraffic` may depend on. Nothing in this crate spawns a
+process, reads a file or opens a socket yet; the driver binary that does is later M17 work. This
+section exists now because the parser and the two foreign-byte error variants are already the
+crate's security boundary, and CONTRIBUTING.md's threat-model rule requires the section in the same
+PR that ships the surface, not deferred to whichever later issue happens to wire in a caller.*
+
+**`CellId::parse` is a path-traversal boundary in a script a stranger is invited to run.** A cell id
+is used verbatim as a result filename stem (`bench/results/<utc-date>-<hw-id>/<cell-id>.json`), so a
+cell id that can smuggle a `/`, a `\`, a `..` segment, or a NUL byte is a primitive for writing
+outside that directory. The parser closes this by construction rather than by scrubbing afterward:
+it accepts only `[a-z0-9_]{1,64}` segments, one to four of them joined by a single dot, at most 128
+bytes total, with no decoding step (so a percent-encoded separator like `%2F` is inert, it is just
+two more rejected bytes) and no normalisation (so the stored string is always exactly the validated
+input, never a lowercased or trimmed variant a caller might not expect). A single-segment id equal to
+one of five `RESERVED_STEMS` (`manifest`, `index`, `summary`, `provenance`, `readme`) is also
+rejected, because those are the other filenames the harness writes into the same run directory and an
+id that collided with one would silently overwrite it. A post-merge adversarial review (#776) ran a
+33-mutant campaign against this parser and its fuzz target and found the parsing logic itself sound
+(200,000 fuzz runs, no crash, exact round trip, every character-class and reserved-stem rule
+individually confirmed live), but found the test suite guarding it was not: five of ten unrelated
+`BenchCell::validate` guards, the reserved-stem list itself, and the character class's `-` exclusion
+could each be silently weakened or deleted with the suite still green. The fix landed test hardening,
+not a parser change: every guard now has a case that exercises it from both sides, `RESERVED_STEMS`
+is pinned against a literal array rather than iterated, and `CellId::parse("a-b")` is now a named
+rejection.
+
+**`Detail` bounds the two error payloads built from bytes we did not write.**
+`BenchError::Parse.detail` is built from an external load generator's or competitor container's
+stdout or stderr; `BenchError::Io.path` is built from an operator-supplied `--out` argument. Both are
+printed to a terminal and written into a run log a reviewer may later read, so an unbounded payload is
+a memory denial of service on the harness and one carrying `\x1b[`, `\r` or a raw `\n` rewrites the
+operator's terminal or forges a log line around the real error. `Detail::new` is the only way either
+variant's foreign-byte field can be built (the field is private), clips to 256 bytes at a character
+boundary before touching a single byte for sanitising (so a two gigabyte tool stdout costs the same as
+a short string), then replaces every byte outside `0x20..=0x7E` with `?`. #776 found this guarantee
+was unverified in one specific way that mattered: nothing in the crate asserted `Detail::new` returns
+the message it was given, only that it excludes a fixed set of bad bytes, so an implementation that
+replaced every byte unconditionally (destroying the message entirely) satisfied every existing
+assertion. The fix pins literal input/output pairs, for example `Detail::new("wrk: unable to
+connect").as_str() == "wrk: unable to connect"`, so content destruction fails loudly. #776 also found
+a real gap in the guarantee itself: `BenchError::Io`'s derived `Display` interpolated `source` (a bare
+`std::io::Error`, needed unsanitised as a `#[source]` link for error-chain walking) directly, so an
+`io::Error` built from foreign bytes rendered raw, unlike `path`. The fix routes `source` through
+`Detail::new` at render time in the `Display` format string itself, so the property holds for
+the variant's OWN `Display`, not only for the field that happened to be typed as `Detail`.
+
+It does NOT hold for a caller that walks the error chain. The variant deliberately keeps
+`#[source] source: std::io::Error` so callers can inspect the cause, and the usual
+`while let Some(e) = err.source()` render prints that io error's own `Display`, which the format
+string never touches. Measured: a source carrying `ESC [ 2J ... CR LF` renders with zero
+non-printable bytes through the variant's `Display` and with four (`27 27 13 10`) through a chain
+walk. So a caller that walks the chain must sanitise, and this is stated here rather than implied,
+because invariant 5 is absolute and a reader who took the earlier wording at face value would have
+skipped that step. Nothing constructs this variant yet, so there is no live exposure; it becomes one
+when a load generator's stderr is wrapped.
+
+**`BenchCell::validate` is advisory, not structural, and callers must know that.** Unlike `CellId`,
+`BenchCell` derives `Deserialize` on public fields with no `#[serde(try_from)]`, so a result file can
+deserialise into a cell that `validate()` would reject (zero routes, a payload above the 16 MiB cap,
+and so on): the type does not make an invalid `BenchCell` unrepresentable the way it makes an invalid
+`CellId` unrepresentable. This is a deliberate, documented design choice (the alternative, routing
+every field through a fallible constructor, was rejected in #404 because the registry uniqueness check
+that matters is deferred to a later issue), not a defect, but it means every future reader of a result
+file (the driver binary, the bench xtask CLI and run script, and the matrix registry) must call
+`validate()` itself after deserialising rather than trusting the wire format to have enforced it
+already.
