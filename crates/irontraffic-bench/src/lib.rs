@@ -21,9 +21,16 @@
 
 mod cell;
 mod error;
+mod provenance;
 
 pub use cell::{
     BenchCell, CacheMode, CellId, KeepaliveMode, PathCorpus, Protocol, RESERVED_STEMS, RateMode,
     TlsMode,
 };
 pub use error::{BenchError, Detail, MAX_DETAIL_BYTES};
+pub use provenance::{
+    BURSTABLE_PREFIXES, BuildStamp, CaptureInputs, CpuInfoFields, LARGE_FILE_CAP, MAX_CPU_ENTRIES,
+    PROBE_OUTPUT_CAP, PROBE_TIMEOUT_SECONDS, Provenance, SMALL_FILE_CAP, StampSource, ToolStamp,
+    capture_build_stamp, format_utc_date, is_burstable, normalize_instance_type, parse_cpuinfo,
+    parse_meminfo, read_bounded, render_hardware, resolve_cpu_model,
+};
