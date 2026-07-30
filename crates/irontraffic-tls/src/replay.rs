@@ -123,14 +123,21 @@ pub struct EarlyDataFilter {
 }
 
 /// Number of 64-byte blocks that hold `capacity` entries at [`REPLAY_BITS_PER_KEY`] bits each,
-/// rounded up.
+/// rounded up, and never zero.
 ///
 /// The u64 intermediate and the `try_from` back to `u32` are defence in depth, not a response to
 /// an anticipated overflow: `capacity` is documented to already be clamped to `1_024..=8_388_608`
-/// by `EarlyDataConfig::clamped`, and `8_388_608 * 40` does not approach `u32::MAX`.
+/// by `EarlyDataConfig::clamped`, and `8_388_608 * 40` does not approach `u32::MAX`. The trailing
+/// `.max(1)` is a second, independent piece of defence in depth: [`EarlyDataFilter::new`]
+/// documents that it does not re-clamp its config, so a caller that skips `clamped()` and passes
+/// `replay_capacity: 0` must still get a real, if severely undersized, one-block filter rather
+/// than the zero-block filter that would silently accept every ticket forever (every probe reads
+/// past the end of an empty generation, which [`block_has_all`] treats as "absent").
 fn blocks_for(capacity: u32) -> u32 {
     let bits = u64::from(capacity) * u64::from(REPLAY_BITS_PER_KEY);
-    u32::try_from(bits.div_ceil(BLOCK_BITS)).unwrap_or(u32::MAX)
+    u32::try_from(bits.div_ceil(BLOCK_BITS))
+        .unwrap_or(u32::MAX)
+        .max(1)
 }
 
 /// Builds one generation of `blocks * 8` zeroed `AtomicU64` words.
@@ -429,6 +436,15 @@ mod tests {
             f.contains(&key),
             "one rotation must not forget a key: it moved to the other generation, not away"
         );
+        // `contains` alone cannot catch a `check_and_insert` that only ever probes the CURRENT
+        // generation (dropping the `block_has_all(other_words, ...)` disjunct): `evaluate` never
+        // calls `contains`, only `check_and_insert`, so this is the function that actually has to
+        // be pinned here. A hit does not insert, so this call has no side effect on what follows.
+        assert!(
+            f.check_and_insert(&key),
+            "check_and_insert, not just contains, must still treat the key as a replay after one \
+             rotation: it is the function evaluate calls"
+        );
 
         // Second rotation: the generation holding the key is now the OTHER one, and it is the one
         // that gets zeroed next, so after this rotation neither generation remembers it.
@@ -442,6 +458,80 @@ mod tests {
             !f.check_and_insert(&key),
             "a replay presented after the filter has forgotten the ticket may be accepted again; \
              the method restriction, not this filter, is what makes that harmless"
+        );
+    }
+
+    /// "Do NOT" rule: `insert` (the gossip receiver's entry point) must write into the CURRENT
+    /// generation, never the other one. Every test that checks an inserted key back through
+    /// `contains` probes BOTH generations, so writing to the wrong one is invisible right up
+    /// until a rotation retires it early: a key inserted into the wrong generation is forgotten
+    /// one rotation sooner than a correctly placed one.
+    #[test]
+    fn insert_writes_into_the_current_generation_only() {
+        let rotate_secs = 3_600;
+        let cfg = small_config(rotate_secs);
+        let t0 = 1_700_000_000u64;
+        let f = EarlyDataFilter::new(&cfg, [20u8; 16], UnixSeconds::new(t0));
+        let key = [0xEEu8; 16];
+
+        f.insert(&key);
+
+        // One rotation: a key correctly written into the CURRENT generation becomes the OTHER
+        // generation and must still be remembered, on exactly the same schedule as
+        // `check_and_insert`'s own insert path in `replay_across_rotation_may_pass` above.
+        f.rotate_if_due(UnixSeconds::new(t0 + u64::from(rotate_secs)));
+        assert!(
+            f.contains(&key),
+            "insert must have written into the CURRENT generation: writing into the OTHER one \
+             would put the key in the generation this same rotation retires, forgetting it one \
+             rotation early"
+        );
+
+        // A second rotation retires the generation the key actually lives in, on schedule.
+        f.rotate_if_due(UnixSeconds::new(t0 + 2 * u64::from(rotate_secs)));
+        assert!(
+            !f.contains(&key),
+            "two rotations must forget an inserted key on the normal schedule, not one rotation \
+             early"
+        );
+    }
+
+    /// "Do NOT" rule: a hit inside `check_and_insert` must not insert. Reinserting on a hit would
+    /// extend a replayed ticket's remembered lifetime every time it is replayed, rather than
+    /// leaving it on its original two-rotation schedule from first presentation.
+    #[test]
+    fn hit_does_not_extend_the_entrys_life() {
+        let rotate_secs = 3_600;
+        let cfg = small_config(rotate_secs);
+        let t0 = 1_700_000_000u64;
+        let f = EarlyDataFilter::new(&cfg, [21u8; 16], UnixSeconds::new(t0));
+        let key = [0xDDu8; 16];
+
+        assert!(!f.check_and_insert(&key), "first presentation must not be a replay");
+
+        // One rotation: the original entry moves from current to other, still remembered.
+        f.rotate_if_due(UnixSeconds::new(t0 + u64::from(rotate_secs)));
+        assert!(f.contains(&key));
+
+        let inserts_before_hit = f.stats().inserts.load(std::sync::atomic::Ordering::Relaxed);
+        assert!(
+            f.check_and_insert(&key),
+            "the key is still within its remembered window and must be reported as a replay"
+        );
+        assert_eq!(
+            f.stats().inserts.load(std::sync::atomic::Ordering::Relaxed),
+            inserts_before_hit,
+            "a hit must not increment inserts: it must not write into the filter at all"
+        );
+
+        // Second rotation retires the generation the ORIGINAL insert lives in. If the hit above
+        // had wrongly reinserted the key into the generation that was current at the time of the
+        // hit, the key would survive this rotation too; it must not.
+        f.rotate_if_due(UnixSeconds::new(t0 + 2 * u64::from(rotate_secs)));
+        assert!(
+            !f.contains(&key),
+            "a hit must not insert into the filter: the entry's life must end on its original \
+             two-rotation schedule, not be extended by every subsequent replay attempt"
         );
     }
 
@@ -626,6 +716,34 @@ mod tests {
         };
         let f = EarlyDataFilter::new(&cfg, [8u8; 16], UnixSeconds::new(1_700_000_000));
         assert_eq!(f.memory_bytes(), 10_000_000);
+    }
+
+    /// `EarlyDataFilter::new` documents that it does not re-clamp `replay_capacity`, so a caller
+    /// that skips `EarlyDataConfig::clamped()` can reach this constructor with
+    /// `replay_capacity: 0`. Measured before `blocks_for`'s `.max(1)` defence in depth: such a
+    /// filter had `memory_bytes() == 0` and `check_and_insert` returned `false` forever, a replay
+    /// filter that silently detects nothing while still reporting healthy insert counters. A
+    /// zero-capacity config must still produce a real, working (if severely undersized) filter.
+    #[test]
+    fn zero_capacity_config_still_produces_a_working_filter() {
+        let cfg = EarlyDataConfig {
+            enabled: true,
+            max_bytes: 16_384,
+            replay_capacity: 0,
+            replay_rotate_secs: 10_800,
+        };
+        let f = EarlyDataFilter::new(&cfg, [22u8; 16], UnixSeconds::new(1_700_000_000));
+        assert!(
+            f.memory_bytes() > 0,
+            "a zero-capacity config must not yield a zero-byte, permanently-empty filter"
+        );
+
+        let key = [0x42u8; 16];
+        assert!(!f.check_and_insert(&key), "first presentation must not be a replay");
+        assert!(
+            f.check_and_insert(&key),
+            "second presentation must be caught even at replay_capacity: 0"
+        );
     }
 
     proptest! {

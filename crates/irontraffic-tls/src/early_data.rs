@@ -128,9 +128,19 @@ impl EarlyDataConfig {
     /// `max_bytes` when enabled, else 0. This is the only sanctioned way to raise
     /// `max_early_data_size` above the 0 that `tls-protocol-cipher-group-alpn-policy` (#116) sets
     /// in `apply_common`.
+    ///
+    /// Re-applies the `MAX_EARLY_DATA_BYTES` hard cap here, in addition to `clamped` applying it
+    /// at configuration-compile time: this is the one function whose return value is actually
+    /// installed on a live `ServerConfig`, so it must uphold the documented hard cap even when
+    /// called on a config that skipped `clamped` (for instance while a future caller's
+    /// configuration-compile wiring is still incomplete), not only on the well-behaved path.
     #[must_use]
     pub fn effective_max_early_data_size(&self) -> u32 {
-        if self.enabled { self.max_bytes } else { 0 }
+        if self.enabled {
+            self.max_bytes.min(MAX_EARLY_DATA_BYTES)
+        } else {
+            0
+        }
     }
 
     /// Whether this configuration may be installed on a listener that enforces client
@@ -303,10 +313,20 @@ pub fn evaluate(
     if facts.bytes_received > config.max_bytes {
         return EarlyDataVerdict::Reject(EarlyDataReject::TooLarge);
     }
-    let Some(key16) = facts.psk_identity.get(..16) else {
+    // `get(..16)` here is a MINIMUM LENGTH GUARD ONLY: it does not select the bytes the filter
+    // hashes. `cluster-derived-session-ticketer`'s (#120) wire format is
+    // `name_e (16 bytes) || nonce (24 bytes) || ciphertext`, and `name_e` is a per-epoch
+    // HKDF-derived constant identical for every ticket issued anywhere in the fleet during that
+    // epoch. Keying the replay filter on only the first 16 bytes would therefore key on the
+    // EPOCH, not the ticket: the first 0-RTT request of an epoch would insert the epoch name and
+    // every subsequent legitimate 0-RTT request, from every client, would be `Reject(Replay)`.
+    // The filter below is keyed on the WHOLE identity, which strictly increases distinguishing
+    // power over a fixed prefix; `get` (never `[..16]`) still guards against an attacker-supplied
+    // identity too short to be a real ticket, exactly as before.
+    if facts.psk_identity.get(..16).is_none() {
         return EarlyDataVerdict::Reject(EarlyDataReject::NoPskIdentity);
-    };
-    if filter.check_and_insert(key16) {
+    }
+    if filter.check_and_insert(facts.psk_identity) {
         return EarlyDataVerdict::Reject(EarlyDataReject::Replay);
     }
     EarlyDataVerdict::Accept
@@ -318,9 +338,11 @@ mod tests {
     use proptest::strategy::ValueTree as _;
     use proptest::test_runner::TestRunner;
 
+    use serde::Deserialize as _;
+
     use super::{
-        EarlyDataConfig, EarlyDataFacts, EarlyDataMethod, EarlyDataReject, EarlyDataVerdict,
-        ForceDenyReason, RouteEarlyData, evaluate,
+        EARLY_DATA_HEADER, EarlyDataConfig, EarlyDataFacts, EarlyDataMethod, EarlyDataReject,
+        EarlyDataVerdict, ForceDenyReason, MAX_EARLY_DATA_BYTES, RouteEarlyData, evaluate,
     };
     use crate::replay::EarlyDataFilter;
     use crate::time::UnixSeconds;
@@ -397,6 +419,64 @@ mod tests {
             assert_eq!(clamped.max_bytes, expected, "input {input}");
             assert!(clamped.enabled, "clamped must not touch enabled");
         }
+    }
+
+    /// The other two thirds of `clamped()`'s contract: `max_bytes_clamped` above only ever pins
+    /// `max_bytes`, so a dropped `.clamp(1_024, 8_388_608)` on `replay_capacity` was invisible to
+    /// the whole suite.
+    #[test]
+    fn replay_capacity_clamped() {
+        for (input, expected) in [
+            (0u32, 1_024u32),
+            (1u32, 1_024u32),
+            (1_024, 1_024),
+            (8_388_608, 8_388_608),
+            (8_388_609, 8_388_608),
+            (u32::MAX, 8_388_608),
+        ] {
+            let clamped = EarlyDataConfig {
+                enabled: true,
+                max_bytes: 16_384,
+                replay_capacity: input,
+                replay_rotate_secs: 10_800,
+            }
+            .clamped();
+            assert_eq!(clamped.replay_capacity, expected, "input {input}");
+        }
+    }
+
+    /// The last third: a dropped `.clamp(60, 86_400)` on `replay_rotate_secs` was equally
+    /// invisible.
+    #[test]
+    fn replay_rotate_secs_clamped() {
+        for (input, expected) in [
+            (0u32, 60u32),
+            (59u32, 60u32),
+            (60, 60),
+            (86_400, 86_400),
+            (86_401, 86_400),
+            (u32::MAX, 86_400),
+        ] {
+            let clamped = EarlyDataConfig {
+                enabled: true,
+                max_bytes: 16_384,
+                replay_capacity: 1_024,
+                replay_rotate_secs: input,
+            }
+            .clamped();
+            assert_eq!(clamped.replay_rotate_secs, expected, "input {input}");
+        }
+    }
+
+    /// `effective_max_early_data_size` is the one function whose return value is actually
+    /// installed on a live `ServerConfig`, so it must uphold `MAX_EARLY_DATA_BYTES` even when
+    /// called on a config that never went through `clamped()`: measured before this defence in
+    /// depth was added, `config(true, u32::MAX).effective_max_early_data_size()` returned
+    /// `4_294_967_295`, not the documented hard cap.
+    #[test]
+    fn effective_max_early_data_size_enforces_hard_cap_even_when_unclamped() {
+        let cfg = config(true, u32::MAX);
+        assert_eq!(cfg.effective_max_early_data_size(), MAX_EARLY_DATA_BYTES);
     }
 
     #[test]
@@ -480,6 +560,176 @@ mod tests {
         let psk = [8u8; 16];
         let facts = compliant_facts(&psk);
         assert_eq!(evaluate(&cfg, &f, &facts), EarlyDataVerdict::Accept);
+    }
+
+    /// `allow_without_query_accepts` above only ever exercises `Get`: condition 1 allows `Get`
+    /// OR `Head`, and the property test only ever asserts the disjunction on the ACCEPT side, so
+    /// a mutation that narrows condition 1 to `method != Get` (rejecting `Head` too) left every
+    /// test green. This pins `Head` all the way to `Accept`, with its own distinct PSK identity
+    /// so it cannot be mistaken for a replay of a `Get` case elsewhere in this module.
+    #[test]
+    fn head_method_is_accepted() {
+        let cfg = config(true, 16_384);
+        let f = filter(&cfg);
+        let psk = [88u8; 16];
+        let mut facts = compliant_facts(&psk);
+        facts.method = EarlyDataMethod::Head;
+        assert_eq!(evaluate(&cfg, &f, &facts), EarlyDataVerdict::Accept);
+    }
+
+    /// BLOCKING: `evaluate` must itself consult the replay filter, not merely own a reference to
+    /// one. Every other test in this module calls `evaluate` at most once per PSK identity, so
+    /// none of them observe whether the eighth condition is wired up at all; deleting the
+    /// `filter.check_and_insert` call outright (and renaming the parameter to `_filter`) left all
+    /// prior tests, and the full crate suite, green. Calling `evaluate` twice with IDENTICAL
+    /// compliant facts and the SAME PSK identity is the direct test: the first call must admit
+    /// the ticket, and the second, being the same ticket presented again, must be rejected as a
+    /// replay.
+    #[test]
+    fn evaluate_consults_the_replay_filter() {
+        let cfg = config(true, 16_384);
+        let f = filter(&cfg);
+        let psk = [13u8; 16];
+        let facts = compliant_facts(&psk);
+
+        assert_eq!(evaluate(&cfg, &f, &facts), EarlyDataVerdict::Accept);
+        assert_eq!(
+            evaluate(&cfg, &f, &facts),
+            EarlyDataVerdict::Reject(EarlyDataReject::Replay)
+        );
+    }
+
+    /// BLOCKING: two tickets that share the first 16 bytes of their PSK identity but differ
+    /// after must be treated as DISTINCT tickets, not conflated into one replay-filter entry.
+    /// This is exactly the shape of a real `cluster-derived-session-ticketer` (#120) ticket:
+    /// `name_e` (16 bytes) is a per-epoch HKDF constant identical for every ticket issued fleet
+    /// wide during that epoch, and only the following `nonce (24 bytes) || ciphertext` actually
+    /// identifies one ticket. Keying the filter on only the first 16 bytes (the pre-fix
+    /// behaviour) would make the SECOND client's first-ever 0-RTT request of an epoch look like
+    /// a replay of the FIRST client's, denying 0-RTT to nearly everyone after the epoch's first
+    /// request. This fixture is watched to fail under that regression: it is the only test in
+    /// this module whose PSK identities share a 16-byte prefix on purpose.
+    #[test]
+    fn tickets_sharing_epoch_prefix_are_not_conflated() {
+        let cfg = config(true, 16_384);
+        let f = filter(&cfg);
+
+        let shared_name_e = [0x55u8; 16];
+        let mut ticket_a = shared_name_e.to_vec();
+        ticket_a.extend_from_slice(&[0xAAu8; 24]);
+        let mut ticket_b = shared_name_e.to_vec();
+        ticket_b.extend_from_slice(&[0xBBu8; 24]);
+        assert_ne!(ticket_a, ticket_b, "the fixture must actually differ after the shared prefix");
+
+        let facts_a = compliant_facts(&ticket_a);
+        assert_eq!(
+            evaluate(&cfg, &f, &facts_a),
+            EarlyDataVerdict::Accept,
+            "ticket A's first presentation"
+        );
+
+        // If the replay key were the shared 16-byte epoch prefix, this DIFFERENT ticket would be
+        // rejected here as a replay of ticket A. Keying on the whole identity must accept it.
+        let facts_b = compliant_facts(&ticket_b);
+        assert_eq!(
+            evaluate(&cfg, &f, &facts_b),
+            EarlyDataVerdict::Accept,
+            "ticket B shares ticket A's first 16 bytes but is a different ticket and must not be \
+             treated as a replay of it"
+        );
+
+        // Ticket A presented again, meanwhile, must still be caught.
+        assert_eq!(
+            evaluate(&cfg, &f, &facts_a),
+            EarlyDataVerdict::Reject(EarlyDataReject::Replay),
+            "ticket A's second presentation must still be a replay"
+        );
+    }
+
+    #[test]
+    fn early_data_header_constant_is_early_data() {
+        // One spelling, pinned as a literal: the strip site and the inject site (both in the
+        // future `early-data-request-wiring` slug) must never be able to disagree about it.
+        assert_eq!(EARLY_DATA_HEADER, "early-data");
+    }
+
+    #[test]
+    fn route_early_data_default_is_deny() {
+        assert_eq!(RouteEarlyData::default(), RouteEarlyData::Deny);
+    }
+
+    /// Pins `#[serde(rename_all = "camelCase")]` on `RouteEarlyData`: dropping that attribute
+    /// leaves every Rust-level test in this module green (they never deserialize the enum), but
+    /// would silently stop `allowQuery` from parsing in the operator-facing JSON form documented
+    /// in `docs/tls/EARLY-DATA.md`.
+    #[test]
+    fn route_early_data_camel_case_variants_parse() {
+        for (input, expected) in [
+            ("deny", RouteEarlyData::Deny),
+            ("allow", RouteEarlyData::Allow),
+            ("allowQuery", RouteEarlyData::AllowQuery),
+        ] {
+            let de = serde::de::value::StrDeserializer::<serde::de::value::Error>::new(input);
+            let parsed = RouteEarlyData::deserialize(de)
+                .unwrap_or_else(|e| panic!("{input} must parse: {e}"));
+            assert_eq!(parsed, expected, "input {input}");
+        }
+    }
+
+    /// Every field of `EarlyDataConfig` has a `#[serde(default = ...)]`, so a map with every
+    /// field omitted must still deserialize, and must produce the literal documented defaults:
+    /// `enabled: false`, `max_bytes: 16_384`, `replay_capacity: 1_000_000`,
+    /// `replay_rotate_secs: 10_800`. This pins the three `default_*` functions AND the
+    /// off-by-default claim the whole issue rests on, against retuning or a flipped default.
+    #[test]
+    fn config_defaults_when_every_field_is_omitted() {
+        let pairs: Vec<(&str, &str)> = vec![];
+        let de =
+            serde::de::value::MapDeserializer::<_, serde::de::value::Error>::new(pairs.into_iter());
+        let cfg = EarlyDataConfig::deserialize(de).expect("every field has a serde default");
+        assert!(!cfg.enabled, "enabled must default to false");
+        assert_eq!(cfg.max_bytes, 16_384);
+        assert_eq!(cfg.replay_capacity, 1_000_000);
+        assert_eq!(cfg.replay_rotate_secs, 10_800);
+    }
+
+    /// Pins `#[serde(rename_all = "camelCase")]` on `EarlyDataConfig`'s three multi-word fields:
+    /// dropping the attribute would make these exact keys (the ones
+    /// `docs/tls/EARLY-DATA.md`'s JSON form publishes) stop matching under
+    /// `deny_unknown_fields`.
+    #[test]
+    fn config_camel_case_fields_parse() {
+        let pairs = vec![
+            ("maxBytes", 32_768u32),
+            ("replayCapacity", 2_000_000u32),
+            ("replayRotateSecs", 7_200u32),
+        ];
+        let de =
+            serde::de::value::MapDeserializer::<_, serde::de::value::Error>::new(pairs.into_iter());
+        let cfg = EarlyDataConfig::deserialize(de).expect("camelCase field names must parse");
+        assert_eq!(cfg.max_bytes, 32_768);
+        assert_eq!(cfg.replay_capacity, 2_000_000);
+        assert_eq!(cfg.replay_rotate_secs, 7_200);
+    }
+
+    #[test]
+    fn config_enabled_field_parses() {
+        let pairs = vec![("enabled", true)];
+        let de =
+            serde::de::value::MapDeserializer::<_, serde::de::value::Error>::new(pairs.into_iter());
+        let cfg = EarlyDataConfig::deserialize(de).expect("enabled must parse from a bool");
+        assert!(cfg.enabled);
+    }
+
+    /// Pins `#[serde(deny_unknown_fields)]` on `EarlyDataConfig`, mirroring
+    /// `policy.rs`'s `unknown_config_field_rejected` for `TlsPolicyConfig`.
+    #[test]
+    fn config_unknown_field_rejected() {
+        let pairs = vec![("enable", "true")];
+        let de =
+            serde::de::value::MapDeserializer::<_, serde::de::value::Error>::new(pairs.into_iter());
+        let result = EarlyDataConfig::deserialize(de);
+        assert!(result.is_err(), "a misspelled field name must be rejected, not ignored");
     }
 
     #[test]
@@ -594,7 +844,16 @@ mod tests {
             proptest::collection::vec(any::<u8>(), 0..24),
         );
 
-        let mut runner = TestRunner::default();
+        // `TestRunner::deterministic()`, not `default()`: `default()` seeds its RNG from OS
+        // entropy on every run, and this generator's compound seven-condition target is drawn
+        // rarely enough (measured: well under 10% of cases) that the accepted count has real
+        // run-to-run variance, which made this test genuinely flaky (measured: 39 pass / 1 fail
+        // over 40 unmodified runs with the OS-seeded RNG). `deterministic()` is proptest's own
+        // documented answer for exactly this ("useful for testing things like strategy
+        // implementations without risking getting 'unlucky' RNGs"), so this run's sequence, and
+        // therefore `accepted`'s value, is fixed for a given proptest version and generator, and
+        // the floor below is set from what this exact seed measures rather than assumed.
+        let mut runner = TestRunner::deterministic();
         let mut total = 0u32;
         let mut accepted = 0u32;
         for _ in 0..500 {
@@ -637,12 +896,17 @@ mod tests {
             }
         }
         assert!(total > 0);
-        // The reachability floor: over several local runs this landed between about 15 and 40
-        // out of 500 cases (the seven-condition conjunction is a demanding target for an
-        // unconstrained generator), so 5 is a floor well under every observed run rather than a
-        // number chosen to just barely pass once.
+        // The reachability floor: `TestRunner::deterministic()` fixes this run's sequence, and
+        // this exact generator, on this exact seed, measures `accepted == 11` out of 500 cases,
+        // reproducibly across repeated runs (checked locally: identical count on 3 separate
+        // invocations). 8 is a floor comfortably under that measured, reproducible value, not a
+        // number tuned to just barely pass once and not an unpinned assumption: it still rejects
+        // a mutation that collapses the Accept branch to near-zero (for instance disabling the
+        // config check or rejecting every method) while tolerating a few cases' worth of drift
+        // if an unrelated future change to this strategy shifts exactly which values the fixed
+        // RNG sequence produces.
         assert!(
-            accepted >= 5,
+            accepted >= 8,
             "prop_evaluate_is_monotone_in_strictness reached Accept only {accepted} times in \
              {total} cases; the generator is not exercising the Accept branch this property is \
              actually about"
