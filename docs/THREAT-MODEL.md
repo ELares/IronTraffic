@@ -1404,6 +1404,15 @@ zero bytes for `ClientAuthKind::None` and `TrustAnchors::id()` otherwise, so a t
 resumes across a client-certificate trust-bundle change. The failure mode when the context does not
 match is `decrypt_unknown_key`, which falls back to a full handshake, not an error: a client that
 cannot resume simply re-authenticates from scratch, and the client-certificate verifier runs again.
+That covers a ticket that outlives a live bundle rotation; it is a separate belt from a second one
+added by `mtls-client-auth-fail-closed` (#124)'s own PR review (#773 BLOCKING 1): both
+`TlsServerConfig::compile` and `TlsServerConfig::compile_with_client_auth` compare the ticketer they
+were handed against the context the CONFIGURATION they are compiling actually calls for (16 zero
+bytes, or `auth.anchors().map(TrustAnchors::id)`), and refuse to compile at all
+(`ListenerError::TicketerContextMismatch`) on a mismatch, via `ClusterTicketer::context()`. That
+catches a caller wiring the wrong ticketer to the wrong listener at configuration time, before any
+handshake and before any ticket is ever minted, which is a different failure than a
+previously-issued ticket surviving a later bundle rotation.
 
 **Residual risk: resumption skips certificate re-validation, so a ticket can outlive a
 certificate.** A resumed TLS 1.3 handshake sends no certificate, so a client that resumes does not
