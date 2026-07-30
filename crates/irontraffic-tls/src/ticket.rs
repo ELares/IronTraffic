@@ -870,6 +870,27 @@ mod tests {
         // `back = 2` would underflow a u64 epoch via `wrapping_sub`, which `checked_sub` in the
         // candidate loop exists to prevent.
         assert_eq!(t.decrypt(&[0u8; 100]), None);
+
+        // Absence of a panic is not enough: `wrapping_sub` would compute candidate epochs
+        // `u64::MAX` (back = 1) and `u64::MAX - 1` (back = 2), both in bounds after the `% 512`
+        // modulo, so `epoch_key` would happily derive and CACHE keys into slots 511 and 510
+        // (`u64::MAX % 512 == 511`, `(u64::MAX - 1) % 512 == 510`). That poisons the ring: when
+        // the real epochs 511 and 510 eventually arrive (about 21 and 21.3 days later at this
+        // ticketer's 3,600-second rotation), `OnceLock::get_or_init` cannot re-initialize an
+        // already-set slot, so those two slots are permanently stuck comparing against the
+        // wrapped epoch and never cache again, silently, for the life of the process. Reading
+        // the ring directly is what makes this observable; `decrypt`'s return value alone
+        // cannot distinguish "never touched" from "touched and evicted".
+        assert!(
+            t.slots_primary.get(511).is_some_and(|s| s.get().is_none()),
+            "slot 511 must stay uninitialized at epoch 0: a wrapping_sub bug would have \
+             populated it with a key derived for the wrapped epoch u64::MAX"
+        );
+        assert!(
+            t.slots_primary.get(510).is_some_and(|s| s.get().is_none()),
+            "slot 510 must stay uninitialized at epoch 0: a wrapping_sub bug would have \
+             populated it with a key derived for the wrapped epoch u64::MAX - 1"
+        );
     }
 
     #[test]
@@ -1055,6 +1076,14 @@ mod tests {
         ] {
             let t = test_ticketer([0x13; 32], [0u8; 16], input, Arc::clone(&clock));
             assert_eq!(t.rotation_secs(), expected, "input {input}");
+            // Invariant 8: `lifetime()` equals `rotation_secs`, checked against the same clamped
+            // value the line above just asserted, not against `t.rotation_secs()` again (which
+            // would only prove the two methods agree with each other, not that either is
+            // correct). `enabled()` is asserted on every one of these six inputs too: this
+            // ticketer never has a disabled state, and a regression that hard-codes `false`
+            // would turn off TLS 1.3 ticket issuance fleet-wide.
+            assert_eq!(t.lifetime(), expected, "input {input}");
+            assert!(t.enabled(), "input {input}");
         }
     }
 
@@ -1400,6 +1429,75 @@ mod tests {
             "every one of the 10,000 random 200-byte inputs must land in the unknown-key path \
              under measurement; this is the real, observable side effect a hollowed-out loop \
              body could not produce"
+        );
+    }
+
+    /// Known-answer test pinning the key schedule byte for byte against literal expected values,
+    /// not against a second call to the same derivation this test is supposed to check: every
+    /// other test in this module is self-consistent (it compares this ticketer's own output
+    /// against itself), so nothing today catches the whole schedule drifting between two
+    /// IronTraffic versions in a mixed-version fleet, silently killing cross-version resumption
+    /// during a rolling upgrade. Pins `name_e`, `key_e`, and the full encoded ticket layout
+    /// (name || nonce || ciphertext) for a fixed root, context, epoch and nonce.
+    #[test]
+    fn key_schedule_matches_known_answer_vector() {
+        let root: [u8; 32] = core::array::from_fn(|i| u8::try_from(i).unwrap_or(0));
+        let context: [u8; 16] = core::array::from_fn(|i| u8::try_from(i).unwrap_or(0));
+        let clock = TestClock::new(5 * 3_600);
+        let t = test_ticketer(root, context, 3_600, clock);
+        assert_eq!(t.epoch_now(), 5, "fixture clock must land on epoch 5");
+
+        let ek = t
+            .epoch_key(RootSel::Primary, 5)
+            .expect("primary root always yields an epoch key");
+        assert_eq!(
+            ek.name,
+            [
+                0x9d, 0xfc, 0xb4, 0xba, 0x66, 0x39, 0x74, 0x56, 0x89, 0xcd, 0x0c, 0xd0, 0x88, 0xdc,
+                0x76, 0xa3,
+            ],
+            "name_e drifted from the pinned known-answer vector for root=0..32, context=0..16, \
+             epoch=5"
+        );
+        assert_eq!(
+            *ek.key,
+            [
+                0x07, 0x40, 0xc4, 0x45, 0x5e, 0x76, 0x8d, 0x19, 0x15, 0xea, 0xaf, 0x40, 0x8d, 0xaf,
+                0x63, 0x30, 0xdc, 0xf3, 0x20, 0x0a, 0xa5, 0x64, 0x14, 0xd6, 0xc9, 0x7e, 0xe1, 0xa9,
+                0x4b, 0x5a, 0x1c, 0xf9,
+            ],
+            "key_e drifted from the pinned known-answer vector for root=0..32, context=0..16, \
+             epoch=5"
+        );
+
+        // Pin the full wire format too: name_e || nonce || AEAD(key_e, nonce, aad=name_e,
+        // plaintext), under a fixed nonce and a fixed plaintext.
+        let kat_clock: Arc<dyn TimeView> = TestClock::new(5 * 3_600);
+        let t_fixed_nonce = ClusterTicketer::new(
+            TicketRoot::new(root),
+            context,
+            3_600,
+            kat_clock,
+            Arc::new(FixedNonceSource([0x24; 24])),
+        );
+        let ticket = t_fixed_nonce
+            .encrypt(b"kat-plaintext")
+            .expect("entropy never fails");
+        assert_eq!(
+            ticket,
+            vec![
+                // name_e, the same 16 bytes pinned above.
+                0x9d, 0xfc, 0xb4, 0xba, 0x66, 0x39, 0x74, 0x56, 0x89, 0xcd, 0x0c, 0xd0, 0x88, 0xdc,
+                0x76, 0xa3, // nonce, fixed at 0x24 repeated 24 times by FixedNonceSource.
+                0x24, 0x24, 0x24, 0x24, 0x24, 0x24, 0x24, 0x24, 0x24, 0x24, 0x24, 0x24, 0x24, 0x24,
+                0x24, 0x24, 0x24, 0x24, 0x24, 0x24, 0x24, 0x24, 0x24, 0x24,
+                // XChaCha20-Poly1305(key_e, nonce, aad = name_e, b"kat-plaintext"): 13 bytes of
+                // ciphertext plus a 16-byte tag.
+                0xe2, 0x51, 0x3d, 0x63, 0xc4, 0xfc, 0x93, 0xc8, 0xb0, 0x1b, 0xb2, 0x9a, 0xd3, 0xe9,
+                0x5f, 0x59, 0xb4, 0x43, 0xaf, 0xbe, 0xf4, 0x7e, 0x30, 0xcf, 0x78, 0xdf, 0x42, 0x4a,
+                0x2e,
+            ],
+            "the full ticket wire format drifted from the pinned known-answer vector"
         );
     }
 
