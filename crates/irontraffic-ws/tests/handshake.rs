@@ -1010,8 +1010,16 @@ fn display_does_not_leak_the_wrapped_reject_reason() {
 /// against a gross regression, and its home is the serialized perf job tracked in #753 alongside
 /// #418, not a binary running in parallel with twenty six sibling tests.
 ///
-/// What remains here is the functional half, and it is worth keeping: 100,000 real round trips
-/// asserting `parse`, `accept_key` and `verify` all keep succeeding at scale.
+/// What remains here is the functional half: 100,000 real round trips asserting `parse` and
+/// `verify` keep succeeding at scale.
+///
+/// It does NOT assert `accept_key`, and saying otherwise was a false claim in an earlier version of
+/// this comment. `verify` recomputes `accept_key` internally and compares it against a fixture
+/// header that `accepting_response` also built with `accept_key`, so both sides of the comparison
+/// move together and any deterministic mutation stays self consistent. That is exactly the trap
+/// `accept_key`'s own production doc names: "the bug survives any test that uses the same
+/// implementation on both sides". `rfc_6455_accept_vector` is what actually pins it, against the
+/// RFC 6455 literal.
 #[test]
 fn handshake_round_trip_is_within_the_per_handshake_budget() {
     const ITERATIONS: u32 = 100_000;
@@ -1038,8 +1046,10 @@ fn handshake_round_trip_is_within_the_per_handshake_budget() {
     // a smaller number to itself and passing.
     assert_eq!(
         verified, 100_000,
-        "every round trip must parse, derive an accept key and verify; emptying the loop or \
-         breaking any of the three must FAIL this test"
+        "every round trip must parse and verify; emptying the loop or breaking either must FAIL \
+         this test. NOT accept_key: verify recomputes it and compares against a fixture built the \
+         same way, so both sides move together. rfc_6455_accept_vector pins that against the RFC \
+         literal"
     );
 }
 
