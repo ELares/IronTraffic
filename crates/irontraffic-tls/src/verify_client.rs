@@ -411,6 +411,12 @@ pub struct IronClientVerifier {
     /// Whether the revocation loop in `verify_client_cert` runs at all. Step 2 reads this, so it
     /// must be a field: the `revocation` argument to `new` is stored here and nowhere else.
     revocation: RevocationMode,
+    /// Whether [`Self::new`] cleared the root hint subjects because `anchors.len()` exceeded
+    /// [`MAX_ROOT_HINTS`]. Exposed by [`Self::root_hints_cleared`] so invariant 11 (at most
+    /// `MAX_ROOT_HINTS` DNs are ever sent) is something a caller can observe directly, rather than
+    /// only inferable indirectly by driving a real handshake and counting what a custom
+    /// `ResolvesClientCert` was offered.
+    root_hints_cleared: bool,
     crl_cfg: CrlConfig,
     time: Arc<dyn TimeView>,
     stats: ClientAuthStats,
@@ -424,6 +430,7 @@ impl core::fmt::Debug for IronClientVerifier {
             .field("anchors_id", &hex_str(self.anchors_id))
             .field("revocation", &self.revocation)
             .field("allow_unknown_revocation", &self.allow_unknown_revocation)
+            .field("root_hints_cleared", &self.root_hints_cleared)
             .finish_non_exhaustive()
     }
 }
@@ -481,7 +488,8 @@ impl IronClientVerifier {
         // whatever wires this crate's data to structured logging later is the place that does,
         // exactly as `TlsPolicy::startup_warnings` already exposes data with no consumer yet in
         // this same crate.
-        if anchors.len() > MAX_ROOT_HINTS {
+        let root_hints_cleared = anchors.len() > MAX_ROOT_HINTS;
+        if root_hints_cleared {
             builder = builder.clear_root_hint_subjects();
         }
 
@@ -495,6 +503,7 @@ impl IronClientVerifier {
             anchors_id: anchors.id(),
             allow_unknown_revocation,
             revocation,
+            root_hints_cleared,
             crl_cfg,
             time,
             stats: ClientAuthStats::default(),
@@ -505,6 +514,33 @@ impl IronClientVerifier {
     #[must_use]
     pub fn stats(&self) -> &ClientAuthStats {
         &self.stats
+    }
+
+    /// Whether the revocation loop in `verify_client_cert` runs at all: the same value the
+    /// `revocation` argument to [`Self::new`] was constructed with. Exposed so invariant 6 and
+    /// invariant 10 (revocation is on unless the operator explicitly disabled it) are observable
+    /// on the verifier that is actually installed, rather than only inferable from the config
+    /// document a caller happened to build the verifier from.
+    #[must_use]
+    pub fn revocation(&self) -> RevocationMode {
+        self.revocation
+    }
+
+    /// Whether a certificate whose revocation status could not be determined is accepted rather
+    /// than refused: the same value the `allow_unknown_revocation` argument to [`Self::new`] was
+    /// constructed with. Exposed for the same reason as [`Self::revocation`].
+    #[must_use]
+    pub fn allow_unknown_revocation(&self) -> bool {
+        self.allow_unknown_revocation
+    }
+
+    /// Whether [`Self::new`] cleared the root hint subjects because the trust bundle exceeded
+    /// [`MAX_ROOT_HINTS`] anchors. Exposed so invariant 11 is observable on the verifier that was
+    /// actually built, rather than only inferable by driving a real handshake against a custom
+    /// `ResolvesClientCert` and counting what it was offered.
+    #[must_use]
+    pub fn root_hints_cleared(&self) -> bool {
+        self.root_hints_cleared
     }
 }
 
@@ -1142,6 +1178,24 @@ mod tests {
         let at_cap_refs: Vec<&[u8]> = at_cap_der.iter().map(Vec::as_slice).collect();
         let at_cap_anchors =
             TrustAnchors::from_der_bundle(&at_cap_refs).expect("32 real anchors must build");
+        // `IronClientVerifier`'s own accessor, checked directly rather than only inferred from a
+        // real handshake below: pins invariant 11 on the verifier that was actually built, not
+        // only on a side effect a custom `ResolvesClientCert` happens to observe.
+        let at_cap_auth = ClientAuth::Optional(at_cap_anchors.clone());
+        let at_cap_verifier = IronClientVerifier::new(
+            &at_cap_auth,
+            empty_crls(),
+            default_crl_cfg(),
+            false,
+            RevocationMode::Disabled,
+            clock(),
+        )
+        .expect("build")
+        .expect("Optional produces a verifier");
+        assert!(
+            !at_cap_verifier.root_hints_cleared(),
+            "at exactly the cap, root_hints_cleared() must report false"
+        );
         let hints_at_cap = hint_count_for(&issuing, at_cap_anchors);
         assert!(
             hints_at_cap > 0,
@@ -1155,6 +1209,21 @@ mod tests {
         let over_cap_refs: Vec<&[u8]> = over_cap_der.iter().map(Vec::as_slice).collect();
         let over_cap_anchors =
             TrustAnchors::from_der_bundle(&over_cap_refs).expect("33 real anchors must build");
+        let over_cap_auth = ClientAuth::Optional(over_cap_anchors.clone());
+        let over_cap_verifier = IronClientVerifier::new(
+            &over_cap_auth,
+            empty_crls(),
+            default_crl_cfg(),
+            false,
+            RevocationMode::Disabled,
+            clock(),
+        )
+        .expect("build")
+        .expect("Optional produces a verifier");
+        assert!(
+            over_cap_verifier.root_hints_cleared(),
+            "one anchor over the cap, root_hints_cleared() must report true"
+        );
         let hints_over_cap = hint_count_for(&issuing, over_cap_anchors);
         assert_eq!(
             hints_over_cap, 0,
@@ -1259,9 +1328,14 @@ mod tests {
         hints_len.load(Ordering::Relaxed)
     }
 
-    /// Drives two in-memory TLS endpoints through a handshake. Same shape used throughout this
-    /// crate's own tests (`policy.rs`, `tests/handshake_resolver.rs`), duplicated rather than
-    /// shared because each of those lives in a module this one cannot see.
+    /// Drives two in-memory TLS endpoints through a handshake, returning the first error either
+    /// side reports, `None` if both complete, or `Some` synthetic error if the 16-round-trip
+    /// budget is exhausted while either side is STILL handshaking: without that third outcome, a
+    /// stalled handshake that never errors and never finishes is indistinguishable from a
+    /// completed one, and a caller asserting `is_none()` to mean "succeeded" would pass on a
+    /// connection that never actually exchanged the bytes a completed handshake requires. Same
+    /// shape used throughout this crate's own tests (`policy.rs`, `tests/handshake_resolver.rs`),
+    /// duplicated rather than shared because each of those lives in a module this one cannot see.
     fn pump_handshake(
         client: &mut rustls::ClientConnection,
         server: &mut rustls::ServerConnection,
@@ -1298,10 +1372,12 @@ mod tests {
                 return Some(e);
             }
             if !client.is_handshaking() && !server.is_handshaking() {
-                break;
+                return None;
             }
         }
-        None
+        Some(std::io::Error::other(
+            "handshake did not complete within the 16-round-trip budget",
+        ))
     }
 
     // -----------------------------------------------------------------------
@@ -1324,6 +1400,11 @@ mod tests {
         )
         .expect("build")
         .expect("Required produces a verifier");
+        assert!(
+            !verifier.allow_unknown_revocation(),
+            "the verifier's own accessor must report the false the constructor was given"
+        );
+        assert_eq!(verifier.revocation(), RevocationMode::Enforced);
         let ee = end_entity(&leaf);
         let err = verifier
             .verify_client_cert(&ee, &[], now())
@@ -1351,6 +1432,10 @@ mod tests {
         )
         .expect("build")
         .expect("Required produces a verifier");
+        assert!(
+            verifier.allow_unknown_revocation(),
+            "the verifier's own accessor must report the true the constructor was given"
+        );
         let ee = end_entity(&leaf);
         assert!(verifier.verify_client_cert(&ee, &[], now()).is_ok());
         assert_eq!(verifier.stats().unknown_allowed.load(Ordering::Relaxed), 1);
@@ -1549,6 +1634,11 @@ mod tests {
         )
         .expect("build")
         .expect("Required produces a verifier");
+        assert_eq!(
+            verifier.revocation(),
+            RevocationMode::Disabled,
+            "the verifier's own accessor must report the Disabled the constructor was given"
+        );
         let ee = end_entity(&leaf);
         assert!(
             verifier.verify_client_cert(&ee, &[], now()).is_ok(),
