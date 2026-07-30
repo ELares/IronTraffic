@@ -3,9 +3,18 @@
 //! Benchmarks for `CertIndex::resolve`, the certificate-selection path per TLS handshake.
 //!
 //! Budgets are recorded here, not gated: `perf-budgets-file-and-raise-lint` (#418) wires up
-//! enforcement once its budget file exists. The flatness assertion (max/min ratio under 1.35
-//! across n) is the important property and is enforced by the unit test
-//! `store::index::tests::resolve_flat_across_n`.
+//! enforcement once its budget file exists.
+//!
+//! Flatness across n is the important property, and it is worth being precise about where it is
+//! enforced, because this file previously pointed at a test that stopped providing it:
+//!
+//! * `store::index::tests::resolve_flat_across_n` enforces it in the normal suite,
+//!   deterministically, by counting candidate names examined and map probes per resolution rather
+//!   than by reading a clock. A wall-clock version failed intermittently under the parallel suite
+//!   and blocked the gate at random (#750).
+//! * That test counts INSTRUMENTED work. Cost added on a path that touches neither the maps nor a
+//!   stored name is invisible to it, and nothing in the tree currently catches that. The
+//!   serialized perf job that would is #753, and it belongs with #418.
 //!
 //! **`resolver/resolve_parts`, `resolver/challenge_branch`, and `resolver/alpn_verdict_100`,
 //! named in `cert-resolver-and-acme-challenge-map` (#117)'s Benchmarks section, are not present
