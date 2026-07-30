@@ -126,6 +126,14 @@ subtle = "2.6"
 # Constant-time, allocation-free base64 for the Sec-WebSocket-Key and
 # Sec-WebSocket-Accept wire values (`ws-upgrade-handshake`, #203).
 base64ct = "1.6"
+# Wait-free publication cell for the TLS certificate index
+# (`cert-index-incremental-rebuild-and-publish`, #118): a reload builds a
+# whole new `CertIndex` off the hot path and stores it with one atomic
+# pointer swap, so a handshake in `TlsMaterialCell::load` never blocks on a
+# reload and an in-flight connection is never torn. Declared here, at exactly
+# the third allowlisted site in the whole workspace; see decision-ledger
+# entry 42's amendment and `scripts/allowlist-arcswap-store.txt`.
+arc-swap = "1.9.2"
 
 [workspace.lints.rust]
 # A proxy parses attacker-controlled bytes on every request. There is no

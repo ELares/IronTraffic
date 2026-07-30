@@ -16,6 +16,7 @@ use x509_cert::der::asn1::{AnyRef, ObjectIdentifier};
 use x509_cert::der::{Decode, Encode, Tagged};
 
 use super::arena::{ChainInterner, MAX_DER_BYTES};
+use super::challenge::ChallengeError;
 use crate::time::UnixSeconds;
 
 /// Maximum chain depth (leaf plus intermediates) we will accept.
@@ -114,6 +115,8 @@ pub enum CertError {
     /// group index would truncate. Refusing to build is the only safe answer: a truncated index
     /// serves the wrong name's certificate.
     IndexTooLarge,
+    /// A challenge-map operation failed. Carries the challenge error unchanged.
+    Challenge(ChallengeError),
 }
 
 impl core::fmt::Display for CertError {
@@ -155,6 +158,7 @@ impl core::fmt::Display for CertError {
             CertError::IndexTooLarge => f.write_str(
                 "the certificate index exceeds its 1 GiB name arena or 16777216 group limit",
             ),
+            CertError::Challenge(e) => write!(f, "challenge map error: {e}"),
         }
     }
 }
@@ -170,6 +174,12 @@ impl From<crate::name::NameError> for CertError {
 impl From<crate::name::WildcardError> for CertError {
     fn from(e: crate::name::WildcardError) -> Self {
         CertError::Wildcard(e)
+    }
+}
+
+impl From<ChallengeError> for CertError {
+    fn from(e: ChallengeError) -> Self {
+        CertError::Challenge(e)
     }
 }
 
@@ -718,6 +728,22 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "the private key did not parse or does not match the leaf public key"
+        );
+    }
+
+    #[test]
+    fn challenge_error_converts_and_displays() {
+        // Goes through the real `?`-driven conversion path (`From<ChallengeError>`), not a
+        // hand-built `CertError::Challenge(..)` literal on both sides of the assertion: `.into()`
+        // is what a `?` in `store::builder`'s flush actually calls, so a mutation that dropped
+        // the `From` impl (or mismatched its variant) would fail here rather than only fail to
+        // compile something no test exercises.
+        let challenge_err = super::ChallengeError::Full;
+        let cert_err: CertError = challenge_err.into();
+        assert_eq!(cert_err, CertError::Challenge(super::ChallengeError::Full));
+        assert_eq!(
+            cert_err.to_string(),
+            "challenge map error: the TLS-ALPN-01 challenge map already holds 512 entries"
         );
     }
 

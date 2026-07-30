@@ -80,6 +80,14 @@ impl From<NameError> for ChallengeError {
 /// An opaque, already-signed challenge credential. Constructed by the TLS-ALPN-01 solver from a
 /// DER chain and key through [`ChallengeKey::from_der`], so that no caller outside this crate
 /// names a `rustls::` type.
+///
+/// `Clone` and `Debug` are derived (added by `cert-index-incremental-rebuild-and-publish`, #118)
+/// rather than hand-written: the one field is `Arc<rustls::sign::CertifiedKey>`, and
+/// `rustls::sign::CertifiedKey` itself derives both, so `Arc::clone` and its `Debug` impl are
+/// exactly what the derive generates. `store::builder::CertUpdate::InstallChallenge` carries a
+/// `key: ChallengeKey` field and that enum must derive `Clone, Debug` in turn; without this
+/// derive here, `CertUpdate`'s own derive does not compile.
+#[derive(Clone, Debug)]
 pub struct ChallengeKey(Arc<rustls::sign::CertifiedKey>);
 
 impl ChallengeKey {

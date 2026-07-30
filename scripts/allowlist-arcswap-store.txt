@@ -14,3 +14,11 @@
 #
 # Empty in M1: no ArcSwap exists yet, so this ships empty on purpose, ahead
 # of the config plane that will need it.
+#
+# TlsMaterialCell, the third allowlisted ArcSwap declaration site (decision-ledger entry 42's
+# amendment, cert-index-incremental-rebuild-and-publish #118): read once per accepted connection,
+# before any request exists, so it cannot tear the route-to-filter relationship the single-
+# snapshot rule protects, and TLS material changes on ACME issuance and OCSP staple refresh,
+# neither of which is a configuration change. ArcSwap::store appears in exactly one function,
+# TlsMaterialCell::publish, both defined in this one file.
+crates/irontraffic-tls/src/store/publish.rs
