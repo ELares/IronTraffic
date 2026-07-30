@@ -15,6 +15,7 @@ pub mod hkdf;
 pub mod listener;
 pub mod name;
 pub mod ocsp;
+pub mod ocsp_update;
 pub mod policy;
 pub mod provider;
 pub mod store;
