@@ -67,3 +67,10 @@ path = "fuzz_targets/fuzz_ticket_decrypt.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_ocsp_response"
+path = "fuzz_targets/fuzz_ocsp_response.rs"
+test = false
+doc = false
+bench = false

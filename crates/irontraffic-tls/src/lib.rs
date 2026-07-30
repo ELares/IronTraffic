@@ -14,6 +14,7 @@ pub mod crl;
 pub mod hkdf;
 pub mod listener;
 pub mod name;
+pub mod ocsp;
 pub mod policy;
 pub mod provider;
 pub mod store;
