@@ -25,6 +25,8 @@ schema = ["dep:schemars"]
 
 [dependencies]
 rustls = { workspace = true }
+rustls-webpki = { workspace = true }
+rustls-native-certs = { workspace = true }
 siphasher = { workspace = true }
 blake3 = { workspace = true }
 x509-cert = { workspace = true }

@@ -23,6 +23,7 @@ pub mod replay;
 pub mod store;
 pub mod ticket;
 pub mod time;
+pub mod upstream;
 pub mod verify_client;
 
 pub use listener::{
@@ -40,4 +41,9 @@ pub use store::{
     CertIndex, CertIndexBuilder, ChallengeCerts, ChallengeCertsBuilder, ClientCaps, IronResolver,
 };
 pub use ticket::{ClusterTicketer, TicketRoot};
+pub use upstream::{
+    DEFAULT_PQ_SUPPRESS_SECS, MAX_ACCEPTED_SANS, MAX_PEER_SANS, MAX_URI_SAN_BYTES, PqState,
+    SubjectAltName, UpstreamPq, UpstreamTls, UpstreamTlsConfig, UpstreamTlsError, UpstreamTlsStats,
+    UpstreamVerifier, VerifyMode, WellKnownCa,
+};
 pub use verify_client::{ClientAuth, TrustAnchors};
