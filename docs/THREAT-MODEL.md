@@ -1531,3 +1531,13 @@ bypassable by anyone who can send a `Host` header, and that is a residual risk t
 - A peer still chooses which name it presents, so it chooses which of the configured policies it
   is measured against. Fail-closed selection bounds that to the set the operator configured; it
   does not remove the choice.
+- A handshake still costs a signature before any peer identity exists. Every one of the controls
+  in this section bounds how much of that cost an attacker can buy; none of them make the cost
+  zero, because the asymmetry between an attacker's `write()` and our signature is inherent to
+  terminating TLS, not a bug to be fixed.
+- 0-RTT replay cannot be fully prevented in a distributed system: a 0-RTT `ClientHello` can be
+  replayed to more than one node before any single node can prove it has seen that ticket before,
+  and no coordination-free anti-replay scheme closes that window completely. This design does not
+  negotiate 0-RTT today, so the risk is not live, but the residual risk is recorded here rather
+  than left implicit for whenever it is. `early-data-policy-and-replay-filter` (#121) owns this
+  paragraph and the policy that must exist before 0-RTT is turned on.

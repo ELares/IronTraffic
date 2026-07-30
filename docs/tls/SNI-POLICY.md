@@ -77,16 +77,41 @@ That configuration has a hole, and it is the real mechanism behind CVE-2026-4849
    `secure.example.com`. The request routes. A route that requires a client certificate has just
    been served over a connection that presented none.
 
-**The HTTP layer MUST re-check, on every request:** if the request authority's binding requires
-stronger client authentication than the connection provided, refuse the request. Not once per
-connection, once per request, because the authority can change between requests on one
-connection.
+### Per-request authority re-check
+
+**The HTTP layer MUST re-check, on every request:**
+
+```text
+client_auth_for_name(authority) > connection_client_auth
+```
+
+When that comparison is true, refuse the request. `authority` is the request's `Host` header or
+`:authority` pseudo-header; `connection_client_auth` is the `client_auth()` of the
+`TlsServerConfig` the connection was accepted under, which the connection layer already holds.
+`ClientAuthKind` derives `Ord` with `None < Optional < Required` precisely so this is one
+comparison.
+
+This check runs **per request, not per connection**, because the authority can change between
+requests on one connection: HTTP/2 and HTTP/3 carry many authorities on one connection, which is
+the entire attack. Caching the result at connection-accept time and skipping the re-check on later
+requests reopens the hole this section exists to close.
+
+Worked example, the exact configuration above: a connection accepted under `public.example.com`'s
+policy (`None`) later sends a request with authority `secure.example.com`. Certificate-scope
+checking says the connection may carry that authority, because `*.example.com` covers both names.
+The re-check above still fires, because `client_auth_for_name("secure.example.com")` is `Required`
+and the connection's own `client_auth` is `None`. The request is refused.
 
 "May this connection carry this authority at all" and "does this authority's client-auth
 requirement hold on this connection" are different questions. Both must be asked.
 
 A listener whose bindings all share one client-authentication requirement cannot be attacked this
 way, and for that shape the comparison is always false and costs nothing.
+
+Enforcement lives in the HTTP layer, which does not exist yet in this milestone. Until it does,
+this section states the contract rather than running code; see "These four are a contract, not an
+implementation" below for the same status on the handshake-flood limits, which a different piece
+of unwritten work (the accept loop) owns.
 
 ## Handshake-flood limits
 
@@ -114,6 +139,12 @@ The acceptor is sans-IO: it consumes bytes the caller already read. It cannot re
 connections, or see a source address, so it enforces none of the four. **The accept loop that
 owns the socket must**, and if it does not, the listener is trivially exhaustible and these
 numbers are decoration.
+
+That accept loop is the unwritten issue `tls-accept-loop-and-handshake-limits`. It belongs to the
+milestone that owns the accept loop (`conn-accept-loop`), and it must read the compiled
+`ListenerTls` for the accepted listener, run the `feed` loop, honour every `AcceptStep`, and
+enforce the three points below. Until it exists, TLS termination in this codebase is exercised
+only by the in-memory handshake tests in this crate.
 
 1. Start the handshake deadline when the connection is **accepted**, not when the first byte
    arrives. A connection that opens and sends nothing is the cheapest possible attack, and the
