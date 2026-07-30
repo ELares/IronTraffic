@@ -115,10 +115,21 @@ irontraffic-<version>-<target>.tar.gz
   irontraffic-<version>-<target>/
     irontraffic
     LICENSE
+    LICENSE-APACHE
+    LICENSE-MIT
+    NOTICE
     README.md
     docs/QUICKSTART.md
 SHA256SUMS          # one line per tarball, plain sha256sum format
 ```
+
+`LICENSE` is a two-option pointer file (Apache-2.0 or MIT, at the reader's choice) that names
+`LICENSE-APACHE` and `LICENSE-MIT` by path; both are shipped alongside it so the reference resolves
+offline, inside the archive itself, rather than sending a reader to the repository to find the text
+`LICENSE` points at. `NOTICE` is the third-party attribution file the FIPS artifact's OpenSSL licence
+exception (issue #488) requires; it is packaged into every tarball, not only a `crypto-fips` one,
+because the release binary this issue packages does not yet select a feature set narrow enough to
+omit it (see "What this table does not yet say" above).
 
 with a fixed member order (sorted), fixed ownership (`0`/`0`), fixed permissions (`0755` for the
 binary, `0644` otherwise), and `SOURCE_DATE_EPOCH` as every member's mtime, including the gzip
@@ -186,8 +197,7 @@ Concretely, that means:
   design, before any of those checks would otherwise run). Run as written, with no such override, on
   this development machine, 3 of the 14 checks pass anyway (the ones whose assertion happens to hold
   regardless of the host OS) and the rest fail loudly, for the one, understood, and reported reason:
-  `scripts/install.sh` refuses a non-Linux host. On the real `shell-selftests` CI runner (Ubuntu),
-  no override is needed at all.
+  `scripts/install.sh` refuses a non-Linux host.
 - The `aarch64-unknown-linux-gnu`, `aarch64-unknown-linux-musl`, and `x86_64-unknown-linux-gnu`
   targets, the real four-tarball `build-matrix.sh` run against genuine ELF binaries, `ldd`'s actual
   verdict on those binaries, and the `aarch64-linux-musl-cross` toolchain download in the
@@ -195,3 +205,104 @@ Concretely, that means:
   them can be, from this machine. They are exercised by the `release-artifacts` CI job this change
   adds, which does run on Ubuntu with the correct cross toolchains installed, and its first real run
   is the first genuine test of the `aarch64-linux-musl-cross` download step specifically.
+
+## What the first real Ubuntu CI run found, and what this fix round changed
+
+The paragraph above described what a macOS machine with no Docker or Linux cross-toolchain could
+verify before this repository's `shell-selftests` job had ever run for real. It has now run, on the
+real Ubuntu CI runner, and an independent adversarial review reproduced the reproducibility claim
+directly (at two absolute paths of *different* lengths, with different target directories and
+`TMPDIR`s, both the positive and negative control held) while tracing everything the macOS-only
+verification above could not reach. That review is the source of the four fixes below; each was
+watched to fail before being trusted, on this same macOS development machine, using the specific
+technique named:
+
+- **The mode probe (`install_sets_mode_regardless_of_umask`) could never pass on real Ubuntu CI.**
+  `release-selftest.sh` measured the installed mode with `stat -f '%Lp' FILE 2>/dev/null || stat -c
+  '%a' FILE 2>/dev/null`: the `-f` form is BSD/macOS's format flag, but under GNU coreutils `-f` means
+  `--file-system` and `%L` is an unrecognized directive there, which coreutils prints as a literal `?`
+  **without** setting a failure flag, so the command exits 0 with garbage output and the `||`
+  fallback never runs. This was the actual, reported cause of a 13/14 result on the real CI runner.
+  Fixed by trying `stat -c '%a'` first (GNU's form; it errors outright on BSD, correctly falling
+  through) and rejecting any reading that is not exactly three octal digits, rather than trusting a
+  coincidental string mismatch against `"755"` to mean "wrong mode". Verified on this macOS machine
+  two ways: (1) the real, unmodified fix, run for real, produces `14/14`; (2) a `stat` stub was built
+  that reproduces GNU coreutils' documented behavior exactly (`-c` returns the real mode via a direct
+  `stat()` syscall read; `-f` prints `?p` and exits 0), and against that stub the *old* probe order
+  reported `FAIL` on a file that genuinely was `0755`, while the *new* order correctly reported
+  `PASS`. This is the closest a macOS machine can get to reproducing the GNU-specific defect without
+  a Linux host, and it is not the same as having run it on one.
+- **`install_refuses_root` was vacuous.** The no-`IT_ALLOW_ROOT` arm never pointed at the local
+  fixture server, so with the entire root-refusal block deleted, execution simply proceeded past the
+  missing check into `resolve_latest_version` against the real `github.com` and failed for an
+  unrelated reason, still satisfying `[ "$status" -ne 0 ]`. Fixed by pointing that arm at the fixture
+  too and asserting the exact refusal message. Watched to fail: with the root-refusal block replaced
+  by `:`, the fixed test correctly reports `FAIL`; reverted, it is back to `14/14`.
+- **`install_cleans_up_on_interrupt` never entered `main` and never checked for a surviving temp
+  directory.** The injected delay ran *before* `main "$@"`, so `SIGINT` landed during a bare `sleep`
+  with no temp directory ever created; the assertion (`no binary was installed`) was trivially true
+  regardless of whether cleanup does anything at all, and the second half of the test the issue's own
+  edge case names (no temp directory survives) was never checked. Fixed by moving the delay inside
+  the real download path (the fixture server sleeps before answering the tarball request specifically,
+  while a marker file exists) and delivering `SIGINT` to the whole process group, not `install.sh`'s
+  own PID alone: verified directly, with a `sleep` standing in for `curl`, that signalling only the
+  parent process leaves a synchronous foreground child running to completion and defers a trap on
+  `INT` until that child exits on its own, which is indistinguishable, at the timescale this test
+  checks on, from the trap never running. `mktemp -d`'s own directory is also redirected, via a PATH stub, into a
+  directory this test controls: plain `$TMPDIR` was tried first and found unreliable for this
+  specifically on macOS (BSD `mktemp -d` with no template ignores an exported `$TMPDIR` in favor of
+  `_CS_DARWIN_USER_TEMP_DIR`, verified directly), which would have made the leftover-directory check
+  silently vacuous on this development machine while remaining meaningful on Linux; the stub sidesteps
+  that platform difference entirely rather than relying on it. Watched to fail: with the cleanup
+  `trap` replaced by `:`, the fixed test correctly reports `FAIL - install_cleans_up_on_interrupt`
+  with the diagnostic `a temporary directory survived under FORCE_MKTEMP_DIR: tmp.<random>`; reverted,
+  `14/14` again.
+- **The tag-triggered `release-artifacts` job could not have succeeded even once.**
+  `build-matrix.sh` created its output directory (`dist/`, not then in `.gitignore`) and wrote
+  `SHA256SUMS` into it *before* the first target's `build.sh` call, so on a pristine tag checkout
+  `git status --porcelain` reported `?? dist/` starting with target 1 of 4, and `build.sh`'s own dirty
+  gate refused every single target for the rest of the run. Fixed by staging every tarball and the
+  checksum manifest in a `mktemp -d` *outside* the repository tree, and copying the finished artifacts
+  into the real output directory only after every target has built (`/dist` was also added to
+  `.gitignore`, for a stale directory left over from a previous local run). Verified on this machine
+  with a harness that reproduces the actual bug and the actual fix without needing cross-compilation:
+  a real git repository, the real, unmodified `build.sh` and `build-matrix.sh`, and a stand-in `cargo`
+  that answers `cargo metadata` and creates a placeholder file instead of compiling anything (this
+  machine cannot cross-compile any of the four targets; the stand-in exists so `build.sh`'s own real
+  dirty-gate logic runs for real against a real git tree). Against that harness, the *unmodified*
+  original `build-matrix.sh` fails at target 1 with the exact reported message; the fixed version
+  completes all four targets, `sha256sum -c` verifies all four lines, and `git status --porcelain` is
+  empty both during the run and after it. This exercises the ordering bug and its fix directly; it
+  does not exercise real cross-compilation, real `ldd`/`readelf` output, or the real
+  `aarch64-linux-musl-cross` download, none of which can run from this machine.
+
+The same review's `SHOULD_FIX` findings are addressed alongside the four above: `scripts/install.sh`
+now checks both `mv` calls it makes rather than reporting `installed:` and exiting 0 regardless of
+whether either succeeded; the final install is staged under `$bin_dir` itself before the rename
+rather than under `$work_dir` (commonly a different filesystem from the install prefix), so the
+rename is a genuine same-filesystem atomic rename rather than one that degrades to copy-then-unlink
+whenever `$TMPDIR` and `$bin_dir` differ; `scripts/install.sh` is now uploaded as a release asset (the
+`gh release create` step lists it alongside the tarballs and `SHA256SUMS`), so the documented one-line
+install command resolves instead of 404ing; the musl static-linkage check for the native
+(`x86_64-unknown-linux-musl`) target now uses this repository's own, proven, wider pattern (`not a
+dynamic executable\|statically linked`) instead of a narrower one that would reject a genuinely static
+`static-pie` binary, and the foreign-architecture (`aarch64-unknown-linux-musl`) check now reads ELF
+program headers directly (`readelf -lW` for a `PT_INTERP` entry) instead of running `ldd` against a
+binary this runner cannot actually execute, which was untested by this repository before; the
+`aarch64-linux-musl-cross` download is now checked against a `sha256` pinned by downloading the real,
+current asset independently (twice, on two separate occasions) rather than trusted unverified, and the
+checkout step in front of it sets `persist-credentials: false`, matching its sibling
+`shell-selftests` job, since the credential a compromised tarball would otherwise run alongside is the
+one this job uses to publish releases; and `NOTICE`, `LICENSE-APACHE`, and `LICENSE-MIT` are now
+packaged into every tarball alongside `LICENSE` (verified against both `build-matrix.sh`'s own harness
+run above and `release-selftest.sh`'s fixture tarball, listing all seven members, sorted, with the
+expected modes).
+
+**What this fix round could not verify, said plainly:** the `readelf -lW` foreign-architecture check
+was not run against a real ELF binary anywhere (no `readelf` and no musl cross-toolchain are available
+on this machine); the pinned `aarch64-linux-musl-cross.tgz` checksum was computed from a real download
+but has never been exercised inside the actual `release-artifacts` CI job; and none of the four real
+release-artifact builds, `verify-repro.sh` reaching a genuine green result, or the `gh release create`
+step have run on Ubuntu. The `sh -n` and `bash -n` checks pass on all five scripts; no `shellcheck`
+binary is available on this machine to run the acceptance criterion's `shellcheck` check at all, so
+that specific check remains unrun here, not merely unreported.

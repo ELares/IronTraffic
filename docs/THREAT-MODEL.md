@@ -2011,7 +2011,16 @@ it.
 working directory and installs by atomic rename, so two installs racing on the same machine each
 complete cleanly (the last rename wins) rather than producing a torn, partially written binary on
 `PATH`; and a re-run after a partial failure re-downloads and re-verifies from nothing, rather than
-trusting anything left over from the failed attempt.
+trusting anything left over from the failed attempt. `mv` is only atomic when its source and
+destination share a filesystem, and `mktemp -d`'s working directory is commonly tmpfs on Linux while
+an install prefix such as `$HOME/.local/bin` is ordinarily on the root filesystem; a naive rename
+straight from the working directory would silently degrade to copy-then-unlink whenever the two
+differ, which is not atomic and can leave a truncated executable on `PATH` if interrupted mid-copy.
+`scripts/install.sh` avoids this by staging the new binary under the install prefix's own `bin`
+directory (a hidden, PID-suffixed name) before the final rename, so the rename is always
+same-filesystem regardless of where the platform's temporary directory happens to live, and that
+staged file is removed on every exit path, including an interrupted one, by the same cleanup `trap`
+that removes the working directory.
 
 **What a reader is explicitly NOT protected against by this script alone:** a compromise of the
 release host itself (which could serve a matching tarball and `SHA256SUMS` pair for a malicious

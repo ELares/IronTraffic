@@ -53,10 +53,12 @@ main() {
     cp "$copy_a/target/$target/release/irontraffic" "$out_dir/a/irontraffic"
     rustc_a="$( (cd "$copy_a" && rustc -vV) )"
 
-    # Wipe the target directory (and with it, any incremental compilation
-    # state) before the second build, so the second build cannot pass by
-    # reusing anything the first one produced; only the copied-out binary
-    # above survives this.
+    # Wipe copy_a's own target directory now that its binary has been copied
+    # out: build B runs in copy_b, its own independent checkout with its own
+    # target directory, so this cannot affect build B's inputs at all (copy_b
+    # was never built into yet). It exists so this script does not leave a
+    # multi-gigabyte target directory behind for copy_a once that build is no
+    # longer needed, not to make build B "cannot pass by reusing" anything.
     rm -rf "$copy_a/target"
 
     echo "== build B: $copy_b (a DIFFERENT absolute path) =="
