@@ -112,11 +112,20 @@ x509-cert = "0.2"
 # walker needs its `SliceReader` and `Reader` traits directly to skip unknown bytes without
 # materializing per-entry structs.
 der = "0.7"
+# RFC 6960 OCSP request/response types (`ocsp-staple-validation-and-updater`, #122):
+# `OCSPRequest`, `OCSPResponse`, `BasicOCSPResponse`, `CertID`, `ResponderID`. Self-described as
+# early-stage upstream, which is why the response validator is fuzzed rather than trusted. This
+# crate never enables its `builder` feature (that pulls in `digest`, `rand_core` and `signature`,
+# none of which this issue's dependency list authorizes); requests are built by hand from this
+# crate's own typed fields instead.
+x509-ocsp = "0.2.1"
 # dev-only: builds certificate fixtures in tests so no key material is committed
 rcgen = "0.14.8"
 # RFC 6455 Section 4.2.2 Sec-WebSocket-Accept computation: SHA-1 over the
 # base64 Sec-WebSocket-Key string plus the RFC GUID. Not pinned by an earlier
-# milestone in this tree yet, so `ws-upgrade-handshake` (#203) pins it here.
+# milestone in this tree yet, so `ws-upgrade-handshake` (#203) pins it here. Also the mandatory
+# `CertID` identifier hash RFC 6960 section 4.1.1 specifies for OCSP
+# (`ocsp-staple-validation-and-updater`, #122); never used as a signature algorithm.
 sha1 = "0.10"
 # `ConstantTimeEq` for comparing the recomputed Sec-WebSocket-Accept against
 # the value the upstream sent, per the workspace's `constant-time-secrets`
