@@ -317,6 +317,14 @@ impl ClusterTicketer {
     /// Do not pass a compromised root here during break-glass rotation: the overlap exists to
     /// preserve resumption across a planned rotation, and including a compromised root keeps
     /// every ticket it issued decryptable, which defeats the point of rotating away from it.
+    ///
+    /// Calling this again (an operator swapping the overlap root from one previous root to
+    /// another, without restarting) evicts every cached slot from the OLD previous root's ring:
+    /// a slot that already cached an epoch key derived from the outgoing root would otherwise
+    /// keep answering from that stale key for as long as the slot survives, up to `SLOT_COUNT`
+    /// epochs (128 days at the default rotation), because a cache hit only compares the
+    /// candidate epoch, never which root derived the cached entry. Evicting the whole ring is
+    /// what makes "swap the previous root" take effect immediately rather than eventually.
     #[must_use]
     #[allow(
         clippy::needless_pass_by_value,
@@ -330,6 +338,7 @@ impl ClusterTicketer {
             ROOT_SALT,
             previous.0.as_slice(),
         ));
+        self.slots_previous = build_slot_ring();
         self
     }
 
@@ -939,6 +948,52 @@ mod tests {
             .expect("must decrypt via the overlapped previous root");
         assert_eq!(pt, b"rotation overlap");
         assert_eq!(new.stats().decrypt_previous_root.load(Ordering::Relaxed), 1);
+    }
+
+    /// `with_previous_root` swaps in a new overlap root without a restart; a ticket from the
+    /// root it just discarded must stop decrypting immediately, not up to `SLOT_COUNT` epochs
+    /// later. Without evicting `slots_previous`, a slot already cached from the OLD previous
+    /// root would keep answering from that stale key: `epoch_key`'s cache hit only compares the
+    /// candidate epoch, never which root actually derived the cached entry, so the swap would
+    /// silently not take effect until the slot's epoch itself rolled out of the acceptance
+    /// window, up to 128 days at the default rotation.
+    #[test]
+    fn with_previous_root_evicts_previous_slot_ring() {
+        let clock = TestClock::new(1_000_000_000);
+        let time: Arc<dyn TimeView> = clock.clone();
+
+        // Root A, the overlap root about to be discarded, minted a ticket while it was live.
+        let root_a = test_ticketer([0x1E; 32], [0u8; 16], 21_600, Arc::clone(&clock));
+        let ct_from_a = root_a
+            .encrypt(b"discarded previous root")
+            .expect("entropy never fails");
+
+        let t = ClusterTicketer::new(
+            TicketRoot::new([0x1D; 32]),
+            [0u8; 16],
+            21_600,
+            Arc::clone(&time),
+            Arc::new(CountingNonceSource::default()),
+        )
+        .with_previous_root(TicketRoot::new([0x1E; 32]));
+
+        // Root A decrypts while it is the configured overlap root, which also populates
+        // `slots_previous`'s cache for this epoch.
+        assert_eq!(
+            t.decrypt(&ct_from_a).as_deref(),
+            Some(&b"discarded previous root"[..]),
+            "root A must decrypt while it is the configured overlap root"
+        );
+
+        // Operator rotates the overlap root from A to B without restarting the process.
+        let t = t.with_previous_root(TicketRoot::new([0x1F; 32]));
+
+        assert_eq!(
+            t.decrypt(&ct_from_a),
+            None,
+            "a ticket from the DISCARDED previous root must no longer decrypt once \
+             with_previous_root swaps in a new one"
+        );
     }
 
     #[test]
