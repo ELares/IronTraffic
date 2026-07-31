@@ -4,17 +4,25 @@
 //! # The property that matters: absolute, not relative
 //!
 //! `Schedule` computes every due time from `origin_ns` and `rate_hz` alone;
-//! it never accumulates from a previous send or a previous call. `no_drift`
-//! and `due_ns_survives_a_long_history_of_stalls_and_repayment` are the two
-//! tests that pin this directly: the first shows the formula is exact from a
-//! cold start, the second shows a request far in the future is due at
-//! EXACTLY the same instant whether or not the schedule spent the time in
-//! between falling behind and catching back up. A relative implementation
-//! (`next_due = last_send_time + interval`, or a `Schedule` whose `due_ns`
-//! reads `self.next_index` instead of only its `index` argument) would drift
-//! away from the literal pinned in the second test the moment any call to
-//! `releasable_at` fell behind; the mutation this file's own development
-//! watched fail is recorded on that test.
+//! it never accumulates from a previous send or a previous call. `no_drift`,
+//! `due_ns_survives_a_long_history_of_stalls_and_repayment` and
+//! `next_wake_ns_is_absolute_not_relative` pin this directly: the first
+//! shows the formula is exact from a cold start, the second shows a request
+//! far in the future is due at EXACTLY the same instant whether or not the
+//! schedule spent the time in between falling behind and catching back up
+//! (and, since it was widened to raise the stakes far above `burst_cap`,
+//! also that history), and the third asserts `next_wake_ns` itself, the one
+//! field a caller actually reads to know when to send next, against
+//! hand-computed literals at an off-period instant where the absolute and
+//! relative forms diverge. A relative implementation (`next_due =
+//! last_send_time + interval`, a `Release` built from `now_ns + interval`
+//! instead of the index's own due time, or a `Schedule` whose `due_ns` reads
+//! `self.next_index` instead of only its `index` argument) would drift away
+//! from the literals pinned in these tests the moment any call to
+//! `releasable_at` fell behind, or the moment a caller polled at an instant
+//! that does not fall exactly on a period boundary; every mutation this
+//! file's own development watched fail is recorded on the test that catches
+//! it.
 //!
 //! # What these tests do NOT prove
 //!
@@ -25,7 +33,7 @@
 //! `irontraffic-time` / `irontraffic-rand` seams, and every `now_ns` this
 //! file passes in is a plain literal or a value derived from one.
 
-use irontraffic_bench::{BenchError, LOW_NS, MAX_BURST_CAP, Schedule, StallTracker};
+use irontraffic_bench::{BenchError, HIGH_NS, LOW_NS, MAX_BURST_CAP, Schedule, StallTracker};
 use proptest::prelude::*;
 
 /// Deterministic pseudo-random sequence generator (`SplitMix64`), used only
@@ -189,8 +197,16 @@ fn catchup_is_o1_after_a_long_stall() {
         release.count, 64,
         "capped release, same as the steady-state cost"
     );
+    // The bound is wall-clock, not a call- or allocation-count, so it is the
+    // one test in this file with a nonzero flake probability from scheduler
+    // preemption between the two Instant::now() reads (issue #795 NOTE 9).
+    // Measured headroom on the actual closed-form implementation is roughly
+    // 4,800x (worst of 20,000 debug-build samples: 209 ns); a loop-based
+    // entitlement computation would iterate 3,600,000,000 times here and
+    // take seconds, not milliseconds. 50 ms keeps that separation decisive
+    // while giving CI noise far more room than the original 1 ms bound.
     assert!(
-        elapsed < std::time::Duration::from_millis(1),
+        elapsed < std::time::Duration::from_millis(50),
         "releasable_at after a one hour stall took {elapsed:?}, which means entitlement was \
          computed as a loop rather than in closed form"
     );
@@ -251,6 +267,41 @@ fn completion_before_due_saturates() {
     // 10. latency_ns(0, 0) with origin_ns = 100 is Some(0), not a panic.
     let schedule = Schedule::new(100, 1_000_000, 64).expect("valid schedule");
     assert_eq!(schedule.latency_ns(0, 0), Some(0));
+}
+
+#[test]
+fn latency_is_measured_from_this_indexs_own_due_time_not_from_origin() {
+    // 9a. Nonzero-index regression for issue #406 rule 3 ("the recorded
+    // latency of request i is completion_time_i - due_time_i, NOT
+    // completion_time_i - send_time_i"), which the module doc calls the
+    // entire methodology in one line. `latency_is_measured_from_due_time`
+    // and `completion_before_due_saturates` above both call `latency_ns` at
+    // index 0, where `due_ns(0) == origin_ns` identically, so neither can
+    // tell "measured from this index's due time" apart from "measured from
+    // origin_ns for every index" (issue #795 finding 2).
+    //
+    // Hand computed at a nonzero index: Schedule::new(1_000, 1_000_000, 64)
+    // has due_ns(7) == origin_ns + 7 * (1e9 / 1_000_000) == 1_000 + 7_000 ==
+    // 8_000, strictly greater than origin_ns (1_000), so measuring from
+    // due_ns(7) (12_000 - 8_000 == 4_000) and measuring from origin_ns
+    // (12_000 - 1_000 == 11_000) give different answers: this is exactly the
+    // fixture that separates the two, which index 0 cannot.
+    let schedule = Schedule::new(1_000, 1_000_000, 64).expect("valid schedule");
+    assert_eq!(
+        schedule.due_ns(7),
+        Some(8_000),
+        "hand-computed due time of index 7"
+    );
+    assert_eq!(
+        schedule.latency_ns(7, 12_000),
+        Some(4_000),
+        "latency must be measured from due_ns(7) (8_000), not from origin_ns (1_000)"
+    );
+    assert_ne!(
+        schedule.latency_ns(7, 12_000),
+        Some(12_000 - 1_000),
+        "measuring from origin_ns instead of this index's own due time must not match"
+    );
 }
 
 #[test]
@@ -330,15 +381,45 @@ fn stall_beyond_sixty_seconds_is_counted_not_dropped() {
         "the sample must not be clamped into the top bucket"
     );
 
-    // A publishable run is exactly the invariant this out-of-range count
-    // exists to police: a nonzero StallTracker::out_of_range means the run
-    // must be rejected, matching how {{bench-run-result-and-validity-guards}}
-    // is specified to treat `stall_out_of_range`.
-    let publishable = tracker.out_of_range() == 0;
-    assert!(
-        !publishable,
-        "a run whose worst stall fell off the histogram must not publish"
+    // What this test does NOT prove: that a nonzero out_of_range() actually
+    // fails a published run. `RunResult` and its validity guards do not
+    // exist in this crate yet (they are specified by a later issue,
+    // {{bench-run-result-and-validity-guards}}); asserting a local boolean
+    // computed from the same `out_of_range()` call two lines above would be
+    // a tautology, not a check on that link (issue #795 finding 6). This
+    // test's job ends at proving the sample is counted and not silently
+    // folded into the histogram; the publishability wiring is that later
+    // issue's job.
+}
+
+#[test]
+fn stall_out_of_range_boundary_is_pinned_exactly_at_high_ns() {
+    // Companion to stall_beyond_sixty_seconds_is_counted_not_dropped, which
+    // probes a full second past HIGH_NS and so pins nothing about where the
+    // edge actually is. This test pins both sides of the exact boundary:
+    // a stall of exactly HIGH_NS is still recorded into the histogram, and
+    // HIGH_NS + 1 ns is the first duration counted lost. `stall_ns > HIGH_NS`
+    // changed to `>=`, or the threshold widened by even 1 ns, changes one of
+    // these two outcomes (issue #795 finding 4).
+    let mut at_edge = StallTracker::new().expect("valid tracker");
+    at_edge.on_blocked(0);
+    at_edge.on_unblocked(HIGH_NS);
+    assert_eq!(
+        at_edge.out_of_range(),
+        0,
+        "a stall of exactly HIGH_NS must still be recorded, not booked as lost"
     );
+    assert_eq!(at_edge.recorder().len(), 1);
+
+    let mut one_past = StallTracker::new().expect("valid tracker");
+    one_past.on_blocked(0);
+    one_past.on_unblocked(HIGH_NS + 1);
+    assert_eq!(
+        one_past.out_of_range(),
+        1,
+        "one nanosecond past HIGH_NS must be the first duration counted lost"
+    );
+    assert!(one_past.recorder().is_empty());
 }
 
 #[test]
@@ -360,6 +441,32 @@ fn rate_and_cap_validation() {
         Err(BenchError::Cell(_))
     ));
     assert!(Schedule::new(0, 1000, MAX_BURST_CAP).is_ok());
+
+    // The documented rate ceiling itself must be ACCEPTED, not just values
+    // strictly below it: `rate_hz > MAX_RATE_HZ` changed to `>=` rejects
+    // exactly this value while every assertion above still passes, because
+    // the only property test that samples 50_000_000 does not reliably hit
+    // its own inclusive upper bound (issue #795 NOTE 7).
+    assert!(
+        Schedule::new(0, 50_000_000, 64).is_ok(),
+        "the documented maximum rate, 50_000_000 Hz, must be accepted"
+    );
+
+    // `Schedule::new(0, 1000, MAX_BURST_CAP)` above and the rejection two
+    // lines above it are both expressions recomputed from MAX_BURST_CAP
+    // itself, so they hold for ANY value of the constant: raising it does
+    // not move either literal. Pin the constant's actual value, and pin the
+    // rejection against a literal one past it, so raising MAX_BURST_CAP
+    // (issue #406: "do NOT raise that constant either") cannot pass
+    // silently (issue #795 finding 5).
+    assert_eq!(
+        MAX_BURST_CAP, 65_536,
+        "MAX_BURST_CAP moved; it must stay a fixed ceiling, never a configured value"
+    );
+    assert!(matches!(
+        Schedule::new(0, 1000, 65_537),
+        Err(BenchError::Cell(_))
+    ));
 }
 
 #[test]
@@ -407,6 +514,83 @@ fn exhausted_schedule_stops_releasing() {
     }
 }
 
+#[test]
+fn next_wake_ns_is_absolute_not_relative() {
+    // `next_wake_ns` is the ONLY field through which `Schedule` tells a
+    // caller when to send next; every other test that mentions it hits an
+    // edge case (`now_before_origin_releases_nothing`'s early return, or
+    // `exhausted_schedule_stops_releasing`'s exhausted sentinel), so the
+    // steady, behind, and just-caught-up arms had zero assertions on this
+    // field (issue #795 finding 1). This test pins hand-computed literals on
+    // all three.
+
+    // (a) Steady, on-time case. R = 1_000 Hz (a 1_000_000 ns period);
+    // releasable_at(0) is exactly on time for index 0 (due_ns(0) == 0), so
+    // the release is uncapped and the next wake is the absolute due time of
+    // the next index: due_ns_raw(1) == 1 * 1e9 / 1_000 == 1_000_000.
+    let mut on_time = Schedule::new(0, 1_000, 64).expect("valid schedule");
+    let steady = on_time.releasable_at(0);
+    assert_eq!(steady.count, 1);
+    assert_eq!(
+        steady.next_wake_ns, 1_000_000,
+        "on-time wake must be the absolute due time of the next index"
+    );
+
+    // (b) Still-behind after a capped release. Same fixture as
+    // `debt_accumulation`: R = 10_000 Hz, a 100 ms jump owes 1_000 requests,
+    // burst_cap (64) caps the release, and the client is still 936 requests
+    // behind afterwards. A caller that is still behind must be told to wake
+    // immediately (next_wake_ns == now_ns), never one interval later, which
+    // would insert an idle gap into an active catch-up and slow the
+    // client's return to on-schedule.
+    let mut behind = Schedule::new(0, 10_000, 64).expect("valid schedule");
+    let _ = behind.releasable_at(0);
+    let jumped = behind.releasable_at(100_000_000);
+    assert_eq!(
+        jumped.debt, 1_000,
+        "100 ms at 10 kHz owes exactly 1,000 requests"
+    );
+    assert_eq!(jumped.count, 64, "capped at burst_cap");
+    assert_eq!(
+        jumped.next_wake_ns, 100_000_000,
+        "a capped, still-behind release must wake immediately at now_ns, not now_ns + interval"
+    );
+
+    // (c) The discriminating case. R = 1_000_000 Hz (a 1_000 ns period),
+    // now_ns = 5_000_500, an OFF-PERIOD instant (not a multiple of the
+    // 1,000 ns period). due_ns(5_000) == 5_000_000 <= 5_000_500 <
+    // 5_001_000 == due_ns(5_001), so entitlement is exactly indices 0..=5_000
+    // (5_001 requests); burst_cap (6_000) does not cap this release, so
+    // next_index becomes 5_001, past entitled, and the schedule must report
+    // the ABSOLUTE due time of index 5_001: due_ns_raw(5_001) ==
+    // 5_001 * 1_000 == 5_001_000. A relative implementation
+    // (`now_ns + 1e9/rate_hz`) would instead answer
+    // 5_000_500 + 1_000 == 5_001_500, which is the canonical drift bug this
+    // whole module exists to make unrepresentable, and the exact fixture an
+    // independent adversarial review measured on the shipped code (issue
+    // #795 finding 1, evidence block).
+    let mut caught_up = Schedule::new(0, 1_000_000, 6_000).expect("valid schedule");
+    let release = caught_up.releasable_at(5_000_500);
+    assert_eq!(
+        release.debt, 5_001,
+        "indices 0..=5_000 are due at or before 5_000_500"
+    );
+    assert_eq!(
+        release.count, 5_001,
+        "burst_cap 6_000 does not cap this release"
+    );
+    assert_eq!(
+        release.next_wake_ns, 5_001_000,
+        "next_wake_ns must be the absolute due_ns_raw(5_001), not the relative form \
+         now_ns + interval"
+    );
+    assert_ne!(
+        release.next_wake_ns,
+        5_000_500 + 1_000,
+        "next_wake_ns must not equal the relative now_ns + interval (5_001_500)"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Additional test: the absolute-vs-relative property, driven adversarially.
 // ---------------------------------------------------------------------------
@@ -422,12 +606,26 @@ fn due_ns_survives_a_long_history_of_stalls_and_repayment() {
     //
     // Pin literals, not an expression derived from the same computation
     // under test: the far-future index's due time is asserted against the
-    // hand-computed literal 50_000 * 1_000 == 50_000_000, not against a
-    // second call to the formula under test.
+    // hand-computed literal 10_000_000 * 1_000 == 10_000_000_000, not
+    // against a second call to the formula under test.
+    //
+    // Deltas run up to 500,000 ns at R = 1,000,000 Hz (a 1,000 ns period),
+    // which routinely owes several hundred requests per step, far more than
+    // burst_cap (64): `catchup_burst_count() > 0` below is the load-bearing
+    // assertion that this test actually drives the capped, behind-schedule
+    // branch, not just the fully-repaid steady state. The original version
+    // of this test used deltas up to 10,000 ns, which owed at most 10
+    // requests per step against the same cap of 64: every one of its 4,000
+    // releasable_at calls fully repaid in the same call, the debt carried
+    // across calls was always exactly 0, and 0 calls ever reached the
+    // capped branch, despite this test's own prior comment claiming it
+    // "drives 4,000 releasable_at calls carrying accumulated lateness"
+    // (issue #795 finding 3: the fixture could not express the state the
+    // comment claimed to test).
     let rate_hz = 1_000_000u64;
     let mut schedule = Schedule::new(0, rate_hz, 64).expect("valid schedule");
-    let far_future_index = 50_000u64;
-    let expected_due_ns = 50_000_000u64;
+    let far_future_index = 10_000_000u64;
+    let expected_due_ns = 10_000_000_000u64;
     assert_eq!(
         schedule.due_ns(far_future_index),
         Some(expected_due_ns),
@@ -437,11 +635,15 @@ fn due_ns_survives_a_long_history_of_stalls_and_repayment() {
     // Drive an adversarial mix of stalls (a jump far past the client's
     // current entitlement) and immediate re-polls (the same now_ns twice
     // in a row) using a fixed pseudo-random sequence of deltas, none of
-    // which reach far_future_index's own due time.
+    // which reach far_future_index's own due time. Worst case cumulative
+    // now_ns is 2_000 * 499_999 < 1_000_000_000, an order of magnitude below
+    // expected_due_ns, so the in-loop assertion below cannot trip no matter
+    // what the fixed seed draws.
     let mut rng = SplitMix64(0xF00D_F00D_F00D_F00D);
     let mut now_ns = 0u64;
     for _ in 0..2_000 {
-        let jump_ns = rng.next() % 10_000; // small stalls, well under 50 ms
+        let jump_ns = rng.next() % 500_000; // up to 500 us: hundreds of
+        // requests owed at R = 1_000_000, far more than burst_cap (64)
         now_ns += jump_ns;
         assert!(
             now_ns < expected_due_ns,
@@ -452,6 +654,12 @@ fn due_ns_survives_a_long_history_of_stalls_and_repayment() {
         // spinning on a stale next_wake_ns would produce.
         let _ = schedule.releasable_at(now_ns);
     }
+
+    assert!(
+        schedule.catchup_burst_count() > 0,
+        "this test must actually reach the capped, behind-schedule branch, or it proves \
+         nothing about a client that falls behind (see issue #795 finding 3)"
+    );
 
     assert_eq!(
         schedule.due_ns(far_future_index),
@@ -536,6 +744,39 @@ proptest! {
             .latency_ns(index, completion_ns)
             .expect("index is far below max_index");
         let latency_from_send = completion_ns.saturating_sub(send_ns);
+
+        // Independently derive this index's due time from the raw formula
+        // (index * 1e9 / rate_hz, origin_ns is 0 here) rather than reusing
+        // `due_ns` above a second time: an assertion built only from the
+        // function under test can catch a mutation only if it ALSO breaks
+        // `due_ns` itself. `latency_ns` measuring from `origin_ns` instead of
+        // this index's own due time (issue #795 finding 2, mutation M11)
+        // leaves `due_ns` correct and only breaks `latency_ns`, and the
+        // one-directional `>=` below cannot see that: origin-relative
+        // latency is LARGER than send-relative latency for every index > 0,
+        // same direction as the correct answer, so the inequality alone
+        // still holds under that mutation. The equality against this
+        // independently computed due time is what closes the gap.
+        #[expect(
+            clippy::integer_division,
+            reason = "deliberately mirrors the floor division Schedule::due_ns_raw performs, \
+                      computed independently here rather than by calling into the function \
+                      under test"
+        )]
+        let independent_due_u128 = u128::from(index) * 1_000_000_000u128 / u128::from(rate_hz);
+        let independent_due_ns = u64::try_from(independent_due_u128)
+            .expect("index < 1_000 and rate_hz >= 1 keep this far below u64::MAX");
+        prop_assert_eq!(
+            independent_due_ns,
+            due_ns,
+            "sanity: the independent formula must agree with Schedule::due_ns"
+        );
+        prop_assert_eq!(
+            latency_from_due,
+            completion_ns.saturating_sub(independent_due_ns),
+            "latency_ns must equal completion_ns minus THIS index's own due time, not origin_ns \
+             or any other index's"
+        );
 
         prop_assert!(latency_from_due >= latency_from_send);
     }
