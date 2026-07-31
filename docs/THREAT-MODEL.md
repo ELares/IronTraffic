@@ -2085,6 +2085,23 @@ checkable, by rebuilding the named commit and comparing digests: provenance name
 reproduction proves the commit produces the artifact, and these are two different claims of two
 different strengths. See `docs/SUPPLY-CHAIN.md`.
 
+**`deny.toml`, `licence-exceptions.txt`, and `sbom-licence-check.sh` itself are transport trusted
+only.** None of the three is signed or checksummed: `gh release create` uploads all three straight
+from the checkout, never staged into `dist/`, so they appear in no `SHA256SUMS` line and in neither the
+tarball's nor the `SHA256SUMS`' own `.bundle`/`.intoto.bundle` (see `docs/SUPPLY-CHAIN.md` section 1).
+This is a deliberate gap, not an oversight: anyone able to substitute `deny.toml` or
+`licence-exceptions.txt` on the wire is equally able to substitute `sbom-licence-check.sh`, the script
+that reads them, which is strictly more capable, so signing the policy data alone would not close
+anything a substituted script could not already open by itself. The licence check is consequently a
+hygiene check running over the same unauthenticated channel as `scripts/install.sh` itself, not an
+authenticity check: a passing run tells you a component's declared licence is a subset of an allowlist
+that was ALSO fetched unauthenticated, and cannot tell you that allowlist is the project's real one.
+`sbom-licence-check.sh` names the exact `deny.toml` and `licence-exceptions.txt` paths it actually
+applied on every run that reaches a real comparison (an `applied:` line, folded into `verify.sh`'s own
+`sbom licence: subset of the allowlist (...)` line on success, and present in the log `verify.sh` prints
+on a failure), so a shadowed or substituted copy of either file is at least visible in the one screen a
+reader reads, even though this mechanism cannot, by itself, prove it is the wrong one (#791).
+
 **A skipped check is a failure, not a pass.** `scripts/release/verify.sh` exits nonzero whenever a
 check it was asked to perform (checksum, signature, provenance by default) could not be performed at
 all, for instance because the transparency log was unreachable, rather than reporting it as skipped
