@@ -98,32 +98,60 @@
 //! here regardless (this reconstruction is an approximation from four
 //! points, not a histogram, exactly like h2load's and oha's).
 //!
-//! **Each key's weight is the difference of two CUMULATIVE rounded counts,
-//! never an independently rounded gap.** An earlier version of this parser
-//! rounded each `(quantile - prev_quantile) * requests_sent` gap on its own,
-//! the way `oha.rs` rounds its own nine-point ladder's gaps; that is wrong
-//! here (PR 815 review, issue #816 BLOCKING 2). Independent per-gap rounding
-//! lets the SAME half-sample round down at one step and up at the next, so
-//! the errors compound instead of cancelling: on this module's own committed
-//! fixture (`requests: 250`), `(0.95 - 0.90) * 250` is `12.499999999999984`
-//! in f64, which rounds to 12 rather than 13, leaving only 247 of the 248
-//! samples `round(0.99 * 250)` should place at or below the 99th percentile.
-//! The one sample this dropped landed at `latencies.max` instead, so
-//! `value_at_quantile(0.99)` (`count_at_quantile = ceil(0.99 * 250) == 248`)
-//! fell into the `max` bucket rather than the 99th, and the reconstructed
-//! p99 collapsed onto `max`, 2.73x vegeta's own reported value, on 832 of a
-//! 2,602-point sweep of `requests`. Recording the DIFFERENCE between two
-//! cumulative, independently rounded running totals instead means each
-//! step's cumulative count is always the nearest integer to the TRUE
-//! cumulative count, so the ladder allocates EXACTLY `round(quantile *
-//! requests_sent)` samples at or below every quantile, with no drift left to
-//! compound by the time `max` absorbs the remainder.
-//! `parse_reconstructs_p99_within_tolerance_of_vegetas_own_value`
-//! (`tests/loadgen_vegeta.rs`) pins the reconstructed p99 against this
-//! fixture's own literal `latencies.99th`, watched to fail against the
-//! independently-rounded form this replaces; before that assertion existed,
-//! the only check on this reconstruction was `samples > 0`, which a mutation
-//! that made the parser never read `latencies.99th` at all still passed.
+//! **Each key's weight is the difference of two CUMULATIVE counts, never an
+//! independently rounded gap, and each cumulative count is a CEILING, never a
+//! round-to-nearest.** An earlier version of this parser rounded each
+//! `(quantile - prev_quantile) * requests_sent` gap on its own, the way
+//! `oha.rs` rounds its own nine-point ladder's gaps; that is wrong here (PR
+//! 815 review, issue #816 BLOCKING 2). Independent per-gap rounding lets the
+//! SAME half-sample round down at one step and up at the next, so the errors
+//! compound instead of cancelling: on this module's own committed fixture
+//! (`requests: 250`), `(0.95 - 0.90) * 250` is `12.499999999999984` in f64,
+//! which rounds to 12 rather than 13, leaving only 247 of the 248 samples
+//! `round(0.99 * 250)` should place at or below the 99th percentile. The one
+//! sample this dropped landed at `latencies.max` instead, so
+//! `value_at_quantile(0.99)` fell into the `max` bucket rather than the 99th,
+//! and the reconstructed p99 collapsed onto `max`, 2.73x vegeta's own
+//! reported value, on 832 of a 2,602-point sweep of `requests`.
+//!
+//! A first fix took the DIFFERENCE of two cumulative, independently
+//! ROUNDED running totals instead of rounding each gap; that made total
+//! allocation exact (zero mismatches across a 2,602-point sweep and 4,000
+//! random ladders) but left the collapse in place, and made it WORSE: 294 of
+//! 602 gate-eligible run sizes instead of 192 (PR 815 review, issue #817
+//! BLOCKING 1). The reason is that this ladder's own cumulative target and
+//! [`crate::hist::LatencyRecorder::percentiles`]'s own READER disagreed on
+//! which rank a quantile owns. `percentiles()` answers `p99_ns` through
+//! `hdrhistogram::value_at_quantile(0.99)`, which reads the value at rank
+//! `ceil(0.99 * N)` (confirmed directly against the `hdrhistogram` crate's
+//! own source, `value_at_quantile`'s `fractional_count.ceil()`), but a
+//! cumulative total of `round(0.99 * N)` places the LAST sample at the 99th
+//! percentile's value only up to rank `round(0.99 * N)`. Whenever
+//! `round(0.99 * N) < ceil(0.99 * N)`, the rank the reader actually asks for
+//! falls one past that boundary, into the weight recorded at `latencies.max`
+//! instead. `frac(0.99 * N)` takes only the values `0, 0.01, ..., 0.99`, and
+//! `round` and `ceil` disagree on it whenever that fraction is strictly
+//! between 0 and 0.5, which happens for 49 of every 100 values of `N`
+//! (`N mod 100` in `51..=99`): confirmed empirically by sweeping, not only
+//! derived.
+//!
+//! The actual fix is to make the cumulative target the SAME function the
+//! reader uses: each cumulative count is `ceil(quantile * requests_sent)`,
+//! never `round(quantile * requests_sent)`, so the rank the 99th bucket owns
+//! (`ceil(0.99 * requests_sent)`, by construction) is exactly the rank
+//! `value_at_quantile(0.99)` reads. This still allocates EXACTLY
+//! `ceil(quantile * requests_sent)` samples at or below every quantile (each
+//! cumulative count is non-decreasing and bounded by `requests_sent`, since
+//! `quantile <= 0.99 < 1.0`), so total allocation stays exact, and it removes
+//! the one-step-further-down-the-pipe mismatch the rounded-cumulative fix
+//! left behind. `parse_fixture` (`tests/loadgen_vegeta.rs`) pins the
+//! reconstructed p99 against this fixture's own literal `latencies.99th` at
+//! `requests: 250` (`250 mod 100 == 50`, the one residue where `round` and
+//! `ceil` already agreed, so this alone is not a regression guard against the
+//! collapse); `parse_reconstructs_p99_at_a_collapsing_residue` in the same
+//! file is the regression guard proper, built at a `requests` value whose
+//! residue mod 100 falls in `51..=99` and watched to fail against the
+//! rounded-cumulative form this replaces.
 //!
 //! # Untrusted input
 //!
@@ -679,39 +707,47 @@ impl LoadGenerator for Vegeta {
             }
             prev_value_ns = Some(value_ns);
 
-            // CUMULATIVE rounding, not an independently-rounded-per-gap
-            // weight (PR 815 review, issue #816 BLOCKING 2). Rounding each
-            // `(quantile - prev_quantile) * requests_sent_f` gap on its own
-            // lets the SAME half-sample round down at one step and up at
-            // the next, so the errors compound instead of cancelling: at
-            // `requests_sent = 250` with this fixture's own committed
-            // values, `(0.95 - 0.90) * 250` is `12.499999999999984` in f64,
-            // which rounds to 12, not 13, leaving `allocated == 247`, one
-            // short of `round(0.99 * 250) == 248`. The one sample this
-            // dropped was recorded at `latencies.max` instead of the 99th
-            // bucket, so `value_at_quantile(0.99)` (`count_at_quantile =
-            // ceil(0.99 * 250) == 248`) fell into the `max` bucket instead
-            // of the 99th, and the reconstructed p99 collapsed onto `max`
-            // (2.73x vegeta's own reported value on this exact fixture).
-            // Taking the DIFFERENCE of two cumulative, independently-rounded
-            // running totals instead means each step's cumulative count is
-            // always the nearest integer to the TRUE cumulative count, so
-            // the ladder allocates EXACTLY `round(quantile * requests_sent)`
-            // samples at or below every quantile, with no drift left to
-            // compound by the time `max` absorbs the remainder.
-            // `parse_reconstructs_p99_within_tolerance_of_vegetas_own_value`
-            // below is the regression test; it fails against the
-            // independently-rounded form this replaces.
+            // CUMULATIVE, not an independently-rounded-per-gap weight (PR
+            // 815 review, issue #816 BLOCKING 2), and a CEILING, never a
+            // round-to-nearest (PR 815 review, issue #817 BLOCKING 1).
+            // Rounding each `(quantile - prev_quantile) * requests_sent_f`
+            // gap on its own lets the SAME half-sample round down at one
+            // step and up at the next, so the errors compound instead of
+            // cancelling; taking the difference of two cumulative totals
+            // fixes that, but a cumulative total of `round(quantile *
+            // requests_sent)` still disagrees with the READER:
+            // `LatencyRecorder::percentiles()` answers `p99_ns` through
+            // `hdrhistogram::value_at_quantile(0.99)`, which reads the value
+            // at rank `ceil(0.99 * N)`, not `round(0.99 * N)`. Whenever
+            // `round(0.99 * N) < ceil(0.99 * N)` (49 of every 100 values of
+            // `N`, exactly when `N mod 100` is in `51..=99`), the rank the
+            // reader asks for falls one past the rounded cumulative total,
+            // into the weight recorded at `latencies.max` instead, and the
+            // reconstructed p99 collapses onto `max`. Using `ceil` here
+            // instead of `round` makes the cumulative target the SAME
+            // function the reader uses, so the 99th bucket's own cumulative
+            // count (`ceil(0.99 * requests_sent)`) is exactly the rank
+            // `value_at_quantile(0.99)` reads, at every `requests_sent`.
+            // Total allocation stays exact: each cumulative count is
+            // non-decreasing and bounded by `requests_sent_f` (`quantile <=
+            // 0.99 < 1.0`), so `.clamp(...)` below never actually clamps
+            // anything, and is kept only as defence in depth. `parse_fixture`
+            // and `parse_reconstructs_p99_at_a_collapsing_residue` (both in
+            // `tests/loadgen_vegeta.rs`) are the regression tests; the
+            // latter is built at a `requests` value whose residue mod 100
+            // falls in `51..=99`, the one case the former's fixture
+            // (`requests: 250`, residue 50) cannot exercise, and fails
+            // against the rounded-cumulative form this replaces.
             #[expect(
                 clippy::cast_possible_truncation,
                 clippy::cast_sign_loss,
                 reason = "quantile is in (0.0, 1.0] by construction (PERCENTILE_KEYS's quantiles \
                           are fixed, strictly increasing literals), and requests_sent_f is \
                           non-negative, so quantile * requests_sent_f is non-negative and at most \
-                          requests_sent_f; .round().clamp(...) bounds it before this cast"
+                          requests_sent_f; .ceil().clamp(...) bounds it before this cast"
             )]
             let cumulative = (quantile * requests_sent_f)
-                .round()
+                .ceil()
                 .clamp(0.0, requests_sent_f) as u64;
             let weight = cumulative.saturating_sub(prev_cumulative);
             recorder.record_n_ns(value_ns, weight);

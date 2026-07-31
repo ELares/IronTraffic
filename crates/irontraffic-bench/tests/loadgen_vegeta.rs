@@ -248,6 +248,77 @@ fn parse_fixture() {
 }
 
 // ---------------------------------------------------------------------------
+// Not one of the issue's own 24 named tests (PR 815 review, issue #817
+// BLOCKING 1's own regression guard). `parse_fixture` above pins the SAME
+// property at `requests: 250`, but `250 mod 100 == 50`, the ONE residue
+// where `round(0.99 * r) == ceil(0.99 * r)`: a regression that reverted the
+// cumulative allocator's target from `ceil` back to `round` (the fix this
+// module doc's "The percentile reconstruction" section records, PR 815
+// review, issue #817 BLOCKING 1) would leave `parse_fixture` passing
+// unchanged, exactly the "guard sits on the one value that cannot fail"
+// shape that review named. `requests: 151` (`151 mod 100 == 51`, inside the
+// `51..=99` collapsing band the review's own residue rule derives) is what
+// actually exercises the reader/allocator mismatch: at `r = 151`,
+// `round(0.99 * 151) == 149` but `ceil(0.99 * 151) == 150`, and
+// `LatencyRecorder::percentiles`'s own `value_at_quantile(0.99)` reads rank
+// `ceil(0.99 * 151) == 150`, which a `round`-based cumulative target places
+// one rank INTO `latencies.max` (rank 150 falls in the max bucket's
+// `150..=151`, since the `round`-based 99th bucket only reaches rank 149)
+// rather than the 99th bucket. Watched to fail against the `round`-based
+// form this replaces: the reconstructed p99 there collapses onto
+// `latencies.max` (1,668,750), 2.73x this fixture's own declared 610,834,
+// clearing the 1 percent tolerance below by two orders of magnitude.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parse_reconstructs_p99_at_a_collapsing_residue() {
+    let cell = base_cell();
+    let invocation = base_invocation();
+    let tool = base_tool_stamp();
+    let ctx = base_ctx(&cell, &invocation, &tool);
+
+    // The fixture's own percentile ladder, at `requests: 151` instead of
+    // `250`: same values, a residue (51) inside the collapsing band instead
+    // of the one residue (50) that cannot collapse.
+    let doc = r#"{
+        "latencies": {"50th": 404245, "90th": 522854, "95th": 564124, "99th": 610834, "max": 1668750},
+        "bytes_in": {"total": 32000},
+        "requests": 151,
+        "duration": 4980002542,
+        "status_codes": {"200": 151}
+    }"#;
+
+    let raw = Vegeta {
+        max_workers: 8,
+        targets_path: "targets.txt".into(),
+        output_path: "results.bin".into(),
+    }
+    .parse(&ctx, doc.as_bytes(), b"")
+    .expect("well-formed synthetic fixture");
+
+    assert_eq!(raw.requests_sent, 151);
+    // Total allocation stays exact: every one of the 151 samples lands
+    // somewhere, which the rounded-cumulative fix already established and
+    // this ceil-based one does not regress.
+    assert_eq!(raw.latency.percentiles().samples, 151);
+
+    let expected_p99_ns = 610_834.0_f64;
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "p99_ns is well under 2^53 for any run this file's fixtures can produce, so this \
+                  comparison loses no precision that matters"
+    )]
+    let actual_p99_ns = raw.latency.percentiles().p99_ns as f64;
+    let diff = (actual_p99_ns - expected_p99_ns).abs();
+    assert!(
+        diff <= expected_p99_ns * 0.01,
+        "reconstructed p99_ns {actual_p99_ns} not within 1% of the declared {expected_p99_ns}: a \
+         round-based (rather than ceil-based) cumulative allocator collapses this exact residue \
+         onto latencies.max (1,668,750)"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Not one of the issue's own 24 named tests: `src/loadgen/vegeta.rs`'s own
 // module doc states that `status_codes` gets the SAME canonical-rendering
 // check `oha.rs`'s `parse_rejects_status_code_key_aliasing` fix established
