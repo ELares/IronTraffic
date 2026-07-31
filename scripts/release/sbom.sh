@@ -75,6 +75,20 @@ preflight() {
         echo "  with glibc on Linux and with macOS by default." >&2
         exit 1
     fi
+    if ! command -v sha256sum >/dev/null 2>&1 && ! command -v shasum >/dev/null 2>&1; then
+        echo "error: neither sha256sum nor shasum is installed; this script needs" >&2
+        echo "  one to record sha256(Cargo.lock) in the SBOM (the field verify.sh" >&2
+        echo "  binds against the provenance's own cargoLockSha256, invariant 8)." >&2
+        exit 1
+    fi
+}
+
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    else
+        shasum -a 256 "$1" | awk '{print $1}'
+    fi
 }
 
 # Mirrors build.sh's own fallback: a fixed wrong timestamp (the Unix epoch)
@@ -287,6 +301,16 @@ main() {
 
     epoch="$(source_date_epoch)"
     rustc_ver="$(rustc_version_line)"
+    # sha256(Cargo.lock), recorded so verify.sh can bind a --sbom argument
+    # to the artifact it is supposedly describing (invariant 8): without
+    # this, any signed SBOM from any target or any release verifies
+    # correctly beside any tarball, because nothing before this compared
+    # the SBOM's own dependency graph to the artifact's. attest.sh already
+    # records the identical digest in the provenance's own
+    # invocation.parameters.cargoLockSha256; the two are compared directly,
+    # not merely both present, so a real drift between an SBOM and the
+    # dependency graph an artifact was actually built from is caught.
+    cargo_lock_sha256="$(sha256_of "$REPO_ROOT/Cargo.lock")"
 
     work="$(mktemp -d)"
     trap 'rm -rf "$work"' EXIT INT TERM
@@ -337,6 +361,7 @@ main() {
        --arg features "$features" \
        --arg rustc_ver "$rustc_ver" \
        --arg epoch "$epoch" \
+       --arg cargo_lock_sha256 "$cargo_lock_sha256" \
        --argjson overlay "$overlay" \
        "$JQ_CLOSURE$JQ_LICENSES"'
       def purl_of($name; $version): "pkg:cargo/\($name)@\($version)";
@@ -369,7 +394,8 @@ main() {
               { name: "irontraffic:target", value: $target },
               { name: "irontraffic:features", value: $features },
               { name: "irontraffic:rustc_version", value: $rustc_ver },
-              { name: "irontraffic:source_date_epoch", value: ($epoch | tostring) }
+              { name: "irontraffic:source_date_epoch", value: ($epoch | tostring) },
+              { name: "irontraffic:cargo_lock_sha256", value: $cargo_lock_sha256 }
             ]
           },
           components: (

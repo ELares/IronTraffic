@@ -20,8 +20,17 @@
 # (unversioned) has a committed exception with a written reason.
 set -eu
 
+# REPO_ROOT is used only to build the DEFAULT deny_file/exceptions_file
+# paths below, both already absolute from this `cd ... && pwd`; it does NOT
+# chdir the process. This script is invoked by verify.sh's `--sbom` path
+# ($SCRIPT_DIR-relative, see verify.sh's own header) with an <sbom-file>
+# argument that may be relative to the CALLER's working directory (a
+# standalone `sh verify.sh --sbom irontraffic-<v>-<t>.tar.gz.sbom.json` run
+# beside the downloaded files, per docs/SUPPLY-CHAIN.md). A `cd` here, same
+# as verify.sh's own former bug, would resolve that relative sbom_file
+# against the WRONG directory once this script's own `$0` is not sitting
+# inside a repository checkout.
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-cd "$REPO_ROOT"
 
 usage() {
     cat <<'EOF' >&2

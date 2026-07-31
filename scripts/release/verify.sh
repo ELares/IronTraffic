@@ -30,13 +30,26 @@
 # checked, rather than a bare "ok".
 set -eu
 
-REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
-# The directory verify.sh itself lives in, NOT $REPO_ROOT: this script is a
-# release asset a user downloads standalone (see docs/SUPPLY-CHAIN.md), with
-# no repository checkout around it, and sbom-licence-check.sh below is
-# looked up next to THIS file for exactly that reason.
+# The directory verify.sh itself lives in: this script is a release asset a
+# user downloads standalone (see docs/SUPPLY-CHAIN.md), with no repository
+# checkout around it, and sbom-licence-check.sh below is looked up next to
+# THIS file for exactly that reason.
+#
+# THIS SCRIPT DOES NOT chdir ANYWHERE. It used to `cd` to a computed
+# "repository root" two directories above itself
+# (`$(dirname "$0")/../..`), which is correct only when the script still
+# sits inside a checkout at scripts/release/verify.sh. Run the way
+# docs/SUPPLY-CHAIN.md documents standalone use ("curl the script beside the
+# tarball, then `sh verify.sh --artifact <tarball>`"), `dirname "$0"` is
+# `.`, so that computed root landed TWO LEVELS ABOVE the download directory,
+# and a relative `--artifact` (or `--sbom`) path no longer resolved from
+# there: "error: no such file: irontraffic-<version>-<target>.tar.gz" even
+# though the file was sitting right next to this script. Nothing else in
+# this file needs a changed working directory; every path this script reads
+# is either $SCRIPT_DIR-relative (sbom-licence-check.sh) or taken from
+# --artifact/--sbom/SHA256SUMS exactly as the caller's own shell resolves
+# them, which is only correct if this script leaves that resolution alone.
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-cd "$REPO_ROOT"
 
 # Overridable only for this script's own test suite, which cannot reach the
 # real GitHub host, mirroring scripts/install.sh's identical IT_RELEASE_BASE_URL
@@ -177,7 +190,30 @@ main() {
     # first and the (target-triple-starting) second hyphen group; mirrors
     # scripts/install.sh's own construction of this same filename in
     # reverse, so both derive identically from the one Cargo version stamp.
-    version="$(printf '%s' "$artifact_basename" | sed -E 's/^irontraffic-([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?)-.*/\1/')"
+    #
+    # The optional prerelease group is anchored to require the FOLLOWING
+    # hyphen segment to start a known target triple (x86_64 or aarch64),
+    # not merely "the next `-<word>` after the version". Without that
+    # anchor, `[0-9A-Za-z.]+` (needed for a real prerelease like "rc.1")
+    # also matches "aarch64" itself, and the greedy optional group consumes
+    # it: "irontraffic-0.1.0-aarch64-unknown-linux-gnu.tar.gz" parsed as
+    # version "0.1.0-aarch64" (confirmed with BSD sed, GNU sed and Python
+    # `re`, so this is not an engine quirk). x86_64 escaped only because
+    # `_` is not in that character class; aarch64 has no such accident.
+    # Every downstream URL is built from this value, so a wrong version
+    # 404s and silently skips signature and provenance on both aarch64
+    # targets, half the shipped matrix.
+    version="$(printf '%s' "$artifact_basename" | sed -E 's/^irontraffic-([0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?)-(x86_64|aarch64)-.*/\1/')"
+    # Everything after "irontraffic-<version>-" and before the ".tar.gz"
+    # suffix, e.g. "x86_64-unknown-linux-musl". Plain parameter expansion,
+    # not another sed pattern: $version is inserted as a glob pattern here,
+    # and a version string ("0.1.0", "0.1.0-rc.1") contains none of glob's
+    # metacharacters, so this is exact and needs no escaping. Used below to
+    # bind a --sbom argument to the artifact it claims to describe
+    # (invariant 8's other half): without this, an SBOM built for a
+    # DIFFERENT target still passes every other check in this script.
+    target_from_artifact="${artifact_basename#irontraffic-"$version"-}"
+    target_from_artifact="${target_from_artifact%.tar.gz}"
 
     # -------------------------------------------------------------------
     # 1. Checksum. Fails LOUDLY and before anything else runs (test:
@@ -187,7 +223,17 @@ main() {
     sums_dir="$(dirname "$artifact")"
     if locate_or_fetch "$sums_dir/SHA256SUMS" "SHA256SUMS" "$sums_file" "$version"; then
         this_line="$work/SHA256SUMS.this"
-        if grep -F "$artifact_basename" "$sums_file" | sed "s#$sums_dir/##" > "$this_line" 2>/dev/null \
+        # A release SHA256SUMS lists every target's tarball AND every
+        # target's SBOM (`sha256sum *.tar.gz *.sbom.json > SHA256SUMS`), and
+        # "irontraffic-<v>-<target>.tar.gz" is a byte-for-byte PREFIX of
+        # "irontraffic-<v>-<target>.tar.gz.sbom.json". A substring match
+        # (the previous `grep -F`) therefore returns BOTH lines for a
+        # tarball whose SBOM was never downloaded, and `sha256sum -c` fails
+        # naming the SBOM's own line as missing: a false tamper alarm on a
+        # perfectly good artifact. awk's field comparison requires the
+        # WHOLE second (whitespace-delimited) field to equal
+        # $artifact_basename, which a mere prefix cannot satisfy.
+        if awk -v name="$artifact_basename" '$2 == name' "$sums_file" | sed "s#$sums_dir/##" > "$this_line" 2>/dev/null \
             && [ -s "$this_line" ]; then
             checksum_ok=0
             if command -v sha256sum >/dev/null 2>&1; then
@@ -279,6 +325,14 @@ main() {
             # -> "refs/tags/v1.2.3". Used by --strict below; extracted here,
             # once, rather than re-parsing the payload again down there.
             source_ref="$(printf '%s' "$payload" | jq -r '.predicate.invocation.configSource.uri // empty' 2>/dev/null | sed 's/^.*@//' || true)"
+            # sha256(Cargo.lock) as attest.sh recorded it for THIS artifact's
+            # own build. Used below (SBOM step) to bind a --sbom argument to
+            # this exact artifact's dependency graph, invariant 8's other
+            # half: a subject-digest match alone (above) proves the SBOM
+            # bundle format loads and the artifact's own signature is real,
+            # but says nothing about whether a GIVEN --sbom file describes
+            # the SAME build.
+            provenance_cargo_lock_sha256="$(printf '%s' "$payload" | jq -r '.predicate.invocation.parameters.cargoLockSha256 // empty' 2>/dev/null || true)"
             if [ -n "$subject_sha256" ] && [ "$subject_sha256" = "$actual_sha256" ]; then
                 checked=$((checked + 1))
                 echo "provenance: verified"
@@ -338,6 +392,51 @@ main() {
             else
                 note_fail "sbom licence: not a subset of the allowlist (see below)"
                 cat "$work/sbom-licence.log" >&2
+            fi
+
+            # -----------------------------------------------------------
+            # Bind the SBOM to THIS artifact (invariant 8). A signed SBOM
+            # signature (above) proves this project produced SOME SBOM; it
+            # does not prove this SBOM describes this artifact's own
+            # dependency graph. Without this check, any signed SBOM from
+            # any target or any release verifies correctly beside any
+            # tarball: a wrong-target or stale SBOM would pass silently,
+            # naming a licence set that never described the file the user
+            # actually downloaded.
+            #
+            # Two independent comparisons, both against data already
+            # cryptographically verified above (never against the SBOM's
+            # own unverified self-description alone):
+            #   - target: the SBOM's irontraffic:target property must equal
+            #     the target embedded in the artifact's own filename.
+            #   - cargo_lock_sha256: the SBOM's irontraffic:cargo_lock_sha256
+            #     property must equal the artifact's OWN provenance
+            #     attestation's cargoLockSha256 (extracted in step 3), so
+            #     this compares two values the artifact's build itself
+            #     produced, not the SBOM's claim checked against itself.
+            # The second comparison only runs when provenance was actually
+            # verified: with no verified provenance there is nothing
+            # authoritative to bind against, and the target comparison
+            # alone still runs unconditionally, since it needs only the
+            # artifact's own (locally known) filename.
+            # -----------------------------------------------------------
+            sbom_target="$(jq -r '(.metadata.properties[]? | select(.name == "irontraffic:target") | .value) // empty' "$sbom" 2>/dev/null || true)"
+            if [ -n "$sbom_target" ] && [ "$sbom_target" != "$target_from_artifact" ]; then
+                note_fail "sbom binding: sbom's target ($sbom_target) does not match the artifact's own target ($target_from_artifact)"
+            elif [ -z "$sbom_target" ]; then
+                note_fail "sbom binding: sbom has no irontraffic:target property to bind it to the artifact"
+            fi
+
+            if [ -n "${provenance_cargo_lock_sha256:-}" ]; then
+                sbom_cargo_lock_sha256="$(jq -r '(.metadata.properties[]? | select(.name == "irontraffic:cargo_lock_sha256") | .value) // empty' "$sbom" 2>/dev/null || true)"
+                if [ -z "$sbom_cargo_lock_sha256" ]; then
+                    note_fail "sbom binding: sbom has no irontraffic:cargo_lock_sha256 property to bind it to the artifact's provenance"
+                elif [ "$sbom_cargo_lock_sha256" != "$provenance_cargo_lock_sha256" ]; then
+                    note_fail "sbom binding: sbom's cargo_lock_sha256 ($sbom_cargo_lock_sha256) does not match the artifact's own provenance ($provenance_cargo_lock_sha256)"
+                else
+                    checked=$((checked + 1))
+                    echo "sbom binding: target and cargo_lock_sha256 match the artifact's own provenance"
+                fi
             fi
         fi
     fi

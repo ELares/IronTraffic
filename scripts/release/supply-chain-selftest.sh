@@ -156,8 +156,7 @@ if errors:
         print("SCHEMA-ERROR:", e.message[:300])
     sys.exit(1)
 PYEOF
-)"
-    status=$?
+)" && status=0 || status=$?
     if [ "$status" -eq 0 ]; then
         pass "sbom_is_valid_cyclonedx"
     else
@@ -408,6 +407,185 @@ test_verify_fails_on_tampered_artifact() {
 }
 
 # ---------------------------------------------------------------------------
+# 12a. verify_checksum_ignores_sbom_substring_collision
+#
+# A release's real SHA256SUMS lists every target's tarball AND every
+# target's SBOM (ci.yml: `sha256sum *.tar.gz *.sbom.json > SHA256SUMS`),
+# eight lines for a four-target release. Every OTHER checksum fixture in
+# this file (write_sha256sums_line, called once) writes exactly ONE line,
+# which is why nothing caught this before: "irontraffic-<v>-<target>.tar.gz"
+# is a byte-for-byte PREFIX of "irontraffic-<v>-<target>.tar.gz.sbom.json",
+# so a substring-matching selector against a real, eight-line SHA256SUMS
+# returns BOTH lines for a tarball whose SBOM was never downloaded, and
+# `sha256sum -c` fails naming the missing SBOM file: a false tamper alarm
+# on a perfectly good artifact. This fixture reproduces the REAL shape (all
+# four targets' tarballs and all four SBOMs get a line), then verifies only
+# the one tarball a real install actually downloads.
+# ---------------------------------------------------------------------------
+test_verify_checksum_ignores_sbom_substring_collision() {
+    dir="$WORK/substring-fixture"
+    mkdir -p "$dir"
+    version="9.9.9"
+    real_target="x86_64-unknown-linux-musl"
+    for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+        tb="$dir/irontraffic-$version-$t.tar.gz"
+        printf 'decoy tarball content for %s\n' "$t" > "$tb"
+        write_sha256sums_line "$tb"
+        sb="$tb.sbom.json"
+        printf '{"decoy": "sbom for %s"}\n' "$t" > "$sb"
+        write_sha256sums_line "$sb"
+        # Only the target under test keeps its own tarball on disk: a real
+        # verify.sh run only ever has the ONE tarball it downloaded, never
+        # the other three targets' and never any SBOM (this test never
+        # passes --sbom). Removing the rest proves the checksum step needs
+        # nothing beyond the SHA256SUMS lines to pass.
+        if [ "$t" != "$real_target" ]; then
+            rm -f "$tb"
+        fi
+        rm -f "$sb"
+    done
+    real_artifact="$dir/irontraffic-$version-$real_target.tar.gz"
+
+    out="$(sh "$REPO_ROOT/scripts/release/verify.sh" --artifact "$real_artifact" --allow-skipped 2>&1)" && status=0 || status=$?
+    if [ "$status" -ne 0 ]; then
+        fail "verify_checksum_ignores_sbom_substring_collision" "verify.sh failed against a genuine artifact merely because its own SBOM is also listed in a real, eight-line SHA256SUMS: $out"
+        return
+    fi
+    if ! printf '%s' "$out" | grep -q "checksum: done"; then
+        fail "verify_checksum_ignores_sbom_substring_collision" "checksum step did not report done: $out"
+        return
+    fi
+    pass "verify_checksum_ignores_sbom_substring_collision"
+}
+
+# ---------------------------------------------------------------------------
+# 12b. verify_version_regex_handles_aarch64
+#
+# verify.sh's own version-from-filename value never surfaces on stdout or
+# stderr by itself (only URLs built from it do, and curl's stderr is
+# suppressed), so this extracts the EXACT sed expression verify.sh itself
+# uses -- never a hand-copied duplicate that could quietly drift from the
+# real one -- and runs it directly against every shipped target's own
+# filename shape. The bug this catches: a greedy optional prerelease group
+# whose character class ([0-9A-Za-z.]) also matches "aarch64" itself, so
+# "irontraffic-0.1.0-aarch64-unknown-linux-gnu.tar.gz" parsed as version
+# "0.1.0-aarch64"; x86_64 escaped only because "_" is not in that class.
+# ---------------------------------------------------------------------------
+test_verify_version_regex_handles_aarch64() {
+    version_line="$(grep -F "sed -E 's/^irontraffic-" "$REPO_ROOT/scripts/release/verify.sh" || true)"
+    if [ -z "$version_line" ]; then
+        fail "verify_version_regex_handles_aarch64" "could not find verify.sh's own version-from-filename sed line at all"
+        return
+    fi
+    sed_expr="$(printf '%s\n' "$version_line" | sed -E "s/^.*sed -E '//" | sed -E "s/'\\)\"\$//")"
+    if [ -z "$sed_expr" ]; then
+        fail "verify_version_regex_handles_aarch64" "could not extract the sed expression from: $version_line"
+        return
+    fi
+    bad=""
+    for t in x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-unknown-linux-musl aarch64-unknown-linux-musl; do
+        got="$(printf 'irontraffic-0.1.0-%s.tar.gz' "$t" | sed -E "$sed_expr")"
+        if [ "$got" != "0.1.0" ]; then
+            bad="$bad $t=>$got"
+        fi
+    done
+    # A real prerelease must still parse (the fix must not have merely
+    # removed the optional group).
+    pre_got="$(printf 'irontraffic-0.1.0-rc.1-x86_64-unknown-linux-musl.tar.gz' | sed -E "$sed_expr")"
+    if [ "$pre_got" != "0.1.0-rc.1" ]; then
+        bad="$bad prerelease=>$pre_got"
+    fi
+    if [ -n "$bad" ]; then
+        fail "verify_version_regex_handles_aarch64" "verify.sh's own version regex misparsed:$bad"
+        return
+    fi
+    pass "verify_version_regex_handles_aarch64"
+}
+
+# ---------------------------------------------------------------------------
+# 12c. verify_runs_standalone_outside_repo
+#
+# docs/SUPPLY-CHAIN.md documents downloading verify.sh (and
+# sbom-licence-check.sh) STANDALONE, beside the tarball, with no repository
+# checkout: "curl the script beside the tarball, then
+# `sh verify.sh --artifact <tarball>`". verify.sh used to compute a
+# "repository root" two directories above itself and `cd` there before
+# using a relative --artifact path, which is correct only when the script
+# still sits inside scripts/release/ of a checkout; run the documented way,
+# that `cd` landed two levels above the actual download directory, and the
+# relative artifact path no longer resolved. Every OTHER test in this file
+# invokes verify.sh with an ABSOLUTE artifact path from inside the repo,
+# which is structurally blind to this: this test is the one that is not.
+# ---------------------------------------------------------------------------
+test_verify_runs_standalone_outside_repo() {
+    dir="$WORK/standalone-fixture"
+    mkdir -p "$dir"
+    cp "$REPO_ROOT/scripts/release/verify.sh" "$dir/verify.sh"
+    artifact_name="irontraffic-9.9.9-x86_64-unknown-linux-musl.tar.gz"
+    printf 'standalone fixture artifact content\n' > "$dir/$artifact_name"
+    ( cd "$dir" && write_sha256sums_line "$artifact_name" )
+
+    # A subshell, not the current shell: `cd` here must not leak into the
+    # rest of this script. `sh verify.sh` (not an absolute script path)
+    # AND a relative --artifact both matter: the reviewer's own repro used
+    # exactly this shape.
+    out="$(cd "$dir" && sh verify.sh --artifact "$artifact_name" --allow-skipped 2>&1)" && status=0 || status=$?
+    if [ "$status" -ne 0 ]; then
+        fail "verify_runs_standalone_outside_repo" "verify.sh failed when run standalone (no repo checkout) with a relative --artifact path: $out"
+        return
+    fi
+    if ! printf '%s' "$out" | grep -q "checksum: done"; then
+        fail "verify_runs_standalone_outside_repo" "checksum step did not report done: $out"
+        return
+    fi
+    if printf '%s' "$out" | grep -qi "no such file"; then
+        fail "verify_runs_standalone_outside_repo" "verify.sh reported a missing file despite the artifact sitting right next to it: $out"
+        return
+    fi
+    pass "verify_runs_standalone_outside_repo"
+}
+
+# ---------------------------------------------------------------------------
+# 12d. verify_binds_sbom_to_artifact_target
+#
+# Invariant 8's other half. `--sbom` used to be checked entirely on its
+# own: its signature had to verify and its licence set had to be a subset
+# of the allowlist, but nothing ever compared it to the ARTIFACT it was
+# supposedly describing. Any signed SBOM from any target of any release
+# therefore passed beside any tarball. This fixture gives verify.sh a real
+# artifact and a locally-forged SBOM whose own irontraffic:target property
+# names a DIFFERENT target, and asserts the mismatch is caught by name.
+# Deliberately network-free (an unreachable-by-construction .invalid host):
+# this is about the LOCAL comparison logic, not the SBOM's own signature.
+# ---------------------------------------------------------------------------
+test_verify_binds_sbom_to_artifact_target() {
+    dir="$WORK/binding-fixture"
+    mkdir -p "$dir"
+    artifact="$dir/irontraffic-9.9.9-x86_64-unknown-linux-musl.tar.gz"
+    printf 'binding fixture artifact content\n' > "$artifact"
+    write_sha256sums_line "$artifact"
+
+    mismatched_sbom="$dir/irontraffic-9.9.9-aarch64-unknown-linux-gnu.tar.gz.sbom.json"
+    jq -n --arg target "aarch64-unknown-linux-gnu" \
+        '{"$schema": "http://cyclonedx.org/schema/bom-1.6.schema.json", bomFormat: "CycloneDX",
+          specVersion: "1.6", version: 1,
+          metadata: { properties: [ { name: "irontraffic:target", value: $target } ] },
+          components: []}' > "$mismatched_sbom"
+
+    out="$(IT_RELEASE_BASE_URL="https://verify-binding-fixture.invalid/releases" \
+        sh "$REPO_ROOT/scripts/release/verify.sh" --artifact "$artifact" --sbom "$mismatched_sbom" --allow-skipped 2>&1)" && status=0 || status=$?
+    if [ "$status" -eq 0 ]; then
+        fail "verify_binds_sbom_to_artifact_target" "verify.sh exited 0 with an SBOM whose own target does not match the artifact's: $out"
+        return
+    fi
+    if ! printf '%s' "$out" | grep -q "sbom binding: sbom's target"; then
+        fail "verify_binds_sbom_to_artifact_target" "failure did not name the sbom binding check: $out"
+        return
+    fi
+    pass "verify_binds_sbom_to_artifact_target"
+}
+
+# ---------------------------------------------------------------------------
 # 13. verify_fails_when_a_check_is_skipped
 #
 # WHY THE DEFAULT IS A FAILURE, not a pass: the party able to serve a
@@ -530,6 +708,17 @@ EOF
     chmod +x "$idir/stage/irontraffic-$iversion-$itarget/irontraffic"
     ( cd "$idir/stage" && tar -czf "$idir/releases/$iasset" "irontraffic-$iversion-$itarget" )
     ( cd "$idir/releases" && write_sha256sums_line "$iasset" )
+    # A REAL release's SHA256SUMS also lists the SBOM
+    # (ci.yml: `sha256sum *.tar.gz *.sbom.json > SHA256SUMS`), and
+    # "$iasset" is a byte-for-byte PREFIX of "$iasset.sbom.json"; add that
+    # second line (never served: install.sh never requests an SBOM on its
+    # own, mirroring what a real default install actually downloads) so
+    # this fixture exercises install.sh's own checksum-line selector
+    # against the real, colliding shape, not an idealised one-line file.
+    ( cd "$idir/releases" \
+        && printf '{"decoy": "sbom, never served or downloaded by this test"}\n' > "$iasset.sbom.json" \
+        && write_sha256sums_line "$iasset.sbom.json" \
+        && rm -f "$iasset.sbom.json" )
     cp "$REPO_ROOT/scripts/release/verify.sh" "$idir/releases/verify.sh"
 
     iport=$((21000 + ($$ % 9000)))
@@ -743,6 +932,49 @@ test_provenance_subject_matches_digest() {
     fi
 }
 
+# ---------------------------------------------------------------------------
+# 17. verify_sh_fails_on_pr_identity_mismatch
+#
+# THE ROOT CAUSE this issue's own review named: verify.sh, the actual
+# script a user runs, was never once invoked against a real Sigstore
+# bundle by anything. Tests 14/15 above deliberately verify this run's own
+# real signature with `cosign` directly, using an identity regexp read
+# back from THIS run's own $GITHUB_WORKFLOW_REF, because a pull request's
+# identity (".../ci.yml@refs/pull/N/merge") can never match verify.sh's own
+# release pin (refs/tags/v*) -- see build_real_signed_fixture's header for
+# why calling verify.sh there would either always fail for the right
+# reason on every PR or require weakening the pin. This test is the
+# resolution: it calls verify.sh itself, on purpose, expecting that exact,
+# specific refusal, which is the only way available on a pull-request run
+# to exercise verify.sh's real fetch (local, from this fixture's own
+# directory), parse and cosign-bundle-loading code against a genuine
+# signature at all. `.github/workflows/ci.yml`'s tag-only
+# "Verify signature and provenance over the freshly signed dist/" step is
+# the complementary SUCCESS-path exercise, over a real release identity,
+# which only a tagged run can ever produce.
+# ---------------------------------------------------------------------------
+test_verify_sh_fails_on_pr_identity_mismatch() {
+    if ! build_real_signed_fixture; then
+        skip "verify_sh_fails_on_pr_identity_mismatch" "no ambient GitHub Actions OIDC identity in this run"
+        return
+    fi
+    artifact="$(cat "$REAL_FIXTURE_PATH_FILE")"
+    out="$(sh "$REPO_ROOT/scripts/release/verify.sh" --artifact "$artifact" --allow-skipped 2>&1)" && status=0 || status=$?
+    if [ "$status" -eq 0 ]; then
+        fail "verify_sh_fails_on_pr_identity_mismatch" "verify.sh exited 0 against this run's own real signature, whose certificate identity is a pull-request ref, not verify.sh's own refs/tags/v* pin: $out"
+        return
+    fi
+    if ! printf '%s' "$out" | grep -q "checksum: done"; then
+        fail "verify_sh_fails_on_pr_identity_mismatch" "checksum did not pass first, so a later failure would not isolate the identity mismatch specifically: $out"
+        return
+    fi
+    if ! printf '%s' "$out" | grep -q "signature: certificate identity did not match"; then
+        fail "verify_sh_fails_on_pr_identity_mismatch" "failure did not name the certificate identity mismatch specifically (this is the one message that proves verify.sh's own cosign invocation, and its own pin, actually ran against a real bundle): $out"
+        return
+    fi
+    pass "verify_sh_fails_on_pr_identity_mismatch"
+}
+
 test_sbom_is_valid_cyclonedx
 test_sbom_is_reproducible
 test_sbom_excludes_dev_dependencies
@@ -755,10 +987,15 @@ test_licence_check_fails_on_injected_licence
 test_licence_check_fails_on_missing_licence
 test_verify_fails_without_identity_pin
 test_verify_fails_on_tampered_artifact
+test_verify_checksum_ignores_sbom_substring_collision
+test_verify_version_regex_handles_aarch64
+test_verify_runs_standalone_outside_repo
+test_verify_binds_sbom_to_artifact_target
 test_verify_fails_when_a_check_is_skipped
 test_install_verifies_by_default
 test_verify_prints_source_commit
 test_provenance_subject_matches_digest
+test_verify_sh_fails_on_pr_identity_mismatch
 
 echo
 echo "supply-chain-selftest: $((RAN - FAILED))/$RAN passed, $SKIPPED skipped"

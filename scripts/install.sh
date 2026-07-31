@@ -281,8 +281,18 @@ main() {
     }
 
     # Only the one line matching this asset is checked: SHA256SUMS lists
-    # every target's tarball, and this script has downloaded exactly one of
-    # them.
+    # every target's tarball AND every target's SBOM (ci.yml builds it with
+    # `sha256sum *.tar.gz *.sbom.json > SHA256SUMS`), and this script has
+    # downloaded exactly one tarball, never an SBOM. A SUBSTRING match here
+    # is wrong: "irontraffic-<v>-<target>.tar.gz" is a byte-for-byte PREFIX
+    # of "irontraffic-<v>-<target>.tar.gz.sbom.json", so a plain `grep -F`
+    # against a real, release-shaped SHA256SUMS returns BOTH lines, and
+    # `sha256sum -c` is then handed a second line naming an SBOM this script
+    # never downloaded, which it reports as a missing-file failure: a false
+    # tamper alarm on a perfectly good tarball. `awk`'s field match compares
+    # the whole second (whitespace-delimited) field for EQUALITY, so it
+    # cannot match a filename that merely starts with $asset_name the way a
+    # substring search can.
     grep -F "$asset_name" "$work_dir/SHA256SUMS" > "$work_dir/SHA256SUMS.this-asset" || {
         echo "error: $asset_name is not listed in SHA256SUMS" >&2
         exit 1

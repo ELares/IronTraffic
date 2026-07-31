@@ -12,7 +12,12 @@ Every release publishes, per tag:
 - **Four tarballs**, one per shipped target (`x86_64`/`aarch64` times `gnu`/`musl`).
 - **Four CycloneDX 1.6 SBOMs**, one per tarball, each describing exactly that artifact's resolved
   dependency closure for its own target and feature set.
-- **One `SHA256SUMS`**, one line per tarball.
+- **One `SHA256SUMS`**, one line per tarball AND one line per SBOM (eight lines for a four-target
+  release: `sha256sum *.tar.gz *.sbom.json`). Both `install.sh` and `verify.sh` select their own line
+  by an exact, whitespace-delimited field match on the filename, never a substring search: a tarball's
+  own filename is a byte-for-byte prefix of its SBOM's (`...tar.gz` of `...tar.gz.sbom.json`), and a
+  substring match against this file would pick up both lines for a tarball whose SBOM was never
+  downloaded.
 - **Nine signatures**, one over each of the four tarballs, one over each of the four SBOMs, and one
   over `SHA256SUMS` itself, so a user who only wants to make one check has one to make. Each is a
   `<file>.bundle`: cosign's "new bundle format", a self-contained Sigstore bundle holding the
@@ -87,6 +92,16 @@ path was the first one this project shipped, and it failed against this project'
 identity with a Rekor API error outside this project's control
 (`proposedContent.proposedContent.verifiers in body is required`); the bundle format embeds the same
 proof the search would otherwise look up over the network.
+
+**`--sbom` is bound to the artifact, not merely checked on its own.** A signed SBOM proves this project
+produced SOME SBOM; it does not, by itself, prove the SBOM describes the artifact being verified
+alongside it. `verify.sh --sbom` therefore also compares the SBOM's own `irontraffic:target` property
+against the target named in the artifact's filename, and its `irontraffic:cargo_lock_sha256` property
+against `sha256(Cargo.lock)` as recorded in the artifact's own provenance attestation
+(`cargoLockSha256`, section 4) — the same digest `sbom.sh` and `attest.sh` each compute independently
+from the one build. Either mismatch fails the check by name (`sbom binding: ...`), and this is what
+invariant 8 asserts: without it, a signed SBOM from any target of any release verifies correctly beside
+any tarball.
 
 `scripts/install.sh` runs the first form (`verify.sh --strict`) automatically, on every install,
 before anything is placed on `PATH`. The opt-out is explicit and prints a warning naming what is

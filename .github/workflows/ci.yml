@@ -1239,6 +1239,32 @@ jobs:
             target="${target%.tar.gz}"
             sh scripts/release/attest.sh "$f" "$target" "control-plane"
           done
+      - name: Verify signature and provenance over the freshly signed dist/ (tag only)
+        # This is scripts/release/verify.sh's own SUCCESS path, run for
+        # real, the same way the step above (verify-repro.sh) already
+        # closes the reproducibility loop. Tag-gated, not merely
+        # OIDC-token-gated like every other step in this job: verify.sh's
+        # --certificate-identity-regexp is pinned to refs/tags/v*, so it can
+        # never pass against a pull request's own identity
+        # (.../ci.yml@refs/pull/N/merge) even with a perfectly real
+        # signature; running it there would fail this required check on
+        # every pull request for the correct-but-wrong reason.
+        # supply-chain-selftest.sh's own tests 15/16 verify a pull request's
+        # real signature with cosign directly for exactly this reason (see
+        # that file's own header comment on WHY THESE TWO TESTS DO NOT CALL
+        # verify.sh), which means this tag-only step is the ONLY place the
+        # actual consumer script a user runs is ever exercised against a
+        # real signature end to end, not a round trip through the signer's
+        # own inputs. Every companion file (.bundle, .intoto.bundle,
+        # .sbom.json, SHA256SUMS) is found locally, right next to each
+        # tarball in dist/, so this needs no network fetch at all.
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          for f in dist/*.tar.gz; do
+            sh scripts/release/verify.sh --artifact "$f" --sbom "$f.sbom.json" --strict
+          done
+          echo "verify.sh --strict: ok (every tarball, real signature, real provenance)"
       - name: Verify the musl binaries are fully static
         run: |
           set -euo pipefail
