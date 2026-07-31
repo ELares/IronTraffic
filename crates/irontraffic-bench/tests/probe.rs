@@ -697,8 +697,35 @@ fn probe_hits_target_rate() {
         expected_requests: 6_000,
         ..base_config(origin.addr)
     };
-    let started = Instant::now();
+    // Round four of #807 (#808): `started` used to be taken BEFORE this
+    // file's own `spawn_probe` wrapper (above), which starts by locking
+    // `ALLOC_SENSITIVE`. That lock acquisition, not anything inside
+    // `ProbeHandle::spawn` itself, is what can block for a long time: it is
+    // the same mutex `zero_allocations_in_steady_state` (test 14, below)
+    // holds for its ENTIRE body (measured 240..560ms), so whenever that
+    // test's thread already holds it, this test's thread stalls on `.lock()`
+    // for the same span before `ProbeHandle::spawn` (and, inside it, the
+    // probe thread's own connect and schedule-origin capture, src/probe.rs)
+    // even begins. libtest sorts tests by name, so under the default
+    // thread count `probe_hits_target_rate` (sorted 1st) normally wins the
+    // race and acquires the lock first, so the stall lands on some OTHER
+    // test instead; that ordering is not guaranteed and stops holding once
+    // enough test threads run concurrently that the 14th test can start
+    // early, measured on this host at `RUST_TEST_THREADS >= 17` (16 of 16
+    // failures at >=17, 0 of ~37 at <=16). Once the lock IS acquired, the
+    // probe connects and captures its own schedule origin promptly, so a
+    // run that stalled on the lock still paces perfectly from that origin
+    // onward; the failure was entirely in what the OLD `started` charged
+    // to `elapsed` before the probe ever started, not in the probe itself.
+    // Taking `started` AFTER `spawn_probe` returns excludes exactly that
+    // lock-wait, and passed 3 of 3 at `RUST_TEST_THREADS=23` with
+    // achieved_rate 100.342..100.424, where the prior placement failed 3 of
+    // 3 at the same concurrency with achieved_rate 88.76..89.05. The tail
+    // lock wait inside `run_for`'s window needs no equivalent fix: the
+    // probe keeps issuing while it waits, which inflates `issued` and
+    // `elapsed` together, so that wait is already scale invariant.
     let handle = spawn_probe(config, real_time()).expect("spawns against a live origin");
+    let started = Instant::now();
     let outcome = run_for(handle, WINDOW);
     let elapsed = started.elapsed();
 
@@ -1105,12 +1132,15 @@ fn well_formed_non_200_response_is_counted_bad_not_ok() {
 /// forces a reconnect. Reinstating the exception makes a `304` a `Complete`
 /// outcome with `needs_reconnect: false` (the connection, and its buffered
 /// leak, survive); the fix makes it `Bad` with `needs_reconnect: true` (a
-/// brand-new socket per refusal). Every `bad` exchange in this stub comes
-/// from that one refusal path and nothing else forces a reconnect here, so
-/// `reconnects` must equal `bad` exactly: that equality, not `ok`/`bad`
-/// themselves, is the load-bearing assertion below. Watched to fail against a
-/// reintroduced `None if status == 304 => 0` in `wire.rs`: `reconnects` drops
-/// to 0 while `bad` stays 3.
+/// brand-new socket per refusal). `reconnects == 3` below, not `ok`/`bad`
+/// themselves, is the load-bearing assertion: watched to fail against a
+/// reintroduced `None if status == 304 => 0` in `wire.rs`, where it reports
+/// `reconnects` at 0 (`bad` stays 3, unaffected). Round four of #808 removed
+/// a second tie (`reconnects == outcome.bad`) that this same comment used to
+/// point at instead: with `reconnects == 3` and `bad == 3` already asserted
+/// above it, that tie was 3 == 3 on every path that reached it and could
+/// never itself fail, so it was not load-bearing and its own message
+/// overclaimed that it was.
 #[test]
 fn not_modified_with_a_late_body_forces_a_reconnect_not_a_leak() {
     let addr = stub_not_modified_then_late_body(Duration::from_millis(30), b"XXXXXXXXXX");
@@ -1144,15 +1174,10 @@ fn not_modified_with_a_late_body_forces_a_reconnect_not_a_leak() {
     assert_eq!(
         outcome.reconnects, 3,
         "each of the three refusals must force EXACTLY one reconnect apiece (a fresh socket is \
-         exactly what makes the leak structurally impossible), got {}",
+         exactly what makes the leak structurally impossible), got {}; this is the assertion \
+         that actually discriminates the fix from the leak it replaces, since ok and bad alone \
+         hold identically in both worlds (see the doc comment above)",
         outcome.reconnects
-    );
-    assert_eq!(
-        outcome.reconnects, outcome.bad,
-        "reconnects must track bad exactly here (every bad exchange in this stub comes from \
-         the same refusal path, and nothing else in this run forces a reconnect); THIS is the \
-         assertion that actually discriminates the fix from the leak it replaces, since ok and \
-         bad alone hold identically in both worlds"
     );
 }
 

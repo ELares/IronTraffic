@@ -94,9 +94,9 @@
 //! (`crates/irontraffic-origin/src/response.rs`), which this scanner now
 //! refuses unconditionally. `it-origin` already refuses `--status 204`
 //! outright for the analogous reason, so the symmetric fix is to reject
-//! `--status 304 --body-bytes 0` the same way; left to a follow-up issue
-//! against `irontraffic-origin` itself, since that crate is outside this
-//! issue's own Files table.
+//! `--status 304 --body-bytes 0` the same way; that crate is outside this
+//! issue's own Files table, so making that change is left to a follow-up.
+//! Tracked, so the deferral does not evaporate: IronTraffic issue #809.
 //!
 //! The identical silent-zero failure is reachable through a header name this
 //! scanner fails to recognise for a reason that has nothing to do with what
