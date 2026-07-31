@@ -39,7 +39,12 @@ use crate::error::BenchError;
 use crate::hist::LatencyRecorder;
 use crate::provenance::ToolStamp;
 
+mod nighthawk;
 mod oha;
+pub use nighthawk::{
+    ContainerRuntime, MAX_COUNTERS, MAX_DURATION_SECONDS, MAX_PERCENTILE_ENTRIES,
+    MAX_RESULT_ENTRIES, MAX_STATISTICS, MIN_PERCENTILE_ENTRIES, Nighthawk,
+};
 pub use oha::Oha;
 
 /// Largest tool stdout the parser will accept. Checked on the slice length

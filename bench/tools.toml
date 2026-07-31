@@ -1,0 +1,51 @@
+# Pinned load-generation tools. A run whose probed tool version differs from the
+# pin here is refused: a benchmark whose tool drifts between runs is not a
+# comparison. Moving a pin is a reviewed change and requires re-verifying the
+# statistic and counter name tables in the corresponding adapter.
+#
+# HOW A PIN IS COMPARED. Every table carries EXACTLY ONE of these two keys, and a
+# table carrying neither or both is an error:
+#
+#   version = "<exact>"              the string `ToolStamp::version` from the
+#                                    adapter's `parse_version` must equal this,
+#                                    byte for byte.
+#   expect_version_contains = "<s>"  that string must CONTAIN this substring,
+#                                    case-sensitively.
+#
+# `[nighthawk]` uses the substring form on purpose: it runs from a `-dev` image
+# whose version line is a build identifier that changes with every image, so the
+# digest in `digest_file` is what actually pins it and the substring only confirms
+# the binary we probed is Nighthawk at all. Every other tool is a released binary
+# with a stable version string and uses the exact form.
+#
+# The run-time half of this check (probe, then compare by the rule above) is
+# `{{bench-runner-and-repetition}}`. The static half (every adapter has a table,
+# every table has exactly one of the two keys, no table names a mutable reference)
+# is test 15 of `{{bench-matrix-cells-and-corpora}}`.
+#
+# PROVENANCE OF THE NIGHTHAWK PIN. `envoyproxy/nighthawk-dev` is a Bazel-built
+# C++ project this repository does not build, so it is referenced by digest
+# only (see `bench/tools/nighthawk.digest`), never by tag. That digest was
+# obtained on 2026-07-31 directly from the Docker Hub v2 registry HTTPS API
+# (an anonymous pull token from `auth.docker.io`, then a `GET` of the
+# manifest for the image's rolling tag, reading the `Docker-Content-Digest`
+# response header), NOT by running `docker pull` / `docker inspect`: this
+# implementation environment has neither `docker` nor `podman` installed. The
+# digest is therefore genuinely the one that rolling tag resolved to at
+# capture time, but the pinned image was never actually run here, so the
+# statistic and counter name tables in
+# `crates/irontraffic-bench/src/loadgen/nighthawk.rs` are cross-checked
+# against the real upstream Nighthawk source rather than against this exact
+# image's own output. See that file's own module doc for the full evidence
+# trail and its honestly-flagged gaps. Re-verify both the pin and the tables
+# against a real run before this adapter's numbers are trusted.
+
+[nighthawk]
+role = "arbiter"
+image_repo = "envoyproxy/nighthawk-dev"
+digest_file = "bench/tools/nighthawk.digest"
+expect_version_contains = "nighthawk"
+
+[oha]
+role = "sweep"
+version = "1.15.0"

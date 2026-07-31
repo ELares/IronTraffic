@@ -59,9 +59,11 @@ pub use hist::{
     MAX_HGRM_TOTAL_COUNT, Percentiles, SIGNIFICANT_DIGITS, high_ns_ceiling,
 };
 pub use loadgen::{
-    Invocation, LoadGenerator, MAX_HOST_BYTES, MAX_PATH_EXPR_BYTES, MAX_REPORTED_REQUESTS,
-    MAX_TOOL_OUTPUT_BYTES, MAX_TOOL_STDERR_BYTES, MAX_VERSION_OUTPUT_BYTES, Oha, ParseCtx, RawRun,
-    RunParams, Scheme, Target, Unsupported,
+    ContainerRuntime, Invocation, LoadGenerator, MAX_COUNTERS, MAX_DURATION_SECONDS,
+    MAX_HOST_BYTES, MAX_PATH_EXPR_BYTES, MAX_PERCENTILE_ENTRIES, MAX_REPORTED_REQUESTS,
+    MAX_RESULT_ENTRIES, MAX_STATISTICS, MAX_TOOL_OUTPUT_BYTES, MAX_TOOL_STDERR_BYTES,
+    MAX_VERSION_OUTPUT_BYTES, MIN_PERCENTILE_ENTRIES, Nighthawk, Oha, ParseCtx, RawRun, RunParams,
+    Scheme, Target, Unsupported,
 };
 pub use probe::{
     BadReason, MAX_CONSECUTIVE_ERRORS, MAX_HEALTHY_RECONNECTS, MAX_REQUEST_BYTES,
