@@ -25,6 +25,7 @@ mod cell;
 mod error;
 mod guards;
 mod hist;
+mod loadgen;
 mod provenance;
 mod result;
 mod schedule;
@@ -40,6 +41,11 @@ pub use guards::{
 pub use hist::{
     HIGH_NS, LOW_NS, LatencyRecorder, MAX_HGRM_BYTES, MAX_HGRM_LINE_BYTES, MAX_HGRM_LINES,
     MAX_HGRM_TOTAL_COUNT, Percentiles, SIGNIFICANT_DIGITS, high_ns_ceiling,
+};
+pub use loadgen::{
+    Invocation, LoadGenerator, MAX_HOST_BYTES, MAX_PATH_EXPR_BYTES, MAX_REPORTED_REQUESTS,
+    MAX_TOOL_OUTPUT_BYTES, MAX_TOOL_STDERR_BYTES, MAX_VERSION_OUTPUT_BYTES, Oha, ParseCtx, RawRun,
+    RunParams, Scheme, Target, Unsupported,
 };
 pub use provenance::{
     BURSTABLE_PREFIXES, BuildStamp, CaptureInputs, CpuInfoFields, LARGE_FILE_CAP, MAX_CPU_ENTRIES,
