@@ -26,6 +26,15 @@ rustix = { workspace = true, features = ["process"] }
 # `len`, `iter_quantiles`) is in the crate core, and the committed artifact is
 # the text `.hgrm`, never the binary serialisation.
 hdrhistogram = { workspace = true }
+# Pins the probe thread (`src/probe.rs`) to a core the load client does not
+# use. Workspace-internal crates are named by relative path and never through
+# `[workspace.dependencies]`.
+core_affinity = { workspace = true }
+# `probe::ProbeHandle::spawn`'s `time` parameter and the workspace clock seam
+# (`PreciseMono`, `SharedTime`) the probe thread reads instead of calling
+# `std::time::Instant::now` directly. Already on main from `time-source-seam`
+# (#5).
+irontraffic-time = { path = "../irontraffic-time", version = "0.1.0" }
 # The `oha` load-generator adapter's output parser (`src/loadgen/oha.rs`)
 # deserialises the tool's captured JSON stdout. Moved here from
 # dev-dependencies by `bench-loadgen-oha-adapter` (#411): `bench-crate-and-cell-model`
@@ -40,6 +49,17 @@ proptest = { workspace = true }
 # Benchmarks: the `record_ns`, `merge` and `percentiles` criterion targets in
 # `benches/harness.rs`.
 criterion = { workspace = true }
+# `tests/probe.rs` spawns a real `it-origin` child process
+# (`env!("CARGO_BIN_EXE_it-origin")`), per the Tests section: every test but
+# 5, 6, 8, 13, 14, 15 and 16 (which use an in-test stub instead) drives it.
+# `CARGO_BIN_EXE_<name>` is only populated for a binary target that is a
+# dependency of the crate under test, so this dev-dependency is what makes
+# that environment variable exist at all; not part of the issue's Files table
+# line for this manifest, added because the Tests section's own requirement
+# (a real `it-origin` on an ephemeral port) cannot compile otherwise. Test-only:
+# never a normal dependency, and `irontraffic-bench`'s own production code
+# never names it.
+irontraffic-origin = { path = "../irontraffic-origin", version = "0.1.0" }
 
 [[bench]]
 name = "harness"

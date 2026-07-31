@@ -188,6 +188,12 @@ zeroize = { version = "1.8", features = ["zeroize_derive"] }
 # `crypto-aws-lc-rs` feature; this adds a direct dev-dependency entry so the
 # differential test can name it in a `use`.
 aws-lc-rs = "1"
+# Pins the 100 rps single-connection probe thread to a core the load client
+# does not use (`bench-probe-client`, #410), so the probe's own scheduling
+# jitter never contaminates the published percentiles. Pure Rust on every
+# platform this workspace targets (Linux `sched_setaffinity`, macOS
+# `thread_policy_set`), no C build, MIT/Apache-2.0 dual licensed.
+core_affinity = "0.8"
 
 [workspace.lints.rust]
 # A proxy parses attacker-controlled bytes on every request. There is no

@@ -41,10 +41,47 @@
 //! `schedule/releasable_at/after_1s_stall` ~3.94 ns. All three pass with
 //! headroom on this machine; re-measure on the project's actual benchmark
 //! host before trusting these as the reference numbers.
+//!
+//! `probe/request_bytes_build`, `probe/scan_response/1kb` and
+//! `probe/wait_until/1ms` (issue #410) measure the probe's own per-request
+//! cost, which must not contaminate the measurement it exists to take.
+//! Budgets: `probe/request_bytes_build` under 2 microseconds, informational
+//! (runs once per probe, not per request). `probe/scan_response/1kb` under
+//! 300 nanoseconds (runs once per probe request, on the measurement path).
+//! `probe/wait_until/1ms` reports the DEADLINE OVERSHOOT, not the wall time
+//! `b.iter_custom` timed: median overshoot under 30 microseconds, p99
+//! overshoot under 200 microseconds. An overshoot larger than this is added
+//! to every probe sample as a constant bias, so it is the probe's own
+//! accuracy floor and belongs in the methodology document.
+//!
+//! Measured in a sandboxed macOS container (NOT the project's dedicated,
+//! isolated benchmark host; see the AWS c7g recipe posted on issue #284),
+//! `cargo bench`, criterion 0.8: `probe/request_bytes_build` ~5.8 ns (well
+//! under budget). `probe/scan_response/1kb` ~190 to 400 ns across repeated
+//! runs, over budget in some runs, matching the budget in others: this
+//! module has no authorization to add `memchr`, and the SWAR-based
+//! `find_byte` below is the fastest portable, `unsafe`-free substitute
+//! found; it lands close to the 300 ns line rather than comfortably under
+//! it, and it should be re-measured on the real, isolated benchmark host
+//! before trusting either direction. `probe/wait_until/1ms` median overshoot
+//! ranged from about 5.7 us to over 200 us across repeated runs on this
+//! shared, virtualised host: a `park_timeout` wakeup's own scheduling jitter
+//! is exactly what a shared or virtualised CPU adds, and the 30 us / 200 us
+//! budget describes a thread genuinely pinned to its own core on real
+//! hardware, which this sandbox cannot provide (`core_affinity` itself is
+//! unauthoritative here for the same reason). NONE of the three numbers
+//! above should be trusted as the reference measurement; re-measure all
+//! three on the project's actual, isolated benchmark host, per the
+//! Benchmarks section, before publishing them anywhere else.
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use irontraffic_bench::{HIGH_NS, LatencyRecorder, Schedule};
+use irontraffic_bench::{
+    HIGH_NS, LatencyRecorder, MAX_REQUEST_BYTES, ScanOutcome, Schedule, build_request,
+    scan_response_head, wait_until,
+};
+use irontraffic_time::{SharedTime, SystemTimeSource};
 use std::hint::black_box;
+use std::sync::Arc;
 
 /// Deterministic pseudo-random sequence generator (`SplitMix64`), used only to
 /// build fixed benchmark fixtures. Not a production entropy source: this
@@ -251,6 +288,94 @@ fn bench_schedule_releasable_at_after_1s_stall(c: &mut Criterion) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// `probe` (issue #410): the request builder, the response scanner and the
+// pacing function's own overshoot. All three run on the probe's measurement
+// path (once per probe, or once per request), so a regression here silently
+// biases the published percentiles instead of failing an obviously
+// attributable test.
+// ---------------------------------------------------------------------------
+
+/// Assembling the fixed request: runs once per probe, not per request.
+/// Budget: under 2 microseconds, informational.
+fn bench_probe_request_bytes_build(c: &mut Criterion) {
+    let mut buf = [0u8; MAX_REQUEST_BYTES];
+    c.bench_function("probe/request_bytes_build", |b| {
+        b.iter(|| {
+            black_box(build_request(
+                black_box(&mut buf),
+                black_box("bench.example"),
+                black_box("/probe"),
+            ))
+        });
+    });
+}
+
+/// A 1 KiB response head fixture: a status line, a real `Content-Length`,
+/// and a handful of realistic headers (the shape a proxy actually adds:
+/// `Date`, `Server`, `Cache-Control`, a trace id) padded to exactly 1,024
+/// bytes with one long trailing value, rather than dozens of short lines.
+/// This is what makes the header COUNT (and so the number of colon and
+/// name-comparison scans) representative of a real response rather than an
+/// artificially line-heavy one; the byte COUNT (1 KiB) is what the issue's
+/// budget names.
+fn one_kib_response_head_fixture() -> Vec<u8> {
+    let mut head = Vec::from(
+        &b"HTTP/1.1 200 OK\r\n\
+Content-Length: 1024\r\n\
+Content-Type: text/plain\r\n\
+Date: Fri, 24 Jul 2026 00:00:00 GMT\r\n\
+Server: it-origin\r\n\
+Connection: keep-alive\r\n\
+X-Trace-Id: "[..],
+    );
+    let fixed_tail_len = b"\r\n\r\n".len();
+    let padding_len = 1024usize
+        .saturating_sub(head.len())
+        .saturating_sub(fixed_tail_len);
+    head.extend(std::iter::repeat_n(b'a', padding_len));
+    head.extend_from_slice(b"\r\n\r\n");
+    assert_eq!(head.len(), 1024, "fixture must be exactly 1 KiB");
+    head
+}
+
+/// Scanning a 1 KiB response head plus body accounting: runs once per probe
+/// request, on the measurement path. Budget: under 300 nanoseconds.
+fn bench_probe_scan_response_1kb(c: &mut Criterion) {
+    let head = one_kib_response_head_fixture();
+    c.bench_function("probe/scan_response/1kb", |b| {
+        b.iter(|| {
+            let outcome = scan_response_head(black_box(&head));
+            black_box(matches!(outcome, ScanOutcome::Complete(_)))
+        });
+    });
+}
+
+/// `wait_until` for a deadline 1 millisecond out. Reports the DEADLINE
+/// OVERSHOOT (`actual - deadline`), not the wall time `iter_custom`'s own
+/// batch duration would otherwise represent, via a `Duration` built from the
+/// summed overshoot rather than from when the closure actually returned.
+/// Budgets: median overshoot under 30 microseconds, p99 overshoot under 200
+/// microseconds. An overshoot larger than this becomes a constant bias added
+/// to every published sample, so it is the probe's own accuracy floor.
+fn bench_probe_wait_until_1ms(c: &mut Criterion) {
+    let time: SharedTime = Arc::new(SystemTimeSource::new());
+    c.bench_function("probe/wait_until/1ms", |b| {
+        b.iter_custom(|iters| {
+            let mut total_overshoot_ns: u64 = 0;
+            for _ in 0..iters {
+                let now = time.precise().as_measurement_nanos();
+                let deadline_ns = now.saturating_add(1_000_000);
+                wait_until(&time, black_box(deadline_ns));
+                let after = time.precise().as_measurement_nanos();
+                total_overshoot_ns =
+                    total_overshoot_ns.saturating_add(after.saturating_sub(deadline_ns));
+            }
+            std::time::Duration::from_nanos(total_overshoot_ns)
+        });
+    });
+}
+
 criterion_group!(
     benches,
     bench_record_ns_in_range,
@@ -259,6 +384,9 @@ criterion_group!(
     bench_percentiles_query,
     bench_schedule_due_ns,
     bench_schedule_releasable_at_steady,
-    bench_schedule_releasable_at_after_1s_stall
+    bench_schedule_releasable_at_after_1s_stall,
+    bench_probe_request_bytes_build,
+    bench_probe_scan_response_1kb,
+    bench_probe_wait_until_1ms
 );
 criterion_main!(benches);
