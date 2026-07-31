@@ -968,11 +968,35 @@ jobs:
     timeout-minutes: 5
     permissions:
       contents: read
+      # See release-artifacts's identical comment: lets
+      # supply-chain-selftest.sh's cosign-dependent tests get a real
+      # ambient identity on every same-repository run (pull request or
+      # push), not only on a tag.
+      id-token: write
     steps:
       - uses: actions/checkout@v7
         with:
           persist-credentials: false
       - run: sh scripts/release/release-selftest.sh
+      - name: Install cosign
+        # Same pin as release-artifacts's identical step, kept in
+        # agreement deliberately rather than each drifting independently.
+        run: |
+          set -euo pipefail
+          cv=v2.6.4
+          bin=/usr/local/bin/cosign
+          sum="309779b0c4e409186b0a80daba99041fe2cf65a920ce645013901df6211895a9"
+          if ! curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 20 --max-time 120 \
+                 --retry 5 --retry-all-errors \
+                 "https://github.com/sigstore/cosign/releases/download/$cv/cosign-linux-amd64" -o "$bin"; then
+            echo "github.com releases unreachable; falling back to this project's pinned mirror"
+            curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 20 --max-time 120 \
+              --retry 5 --retry-all-errors \
+              "https://github.com/${GITHUB_REPOSITORY}/releases/download/toolchains/cosign-linux-amd64" -o "$bin"
+          fi
+          echo "$sum  $bin" | sha256sum -c -
+          chmod +x "$bin"
+      - run: sh scripts/release/supply-chain-selftest.sh
 
   # Tag-triggered: builds the four-target release matrix, verifies
   # reproducibility and the static/dynamic linkage invariants, and publishes
@@ -1012,6 +1036,17 @@ jobs:
     timeout-minutes: 60
     permissions:
       contents: write
+      # id-token: write is what lets cosign obtain a short-lived Fulcio
+      # certificate from this job's own ambient GitHub Actions OIDC
+      # identity (release-sbom-signing-and-provenance, #428). GitHub
+      # withholds this from a fork pull request's run regardless of what
+      # a workflow requests, which is a platform security boundary, not a
+      # setting this file controls; the sign/attest steps below detect
+      # that absence at runtime and print why, rather than being gated
+      # here by an `if:` on the actor or repository, which this file's own
+      # header rule warns against (a required check gated on a repository
+      # variable is a check that can be turned green by unsetting it).
+      id-token: write
     steps:
       - uses: actions/checkout@v7
         with:
@@ -1087,10 +1122,149 @@ jobs:
           sudo tar -xzf "$tb" -C /opt
           echo "/opt/aarch64-linux-musl-cross/bin" >> "$GITHUB_PATH"
           echo "CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER=aarch64-linux-musl-gcc" >> "$GITHUB_ENV"
+      - name: Install cosign
+        # Two sources, one checksum, the same posture as the
+        # aarch64-linux-musl-cross download above and for the identical
+        # reason: cosign's own install script serves no signature over
+        # itself we could check instead, so a content hash pinned here,
+        # computed from a real download rather than copied from anywhere
+        # claiming to already be a checksum for it, is the floor. The
+        # sigstore-installed release binary is used directly rather than
+        # `go install`, so no Go toolchain is added to this job only to
+        # build one tool.
+        run: |
+          set -euo pipefail
+          cv=v2.6.4
+          bin=/usr/local/bin/cosign
+          sum="309779b0c4e409186b0a80daba99041fe2cf65a920ce645013901df6211895a9"
+          if ! curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 20 --max-time 120 \
+                 --retry 5 --retry-all-errors \
+                 "https://github.com/sigstore/cosign/releases/download/$cv/cosign-linux-amd64" -o "$bin"; then
+            echo "github.com releases unreachable; falling back to this project's pinned mirror"
+            curl --proto '=https' --tlsv1.2 -fsSL --connect-timeout 20 --max-time 120 \
+              --retry 5 --retry-all-errors \
+              "https://github.com/${GITHUB_REPOSITORY}/releases/download/toolchains/cosign-linux-amd64" -o "$bin"
+          fi
+          echo "$sum  $bin" | sha256sum -c -
+          chmod +x "$bin"
+          cosign version
       - name: Build the four-target matrix
         run: sh scripts/release/build-matrix.sh dist
       - name: Verify reproducibility (x86_64-unknown-linux-gnu)
         run: sh scripts/release/verify-repro.sh x86_64-unknown-linux-gnu
+      - name: Generate a CycloneDX SBOM per artifact
+        # Runs unconditionally, on every pull request and every tag: it
+        # needs no network beyond crates.io (already required to build the
+        # matrix above) and no identity, so there is nothing here that can
+        # only fail while cutting a real release.
+        run: |
+          set -euo pipefail
+          for f in dist/*.tar.gz; do
+            base="$(basename "$f")"
+            target="${base#irontraffic-*-}"
+            target="${target%.tar.gz}"
+            sh scripts/release/sbom.sh "$target" "control-plane" "$f.sbom.json"
+            echo "generated $f.sbom.json"
+          done
+      - name: Assert every SBOM's licence set is a subset of the allowlist
+        run: |
+          set -euo pipefail
+          for f in dist/*.sbom.json; do
+            sh scripts/release/sbom-licence-check.sh "$f"
+          done
+      - name: Sign every published artifact and SBOM
+        # Exercised on every pull request from this repository, not only on
+        # a tag: cosign's ambient GitHub Actions OIDC provider issues a
+        # real, distinctly-identified certificate for ANY run with
+        # `id-token: write` granted (subject
+        # ".../ci.yml@refs/pull/N/merge" on a pull request,
+        # ".../ci.yml@refs/tags/vX.Y.Z" on a tag), and only the tag form
+        # matches verify.sh's pinned --certificate-identity-regexp, so a
+        # pull-request run signing here proves the mechanism works without
+        # ever producing a signature that could pass as a release one. A
+        # fork pull request's run gets no ambient token at all (a GitHub
+        # platform restriction, not a setting this file controls), which
+        # sign.sh itself detects and refuses fast; this step lets that
+        # specific, structural case through rather than failing the whole
+        # required check on every external contribution.
+        run: |
+          set -euo pipefail
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "no ambient GitHub Actions OIDC token (expected on a fork pull" >&2
+            echo "  request); skipping signing. A same-repository run always has one." >&2
+            exit 0
+          fi
+          sh scripts/release/sign.sh dist/*.tar.gz dist/*.sbom.json
+      - name: Build SHA256SUMS and sign it too
+        run: |
+          set -euo pipefail
+          ( cd dist && sha256sum *.tar.gz *.sbom.json > SHA256SUMS )
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "no ambient GitHub Actions OIDC token; skipping signing SHA256SUMS." >&2
+            exit 0
+          fi
+          sh scripts/release/sign.sh dist/SHA256SUMS
+      - name: Assert every published file has exactly one signature
+        # Invariant 6: the release job enumerates its own outputs and
+        # asserts one signature each, rather than trusting the sign step
+        # above to have covered everything it claimed to.
+        run: |
+          set -euo pipefail
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "no ambient GitHub Actions OIDC token; nothing was signed to enumerate." >&2
+            exit 0
+          fi
+          missing=0
+          for f in dist/*.tar.gz dist/*.sbom.json dist/SHA256SUMS; do
+            sig_count=0
+            [ -f "$f.bundle" ] && sig_count=$((sig_count + 1))
+            if [ "$sig_count" -ne 1 ]; then
+              echo "FAIL: $f has $sig_count signature(s), want exactly 1" >&2
+              missing=1
+            fi
+          done
+          [ "$missing" -eq 0 ]
+          echo "every published file has exactly one signature"
+      - name: Produce a build provenance attestation per artifact
+        run: |
+          set -euo pipefail
+          if [ -z "${ACTIONS_ID_TOKEN_REQUEST_TOKEN:-}" ]; then
+            echo "no ambient GitHub Actions OIDC token (expected on a fork pull" >&2
+            echo "  request); skipping attestation." >&2
+            exit 0
+          fi
+          for f in dist/*.tar.gz; do
+            base="$(basename "$f")"
+            target="${base#irontraffic-*-}"
+            target="${target%.tar.gz}"
+            sh scripts/release/attest.sh "$f" "$target" "control-plane"
+          done
+      - name: Verify signature and provenance over the freshly signed dist/ (tag only)
+        # This is scripts/release/verify.sh's own SUCCESS path, run for
+        # real, the same way the step above (verify-repro.sh) already
+        # closes the reproducibility loop. Tag-gated, not merely
+        # OIDC-token-gated like every other step in this job: verify.sh's
+        # --certificate-identity-regexp is pinned to refs/tags/v*, so it can
+        # never pass against a pull request's own identity
+        # (.../ci.yml@refs/pull/N/merge) even with a perfectly real
+        # signature; running it there would fail this required check on
+        # every pull request for the correct-but-wrong reason.
+        # supply-chain-selftest.sh's own tests 15/16 verify a pull request's
+        # real signature with cosign directly for exactly this reason (see
+        # that file's own header comment on WHY THESE TWO TESTS DO NOT CALL
+        # verify.sh), which means this tag-only step is the ONLY place the
+        # actual consumer script a user runs is ever exercised against a
+        # real signature end to end, not a round trip through the signer's
+        # own inputs. Every companion file (.bundle, .intoto.bundle,
+        # .sbom.json, SHA256SUMS) is found locally, right next to each
+        # tarball in dist/, so this needs no network fetch at all.
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          for f in dist/*.tar.gz; do
+            sh scripts/release/verify.sh --artifact "$f" --sbom "$f.sbom.json" --strict
+          done
+          echo "verify.sh --strict: ok (every tarball, real signature, real provenance)"
       - name: Verify the musl binaries are fully static
         run: |
           set -euo pipefail
@@ -1204,5 +1378,41 @@ jobs:
           # release asset. `gh release create` uploads an asset under its
           # base filename by default, so `scripts/install.sh` here lands at
           # exactly the advertised path.
-          gh release create "$tag" dist/*.tar.gz dist/SHA256SUMS scripts/install.sh \
+          #
+          # scripts/release/verify.sh and scripts/release/sbom-licence-check.sh
+          # are uploaded the same way and for the identical reason
+          # (release-sbom-signing-and-provenance, #428):
+          # `scripts/install.sh` downloads and runs verify.sh from this same
+          # release, and docs/SUPPLY-CHAIN.md documents downloading and
+          # running it standalone, neither of which works unless it is
+          # itself a release asset. The SBOMs, signatures (`.bundle` per
+          # file, a self-contained Sigstore bundle: signature, certificate
+          # and Rekor inclusion proof together, chosen over a bare
+          # signature plus a live Rekor search; see sign.sh's own comment)
+          # and provenance attestations (`.intoto.bundle`) glob in
+          # alongside the tarballs and SHA256SUMS they cover.
+          #
+          # deny.toml and scripts/release/licence-exceptions.txt are
+          # uploaded here too (#788): sbom-licence-check.sh's own default
+          # lookup now tries beside ITSELF first (see that script's own
+          # header), which only ever finds anything there once these two
+          # are published release assets sitting next to it, and
+          # docs/SUPPLY-CHAIN.md section 3's standalone `--sbom` flow
+          # curls them in for exactly that reason. `gh release create`
+          # uploads each under its own base filename, so
+          # `scripts/release/licence-exceptions.txt` here lands at
+          # `licence-exceptions.txt`, matching what sbom-licence-check.sh
+          # looks for beside itself.
+          #
+          # `dist/*.bundle` is NOT used here on its own: it would also
+          # match every `*.intoto.bundle` (a glob's `*` matches dots), which
+          # made `gh release create` see the same attestation file twice,
+          # once per pattern. Each glob below is specific enough to match
+          # exactly the file kind it names and no other.
+          gh release create "$tag" \
+            dist/*.tar.gz dist/*.sbom.json dist/SHA256SUMS \
+            dist/*.tar.gz.bundle dist/*.sbom.json.bundle dist/SHA256SUMS.bundle \
+            dist/*.intoto.bundle \
+            scripts/install.sh scripts/release/verify.sh scripts/release/sbom-licence-check.sh \
+            deny.toml scripts/release/licence-exceptions.txt \
             --title "$tag" --generate-notes

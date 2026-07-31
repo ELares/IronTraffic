@@ -16,7 +16,21 @@
 # Environment:
 #   IT_VERSION      pin a version (e.g. "0.4.1" or "v0.4.1"); default: latest
 #   IT_ALLOW_ROOT   "1" to allow running as root (default: refuse)
-#   --prefix DIR    install under DIR/bin instead of $HOME/.local/bin
+#   --prefix DIR              install under DIR/bin instead of $HOME/.local/bin
+#   --no-verify-signature     skip signature/provenance verification (NOT
+#                             RECOMMENDED; see below)
+#
+# SIGNATURE VERIFICATION IS ON BY DEFAULT. After the checksum above passes,
+# this script downloads scripts/release/verify.sh (itself a signed release
+# asset, alongside this file) and runs it with --strict against the
+# downloaded tarball: cosign keyless signature, in-toto build provenance,
+# and (with --strict) that the build actually ran from a tagged release.
+# Checksum integrity alone proves a download was not corrupted; it proves
+# nothing about who produced the artifact, which is exactly what the
+# signature and provenance checks are for. A FAILED or SKIPPED verification
+# (no network, no cosign) refuses the install. The only way to install
+# without it is the explicit `--no-verify-signature`, which prints a
+# prominent warning naming what was not checked. See docs/SUPPLY-CHAIN.md.
 #
 # umask is set before anything is written, so the installed binary is 0755
 # regardless of the invoking shell's umask: a group-writable binary left on
@@ -34,11 +48,14 @@ SUPPORTED_TARGETS="x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu x86_64-unk
 
 usage() {
     cat <<'EOF'
-usage: install.sh [--prefix DIR]
+usage: install.sh [--prefix DIR] [--no-verify-signature]
 
 Downloads, verifies, and installs the irontraffic binary for this machine.
 
-  --prefix DIR   install under DIR/bin instead of $HOME/.local/bin
+  --prefix DIR             install under DIR/bin instead of $HOME/.local/bin
+  --no-verify-signature    skip signature/provenance verification (NOT
+                           RECOMMENDED; prints a warning naming what is
+                           not checked). See docs/SUPPLY-CHAIN.md.
 
 environment:
   IT_VERSION      pin a version (e.g. "0.4.1"); default: the latest release
@@ -178,12 +195,22 @@ verify_checksums() {
 
 main() {
     prefix="$HOME/.local"
+    # Verification is ON by default (invariant 10). There is deliberately
+    # no separate opt-in flag to turn it back on: a security check behind
+    # an opt-in flag is a check almost nobody runs. The only lever is the
+    # explicit opt-out below, and every mention of that flag's name in
+    # this file being the "no-" form is itself an acceptance criterion.
+    verify_signature=1
     while [ "$#" -gt 0 ]; do
         case "$1" in
             --prefix)
                 [ "$#" -ge 2 ] || { echo "error: --prefix requires a value" >&2; exit 2; }
                 prefix="$2"
                 shift 2
+                ;;
+            --no-verify-signature)
+                verify_signature=0
+                shift
                 ;;
             --help|-h)
                 usage
@@ -254,12 +281,23 @@ main() {
     }
 
     # Only the one line matching this asset is checked: SHA256SUMS lists
-    # every target's tarball, and this script has downloaded exactly one of
-    # them.
-    grep -F "$asset_name" "$work_dir/SHA256SUMS" > "$work_dir/SHA256SUMS.this-asset" || {
+    # every target's tarball AND every target's SBOM (ci.yml builds it with
+    # `sha256sum *.tar.gz *.sbom.json > SHA256SUMS`), and this script has
+    # downloaded exactly one tarball, never an SBOM. A SUBSTRING match here
+    # is wrong: "irontraffic-<v>-<target>.tar.gz" is a byte-for-byte PREFIX
+    # of "irontraffic-<v>-<target>.tar.gz.sbom.json", so a plain `grep -F`
+    # against a real, release-shaped SHA256SUMS returns BOTH lines, and
+    # `sha256sum -c` is then handed a second line naming an SBOM this script
+    # never downloaded, which it reports as a missing-file failure: a false
+    # tamper alarm on a perfectly good tarball. `awk`'s field match compares
+    # the whole second (whitespace-delimited) field for EQUALITY, so it
+    # cannot match a filename that merely starts with $asset_name the way a
+    # substring search can.
+    awk -v name="$asset_name" '$2 == name' "$work_dir/SHA256SUMS" > "$work_dir/SHA256SUMS.this-asset"
+    if [ ! -s "$work_dir/SHA256SUMS.this-asset" ]; then
         echo "error: $asset_name is not listed in SHA256SUMS" >&2
         exit 1
-    }
+    fi
 
     if ! verify_checksums "$checker" "$work_dir" "$work_dir/SHA256SUMS.this-asset"; then
         echo "error: checksum verification FAILED for $asset_name. Refusing to install" >&2
@@ -269,9 +307,39 @@ main() {
     # Edge case 13e, said out loud rather than merely implied by exit code
     # 0: SHA256SUMS comes from the same origin as the tarball, so this
     # proves the transfer was not corrupted and proves nothing about who
-    # produced the artifact. Signature verification is added by a later
-    # release issue and becomes the default there.
-    echo "checksum verified (integrity only; signature verification lands in the next release)"
+    # produced the artifact by itself. The signature and provenance checks
+    # right below are what establish that.
+    echo "checksum verified (integrity only)"
+
+    if [ "$verify_signature" -eq 1 ]; then
+        verify_script="$work_dir/verify.sh"
+        verify_url="$IT_RELEASE_BASE_URL/download/$version/verify.sh"
+        echo "downloading verify.sh"
+        fetch_to_file "$verify_url" "$verify_script" || {
+            echo "error: download failed: $verify_url" >&2
+            echo "  Refusing to install without signature verification. Pass" >&2
+            echo "  --no-verify-signature to install anyway (NOT RECOMMENDED)." >&2
+            exit 1
+        }
+        echo "verifying signature and provenance"
+        if ! sh "$verify_script" --artifact "$work_dir/$asset_name" --strict; then
+            echo "error: signature/provenance verification FAILED for $asset_name." >&2
+            echo "  Refusing to install an artifact this project cannot verify it" >&2
+            echo "  produced. Pass --no-verify-signature to install anyway (NOT" >&2
+            echo "  RECOMMENDED): see docs/SUPPLY-CHAIN.md for what that skips." >&2
+            exit 1
+        fi
+    else
+        # The opt-out this issue requires, and the one place its warning is
+        # printed: naming, specifically, what is no longer being checked,
+        # not a generic "verification skipped" line.
+        echo "WARNING: --no-verify-signature was passed. Skipping signature" >&2
+        echo "  verification, build provenance verification, and the SBOM" >&2
+        echo "  licence check. This install only checked that the download was" >&2
+        echo "  not corrupted in transit; it did NOT check that this project" >&2
+        echo "  produced this artifact, from what commit, or under what" >&2
+        echo "  licence terms. See docs/SUPPLY-CHAIN.md." >&2
+    fi
 
     extract_dir="$work_dir/extracted"
     mkdir -p "$extract_dir"
