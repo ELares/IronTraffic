@@ -19,6 +19,21 @@
 //! count, filter chain depth, cache mode, keepalive mode and rate mode. A
 //! [`BenchCell`] carries all eleven; [`CellId`] is the stable identifier that
 //! doubles as the cell's result filename stem.
+//!
+//! [`ProbeHandle`] is the 100 requests per second single-connection
+//! reference client (`bench-probe-client`, #410) whose percentiles are the
+//! published latency. Its request builder, response scanner and pacing
+//! function are re-exported here as [`build_request`], [`scan_response_head`]
+//! (with [`ScanOutcome`], [`ResponseHead`] and [`BadReason`]), and
+//! [`wait_until`], beyond what issue #410's own Files table line for this
+//! file literally names: the issue's own "Tests" section needs the scanner
+//! reachable from the `response_scan_is_total` property test in
+//! `tests/probe.rs`, and its own "Benchmarks" section needs the request
+//! builder and the pacing function reachable from `probe/request_bytes_build`
+//! and `probe/wait_until/1ms` in `benches/harness.rs`; both are separate
+//! crates that can see only this crate's public API. `irontraffic-origin`'s
+//! own `lib.rs` (`pub mod serve;`, added the same way for the same reason,
+//! by its own doc comment) is the precedent.
 #![deny(missing_docs)]
 
 mod cell;
@@ -26,6 +41,7 @@ mod error;
 mod guards;
 mod hist;
 mod loadgen;
+mod probe;
 mod provenance;
 mod result;
 mod schedule;
@@ -46,6 +62,11 @@ pub use loadgen::{
     Invocation, LoadGenerator, MAX_HOST_BYTES, MAX_PATH_EXPR_BYTES, MAX_REPORTED_REQUESTS,
     MAX_TOOL_OUTPUT_BYTES, MAX_TOOL_STDERR_BYTES, MAX_VERSION_OUTPUT_BYTES, Oha, ParseCtx, RawRun,
     RunParams, Scheme, Target, Unsupported,
+};
+pub use probe::{
+    BadReason, MAX_CONSECUTIVE_ERRORS, MAX_HEALTHY_RECONNECTS, MAX_REQUEST_BYTES,
+    MAX_RESPONSE_BODY_BYTES, ProbeConfig, ProbeHandle, ProbeOutcome, REQUEST_DEADLINE_NS,
+    ResponseHead, SPIN_THRESHOLD_NS, ScanOutcome, build_request, scan_response_head, wait_until,
 };
 pub use provenance::{
     BURSTABLE_PREFIXES, BuildStamp, CaptureInputs, CpuInfoFields, LARGE_FILE_CAP, MAX_CPU_ENTRIES,
