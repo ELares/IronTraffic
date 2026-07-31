@@ -8,7 +8,8 @@
 use irontraffic_bench::{
     BenchError, BuildStamp, CaptureInputs, CpuInfoFields, PROBE_TIMEOUT_SECONDS, Provenance,
     StampSource, ToolStamp, capture_build_stamp, format_utc_date, is_burstable,
-    normalize_instance_type, parse_cpuinfo, parse_meminfo, render_hardware, resolve_cpu_model,
+    normalize_instance_type, parse_cpuinfo, parse_meminfo, read_bounded, render_hardware,
+    resolve_cpu_model,
 };
 use proptest::prelude::*;
 
@@ -109,6 +110,11 @@ fn parses_dual_socket_cpuinfo() {
          would otherwise undercount to 16)"
     );
     assert!(!fields.physical_cores_assumed);
+    // Invariant 3 (logical_cores >= physical_cores >= 1) already follows from
+    // the two literal assert_eq! calls above (64 >= 32 >= 1); a separate
+    // assertion here would be implied by them, not an independent check.
+    // Invariant 3 is independently enforced (and watched to fail) by the
+    // debug_assert in assemble_provenance, see src/provenance.rs.
 }
 
 // ---------------------------------------------------------------------------
@@ -524,6 +530,241 @@ fn hostile_build_stamp_fields_are_rejected() {
 }
 
 // ---------------------------------------------------------------------------
+// SHOULD_FIX 3 (issue #783): profile is read back from the binary's own
+// stamp, never assumed release.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn embedded_profile_is_read_from_the_binarys_own_stamp_not_assumed_release() {
+    let scripts = ScriptDir::new();
+    let debug_binary = scripts.write_script(
+        "debug_profile.sh",
+        &stamp_script_body(
+            r#"{"name":"test-binary","version":"1.0.0","git_sha":"0a1b2c3d4e5f","dirty":false,"profile":"debug","features":[]}"#,
+        ),
+    );
+    let stamp = capture_build_stamp(&debug_binary)
+        .expect("a well formed debug-profile stamp must be accepted");
+    assert_eq!(
+        stamp.profile, "debug",
+        "profile must be read back from the binary's own stamp; disqualifying condition 4 \
+         (non-release build profile) depends on this being the binary's real answer, not an \
+         assumed \"release\""
+    );
+}
+
+// ---------------------------------------------------------------------------
+// BLOCKING 2 (issue #783): the Fallback build stamp extracts the version
+// token from conventional `<name> <version>` output rather than storing the
+// whole line, which the version character class (no space) would otherwise
+// always reject.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn fallback_stamp_extracts_the_version_token_from_conventional_version_output() {
+    let scripts = ScriptDir::new();
+    let release_dir = scripts.dir.join("release");
+    std::fs::create_dir_all(&release_dir).expect("the release subdirectory must be creatable");
+    let binary_path = release_dir.join("irontraffic");
+    // Rejects --version --json outright (exit 2, no JSON), and answers plain
+    // --version exactly the way both of this repository's own binaries do:
+    // "<name> <version>", not a bare version.
+    std::fs::write(
+        &binary_path,
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"--version\" ] && [ \"$2\" = \"--json\" ]; then\n\
+         \x20\x20exit 2\n\
+         fi\n\
+         echo 'irontraffic 0.1.0'\n\
+         exit 0\n",
+    )
+    .expect("the fixture binary must be writable");
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = std::fs::metadata(&binary_path)
+            .expect("the fixture binary's metadata must be readable")
+            .permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&binary_path, perms)
+            .expect("the fixture binary must be made executable");
+    }
+
+    let stamp = capture_build_stamp(&binary_path).expect(
+        "a binary that rejects --version --json but answers plain --version with the \
+         conventional \"<name> <version>\" form must still fall back successfully, not be \
+         refused as unparseable",
+    );
+    assert_eq!(stamp.stamp_source, StampSource::Fallback);
+    assert_eq!(
+        stamp.version, "0.1.0",
+        "the version token must be extracted from \"irontraffic 0.1.0\", not the whole line \
+         (which contains a space the version character class excludes)"
+    );
+    assert_eq!(stamp.name, "irontraffic");
+    assert_eq!(stamp.profile, "release");
+    assert!(
+        stamp
+            .git_sha
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()),
+        "git_sha must be lowercase hex (from this worktree's own git rev-parse), got {:?}",
+        stamp.git_sha
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SHOULD_FIX 6 (issue #783): a git_sha of the literal "unknown", which
+// crates/irontraffic's own build.rs (#427, already merged) documents and
+// emits for a source-tarball build with no .git directory and no IT_GIT_SHA
+// override, is refused rather than published. DECISION (see PR body): this
+// stays a hard error rather than becoming a seventh unpublishable reason.
+// An unknown git_sha means the run cannot be attributed to any commit at
+// all, which is a stronger failure than "dirty" or "non-release" (both of
+// which DO know a specific, recordable fact); it is the "no kernel version,
+// no run" contract applied to the git SHA. A tarball build that wants to be
+// benchmarked sets IT_GIT_SHA in the environment, per build.rs's own
+// documented override.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn embedded_git_sha_of_unknown_is_rejected_not_silently_accepted() {
+    let scripts = ScriptDir::new();
+    let unknown_sha = scripts.write_script(
+        "unknown_sha.sh",
+        &stamp_script_body(
+            r#"{"name":"irontraffic","version":"0.1.0","git_sha":"unknown","dirty":false,"profile":"release","features":[]}"#,
+        ),
+    );
+    let err = capture_build_stamp(&unknown_sha)
+        .expect_err("a git_sha of the literal \"unknown\" must be refused, not published");
+    assert!(matches!(err, BenchError::Parse { .. }));
+}
+
+// ---------------------------------------------------------------------------
+// SHOULD_FIX 4 (issue #783): read_bounded, the module's only file reader and
+// its named fail-open, has real coverage.
+// ---------------------------------------------------------------------------
+
+#[allow(
+    clippy::expect_used,
+    reason = "test-support setup, not itself a #[test] fn"
+)]
+fn read_bounded_fixture_dir(id: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "irontraffic-bench-read-bounded-{}-{id}",
+        std::process::id()
+    ));
+    std::fs::create_dir_all(&dir)
+        .expect("a temp directory for a read_bounded fixture must be creatable");
+    dir
+}
+
+#[test]
+fn read_bounded_returns_exact_bytes_under_the_cap() {
+    let dir = read_bounded_fixture_dir("under");
+    let path = dir.join("clocksource");
+    std::fs::write(&path, b"tsc").expect("the fixture file must be writable");
+    let bytes = read_bounded(&path, 32).expect("a 3 byte file under a 32 byte cap must read fully");
+    assert_eq!(bytes, b"tsc");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn read_bounded_accepts_a_file_of_exactly_cap_bytes() {
+    let dir = read_bounded_fixture_dir("exact");
+    let path = dir.join("exact");
+    std::fs::write(&path, b"12345678").expect("the fixture file must be writable");
+    let bytes = read_bounded(&path, 8).expect(
+        "a file whose length equals the cap exactly must be accepted, not rejected off by one",
+    );
+    assert_eq!(bytes.len(), 8);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn read_bounded_rejects_a_file_that_exceeds_the_cap_rather_than_truncating() {
+    // Edge case 4a's exact scenario: "tsc" is a valid clocksource value and
+    // is also a byte-for-byte PREFIX of the hostile content below, so a
+    // truncating fail-open (returning the first `cap` bytes instead of
+    // erroring) would read back exactly "tsc" and silently make an
+    // unpublishable run publishable.
+    let dir = read_bounded_fixture_dir("over");
+    let path = dir.join("clocksource");
+    std::fs::write(&path, b"tsc_hpet_hostile_padding_past_the_cap")
+        .expect("the fixture file must be writable");
+    let err = read_bounded(&path, 3).expect_err(
+        "a file exceeding the cap must be rejected, never truncated to the first cap bytes",
+    );
+    assert!(matches!(err, BenchError::Io { .. }));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ---------------------------------------------------------------------------
+// SHOULD_FIX 8 (issue #783): both ToolStamp Field-bounds rows are enforced.
+// ---------------------------------------------------------------------------
+
+#[cfg(unix)]
+#[test]
+fn capture_rejects_a_loadgen_version_that_violates_its_character_class() {
+    let scripts = ScriptDir::new();
+    let clean_stamp = scripts.write_script(
+        "clean.sh",
+        &stamp_script_body(
+            r#"{"name":"test-binary","version":"1.0.0","git_sha":"0a1b2c3d4e5f","dirty":false,"profile":"release","features":[]}"#,
+        ),
+    );
+    let inputs = CaptureInputs {
+        sut_binary: clean_stamp.clone(),
+        origin_binary: clean_stamp,
+        loadgen: ToolStamp {
+            name: "nighthawk".to_owned(),
+            version: "1.0.0@evil".to_owned(),
+            image_digest: None,
+        },
+        warmup_seconds: 5,
+        measure_seconds: 30,
+        repetitions: 1,
+        allow_dirty: false,
+    };
+    let err = Provenance::capture(&inputs).expect_err(
+        "a loadgen version containing '@' violates ToolStamp::version's character class",
+    );
+    assert!(matches!(err, BenchError::Parse { .. }));
+}
+
+#[cfg(unix)]
+#[test]
+fn capture_rejects_a_loadgen_image_digest_that_violates_its_character_class() {
+    let scripts = ScriptDir::new();
+    let clean_stamp = scripts.write_script(
+        "clean.sh",
+        &stamp_script_body(
+            r#"{"name":"test-binary","version":"1.0.0","git_sha":"0a1b2c3d4e5f","dirty":false,"profile":"release","features":[]}"#,
+        ),
+    );
+    let inputs = CaptureInputs {
+        sut_binary: clean_stamp.clone(),
+        origin_binary: clean_stamp,
+        loadgen: ToolStamp {
+            name: "nighthawk".to_owned(),
+            version: "1.0.0".to_owned(),
+            image_digest: Some("sha256/UPPERCASE-not-allowed".to_owned()),
+        },
+        warmup_seconds: 5,
+        measure_seconds: 30,
+        repetitions: 1,
+        allow_dirty: false,
+    };
+    let err = Provenance::capture(&inputs).expect_err(
+        "a loadgen image_digest containing '/' and uppercase violates its character class",
+    );
+    assert!(matches!(err, BenchError::Parse { .. }));
+}
+
+// ---------------------------------------------------------------------------
 // 8 / 9 / 10 / 11 / 12: recompute_publishable's six conditions.
 // ---------------------------------------------------------------------------
 
@@ -779,6 +1020,9 @@ fn capture_on_this_machine_produces_a_clean_hardware_string() {
         .expect("hardware must contain a comma")];
     assert!(!before_first_comma.contains('/'));
     assert!(!provenance.hardware.contains('@'));
+    // Invariant 7, against a real rustix::process::getrlimit() reading on
+    // this machine, not a fixture literal.
+    assert!(provenance.ulimit_nofile > 0);
 
     // macOS is a supported development platform but never a publishing
     // platform: the capture succeeds, but clocksource is the fixed
@@ -792,4 +1036,84 @@ fn capture_on_this_machine_produces_a_clean_hardware_string() {
         assert_eq!(provenance.clocksource, "unavailable");
         assert!(!provenance.publishable);
     }
+}
+
+// ---------------------------------------------------------------------------
+// SHOULD_FIX 7 (issue #783): the live host capture is verified against an
+// independent oracle, not just a shape check a hard coded constant would
+// also satisfy.
+// ---------------------------------------------------------------------------
+
+/// Runs `sysctl -n <key>` directly via `std::process::Command`, NOT through
+/// this crate's own `run_sysctl` helper: the whole point is an oracle that
+/// does not share code with the function under test, so a mutation that hard
+/// codes `capture_host_facts`'s macOS branch to a placeholder constant is
+/// caught by comparison against a value this test computed on its own.
+#[cfg(target_os = "macos")]
+#[allow(
+    clippy::expect_used,
+    reason = "test-support helper, not itself a #[test] fn"
+)]
+fn oracle_sysctl(key: &str) -> String {
+    let output = std::process::Command::new("sysctl")
+        .args(["-n", key])
+        .output()
+        .expect("sysctl must be runnable on macOS to compute the oracle value");
+    assert!(output.status.success(), "sysctl -n {key} exited non-zero");
+    String::from_utf8(output.stdout)
+        .expect("sysctl output must be utf-8")
+        .trim()
+        .to_owned()
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn capture_host_facts_matches_independently_queried_sysctl_values() {
+    let scripts = ScriptDir::new();
+    let stamp_binary = scripts.write_script(
+        "stamp.sh",
+        &stamp_script_body(
+            r#"{"name":"test-binary","version":"1.0.0","git_sha":"0a1b2c3d4e5f","dirty":false,"profile":"release","features":[]}"#,
+        ),
+    );
+    let inputs = CaptureInputs {
+        sut_binary: stamp_binary.clone(),
+        origin_binary: stamp_binary,
+        loadgen: ToolStamp {
+            name: "nighthawk".to_owned(),
+            version: "1.0.0".to_owned(),
+            image_digest: None,
+        },
+        warmup_seconds: 5,
+        measure_seconds: 30,
+        repetitions: 1,
+        allow_dirty: false,
+    };
+    let provenance = Provenance::capture(&inputs).expect("capture must succeed on macOS");
+
+    let expected_kernel = oracle_sysctl("kern.osrelease");
+    assert_eq!(
+        provenance.kernel, expected_kernel,
+        "kernel must be read from kern.osrelease on this machine, not a placeholder constant"
+    );
+
+    let expected_mem_bytes: u64 = oracle_sysctl("hw.memsize")
+        .parse()
+        .expect("hw.memsize must be an integer");
+    assert_eq!(
+        provenance.mem_bytes, expected_mem_bytes,
+        "mem_bytes must be read from hw.memsize on this machine, not a placeholder constant"
+    );
+
+    // Independent re-derivation of the documented cpu_model normalisation
+    // rule (cut at the first '@', trim, collapse internal whitespace runs),
+    // not a call into resolve_cpu_model or normalize_cpu_model.
+    let raw_brand = oracle_sysctl("machdep.cpu.brand_string");
+    let cut_at_at = raw_brand.split('@').next().unwrap_or(&raw_brand).trim();
+    let expected_cpu_model = cut_at_at.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert_eq!(
+        provenance.cpu_model, expected_cpu_model,
+        "cpu_model must be read from machdep.cpu.brand_string on this machine, not a \
+         placeholder constant"
+    );
 }

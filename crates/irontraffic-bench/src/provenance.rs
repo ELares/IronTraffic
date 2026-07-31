@@ -349,7 +349,9 @@ pub fn read_bounded(path: &Path, cap: usize) -> Result<Vec<u8>, BenchError> {
 #[cfg(target_os = "linux")]
 fn decode_nul_trimmed_utf8(bytes: &[u8]) -> Option<String> {
     let end = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
-    std::str::from_utf8(&bytes[..end]).ok().map(str::to_owned)
+    std::str::from_utf8(bytes.get(..end)?)
+        .ok()
+        .map(str::to_owned)
 }
 
 // ---------------------------------------------------------------------------
@@ -1049,6 +1051,15 @@ fn validate_build_stamp(mut stamp: BuildStamp) -> Result<BuildStamp, BenchError>
             "version violates its bound or character class",
         ));
     }
+    // Deliberately rejects the literal "unknown" too, which
+    // crates/irontraffic's own build.rs (#427) emits for a source-tarball
+    // build with no .git directory and no IT_GIT_SHA override: an
+    // unattributable build cannot be reproduced or compared across runs, so
+    // the harness refuses to start rather than publish a record nobody can
+    // trace to a commit, the "no kernel version, no run" contract applied to
+    // the git SHA. See PR discussion on issue #407 for the full decision; a
+    // tarball build that wants to be benchmarked sets IT_GIT_SHA in the
+    // environment, per build.rs's own documented override.
     if !bounded_ascii(&stamp.git_sha, 40, is_git_sha_char) {
         return Err(BenchError::parse(
             "build_stamp",
@@ -1221,9 +1232,20 @@ pub fn capture_build_stamp(binary: &Path) -> Result<BuildStamp, BenchError> {
             io_error("--version exited non-zero"),
         ));
     }
-    let version = std::str::from_utf8(&version_probe.stdout)
+    let version_text = std::str::from_utf8(&version_probe.stdout)
         .map(|s| s.trim().to_owned())
         .map_err(|_| BenchError::parse("build_stamp", "--version output is not utf-8"))?;
+    // Every conventional CLI, including both binaries in this repository,
+    // prints `<name> <version>` on plain `--version` (`irontraffic 0.1.0`,
+    // `it-origin 0.1.0`). The version class excludes the space between them,
+    // so storing the whole line would make the Fallback path fail on every
+    // real binary; take the last whitespace-separated token instead. A line
+    // with no whitespace at all (a bare `0.1.0`) is its own last token.
+    let version = version_text
+        .split_whitespace()
+        .next_back()
+        .unwrap_or(version_text.as_str())
+        .to_owned();
 
     let stamp = BuildStamp {
         name: name_from_stem(binary)?,
@@ -1298,17 +1320,38 @@ fn parse_port_range(s: &str) -> Option<(u32, u32)> {
 
 #[cfg(target_os = "linux")]
 fn sum_thermal_throttle() -> Option<u64> {
-    let base = Path::new("/sys/devices/system/cpu");
+    sum_thermal_throttle_from(Path::new("/sys/devices/system/cpu"), MAX_CPU_ENTRIES)
+}
+
+/// The pure half of [`sum_thermal_throttle`], parameterised on the directory
+/// and the entry cap so a test can drive the cap-exceeded path with a
+/// handful of fixture directories rather than [`MAX_CPU_ENTRIES`] real ones.
+///
+/// Counts only entries that match the `cpu[0-9]+` shape toward `max_entries`;
+/// a directory also containing `online`, `possible`, `cpufreq`,
+/// `vulnerabilities`, and similar non-`cpu*` siblings must not spend the
+/// budget on them. Reaching the cap stops the walk immediately and returns
+/// `None` rather than the sum collected so far: edge case 4b requires that a
+/// directory with more `cpu*` entries than the cap is indistinguishable from
+/// one this module refused to read, never a partial number that would read
+/// in a committed record exactly like a complete throttle count.
+#[cfg(target_os = "linux")]
+fn sum_thermal_throttle_from(base: &Path, max_entries: usize) -> Option<u64> {
     let entries = base.read_dir().ok()?; // it-allow: no-blocking-in-async reason: irontraffic-bench has no async runtime; capture() runs once per invocation before anything is spawned.
     let mut total: u64 = 0;
     let mut any_found = false;
-    for entry in entries.take(MAX_CPU_ENTRIES) {
+    let mut cpu_entries_visited: usize = 0;
+    for entry in entries {
         let Ok(entry) = entry else { continue };
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
         if !name.starts_with("cpu") || !name["cpu".len()..].bytes().all(|b| b.is_ascii_digit()) {
             continue;
         }
+        if cpu_entries_visited >= max_entries {
+            return None;
+        }
+        cpu_entries_visited += 1;
         let counter_path = entry.path().join("thermal_throttle/core_throttle_count");
         if let Ok(bytes) = read_bounded(&counter_path, SMALL_FILE_CAP)
             && let Ok(text) = std::str::from_utf8(&bytes)
@@ -1483,6 +1526,104 @@ fn capture_host_facts() -> Result<HostFacts, BenchError> {
 // Provenance::capture and recompute_publishable.
 // ---------------------------------------------------------------------------
 
+/// The non-[`HostFacts`] pieces [`assemble_provenance`] needs: everything
+/// `capture()` gathers itself rather than reading from the OS-specific host
+/// capture routine. Grouped into one struct so `assemble_provenance` takes
+/// two arguments instead of ten (`clippy::too_many_arguments`).
+struct AssembledParts {
+    utc_date: String,
+    cpu_arch: String,
+    ulimit_nofile: u64,
+    sut: BuildStamp,
+    origin: BuildStamp,
+    loadgen: ToolStamp,
+    warmup_seconds: u32,
+    measure_seconds: u32,
+    repetitions: u32,
+}
+
+/// Assembles a [`Provenance`] from already captured, already validated
+/// pieces: the OS-specific [`HostFacts`], and the [`AssembledParts`]
+/// `capture()` gathers separately (the two build stamps, the tool stamp, the
+/// descriptor limit). Pure and infallible; every fallible step already
+/// happened in the caller.
+///
+/// This is a deliberate seam. `capture_host_facts()` can only run against the
+/// real host, which makes the burstable guard's call site (deriving
+/// `burstable` from `host.instance_type` via [`is_burstable`]) and the
+/// straight pass-through of `host.cpu_model`, `host.mem_bytes` and
+/// `host.kernel` otherwise untestable: nothing can hand `capture()` a
+/// hypothetical host record. A test builds a [`HostFacts`] by hand and calls
+/// this function directly instead.
+fn assemble_provenance(host: HostFacts, parts: AssembledParts) -> Provenance {
+    let AssembledParts {
+        utc_date,
+        cpu_arch,
+        ulimit_nofile,
+        sut,
+        origin,
+        loadgen,
+        warmup_seconds,
+        measure_seconds,
+        repetitions,
+    } = parts;
+
+    let instance_type = host.instance_type;
+    let burstable = instance_type.as_deref().is_some_and(is_burstable);
+
+    let hardware = render_hardware(
+        &host.cpu_model,
+        host.physical_cores,
+        host.logical_cores,
+        host.mem_bytes,
+    );
+
+    let mut provenance = Provenance {
+        utc_date,
+        hardware,
+        cpu_model: host.cpu_model,
+        cpu_arch,
+        physical_cores: host.physical_cores,
+        physical_cores_assumed: host.physical_cores_assumed,
+        logical_cores: host.logical_cores,
+        mem_bytes: host.mem_bytes,
+        instance_type,
+        burstable,
+        kernel: host.kernel,
+        clocksource: host.clocksource,
+        governor: host.governor,
+        thermal_throttle_count: host.thermal_throttle_count,
+        ulimit_nofile,
+        ip_local_port_range: host.ip_local_port_range,
+        sut,
+        origin,
+        loadgen,
+        warmup_seconds,
+        measure_seconds,
+        repetitions,
+        publishable: true,
+        unpublishable_reasons: Vec::new(),
+    };
+    provenance.recompute_publishable();
+
+    // Invariants 3 and 7, cheap to check on every assembled record: a run
+    // that reports fewer logical than physical cores, zero physical cores,
+    // or a zero descriptor limit has already lied in a field the publishing
+    // guard does not otherwise cross check.
+    debug_assert!(
+        provenance.logical_cores >= provenance.physical_cores && provenance.physical_cores >= 1,
+        "invariant 3 violated: logical_cores {} must be >= physical_cores {}, and physical_cores must be >= 1",
+        provenance.logical_cores,
+        provenance.physical_cores
+    );
+    debug_assert!(
+        provenance.ulimit_nofile > 0,
+        "invariant 7 violated: ulimit_nofile must be > 0"
+    );
+
+    provenance
+}
+
 impl Provenance {
     /// Captures everything from the running system. Call FIRST, before
     /// spawning any process.
@@ -1500,9 +1641,6 @@ impl Provenance {
         let host = capture_host_facts()?;
         let cpu_arch = std::env::consts::ARCH.to_owned();
 
-        let instance_type = host.instance_type;
-        let burstable = instance_type.as_deref().is_some_and(is_burstable);
-
         let ulimit_nofile = rustix::process::getrlimit(rustix::process::Resource::Nofile)
             .current
             .unwrap_or(u64::MAX);
@@ -1519,41 +1657,20 @@ impl Provenance {
 
         let loadgen = validate_tool_stamp(inputs.loadgen.clone())?;
 
-        let hardware = render_hardware(
-            &host.cpu_model,
-            host.physical_cores,
-            host.logical_cores,
-            host.mem_bytes,
-        );
-
-        let mut provenance = Self {
-            utc_date,
-            hardware,
-            cpu_model: host.cpu_model,
-            cpu_arch,
-            physical_cores: host.physical_cores,
-            physical_cores_assumed: host.physical_cores_assumed,
-            logical_cores: host.logical_cores,
-            mem_bytes: host.mem_bytes,
-            instance_type,
-            burstable,
-            kernel: host.kernel,
-            clocksource: host.clocksource,
-            governor: host.governor,
-            thermal_throttle_count: host.thermal_throttle_count,
-            ulimit_nofile,
-            ip_local_port_range: host.ip_local_port_range,
-            sut,
-            origin,
-            loadgen,
-            warmup_seconds: inputs.warmup_seconds,
-            measure_seconds: inputs.measure_seconds,
-            repetitions: inputs.repetitions,
-            publishable: true,
-            unpublishable_reasons: Vec::new(),
-        };
-        provenance.recompute_publishable();
-        Ok(provenance)
+        Ok(assemble_provenance(
+            host,
+            AssembledParts {
+                utc_date,
+                cpu_arch,
+                ulimit_nofile,
+                sut,
+                origin,
+                loadgen,
+                warmup_seconds: inputs.warmup_seconds,
+                measure_seconds: inputs.measure_seconds,
+                repetitions: inputs.repetitions,
+            },
+        ))
     }
 
     /// Re-evaluates `publishable` and `unpublishable_reasons` from the current
@@ -1655,6 +1772,69 @@ mod tests {
         assert!(!is_governor_char(b'-'));
     }
 
+    /// The seam test for the burstable guard's call site. `HostFacts` can
+    /// only otherwise be produced by `capture_host_facts()`, which only runs
+    /// against the real host; this builds one by hand so the derivation
+    /// `burstable = instance_type.as_deref().is_some_and(is_burstable)`
+    /// inside `assemble_provenance` is exercised directly, independent of
+    /// what any real machine's `instance_type` happens to be. Also pins that
+    /// every other `HostFacts` field is passed straight through rather than
+    /// being replaced along the way.
+    #[test]
+    fn assemble_provenance_derives_burstable_from_instance_type_via_is_burstable() {
+        let host = HostFacts {
+            cpu_model: "Example CPU".to_owned(),
+            physical_cores: 4,
+            physical_cores_assumed: false,
+            logical_cores: 8,
+            mem_bytes: 16 * GIB,
+            instance_type: Some("t4g.large".to_owned()),
+            kernel: "6.1.0-generic".to_owned(),
+            clocksource: "tsc".to_owned(),
+            governor: Some("performance".to_owned()),
+            thermal_throttle_count: Some(3),
+            ip_local_port_range: Some((32_768, 60_999)),
+        };
+        let stamp = BuildStamp {
+            name: "irontraffic".to_owned(),
+            version: "0.1.0".to_owned(),
+            git_sha: "0a1b2c3d4e5f".to_owned(),
+            dirty: false,
+            profile: "release".to_owned(),
+            features: Vec::new(),
+            stamp_source: StampSource::Embedded,
+        };
+        let loadgen = ToolStamp {
+            name: "nighthawk".to_owned(),
+            version: "1.0.0".to_owned(),
+            image_digest: None,
+        };
+
+        let provenance = assemble_provenance(
+            host,
+            AssembledParts {
+                utc_date: "2026-07-24T00:00:00Z".to_owned(),
+                cpu_arch: "aarch64".to_owned(),
+                ulimit_nofile: 1_048_576,
+                sut: stamp.clone(),
+                origin: stamp,
+                loadgen,
+                warmup_seconds: 5,
+                measure_seconds: 30,
+                repetitions: 3,
+            },
+        );
+
+        assert!(
+            provenance.burstable,
+            "instance_type \"t4g.large\" must set burstable true via is_burstable at the \
+             assembly call site, not a hard coded false"
+        );
+        assert_eq!(provenance.cpu_model, "Example CPU");
+        assert_eq!(provenance.mem_bytes, 16 * GIB);
+        assert_eq!(provenance.kernel, "6.1.0-generic");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn devicetree_model_is_trimmed_at_the_first_nul() {
@@ -1663,5 +1843,72 @@ mod tests {
             decode_nul_trimmed_utf8(bytes).as_deref(),
             Some("Neoverse-V1 board")
         );
+    }
+
+    /// A throwaway `/sys/devices/system/cpu`-shaped directory: `count` real
+    /// `cpu<N>/thermal_throttle/core_throttle_count` files each holding
+    /// `value_each`, plus one non-`cpu*` sibling (`online`) so the cap
+    /// counting logic under test is shown to ignore it.
+    #[cfg(target_os = "linux")]
+    #[allow(
+        clippy::expect_used,
+        reason = "test-support helper, not itself a #[test] fn"
+    )]
+    fn fixture_thermal_dir(id: &str, count: usize, value_each: u64) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "irontraffic-bench-thermal-{}-{id}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("fixture thermal dir must be creatable");
+        std::fs::write(dir.join("online"), b"0-7").expect("the non-cpu* sibling must be writable");
+        for i in 0..count {
+            let core_dir = dir.join(format!("cpu{i}")).join("thermal_throttle");
+            std::fs::create_dir_all(&core_dir).expect("fixture core dir must be creatable");
+            std::fs::write(core_dir.join("core_throttle_count"), value_each.to_string())
+                .expect("fixture counter file must be writable");
+        }
+        dir
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn thermal_throttle_sums_only_cpu_star_entries_under_the_cap() {
+        let dir = fixture_thermal_dir("under-cap", 3, 5);
+        let sum = sum_thermal_throttle_from(&dir, MAX_CPU_ENTRIES);
+        assert_eq!(
+            sum,
+            Some(15),
+            "3 cpu* entries of 5 each, under the cap and past a non-cpu* sibling, must sum to 15"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn thermal_throttle_records_none_past_the_cap_rather_than_a_partial_sum() {
+        // Edge case 4b: a directory with more cpu* entries than the cap
+        // records None, never Some(partial_sum), which would read in a
+        // committed record exactly like a complete throttle count.
+        let dir = fixture_thermal_dir("over-cap", 5, 5);
+        let sum = sum_thermal_throttle_from(&dir, 3);
+        assert_eq!(
+            sum, None,
+            "5 cpu* entries against a cap of 3 must record None, not a partial sum of any of \
+             the first 3 entries visited"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn thermal_throttle_sums_exactly_at_the_cap_boundary() {
+        let dir = fixture_thermal_dir("at-cap", 4, 2);
+        let sum = sum_thermal_throttle_from(&dir, 4);
+        assert_eq!(
+            sum,
+            Some(8),
+            "exactly 4 cpu* entries against a cap of 4 must not be treated as exceeding it"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
