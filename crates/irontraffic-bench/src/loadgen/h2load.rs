@@ -83,6 +83,53 @@
 //! produce the output shape this parser reads, so it is the resolution
 //! chosen over moving the pin.
 //!
+//! # `errors` is `failed` ALONE, another deliberate, evidence-backed DEVIATION
+//! # from issue #413's own Design section
+//!
+//! Issue #413's own Design section, "h2load output parsing" table, names
+//! `errors` as `failed`, `errored` and `timeout` SUMMED. That is wrong for the
+//! pinned `1.68.1`, confirmed directly against `src/h2load.cc` (dumped in
+//! full over HTTPS from the pinned tag, the same fetch this module's other
+//! deviation section describes): `req_error` and `req_timedout` are SUBSETS
+//! of `req_failed`, never additive on top of it, so summing all three
+//! double- or triple-counts (PR 815 review, issue #817 `SHOULD_FIX`).
+//!
+//! Every site in the pinned tag that increments `req_error` increments
+//! `req_failed` by the identical amount on the same or the immediately
+//! preceding line: `try_again_or_fail` (`req_failed += req_inflight;
+//! req_error += req_inflight;`, lines 708-709), `process_abandoned_streams`
+//! (`req_failed += req_abandoned; req_error += req_abandoned;`, lines
+//! 830-831), `process_request_failure` (lines 842-843, identical shape),
+//! `on_stream_close`'s failure branch (`++req_failed; ++req_error;`, lines
+//! 1051-1052), and the `main`-level `req_not_issued` fold-in (`req_failed +=
+//! req_not_issued; req_error += req_not_issued;`, lines 3317-3318).
+//! `process_timedout_streams` (lines 806-821) adds `req_inflight` to
+//! `req_timedout` and then immediately calls `process_abandoned_streams`,
+//! which adds the SAME still-unzeroed `req_inflight` (plus `req_left`) to
+//! both `req_failed` and `req_error`: the requests a timeout counts are
+//! counted again, not on top, when `req_failed` is computed. The one place
+//! `req_failed` is incremented WITHOUT a paired `req_error` increment is
+//! `on_stream_close`'s SUCCESS branch with a non-2xx/3xx status (line 1043,
+//! `++worker->stats.req_failed;`, no `req_error` nearby): this is what
+//! establishes the direction is a strict subset, `req_error <= req_failed`
+//! and `req_timedout <= req_failed` always, never the other way round and
+//! never additive.
+//!
+//! One consequence worth stating plainly, because a naive reading of the
+//! `requests:` line's own field order suggests otherwise: `errors_u128 =
+//! failed` alone is what keeps this parser able to read a REALISTIC capture
+//! with a nonzero `errored` or `timeout` at all. `print_stats`'s own
+//! `req_not_issued` fold-in (this module's own doc, "The fixture's own
+//! arithmetic," immediately below) already forces `total == succeeded +
+//! failed` as an identity; the additive formula named in the Design section
+//! would then require `succeeded + failed + errored + timeout <= total` for
+//! any run reporting a nonzero `errored` or `timeout` alongside a nonzero
+//! `failed`, which is arithmetically impossible whenever `errored` or
+//! `timeout` is positive (they can only ever be a PORTION of `failed`, per
+//! the subset relation above, so adding them on top always overshoots).
+//! Taking `errors = failed` alone is the only formula a real `1.68.1`
+//! capture with any transport-level failure at all can ever satisfy.
+//!
 //! # The fixture's own arithmetic now matches every relation `print_stats` guarantees
 //!
 //! The same PR 815 review (issue #816 BLOCKING 3) found
@@ -514,20 +561,19 @@ fn parse_sd_stat_row(rest: &str, label: &str) -> Result<SdStatRow, BenchError> {
     })
 }
 
-/// The four counts this parser reads from the `requests:` line, in the
-/// fixed order h2load always emits them: `<total> total, <started> started,
-/// <done> done, <succeeded> succeeded, <failed> failed, <errored> errored,
-/// <timeout> timeout`. `started`/`done`/`succeeded` are validated for shape
-/// (each must be a plain digit run with the expected trailing label) but not
-/// stored: this issue's own Parsing table maps only `total` (to
-/// `requests_sent`) and the sum of `failed`+`errored`+`timeout` (to
-/// `errors`) onto any `RawRun` field.
+/// The two counts this parser stores from the `requests:` line, in the fixed
+/// order h2load always emits its seven fields: `<total> total, <started>
+/// started, <done> done, <succeeded> succeeded, <failed> failed, <errored>
+/// errored, <timeout> timeout`. `started`/`done`/`succeeded`/`errored`/
+/// `timeout` are all validated for shape (each must be a plain digit run
+/// with the expected trailing label) but not stored: only `total` (to
+/// `requests_sent`) and `failed` (to `errors`, ALONE, not summed with
+/// `errored`/`timeout`; see this module's own doc, "`errors` is `failed`
+/// alone") map onto a `RawRun` field.
 #[derive(Debug, Clone, Copy)]
 struct RequestsFields {
     total: u64,
     failed: u64,
-    errored: u64,
-    timeout: u64,
 }
 
 /// Parses one `<n> <label>` segment (for example `"1000 total"`), checking
@@ -584,14 +630,13 @@ fn parse_requests_line(rest: &str) -> Result<RequestsFields, BenchError> {
     parse_count_field(done_f, " done")?;
     parse_count_field(succeeded_f, " succeeded")?;
     let failed = parse_count_field(failed_f, " failed")?;
-    let errored = parse_count_field(errored_f, " errored")?;
-    let timeout = parse_count_field(timeout_f, " timeout")?;
-    Ok(RequestsFields {
-        total,
-        failed,
-        errored,
-        timeout,
-    })
+    // `errored` and `timeout` are validated for shape, exactly like
+    // `started`/`done`/`succeeded` above, but their values are not stored:
+    // see `RequestsFields`'s own doc and this module's "`errors` is `failed`
+    // alone" section for why they are never summed into `errors`.
+    parse_count_field(errored_f, " errored")?;
+    parse_count_field(timeout_f, " timeout")?;
+    Ok(RequestsFields { total, failed })
 }
 
 /// Parses the `status codes:` line's value part, returning only the `2xx`
@@ -987,12 +1032,18 @@ impl LoadGenerator for H2Load {
             ));
         }
 
-        // `errors` per the Design's own Parsing table: failed + errored +
-        // timeout, summed in u128 so three hostile near-u64::MAX counts
-        // cannot wrap into a small number.
-        let errors_u128 = u128::from(requests_fields.failed)
-            .saturating_add(u128::from(requests_fields.errored))
-            .saturating_add(u128::from(requests_fields.timeout));
+        // `errors` is `failed` ALONE, a documented DEVIATION from issue
+        // #413's own Design section (which names `failed + errored +
+        // timeout`): see this module's own doc, "`errors` is `failed`
+        // alone", for the full evidence trail (PR 815 review, issue #817
+        // SHOULD_FIX). `errored` and `timeout` are still fully parsed and
+        // shape-checked by `parse_requests_line` above; they are just not
+        // summed into `errors`, because in the pinned `1.68.1` they are
+        // SUBSETS of `failed`, never additive on top of it. Widened to
+        // u128 before the addition below (not because this single term can
+        // itself overflow u64, but so `responses_ok + errors` cannot wrap
+        // if a hostile capture sets either near `u64::MAX`).
+        let errors_u128 = u128::from(requests_fields.failed);
 
         // `status_counts` mirrors Nighthawk's own scheme (see that module's
         // doc): h2load's own counter set gives only 2xx/3xx/4xx/5xx class

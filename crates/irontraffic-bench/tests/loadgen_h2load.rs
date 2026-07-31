@@ -73,6 +73,23 @@
 //! has confirmed these relations against an actual binary, only against
 //! `1.68.1`'s own published source. Re-verify against a real run before this
 //! parser is trusted for a real cell.
+//!
+//! # The four table rows' column widths now match `print_stats` byte-for-byte
+//! # too (PR 815 review, issue #817's own NOTE)
+//!
+//! The fixture's values were already correct, but its column WIDTHS were
+//! not: `print_stats` pads each of the four duration/number columns to
+//! `std::setw(10)` and the trailing percentage to `std::setw(9)` (`src/
+//! h2load.cc`'s own `time for request:`/`time for connect:`/`time to 1st
+//! byte:`/`req/s` block), and the fixture used plain two-space separators
+//! instead. This was cosmetic, not functional: `parse_sd_stat_row` strips
+//! the label prefix and calls `split_ascii_whitespace`, so it is whitespace
+//! tolerant by construction and no parsed field or test outcome ever
+//! depended on the exact padding. It is fixed anyway because this fixture is
+//! the one artefact a future maintainer will diff a real capture against,
+//! and a byte-exact, compiled verbatim re-emission of `print_stats`'s own
+//! four-row block (using this fixture's own committed values) is what the
+//! four rows are now identical to.
 
 use irontraffic_bench::{
     BenchCell, BenchError, CacheMode, CellId, H2Load, Invocation, KeepaliveMode, LoadGenerator,
@@ -441,17 +458,21 @@ fn parse_fixture() {
     // adapter, three files over.
     assert_eq!(raw.duration_ns, 35_000_000_000);
     // Pinned against the fixture's own literal `20 failed, 0 errored, 0
-    // timeout` (same review, same SHOULD_FIX). NOTE what this alone does
-    // and does not prove: this fixture's `errored` and `timeout` are
-    // legitimately 0 (a real `1.68.1` run reporting the `20 5xx` this
+    // timeout` (PR 815 review, issue #816 SHOULD_FIX 1). NOTE what this
+    // alone does and does not prove: this fixture's `errored` and `timeout`
+    // are legitimately 0 (a real `1.68.1` run reporting the `20 5xx` this
     // fixture's own `status codes:` line carries has no transport-level
     // connection failures to report; see this file's own module doc, "Every
     // relation 1.68.1's own print_stats guarantees"), so this assertion
-    // alone cannot distinguish `errors_u128 = failed + errored + timeout`
-    // from `errors_u128 = failed` alone: both equal 20 here.
-    // `parse_errors_sums_failed_errored_and_timeout` below, a deliberately
-    // synthetic (not fixture-realistic) probe, is what actually exercises
-    // the three-way sum with all three terms non-zero and distinct.
+    // alone cannot distinguish `errors = failed` alone from a mutation that
+    // sums in `errored`/`timeout` too: both equal 20 here.
+    // `parse_errors_is_failed_alone` below, a deliberately synthetic (not
+    // fixture-realistic) probe, is what actually exercises `errored` and
+    // `timeout` as non-zero and distinct from `failed`, and pins that they
+    // are NOT added in (PR 815 review, issue #817 SHOULD_FIX: `req_error`
+    // and `req_timedout` are subsets of `req_failed` in the pinned tag's own
+    // source, never additive on top of it; see `h2load.rs`'s own module doc,
+    // "`errors` is `failed` alone").
     assert_eq!(raw.errors, 20);
     assert!(
         !raw.latency_exact,
@@ -463,24 +484,33 @@ fn parse_fixture() {
 
 // ---------------------------------------------------------------------------
 // Not one of the issue's own 24 named tests (PR 815 review, issue #816
-// SHOULD_FIX 1). This document is a DELIBERATELY SYNTHETIC arithmetic probe,
-// not a claim about what a real h2load run produces: `tests/fixtures/h2load-output.txt`
-// itself cannot exercise `errors_u128`'s three-way sum with `failed`,
-// `errored` and `timeout` all non-zero and distinct, because a real
-// `1.68.1` run's own `print_stats` forces `total == succeeded + failed`
-// exactly (see this file's own module doc), and this crate's Parsing table
-// treats `errored`/`timeout` as ADDITIVE on top of `failed` rather than a
-// breakdown within it, so a genuine capture with non-zero `errored` or
-// `timeout` alongside a non-zero `failed` would need `succeeded + failed +
-// errored + timeout` to exceed `total`, which `H2Load::parse`'s own
-// "counters are inconsistent" check refuses. This synthetic document
-// deliberately violates the realism `tests/fixtures/h2load-output.txt` was
-// just fixed to honour (BLOCKING 3), on purpose, to isolate the ONE formula
-// this test exists to pin.
+// SHOULD_FIX 1; formula corrected by issue #817 SHOULD_FIX). This document is
+// a DELIBERATELY SYNTHETIC arithmetic probe, not a claim about what a real
+// h2load run produces in every field: `tests/fixtures/h2load-output.txt`
+// itself cannot exercise `errored`/`timeout` as non-zero and distinct from
+// `failed` at the same time as a non-zero `failed`, because in the pinned
+// `1.68.1` `req_error` and `req_timedout` are SUBSETS of `req_failed`, never
+// additive on top of it (confirmed directly against `src/h2load.cc`; see
+// `h2load.rs`'s own module doc, "`errors` is `failed` alone", for the full
+// evidence trail: every `req_error` increment site pairs with an identical
+// `req_failed` increment, and `process_timedout_streams` adds to
+// `req_timedout` then immediately calls `process_abandoned_streams`, which
+// adds the SAME requests to `req_failed` too). A real capture can
+// legitimately report `100 failed, 50 errored, 25 timeout` together (a
+// connection dropping mid-run is exactly this shape), and `errors` must
+// still read as `100`, not `175`: that is what `H2Load::parse`'s own
+// consistency check (`responses_ok + errors <= requests_sent`) requires it
+// to be able to accept, and what an EARLIER version of this synthetic
+// document and this test's own name got backwards, treating the sum as the
+// realistic case rather than the one no real `1.68.1` output can ever
+// satisfy at all (a genuine capture with `errored`/`timeout` on top of a
+// nonzero `failed` would then need `succeeded + failed + errored + timeout`
+// to exceed `total`, which `print_stats`'s own `total == succeeded + failed`
+// identity forbids).
 // ---------------------------------------------------------------------------
 
 #[test]
-fn parse_errors_sums_failed_errored_and_timeout() {
+fn parse_errors_is_failed_alone() {
     let text = "finished in 10.00s, 100.00 req/s, 12.50KB/s\n\
          requests: 1000 total, 1000 started, 1000 done, 800 succeeded, 100 failed, 50 errored, 25 timeout\n\
          status codes: 800 2xx, 0 3xx, 0 4xx, 100 5xx\n\
@@ -496,15 +526,14 @@ fn parse_errors_sums_failed_errored_and_timeout() {
 
     let raw = base_h2load()
         .parse(&ctx, text.as_bytes(), b"")
-        .expect("well-formed synthetic fixture");
+        .expect("a realistic capture with non-zero errored/timeout alongside failed must parse");
 
-    // 100 + 50 + 25 = 175, distinct from `failed` alone (100): this is what
-    // distinguishes the three-term sum the Design's own Parsing table
-    // specifies ("failed, errored and timeout summed") from a mutation that
-    // narrows it to `failed` alone, which the shipped fixture's own
-    // legitimately-zero `errored`/`timeout` cannot (100 + 0 + 0 == 100
-    // either way).
-    assert_eq!(raw.errors, 175);
+    // `failed` alone (100), distinct from a three-term sum (175): this is
+    // what distinguishes `errors = failed` from the mutation this test
+    // exists to catch (summing `errored`/`timeout` back in), which the
+    // shipped fixture's own legitimately-zero `errored`/`timeout` cannot
+    // (100 + 0 + 0 == 100 either way).
+    assert_eq!(raw.errors, 100);
     assert_eq!(raw.responses_ok, 800);
     assert_eq!(raw.requests_sent, 1_000);
 }
