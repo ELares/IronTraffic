@@ -20,6 +20,39 @@
 //! is not a concern of this module at all: [`super`] classifies that case
 //! itself, after reading exactly the declared body, and keeps the
 //! connection.
+//!
+//! # Absent framing information is refused, not defaulted to zero
+//!
+//! A response that declares neither `Content-Length` nor
+//! `Transfer-Encoding` has told this scanner nothing about where its body
+//! ends. An earlier version of this module defaulted that case to a
+//! zero-length body, which is indistinguishable, from the caller's side,
+//! from a response that genuinely has none: the exchange completes the
+//! instant the head terminator arrives, is classified `ok` or `bad` on
+//! whatever status came back, and the connection is kept. Any body bytes the
+//! peer then actually sends are read as the front of the NEXT response,
+//! silently desynchronizing every exchange after it. [`scan_response_head`]
+//! instead refuses this shape with [`BadReason::MissingContentLength`], for
+//! every status except `304`: RFC 9110 Section 8.6 defines a `304` response
+//! as never carrying a body, so the absence of a length on that one status
+//! is not ambiguous, and `it-origin` itself omits the header only for it
+//! (see `crates/irontraffic-origin/src/response.rs`).
+//!
+//! The identical silent-zero failure is reachable through a header name this
+//! scanner fails to recognise for a reason that has nothing to do with what
+//! header it is: `Content-Length : 5` (a space before the colon) is read as
+//! the name `"Content-Length "`, which does not case-insensitively equal
+//! `"content-length"`, so a matcher that only compares names is fooled into
+//! treating it as an ordinary, uninspected header. The same shape on
+//! `Transfer-Encoding` is worse: it lets a chunked response smuggle past the
+//! [`BadReason::Chunked`] refusal entirely, riding on an unrelated declared
+//! `Content-Length` instead. RFC 9112 Section 5.1 requires a server to
+//! REJECT (not merely ignore) a field line carrying whitespace between the
+//! name and the colon; this module does the same, with
+//! [`BadReason::MalformedHeaderName`], before either honoured name is ever
+//! compared. `irontraffic_origin`'s own request-side scanner refuses the
+//! identical shape for the identical reason
+//! (`crates/irontraffic-origin/src/serve.rs`).
 
 /// Largest number of bytes [`scan_response_head`] will scan looking for the
 /// head terminator, matching the probe's fixed read buffer
@@ -57,6 +90,13 @@ pub enum BadReason {
     MalformedStatusLine,
     /// A header line carried no `:`.
     MalformedHeaderLine,
+    /// A header's name carried ASCII whitespace before its `:` (for example
+    /// `Content-Length : 5`). RFC 9112 Section 5.1 requires this to be
+    /// refused rather than matched loosely or silently skipped as an
+    /// unrecognised header: the latter is exactly how a space before the
+    /// colon can make this scanner fail to recognise `Content-Length` or
+    /// `Transfer-Encoding` at all. See the module doc comment.
+    MalformedHeaderName,
     /// A `Content-Length` value that is not a plain ASCII digit run.
     MalformedContentLength,
     /// Two `Content-Length` headers with different values.
@@ -70,6 +110,10 @@ pub enum BadReason {
     /// it means whatever sits between the probe and `it-origin` transformed
     /// the response, and the cell is not measuring what it claims to.
     Chunked,
+    /// Neither `Content-Length` nor `Transfer-Encoding` was present, on a
+    /// status other than `304`. See the module doc comment: guessing a
+    /// zero-length body here is the failure this scanner exists to prevent.
+    MissingContentLength,
 }
 
 /// What [`scan_response_head`] found in the bytes accumulated so far.
@@ -237,6 +281,16 @@ fn parse_head(head: &[u8], head_len: usize) -> ScanOutcome {
             return ScanOutcome::Bad(BadReason::MalformedHeaderLine);
         };
         let name = line.get(..colon).unwrap_or(&[]);
+        // RFC 9112 Section 5.1: refuse a field name carrying whitespace
+        // before the colon rather than silently treating it as some other,
+        // unrecognised header. Checked before either honoured name is
+        // compared, so `Content-Length : 5` and `Transfer-Encoding :
+        // chunked` alike are caught here rather than falling through to the
+        // "any other header: skip" branch below. See the module doc
+        // comment.
+        if name.iter().any(u8::is_ascii_whitespace) {
+            return ScanOutcome::Bad(BadReason::MalformedHeaderName);
+        }
         let raw_value = line.get(colon.saturating_add(1)..).unwrap_or(&[]);
         let value = raw_value.trim_ascii();
 
@@ -269,7 +323,18 @@ fn parse_head(head: &[u8], head_len: usize) -> ScanOutcome {
     if digits_too_long {
         return ScanOutcome::Bad(BadReason::ContentLengthDigitsTooLong);
     }
-    let content_length = content_length_raw.unwrap_or(0);
+    // Neither header was present. `304` is the one status RFC 9110 Section
+    // 8.6 defines as never carrying a body, so its absence of a declared
+    // length is not ambiguous; `it-origin` itself omits the header only for
+    // it (`crates/irontraffic-origin/src/response.rs`). Every other status
+    // is refused rather than assumed empty: see the module doc comment for
+    // why a zero default here is exactly the failure this scanner exists to
+    // prevent.
+    let content_length = match content_length_raw {
+        Some(value) => value,
+        None if status == 304 => 0,
+        None => return ScanOutcome::Bad(BadReason::MissingContentLength),
+    };
     if content_length > super::MAX_RESPONSE_BODY_BYTES {
         return ScanOutcome::Bad(BadReason::ContentLengthTooLarge);
     }
@@ -491,16 +556,59 @@ mod tests {
     }
 
     #[test]
-    fn complete_minimal_head_defaults_content_length_to_zero() {
+    fn minimal_head_with_no_content_length_or_transfer_encoding_is_bad() {
+        // Formerly `complete_minimal_head_defaults_content_length_to_zero`,
+        // which pinned a `Complete(content_length: 0)` default as intended.
+        // That default is exactly the shape the review demonstrated
+        // publishing a 20x understated latency as a healthy run: a real
+        // body with no Content-Length and no Transfer-Encoding completed
+        // the exchange the instant the head terminator arrived. See the
+        // module doc comment.
         let outcome = scan_response_head(b"HTTP/1.1 200 OK\r\n\r\n");
+        assert_eq!(outcome, ScanOutcome::Bad(BadReason::MissingContentLength));
+    }
+
+    #[test]
+    fn not_modified_without_content_length_is_complete_with_zero_body() {
+        // The one documented, tested exception: RFC 9110 Section 8.6 defines
+        // a 304 response as never carrying a body, so the absence of
+        // Content-Length here is not ambiguous framing. `it-origin` itself
+        // omits the header only for this status
+        // (crates/irontraffic-origin/src/response.rs), so this is the exact
+        // shape a real run can see.
+        let outcome = scan_response_head(b"HTTP/1.1 304 Not Modified\r\n\r\n");
         match outcome {
             ScanOutcome::Complete(head) => {
-                assert_eq!(head.status, 200);
+                assert_eq!(head.status, 304);
                 assert_eq!(head.content_length, 0);
-                assert_eq!(head.head_len, 19);
             }
             other => panic!("expected Complete, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn header_name_with_space_before_colon_is_rejected_not_silently_skipped() {
+        // `Content-Length : 5`: read as the name `"Content-Length "`, which
+        // fails `eq_ignore_ascii_case` against `"content-length"`. Before
+        // the whitespace refusal this fell through to "any other header:
+        // skip", reaching the exact same silent-zero shape as the test
+        // above with an ostensibly present Content-Length header (the
+        // BLOCKING finding's second reproduction).
+        let outcome = scan_response_head(b"HTTP/1.1 200 OK\r\nContent-Length : 5\r\n\r\n");
+        assert_eq!(outcome, ScanOutcome::Bad(BadReason::MalformedHeaderName));
+    }
+
+    #[test]
+    fn transfer_encoding_with_space_before_colon_is_rejected_not_silently_skipped() {
+        // The same whitespace-in-name gap on the OTHER honoured header is
+        // worse than a silent zero: without this refusal, "Transfer-Encoding
+        // " never matches "transfer-encoding", so a genuinely chunked
+        // response smuggles past the Chunked refusal entirely by riding on
+        // an unrelated declared Content-Length.
+        let outcome = scan_response_head(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nTransfer-Encoding : chunked\r\n\r\n",
+        );
+        assert_eq!(outcome, ScanOutcome::Bad(BadReason::MalformedHeaderName));
     }
 
     #[test]
