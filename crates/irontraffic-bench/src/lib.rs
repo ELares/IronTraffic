@@ -4,13 +4,15 @@
 //! This crate is a development tool, not a runtime dependency: it is
 //! `publish = false` and nothing in `crates/irontraffic` may depend on it. It
 //! holds the sans-IO logic the whole M17 benchmark harness is built from: the
-//! cell model and the [`LatencyRecorder`] histogram wrapper defined here, and
-//! (added by later issues in this milestone) the open-loop schedule,
-//! provenance capture, the validity guards, the load-generator adapters, the
-//! matrix and the report writer. `xtask`, created later, is a thin binary
-//! that spawns processes and calls into this library; putting the logic here rather than in `xtask`
-//! itself is what lets `cargo-fuzz` and unit tests reach the parsers that
-//! consume untrusted output from external load generators.
+//! cell model, the [`LatencyRecorder`] histogram wrapper, provenance capture,
+//! and the absolute open-loop [`Schedule`] with its [`StallTracker`]
+//! coordinated-omission detector, all defined here, and (added by later
+//! issues in this milestone) the validity guards, the load-generator
+//! adapters, the matrix and the report writer. `xtask`, created later, is a
+//! thin binary that spawns processes and calls into this library; putting
+//! the logic here rather than in `xtask` itself is what lets `cargo-fuzz`
+//! and unit tests reach the parsers that consume untrusted output from
+//! external load generators.
 //!
 //! The published benchmark matrix has eleven dimensions: protocol, TLS mode,
 //! payload size, route table size, path corpus, connection count, upstream
@@ -25,6 +27,7 @@ mod guards;
 mod hist;
 mod provenance;
 mod result;
+mod schedule;
 
 pub use cell::{
     BenchCell, CacheMode, CellId, KeepaliveMode, PathCorpus, Protocol, RESERVED_STEMS, RateMode,
@@ -48,3 +51,4 @@ pub use result::{
     Bottleneck, DeepestPercentile, InvariantId, MAX_COMMAND_LINE, RunResult, SuspectReason,
     Validity,
 };
+pub use schedule::{MAX_BURST_CAP, Release, Schedule, StallTracker};

@@ -843,7 +843,7 @@ fn poll_until_done(child: &mut Child, exceeded: &Arc<AtomicBool>) -> (bool, bool
         if start.elapsed() >= Duration::from_secs(PROBE_TIMEOUT_SECONDS) {
             return (true, false);
         }
-        std::thread::sleep(Duration::from_millis(20)); // it-allow: no-blocking-in-async reason: irontraffic-bench has no async runtime; this is the poll interval of a synchronous subprocess-timeout loop.
+        std::thread::sleep(Duration::from_millis(20)); // it-allow: no-blocking-in-async reason: irontraffic-bench has no async runtime; this is the poll interval of a synchronous subprocess-timeout loop. it-allow: no-accumulated-sleep reason: this is a coarse subprocess poll interval bounded by the start.elapsed() >= PROBE_TIMEOUT_SECONDS deadline check above on every loop iteration, not an open-loop request pacing schedule; the 20ms overshoot this sleep can add does not accumulate across many due times the way Schedule::releasable_at's absolute schedule must, it only delays this one poll's own next check by a bounded, harmless amount.
     }
 }
 
