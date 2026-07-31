@@ -657,6 +657,24 @@ criterion_group!(orphan_group, bench_orphan_group);
 criterion_main!(benches);
 RS
 
+# ---------------------------------------------------------------------------
+# no-accumulated-sleep (issue #406): a relative sleep in the harness path,
+# exactly the accumulating-drift construct the rule exists to ban. Placed
+# under crates/irontraffic-bench/src, which is in scope (unlike benches/,
+# tests/ or examples/, which scan_prod never sees at all).
+# ---------------------------------------------------------------------------
+mkdir -p "$A/crates/irontraffic-bench/src"
+cat > "$A/crates/irontraffic-bench/src/rogue_pace.rs" <<'RS'
+//! Deliberately violates no-accumulated-sleep: a relative sleep in a pacing
+//! loop, which overshoots on every call and accumulates without bound.
+use std::time::Duration;
+
+/// Paces requests with a relative sleep instead of an absolute deadline.
+pub async fn bad_pace(interval: Duration) {
+    tokio::time::sleep(interval).await;
+}
+RS
+
 printf '[workspace.dependencies]\nserde = "1"\n' > "$A/Cargo.toml"
 
 EXPECTED='allow-needs-reason
@@ -671,6 +689,7 @@ framing-fields-confined
 hot-path-allocation
 hot-path-lock
 interior-mutability
+no-accumulated-sleep
 no-blocking-in-async
 no-guarded-alias
 no-ignored-tests

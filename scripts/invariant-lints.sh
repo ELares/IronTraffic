@@ -2270,6 +2270,47 @@ genuinely is not a criterion target:
   // it-allow: bench-registration reason: <why this fn or group is not a target>" "$hits"
 
 # ---------------------------------------------------------------------------
+# 26. no-accumulated-sleep: a load-generation loop that sleeps for a
+#     relative duration (`sleep(interval)`, `thread::sleep`,
+#     `tokio::time::sleep(interval)`, `park_timeout` with a duration rather
+#     than a deadline) overshoots on every call, and the overshoot
+#     accumulates without bound: this is exactly the closed-loop drift bug
+#     issue #406's absolute `Schedule` exists to make unrepresentable, and
+#     this rule stops it from being written anywhere ELSE in the harness
+#     that drives `Schedule`.
+#
+#     SCOPE. Only the two places a pacing loop can live: the benchmark
+#     harness crate and the xtask driver that will spawn load generator
+#     processes. `xtask/` does not exist yet (created later by
+#     bench-xtask-cli-and-run-sh); this rule uses scan_prod, whose file list
+#     comes from rust_non_test_files(), which in turn comes from `git
+#     ls-files`, so a missing xtask/ directory simply contributes no files
+#     to the shadow tree, exactly like every other path-prefix-filtered rule
+#     in this file (see transport-seam and hotpath_crate_files above), and
+#     unlike a bare `grep -r ... xtask/`, which exits 2 on a directory that
+#     is not there yet and would turn this issue's own merge red.
+#     crates/irontraffic-origin/ (created by origin-known-cost-server) is
+#     deliberately out of scope: its per-request delay is already a
+#     sleep_until deadline.
+#
+#     PATTERN. A literal search for `sleep(` and `park_timeout(` already
+#     excludes `sleep_until(` and `park_deadline(` by construction, with no
+#     separate `grep -v` needed: neither is immediately followed by `(` (mod
+#     whitespace) after the banned token, because a `_` intervenes in both.
+#     `sleep_ms(` (the pre-1.6 std spelling) is matched as its own
+#     alternative for the same reason: it is a distinct token from `sleep(`,
+#     not a substring match of it.
+# ---------------------------------------------------------------------------
+hits="$(scan_prod no-accumulated-sleep '\b(sleep|sleep_ms|park_timeout)\s*\(' \
+  | grep -E '^(crates/irontraffic-bench/|xtask/)' || true)"
+[ -n "$hits" ] && fail no-accumulated-sleep \
+"no-accumulated-sleep: use a deadline (sleep_until / an absolute instant), not
+a relative sleep; relative sleeps overshoot and the overshoot accumulates
+without bound. Drive pacing from Schedule::releasable_at's next_wake_ns
+instead:
+  // it-allow: no-accumulated-sleep reason: <why the deadline form is impossible here>" "$hits"
+
+# ---------------------------------------------------------------------------
 if [ "$FAILED" -ne 0 ]; then
   printf '\ninvariant-lints: FAILED. Each block above names the rule, explains why it\n'
   printf 'exists, and lists the offending lines. Fix the code; do not silence a lint\n'

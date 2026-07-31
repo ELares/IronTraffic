@@ -18,9 +18,32 @@
 //! `percentiles/query` ~35.0 us. All four pass with headroom on this machine;
 //! re-measure on the project's actual benchmark host before trusting these as
 //! the reference numbers, per the Benchmarks section of issue #405.
+//!
+//! `schedule/due_ns`, `schedule/releasable_at/steady` and
+//! `schedule/releasable_at/after_1s_stall` (issue #406) measure
+//! [`Schedule`]'s two hot-path operations. Budgets: `schedule/due_ns` under
+//! 25 nanoseconds (a multiply, an add and a 128-bit divide by a runtime
+//! divisor, which lowers to a `__udivti3` call rather than a single
+//! instruction: that call, not the arithmetic, is the cost, so this is not
+//! budgeted as if it were a 64-bit divide). `schedule/releasable_at/steady`
+//! under 50 nanoseconds (two of the divides above; this runs once per
+//! released request in the probe client, so it is on the measurement path).
+//! `schedule/releasable_at/after_1s_stall` under 100 nanoseconds, the same
+//! cost as the steady call: this is the assertion that catch-up entitlement
+//! is closed form and not a loop (a loop implementation would iterate
+//! 1,000,000 times at the `R = 1,000,000` this benchmark uses, roughly four
+//! orders of magnitude over this budget), so this benchmark is also the
+//! regression test for that algorithmic choice.
+//!
+//! Measured on an Apple M4 Pro (macOS, `aarch64`, debug assertions off,
+//! `cargo bench`, criterion 0.8): `schedule/due_ns` ~1.67 ns,
+//! `schedule/releasable_at/steady` ~6.43 ns,
+//! `schedule/releasable_at/after_1s_stall` ~3.94 ns. All three pass with
+//! headroom on this machine; re-measure on the project's actual benchmark
+//! host before trusting these as the reference numbers.
 
 use criterion::{Criterion, criterion_group, criterion_main};
-use irontraffic_bench::{HIGH_NS, LatencyRecorder};
+use irontraffic_bench::{HIGH_NS, LatencyRecorder, Schedule};
 use std::hint::black_box;
 
 /// Deterministic pseudo-random sequence generator (`SplitMix64`), used only to
@@ -159,11 +182,83 @@ fn bench_percentiles_query(c: &mut Criterion) {
     });
 }
 
+// ---------------------------------------------------------------------------
+// `Schedule` (issue #406): `due_ns` and `releasable_at`'s two shapes.
+// ---------------------------------------------------------------------------
+
+#[allow(
+    clippy::expect_used,
+    reason = "bench harness setup, not request-path code: these are the crate's own fixed, \
+              valid Schedule::new arguments, so construction cannot fail"
+)]
+fn bench_schedule_due_ns(c: &mut Criterion) {
+    let schedule = Schedule::new(0, 1_000_000, 64).expect("valid schedule");
+    // Cycles through a growing index rather than one fixed value, the same
+    // discipline `cyclic` applies to `record_ns` above, so the measurement
+    // is not just the cost of re-touching one cached computation.
+    let mut i: u64 = 0;
+    c.bench_function("schedule/due_ns", |b| {
+        b.iter(|| {
+            let idx = i;
+            i = i.wrapping_add(1);
+            black_box(schedule.due_ns(black_box(idx)))
+        });
+    });
+}
+
+#[allow(
+    clippy::expect_used,
+    reason = "bench harness setup, not request-path code: these are the crate's own fixed, \
+              valid Schedule::new arguments, so construction cannot fail"
+)]
+fn bench_schedule_releasable_at_steady(c: &mut Criterion) {
+    let mut schedule = Schedule::new(0, 1_000_000, 64).expect("valid schedule");
+    // `now_ns` tracks exactly this iteration's due time, so every call
+    // releases exactly one request and never accrues debt: the "no debt"
+    // steady state the budget above is written against.
+    let mut i: u64 = 0;
+    c.bench_function("schedule/releasable_at/steady", |b| {
+        b.iter(|| {
+            let now_ns = i * 1000;
+            i += 1;
+            black_box(schedule.releasable_at(black_box(now_ns)))
+        });
+    });
+}
+
+#[allow(
+    clippy::expect_used,
+    reason = "bench harness setup, not request-path code: these are the crate's own fixed, \
+              valid Schedule::new arguments, so construction cannot fail"
+)]
+fn bench_schedule_releasable_at_after_1s_stall(c: &mut Criterion) {
+    c.bench_function("schedule/releasable_at/after_1s_stall", |b| {
+        // `iter_batched`, not `iter`: each timed call must carry a full one
+        // second of debt, which only holds if every measured call starts
+        // from a freshly built, never-advanced Schedule. Reusing one
+        // Schedule across iterations (the way the steady benchmark above
+        // deliberately does) would drain the debt after roughly 15,625
+        // calls (1,000,000 requests owed, released 64 at a time) and this
+        // benchmark would silently start measuring the cheap post-drain
+        // case for the remainder of the run, on a machine fast enough to
+        // run that many iterations inside criterion's default measurement
+        // window, which it is.
+        b.iter_batched(
+            || Schedule::new(0, 1_000_000, 64).expect("valid schedule"),
+            |mut schedule| black_box(schedule.releasable_at(black_box(1_000_000_000))),
+            criterion::BatchSize::SmallInput,
+        );
+    });
+}
+
 criterion_group!(
     benches,
     bench_record_ns_in_range,
     bench_record_ns_out_of_range,
     bench_merge_two_full,
-    bench_percentiles_query
+    bench_percentiles_query,
+    bench_schedule_due_ns,
+    bench_schedule_releasable_at_steady,
+    bench_schedule_releasable_at_after_1s_stall
 );
 criterion_main!(benches);
