@@ -70,7 +70,7 @@
 //! an earlier version of this module declined it on the grounds that "the
 //! canonical-rendering check alone already closes the aliasing class that
 //! class of bug actually exploited." That reasoning does not extend to
-//! `latencies` (PR 815 review, issue #816 SHOULD_FIX 6): the
+//! `latencies` (PR 815 review, issue #816 `SHOULD_FIX` 6): the
 //! canonical-rendering check runs only inside the `status_codes` loop, and a
 //! LITERALLY duplicated key like `"99th"` appearing twice is a different
 //! failure mode from a numerically-aliased key like `"0200"` in the first
