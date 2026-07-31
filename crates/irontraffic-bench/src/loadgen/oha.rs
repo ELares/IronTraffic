@@ -29,7 +29,7 @@ use serde_json::Value;
 
 use crate::cell::{BenchCell, KeepaliveMode, PathCorpus, Protocol, RateMode, TlsMode};
 use crate::error::BenchError;
-use crate::hist::{HIGH_NS, LatencyRecorder};
+use crate::hist::LatencyRecorder;
 use crate::provenance::ToolStamp;
 
 use super::{Invocation, MAX_HOST_BYTES, MAX_PATH_EXPR_BYTES, MAX_REPORTED_REQUESTS};
@@ -710,6 +710,24 @@ impl LoadGenerator for Oha {
         )]
         let errors = error_sum as u64;
 
+        // `statusCodeDistribution` being non-empty (checked above) does not
+        // by itself guarantee a request was ever sent: a hostile or
+        // corrupted document can carry status-code keys whose values are
+        // all `0` (for example `{"200": 0}`) with an equally empty
+        // `errorDistribution`, which sums to `requests_sent == 0` while
+        // still passing the emptiness check above. Round two's own review
+        // showed this exact field, `requests_sent`, is the honest test for
+        // "did a run happen", not a downstream property of the latency
+        // reconstruction: rejecting on the reconstructed recorder's state
+        // (the previous approach) fired on a genuine single-request oha
+        // capture, because a `requests_sent` of 1 legitimately rounds every
+        // one of the nine percentile gaps to a weight of 0 before the floor
+        // applied below. `requests_sent == 0` is checked directly, here,
+        // once, before that reconstruction begins.
+        if requests_sent == 0 {
+            return Err(BenchError::parse("oha", "requests_sent is zero: not a run"));
+        }
+
         // Reconstructed from `latencyPercentiles`: oha reports percentiles,
         // not a histogram, so this is an APPROXIMATION. `latency_exact` is
         // false for oha, always, and this is never "improved" to claim
@@ -785,45 +803,27 @@ impl LoadGenerator for Oha {
                           value representable in u64 before this cast"
             )]
             let weight = (gap * requests_sent_f).round().clamp(0.0, requests_sent_f) as u64;
-            // Values above HIGH_NS are counted in `out_of_range` by
-            // `record_n_ns` itself, never clamped into the top bucket: see
-            // edge case 9, "a percentile above 60 seconds... fails
-            // invariant I7 and invalidates the run rather than silently
-            // truncating." `record_n_ns` treats a `count` of 0 as a
-            // complete no-op BY ITS OWN CONTRACT (so a repeated no-op call
-            // never perturbs `max_ns`), which for a small `requests_sent`
-            // can round `weight` itself all the way down to 0 even for a
-            // percentile value that IS above HIGH_NS, silently dropping the
-            // exact tail-truncation signal I7 depends on. `weight.max(1)`
-            // applies ONLY on this branch, so an out-of-range percentile is
-            // always counted at least once, independent of how thin its own
-            // reconstructed slice would otherwise be; the in-range branch's
-            // weight, including a legitimate 0, is untouched.
-            if value_ns > HIGH_NS {
-                recorder.record_n_ns(value_ns, weight.max(1));
-            } else {
-                recorder.record_n_ns(value_ns, weight);
-            }
+            // `record_n_ns` itself decides, from `value_ns` alone, whether
+            // this contributes to the in-range histogram or to
+            // `out_of_range`; the one call below covers both. `record_n_ns`
+            // treats a `count` of 0 as a complete no-op BY ITS OWN CONTRACT
+            // (so a repeated no-op call never perturbs `max_ns`), which for
+            // a small `requests_sent` can round `weight` itself all the way
+            // down to 0 for EITHER an out-of-range percentile (silently
+            // dropping the exact tail-truncation signal invariant I7
+            // depends on, edge case 9) or an in-range one (round two's own
+            // review: a genuine `requests_sent == 1` oha capture rounds
+            // every one of the nine gaps to 0, so a `weight`-only call would
+            // reconstruct an entirely empty histogram and publish
+            // `p50 == p99 == max == 0` ns for a real, ordinary run).
+            // `weight.max(1)` floors both cases alike: every reported
+            // percentile is counted at least once, independent of how thin
+            // its own reconstructed slice would otherwise be. `requests_sent
+            // == 0` is rejected earlier, above, before this loop runs, so
+            // this floor never manufactures a sample for a document that
+            // legitimately describes zero requests.
+            recorder.record_n_ns(value_ns, weight.max(1));
             prev_quantile = quantile;
-        }
-
-        // A run whose latency reconstruction produced neither an in-range
-        // sample nor an out-of-range one is not a measurement of anything.
-        // For a small enough `requests_sent`, every one of the nine
-        // weighted gaps above can independently round to 0, so an entirely
-        // empty `LatencyRecorder` would otherwise still parse `Ok` and
-        // publish p50 == p99 == p99.99 == max == 0 ns as though it were a
-        // real, healthy run. A run whose whole recorded mass legitimately
-        // landed ABOVE HIGH_NS is a DIFFERENT, already-handled case:
-        // `out_of_range` being nonzero (guaranteed nonzero the instant any
-        // percentile is out of range, by the branch immediately above) is
-        // exactly what invariant I7 exists to invalidate downstream, so
-        // that case is not rejected a second time here.
-        if recorder.is_empty() && recorder.out_of_range() == 0 {
-            return Err(BenchError::parse(
-                "oha",
-                "latency reconstruction produced zero recorded and zero out-of-range samples",
-            ));
         }
 
         // ttfb, connect and stall are `None` for oha. The Parsing table

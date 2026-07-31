@@ -1147,16 +1147,24 @@ fn parse_rejects_duplicate_summary_object() {
     );
 }
 
-/// `SHOULD_FIX` finding 4: for a small enough `requests_sent`, every one of
-/// the nine percentile gaps can independently round to a weight of 0, so an
-/// entirely empty reconstruction previously parsed `Ok` with
-/// `p50 == p99 == max == 0` ns, indistinguishable from a genuinely
-/// instantaneous run. A single response and an ordinary 1ms to 9ms
-/// percentile chain reproduces it: every gap (0.10, 0.15, 0.25, 0.25, 0.15,
-/// 0.05, 0.04, 0.009, 0.0001) times `requests_sent` (1) is below 0.5 and
-/// rounds to 0.
+/// `SHOULD_FIX` finding 4, as corrected by round two review of PR 799.
+/// Round one's original fix rejected any input whose latency reconstruction
+/// recorded zero samples and had zero `out_of_range`, inferred from the
+/// `LatencyRecorder`'s own post-reconstruction state. Round two's review ran
+/// real `oha 1.15.0 --no-tui --output-format json -n 1 -c 1` against a local
+/// server and showed that guard fires on a genuine single-request capture:
+/// `requests_sent == 1` legitimately rounds every one of the nine percentile
+/// gaps to a weight of 0 before a floor is applied, which round one's guard
+/// could not tell apart from a document that never described a request at
+/// all. The honest test for "did a run happen" is `requests_sent == 0`
+/// itself, checked directly and before the latency reconstruction runs (see
+/// `parse_accepts_a_genuine_single_request_oha_capture` below for the
+/// n == 1 case this now correctly accepts). This closes the round-one gap a
+/// different way: a status map whose only entry is present but reports `0`
+/// occurrences, with an equally empty `errorDistribution`, sums to
+/// `requests_sent == 0`, which genuinely is not a run.
 #[test]
-fn parse_rejects_a_reconstruction_with_zero_recorded_samples() {
+fn parse_rejects_a_reconstruction_with_zero_requests_sent() {
     let cell = base_cell();
     let invocation = base_invocation();
     let tool = base_tool_stamp();
@@ -1166,14 +1174,69 @@ fn parse_rejects_a_reconstruction_with_zero_recorded_samples() {
         tool: &tool,
     };
 
-    let text = r#"{"summary":{"total":2.0,"totalData":13},"statusCodeDistribution":{"200":1},"errorDistribution":{},"latencyPercentiles":{"p10":0.001,"p25":0.002,"p50":0.003,"p75":0.004,"p90":0.005,"p95":0.006,"p99":0.007,"p99.9":0.008,"p99.99":0.009}}"#;
-    let err = Oha.parse(&ctx, text.as_bytes(), b"").expect_err(
-        "a reconstruction with zero recorded and zero out-of-range samples must be rejected",
-    );
+    let mut hostile = valid_value();
+    hostile["statusCodeDistribution"] = json!({ "200": 0 });
+    let bytes = serde_json::to_vec(&hostile).expect("serialises");
+    let err = Oha
+        .parse(&ctx, &bytes, b"")
+        .expect_err("a document whose requests_sent sums to 0 must be rejected");
     let detail = expect_parse_detail(&err);
     assert!(
-        detail.contains("zero"),
-        "expected the empty-reconstruction guard to reject this input; got: {detail}"
+        detail.contains("requests_sent") && detail.contains("zero"),
+        "expected the requests_sent == 0 guard to reject this input; got: {detail}"
+    );
+}
+
+/// `SHOULD_FIX` finding 4, round two's own blocking finding: a genuine
+/// `oha 1.15.0` single-request capture must parse, not be rejected. This is
+/// the exact shape the reviewer captured by running the real, pinned
+/// `oha 1.15.0` binary against a local `python3 -m http.server`:
+/// `oha --no-tui --output-format json -n 1 -c 1 http://127.0.0.1/index.html`.
+/// Every `latencyPercentiles` value below is identical (`0.004734833`
+/// seconds) because a single request has exactly one latency value at every
+/// quantile; every one of the nine gaps (0.10 through 0.0009) times
+/// `requests_sent` (1) is below 0.5 and rounds to a weight of 0, which is
+/// exactly the state round one's guard rejected. Watched to fail against
+/// that guard first: before this round's fix, this input returned
+/// `Err("latency reconstruction produced zero recorded and zero
+/// out-of-range samples")` instead of the `Ok` asserted below.
+#[test]
+fn parse_accepts_a_genuine_single_request_oha_capture() {
+    let cell = base_cell();
+    let invocation = base_invocation();
+    let tool = base_tool_stamp();
+    let ctx = ParseCtx {
+        cell: &cell,
+        invocation: &invocation,
+        tool: &tool,
+    };
+
+    let text = r#"{"summary":{"total":0.007424167,"totalData":6},"statusCodeDistribution":{"200":1},"errorDistribution":{},"latencyPercentiles":{"p10":0.004734833,"p25":0.004734833,"p50":0.004734833,"p75":0.004734833,"p90":0.004734833,"p95":0.004734833,"p99":0.004734833,"p99.9":0.004734833,"p99.99":0.004734833}}"#;
+    let raw = Oha
+        .parse(&ctx, text.as_bytes(), b"")
+        .expect("a genuine single-request oha 1.15.0 capture must parse");
+
+    assert_eq!(raw.requests_sent, 1);
+    assert_eq!(raw.responses_ok, 1);
+    assert_eq!(raw.errors, 0);
+    assert_eq!(raw.out_of_range, 0);
+    assert!(
+        !raw.latency.is_empty(),
+        "a genuine single-request run must record at least one latency sample, not publish an \
+         all-zero histogram as fact"
+    );
+
+    let expected_ns = 4_734_833.0_f64;
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "p50_ns is well under 2^53 for any run this crate's own bounds can produce, so \
+                  this comparison loses no precision that matters"
+    )]
+    let actual_ns = raw.latency.percentiles().p50_ns as f64;
+    let diff = (actual_ns - expected_ns).abs();
+    assert!(
+        diff <= expected_ns * 0.01,
+        "reconstructed p50_ns {actual_ns} not within 1% of the capture's own {expected_ns}"
     );
 }
 
