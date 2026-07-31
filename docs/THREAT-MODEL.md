@@ -2186,8 +2186,22 @@ one row: the standard library's own floating-point string parser accepts `nan`, 
 casting a not-a-number floating value to an unsigned integer yields `0` in Rust, so a corrupted or
 hostile column would otherwise become a zero-nanosecond sample in a histogram this crate would go on to
 report percentiles from. `grep -n "parse::<f64>\|as f64" crates/irontraffic-bench/src/loadgen/h2load.rs`
-returning nothing is an acceptance criterion of the issue that shipped this parser, checked in CI, not
-merely a code-review preference.
+returning nothing is an acceptance criterion of the issue that shipped this parser, and is now checked in
+CI (`scripts/invariant-lints.sh`'s `h2load-no-float` rule): a PR 815 review (issue #816 NOTE) found this
+sentence claimed CI enforcement before any job or script actually ran the grep, so the rule was wired in
+rather than left as an unenforced claim in a permanent document.
+
+**HTTP/3 is selected through `--alpn-list`, not the literal `--h3` flag issue #413's own Design section
+names.** The pinned h2load `1.68.1` has no `--h3` option at all (`src/h2load.cc`'s `getopt_long` table,
+dumped in full from the exact pinned tag): that flag first appears in `v1.69.0`, the SAME release that
+deletes the `time for request:`/`time to 1st byte:` labels this parser reads, so no `nghttp2` release
+both accepts `--h3` and prints the summary shape this parser needs. A PR 815 review (issue #816
+BLOCKING 1) found this by reading the pinned tag's own source rather than trusting the Design section's
+flag spelling; `H2Load::plan` now emits `--alpn-list h3` for `Protocol::H3` instead, which is what makes
+`Config::is_quic()` return `true` in `1.68.1` (`alpn_list[0]` must be the h3 ALPN token). See
+`crates/irontraffic-bench/src/loadgen/h2load.rs`'s own module doc, "HTTP/3 is selected through
+`--alpn-list`," for the full evidence trail. This is a deliberate, evidence-backed deviation from the
+issue's literal text, not an oversight.
 
 **`cross_check` is the actual security surface this issue exists to ship, not a side effect of adding a
 second load generator.** Two independently written tools agreeing on p99 is the only cheap check
@@ -2262,6 +2276,14 @@ against this harness's self-signed fixture certificate will therefore fail close
 adapter's own flag surface has no answer to, rather than silently skip verification; this is an honest
 absence, not a workaround this adapter's code should paper over by, for example, disabling verification
 some other way this issue does not ask for.
+
+**That option-table read was, at one point, checked only for an absence, not for the presence of what
+this adapter actually emits.** A PR 815 review (issue #816 BLOCKING 1) found the table had genuinely
+been read to confirm `-k`/`--insecure`/`--cacert` are absent, but not to confirm `--h3` (the flag an
+earlier version of this adapter emitted for `Protocol::H3`) is PRESENT; it is not, in `1.68.1`. The same
+table dump that answers the absence question also settles the presence one now: `getopt_long` id 19,
+`{"alpn-list", required_argument, &flag, 19}`, is what `H2Load::plan` emits instead (see the finding
+above, "HTTP/3 is selected through `--alpn-list`").
 
 ## Installation and release artifacts
 
