@@ -293,10 +293,11 @@ main() {
     # the whole second (whitespace-delimited) field for EQUALITY, so it
     # cannot match a filename that merely starts with $asset_name the way a
     # substring search can.
-    grep -F "$asset_name" "$work_dir/SHA256SUMS" > "$work_dir/SHA256SUMS.this-asset" || {
+    awk -v name="$asset_name" '$2 == name' "$work_dir/SHA256SUMS" > "$work_dir/SHA256SUMS.this-asset"
+    if [ ! -s "$work_dir/SHA256SUMS.this-asset" ]; then
         echo "error: $asset_name is not listed in SHA256SUMS" >&2
         exit 1
-    }
+    fi
 
     if ! verify_checksums "$checker" "$work_dir" "$work_dir/SHA256SUMS.this-asset"; then
         echo "error: checksum verification FAILED for $asset_name. Refusing to install" >&2

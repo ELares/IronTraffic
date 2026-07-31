@@ -98,7 +98,7 @@ produced SOME SBOM; it does not, by itself, prove the SBOM describes the artifac
 alongside it. `verify.sh --sbom` therefore also compares the SBOM's own `irontraffic:target` property
 against the target named in the artifact's filename, and its `irontraffic:cargo_lock_sha256` property
 against `sha256(Cargo.lock)` as recorded in the artifact's own provenance attestation
-(`cargoLockSha256`, section 4) — the same digest `sbom.sh` and `attest.sh` each compute independently
+(`cargoLockSha256`, section 4), the same digest `sbom.sh` and `attest.sh` each compute independently
 from the one build. Either mismatch fails the check by name (`sbom binding: ...`), and this is what
 invariant 8 asserts: without it, a signed SBOM from any target of any release verifies correctly beside
 any tarball.
