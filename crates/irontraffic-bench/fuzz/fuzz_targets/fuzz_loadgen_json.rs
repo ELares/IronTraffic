@@ -10,11 +10,19 @@
 //! `CellId::parse` (`fuzz_cell_id.rs`) and `LatencyRecorder::read_hgrm`
 //! (`fuzz_hgrm_parse.rs`), and gets the same treatment. Contract: no panic,
 //! no hang, no unbounded allocation, for arbitrary bytes as EITHER stdout or
-//! stderr. `data` is fed to `parse` twice per adapter: once as stdout with
-//! empty stderr, so the stdout parser is fuzzed, and once as stderr with a
-//! FIXED valid stdout, so the stderr-handling code path (the warning
-//! substring scan and the stderr size guard) is fuzzed too, rather than only
-//! the stdout one.
+//! stderr. `data` is fed to `parse` twice per adapter, through the shared
+//! [`fuzz_adapter`] helper: once as stdout with empty stderr, so the stdout
+//! parser is fuzzed, and once as stderr with a FIXED valid stdout, so the
+//! stderr-handling code path (the warning substring scan and the stderr size
+//! guard) is fuzzed too, rather than only the stdout one. The fixed valid
+//! stdout is now PER ADAPTER (`OHA_VALID_STDOUT`, `NIGHTHAWK_VALID_STDOUT`),
+//! not one shared constant: a single shared fixture would only ever be
+//! valid-shaped for the one adapter it was captured from, so every other
+//! adapter's stderr-path half would reach `check_ok_raw_run` only on the rare
+//! mutation that happens to reconstruct its own whole valid document out of
+//! arbitrary bytes, an unmeasured and likely near-zero reachability exactly
+//! like the generator defect this milestone's own review process has caught
+//! before.
 //!
 //! `parse_version` is fuzzed on the same bytes: it is a second, much
 //! smaller untrusted-input parser (a version probe's stdout) that shares
@@ -23,11 +31,20 @@
 //! One fixed `ParseCtx` is built ONCE, at the top of the body, from the base
 //! cell, a fixed `Invocation` and a fixed `ToolStamp`: the CONTEXT never
 //! varies, only the byte slice does, matching `ParseCtx`'s own doc
-//! ("`&`-borrowed, so `parse` stays pure and stays fuzzable").
+//! ("`&`-borrowed, so `parse` stays pure and stays fuzzable"). It is shared
+//! across every adapter: `ctx.cell.keepalive == KeepaliveMode::Both` makes
+//! `Nighthawk::parse`'s `connect` optional rather than required, and
+//! `ctx.cell.rate` being `Fixed` makes every adapter's `latency_trustworthy`
+//! true; nothing else in `ctx` is adapter specific.
 //!
-//! ADDING AN ADAPTER: append one entry to `ADAPTERS` below. Everything else
-//! (the stdout path, the stderr path, the shared assertions) is generic over
-//! `&dyn LoadGenerator` already.
+//! ADDING AN ADAPTER: add one `const <NAME>_VALID_STDOUT` fixture and one
+//! `fuzz_adapter(&<Adapter>, &ctx, data, <NAME>_VALID_STDOUT)` call in the
+//! `fuzz_target!` body below. `Nighthawk` could not use a `'static` array of
+//! trait objects the way a future all-unit-struct adapter list could
+//! (`Oha` is a zero-sized, `Copy` unit struct that Rust const-promotes to
+//! `'static`; `Nighthawk` owns `String` fields built at runtime, which
+//! cannot be), so each adapter is fuzzed by its own explicit call rather
+//! than by iterating a shared array.
 //!
 //! # Known CI gap (#756)
 //!
@@ -50,8 +67,9 @@
 //! files list for this issue does not include `.github/workflows/ci.yml`.
 
 use irontraffic_bench::{
-    BenchCell, CacheMode, CellId, Invocation, KeepaliveMode, LoadGenerator, MAX_REPORTED_REQUESTS,
-    Oha, ParseCtx, PathCorpus, Protocol, RateMode, RawRun, TlsMode, ToolStamp,
+    BenchCell, CacheMode, CellId, ContainerRuntime, Invocation, KeepaliveMode, LoadGenerator,
+    MAX_REPORTED_REQUESTS, Nighthawk, Oha, ParseCtx, PathCorpus, Protocol, RateMode, RawRun,
+    TlsMode, ToolStamp,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -59,7 +77,19 @@ use libfuzzer_sys::fuzz_target;
 /// fuzzing the stderr path. The same file `tests/loadgen_oha.rs` uses as its
 /// own authority (`parse_fixture`), so this target and the unit tests agree
 /// on what "a valid run" looks like.
-const VALID_STDOUT: &[u8] = include_bytes!("../../tests/fixtures/oha-1.15.0.json");
+const OHA_VALID_STDOUT: &[u8] = include_bytes!("../../tests/fixtures/oha-1.15.0.json");
+
+/// The Nighthawk fixture `tests/loadgen_nighthawk.rs` also uses as its own
+/// authority, reused here for the identical reason `OHA_VALID_STDOUT` is: see
+/// that constant's own doc. Unlike `OHA_VALID_STDOUT`, this is NOT a genuine
+/// capture (see `src/loadgen/nighthawk.rs`'s own module doc for why one could
+/// not be produced in this environment), only a reconstruction cross-checked
+/// against the real upstream Nighthawk source; it is still the one input
+/// that lets the stderr-path loop below reach `check_ok_raw_run` for
+/// `Nighthawk` on every single execution, rather than only on the rare
+/// mutation that happens to reconstruct a whole valid `results` document out
+/// of the stdout-path's arbitrary bytes.
+const NIGHTHAWK_VALID_STDOUT: &[u8] = include_bytes!("../../tests/fixtures/nighthawk-output.json");
 
 #[allow(
     clippy::expect_used,
@@ -83,10 +113,23 @@ fn base_cell() -> BenchCell {
     }
 }
 
-/// Every registered adapter's parser is fuzzed by this one target. Adding an
-/// adapter in a later issue is exactly one more line here.
-fn adapters() -> [&'static dyn LoadGenerator; 1] {
-    [&Oha]
+/// Runs both halves of this target's fuzz contract for one adapter: the
+/// stdout path (`data` varies, stderr empty) and the stderr path (stdout
+/// fixed to `valid_stdout`, `data` varies), plus `parse_version` on the same
+/// bytes. Shared so every adapter this target ever gains gets the identical
+/// treatment; see the module doc's "ADDING AN ADAPTER" note for why this is
+/// a plain function call per adapter rather than a loop over a `'static`
+/// array.
+fn fuzz_adapter(adapter: &dyn LoadGenerator, ctx: &ParseCtx<'_>, data: &[u8], valid_stdout: &[u8]) {
+    let _ = adapter.parse_version(data);
+
+    if let Ok(raw) = adapter.parse(ctx, data, b"") {
+        check_ok_raw_run(&raw);
+    }
+
+    if let Ok(raw) = adapter.parse(ctx, valid_stdout, data) {
+        check_ok_raw_run(&raw);
+    }
 }
 
 /// Shared, adapter-agnostic assertions on a successful parse. Matches the
@@ -212,21 +255,21 @@ fuzz_target!(|data: &[u8]| {
         tool: &tool,
     };
 
-    for adapter in adapters() {
-        // parse_version: a second, smaller untrusted-input parser.
-        let _ = adapter.parse_version(data);
+    fuzz_adapter(&Oha, &ctx, data, OHA_VALID_STDOUT);
 
-        // Stdout path: `data` varies, stderr is empty.
-        if let Ok(raw) = adapter.parse(&ctx, data, b"") {
-            check_ok_raw_run(&raw);
-        }
-
-        // Stderr path: stdout is FIXED and valid, `data` varies. This is
-        // what actually exercises the stderr size guard and the
-        // rate-warning substring scan under arbitrary bytes, rather than
-        // only ever handing them a clean, empty stderr.
-        if let Ok(raw) = adapter.parse(&ctx, VALID_STDOUT, data) {
-            check_ok_raw_run(&raw);
-        }
-    }
+    // `Nighthawk`'s fields are `String`s built at runtime, never a `'static`
+    // const-promoted value the way the zero-sized `Oha` unit struct is, so
+    // it is constructed fresh here rather than added to a shared array.
+    // Neither field's exact content matters to `parse`/`parse_version`
+    // (`from_pin`'s own validation runs once, at construction, well before
+    // this point, and is not itself under fuzz here): only `Nighthawk::name`
+    // ("nighthawk", a `&'static str`) and the parsing logic in `parse`/
+    // `parse_version` are exercised.
+    let nighthawk = Nighthawk {
+        runtime: ContainerRuntime::Docker,
+        image: "envoyproxy/nighthawk-dev@sha256:0000000000000000000000000000000000000000000000000000000000000000"
+            .to_owned(),
+        client_cores: "0-3".to_owned(),
+    };
+    fuzz_adapter(&nighthawk, &ctx, data, NIGHTHAWK_VALID_STDOUT);
 });

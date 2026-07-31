@@ -2044,6 +2044,91 @@ anything up to `high_ns_ceiling()` are the SAME histogram bucket), specifically 
 `> HIGH_NS` out-of-range guard, unchanged, does not divert a row `write_hgrm` wrote as recorded into
 `out_of_range` on the way back in.
 
+## Benchmark tool containers (`bench-loadgen-nighthawk-arbiter`, #412)
+
+*Status: `Nighthawk::plan`/`Nighthawk::parse` ship in `irontraffic-bench`; the driver binary that
+actually spawns the `docker run`/`podman run` command this adapter builds is later M17 work
+(`{{bench-runner-and-repetition}}`). This section is written now, in the same pull request that
+introduces the invocation, per `CONTRIBUTING.md`'s rule, because the invocation's shape and the
+digest pin are already fixed by this issue and do not change when the runner lands.*
+
+**This is the first place the repository runs a third-party OCI image.** Every other surface in
+this document parses bytes this project's own code receives; this one hands a benchmark host's own
+process namespace and (deliberately, see below) its network namespace to `envoyproxy/nighthawk-dev`,
+an image this project builds no part of. The credibility argument for accepting this dependency at
+all (`Nighthawk` is the arbiter specifically because it is not code this project wrote or could bias)
+is in `science/benchmarking.md` and `crates/irontraffic-bench/src/loadgen/nighthawk.rs`'s own module
+doc, not repeated here; this section is only about what running it costs.
+
+**The digest pin is the actual control, and it is enforced by construction, not by convention.**
+`Nighthawk::from_pin` is the ONLY constructor this type has, and it is the only code path that ever
+builds the `image` field: it reads `bench/tools/nighthawk.digest`, trims ASCII whitespace, and
+requires the remainder to match `^sha256:[0-9a-f]{64}$` exactly, byte for byte, with no fallback to a
+tag on any error path (a missing file, a malformed digest, or a tag such as `latest` are each a
+distinct `Err`, never a warning that lets construction proceed anyway). There is no
+`--skip-digest-check` escape hatch, and no code anywhere in this crate joins `image_repo` with a tag
+string. A digest is content-addressed and immutable; a tag is a mutable pointer an upstream compromise
+or a build re-run can silently repoint, which is exactly the property a "pinned" benchmark cannot
+tolerate: a run whose tool changed underneath it between two invocations is not a comparison.
+
+**`image_repo` and `client_cores` are interpolated into a `docker run`/`podman run` argument vector,
+and this is an argument-injection surface even though the vector itself is not a shell-injection
+one.** Spawning with an argument vector (never a shell) already closes shell injection: no argument
+value is ever re-interpreted by a shell's own tokenizer or globbing. It does nothing about argument
+injection, because `image_repo` sits in the position immediately before `nighthawk_client` and
+`client_cores` sits as `--cpuset-cpus`'s value, and a container runtime keeps parsing flags until it
+sees the first token that is not one. A value of `--privileged` in the `image_repo` position is
+consumed by the runtime as a FLAG, and the following literal `nighthawk_client` token is read as the
+image name instead: a real privilege escalation reached through a field that looks like inert
+configuration. `Nighthawk::from_pin` validates both fields once, at construction (length cap,
+character class, and a `starts_with('-')`/leading-`.` rejection), so `plan` can never be reached with
+an unvalidated field: `crates/irontraffic-bench/tests/loadgen_nighthawk.rs`'s
+`from_pin_rejects_flag_shaped_fields` pins this for both fields against `--privileged`, a bare `-v`,
+and (for `image_repo`) a leading `.` and an oversized string.
+
+**Why `--network host` is a deliberate measurement requirement, not an oversight, and the one
+isolation boundary this invocation deliberately gives up.** A bridge network's NAT adds a hop with its
+own, variable latency; putting that hop inside a latency measurement whose entire purpose is to be the
+published number would corrupt the thing being measured. `--network host` puts the container in the
+benchmark host's own network namespace, sharing that namespace (and its clock) with whatever else runs
+there. This is the SINGLE boundary this invocation gives up, and it is the reason the flags below exist
+at all: with the network namespace already shared, there is no isolation layer left over on which "one
+more hardening flag" would be free, so every flag that remains is one this design chose to keep rather
+than one it could not have removed.
+
+**The hardening flags reduce blast radius; they do not make a hostile image safe.** With
+`--network host` and the host's own clock already available to it, an image that wanted to do harm
+has room. The flags this invocation still applies are real, specific, and load-bearing anyway,
+because the actual control is the digest pin (a compromised image cannot reach this host until this
+pin is deliberately moved) and these flags bound what a compromised image can do between the day it is
+compromised and the day the pin's own re-verification catches it:
+
+| Flag | What it removes |
+| --- | --- |
+| `--cap-drop ALL` | Every Linux capability. A load generator needs none; if the pinned image genuinely needs one, the remedy is adding exactly that one capability with a comment naming why, never re-adding `ALL` or reaching for `--privileged`. |
+| `--security-opt no-new-privileges` | The ability for any process inside the container to gain privileges it did not start with (for example through a setuid binary), even if the image itself is later found to ship one. |
+| `--read-only` plus `--tmpfs /tmp:rw,noexec,nosuid,size=64m` | Persistence: a compromised process cannot write anywhere in the container's own filesystem except a 64 MiB, non-executable, no-setuid scratch space that is discarded when the container exits. |
+| `--memory 4g` | An unbounded memory claim: a runaway or hostile client process cannot take the benchmark host down mid-matrix by exhausting its memory. |
+| `--pids-limit 4096` | A fork bomb, or any other unbounded process-count claim inside the container. |
+
+Every one of these five sits in the FIXED argument order `Nighthawk::plan` builds
+(`crates/irontraffic-bench/src/loadgen/nighthawk.rs`), and
+`crates/irontraffic-bench/tests/loadgen_nighthawk.rs`'s `plan_carries_the_hardening_flags` asserts all
+five are present and that none of `--privileged`, `-v`, or `--volume` is: removing a flag to "simplify
+the command line" fails a test rather than passing review unnoticed. There is no `--privileged`, no
+bind mount of any host path, and no `--user root` anywhere in this invocation.
+
+**The rule that closes the gap `--network host` opens: a benchmark host is not a production host,
+and holds no secret worth stealing.** This is the actual reason `--network host` is acceptable here at
+all, not a rationalization after the fact. `it-origin` (documented above) already establishes the same
+rule for the system under test's synthetic upstream; this section extends it to the load-generation
+side of the same private benchmark link. A benchmark host runs no tenant traffic, holds no production
+credential, and is provisioned, matrixed, and torn down specifically to produce a number for
+`science/benchmarking.md`, not to serve a request from an untrusted network. Nothing in this section
+should be read as a template for running an unpinned or lightly-sandboxed third-party image anywhere
+this project's data plane actually terminates untrusted traffic; it applies to this one, deliberately
+isolated, disposable class of host and to no other.
+
 ## Installation and release artifacts
 
 `scripts/install.sh` is a `curl | sh` channel: it places an executable file on a user's machine and
