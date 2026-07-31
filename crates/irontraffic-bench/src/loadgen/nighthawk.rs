@@ -59,47 +59,69 @@
 //! read by this parser:
 //!
 //! - This issue's own Context fact 5 describes each statistic as carrying
-//!   `raw_mean`/`raw_pstdev`. Source (2) above shows `output_collector_impl.cc`
-//!   selects the serialisation domain by whether the statistic id ends in
-//!   `"_size"`; none of the four ids this parser reads do, so upstream would
-//!   actually populate `mean`/`pstdev`/`min`/`max` (`google.protobuf.Duration`
-//!   fields) rather than the `raw_*` doubles for those four. This parser
-//!   reads neither shape, so the discrepancy does not change its behaviour.
+//!   `raw_mean`/`raw_pstdev`, and `tests/fixtures/nighthawk-output.json`'s
+//!   `"global"` statistics carry exactly those two fields, per that fact,
+//!   verbatim. Source (2) above shows `output_collector_impl.cc` selects the
+//!   serialisation domain by whether the statistic id ends in `"_size"`;
+//!   none of the four ids this parser reads do, so upstream would actually
+//!   populate `mean`/`pstdev`/`min`/`max` (`google.protobuf.Duration` fields)
+//!   rather than the `raw_*` doubles for those four. The fixture therefore
+//!   follows the issue's own literal Context text rather than this module's
+//!   own more precise source cross-check; both readings are recorded here so
+//!   a reviewer can tell the fixture matched the ISSUE, not that it matched
+//!   the real image. This parser reads neither shape, so the discrepancy
+//!   does not change its behaviour either way.
 //! - `RawRun::duration_ns` is not named by this issue's own Design or Context
 //!   sections at all. The `Result` proto (source (2)) carries an
 //!   `execution_duration` field of exactly the right type and purpose, so
 //!   this parser reads that; this is this adapter's own choice where the
 //!   issue is silent, not something stated in the issue.
 //!
-//! # A tension this issue's own text does not resolve
+//! # A tension this issue's own text raised, now resolved: the floor is
+//! # LATENCY-only
 //!
-//! The "Reconstructing the recorder" design section states its seven
-//! assertions, including the [`MIN_PERCENTILE_ENTRIES`] floor, apply "for
-//! each statistic", and invariant 2 requires `sequencer.blocking` to be
-//! present on every successful parse. Read together, that means the SAME
-//! 64-entry floor invariant 1's own honest caveat motivates for the LATENCY
-//! statistic (so `latency_exact` is not a lie) is also, uniformly, required
-//! of the STALL statistic. But `sequencer.blocking` measures a fundamentally
-//! rarer event than request latency: a healthy open-loop run is expected to
-//! see LITTLE or NO blocking (that is the entire point of open-loop
-//! measurement, per this issue's own epigraph), and Nighthawk's percentile
-//! ladder is built by an `HdrHistogram` percentile ITERATOR whose row count
-//! depends on how many distinct values were actually recorded, not on a
-//! fixed schedule. Whether a genuinely healthy, near-zero-blocking Nighthawk
-//! run against the pinned image would emit 64 or more `sequencer.blocking`
-//! percentile rows is UNVERIFIED here, for the same reason nothing else in
-//! this module was verified against a live run: this could not be tested
-//! without `docker`/`podman`. If it turns out a real healthy run emits fewer
-//! than [`MIN_PERCENTILE_ENTRIES`] rows for `sequencer.blocking` specifically,
-//! every legitimate run would fail to parse, which is exactly the failure
-//! this issue's own Design section warns against for the latency statistic
-//! ("Do NOT keep a floor a real run cannot meet, because then every run
-//! fails"). This is flagged rather than silently resolved one way or the
-//! other: lowering the floor for `sequencer.blocking` alone, or exempting it
-//! from the uniform reconstruction routine, would be narrowing the issue's
-//! own explicit "for each statistic" wording without evidence; keeping it
-//! uniform, as implemented here, risks the failure mode above. Re-verify
-//! against the pinned image before this adapter is trusted for a real run.
+//! An earlier reading of this module applied the [`MIN_PERCENTILE_ENTRIES`]
+//! floor uniformly to every statistic, because the "Reconstructing the
+//! recorder" design section states its seven assertions apply "for each
+//! statistic". That reading was demonstrated wrong by execution, not by
+//! argument: `sequencer.blocking` measures a fundamentally rarer event than
+//! request latency (a healthy open-loop run is DEFINED by having little or
+//! no blocking, per this issue's own epigraph), and an `HdrHistogram`
+//! percentile iterator cannot emit more distinct rows than it recorded
+//! samples. A run with 5, 20 or 63 stalls therefore cannot produce 64
+//! percentile rows no matter how healthy it is, so the uniform floor made
+//! `Nighthawk::parse` reject exactly the clean runs it exists to certify
+//! while admitting badly blocked ones (which have many distinct stall
+//! durations and so clear 64 rows easily): the arbiter's gate was inverted.
+//! This is exactly the failure this issue's own Design section warns
+//! against ("Do NOT keep a floor a real run cannot meet, because then every
+//! run fails and the first fix anyone reaches for is setting
+//! `latency_exact = true` unconditionally").
+//!
+//! The floor is therefore applied ONLY to `benchmark_http_client.request_to_response`,
+//! the one statistic whose reconstruction decides [`RawRun::latency_exact`].
+//! `benchmark_http_client.queue_to_connect` and `sequencer.blocking` are both
+//! reconstructed with [`PercentileFloor::NotEnforced`]: every OTHER check
+//! (max entries, strictly increasing percentiles, non-decreasing durations
+//! and counts, the [`super::MAX_REPORTED_REQUESTS`] cap, and the
+//! reconciliation against the statistic's own declared `count`) still
+//! applies in full, and invariant 2 (`sequencer.blocking` must be PRESENT and
+//! well-formed) is untouched; only the minimum ROW COUNT is no longer
+//! required of these two. This narrows the issue's own "for each statistic"
+//! wording for the two statistics that do not set `latency_exact`, on the
+//! evidence above (a floor a real healthy run structurally cannot meet is
+//! worse than no floor at all), not merely to make CI pass. See
+//! `parse_low_blocking_run_is_ok` and `parse_low_connect_sample_run_is_ok` in
+//! `tests/loadgen_nighthawk.rs`, each of which is watched to FAIL against the
+//! old uniform floor and to PASS once it is scoped to latency alone.
+//!
+//! Whether the pinned image's `request_to_response` statistic itself always
+//! clears 64 rows on a legitimate full-length run remains UNVERIFIED here,
+//! for the same reason nothing else in this module was verified against a
+//! live run: this could not be tested without `docker`/`podman`. Re-verify
+//! against the pinned image before this adapter is trusted for a real run,
+//! per the Design's own instruction to read the floor off a captured
+//! full-length fixture and lower it if a legitimate run cannot clear it.
 //!
 //! # Two more honest gaps in the invocation
 //!
@@ -145,9 +167,15 @@ use super::{LoadGenerator, ParseCtx, RawRun, RunParams, Target, Unsupported};
 use super::{MAX_TOOL_OUTPUT_BYTES, MAX_TOOL_STDERR_BYTES, MAX_VERSION_OUTPUT_BYTES};
 
 /// Minimum percentile entries a statistic must carry for `latency_exact` to
-/// hold. See the module doc's "A tension this issue's own text does not
-/// resolve" section: this floor is applied uniformly to every statistic this
-/// adapter reconstructs, not only the one that decides `latency_exact`.
+/// hold. See the module doc's "the floor is LATENCY-only" section: this
+/// floor is enforced ONLY when reconstructing
+/// `benchmark_http_client.request_to_response`, the statistic that decides
+/// `latency_exact`. `queue_to_connect` and `sequencer.blocking` are
+/// reconstructed with [`PercentileFloor::NotEnforced`]: an `HdrHistogram`
+/// percentile iterator cannot emit more distinct rows than it recorded
+/// samples, and near-zero blocking is the definition of a healthy open-loop
+/// run, so this floor applied to either would reject exactly the clean runs
+/// the arbiter exists to certify.
 pub const MIN_PERCENTILE_ENTRIES: usize = 64;
 
 /// Maximum percentile entries the parser will read from one statistic.
@@ -591,22 +619,45 @@ fn find_counter(counters: &[Value], name: &str) -> Result<u64, BenchError> {
     ))
 }
 
+/// Whether [`reconstruct_statistic`] enforces the [`MIN_PERCENTILE_ENTRIES`]
+/// row-count floor for the statistic it is reconstructing. See the module
+/// doc's "the floor is LATENCY-only" section for why this exists: the floor
+/// protects `latency_exact`, a flag only the latency statistic sets, and an
+/// `HdrHistogram` percentile iterator cannot emit more distinct rows than it
+/// recorded samples, so applying it to a rare-event statistic like
+/// `sequencer.blocking` would reject exactly the healthy runs the arbiter
+/// exists to certify.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PercentileFloor {
+    /// Require at least [`MIN_PERCENTILE_ENTRIES`] rows. Used only for
+    /// `benchmark_http_client.request_to_response`.
+    Enforced,
+    /// No row-count floor. Every other check (max entries, strictly
+    /// increasing percentiles, non-decreasing durations and counts, the
+    /// [`super::MAX_REPORTED_REQUESTS`] cap, and the reconciliation against
+    /// the statistic's own declared `count`) still applies in full; only the
+    /// minimum row count is not required. Used for `queue_to_connect` and
+    /// `sequencer.blocking`.
+    NotEnforced,
+}
+
 /// Reconstructs a `LatencyRecorder` from one Nighthawk `Statistic` JSON
 /// object's `percentiles` array, per the Design's "Reconstructing the
 /// recorder" section: for each ascending percentile entry, `count_i -
 /// count_{i-1}` samples are recorded at `duration_i`. `stat_id` is used only
 /// in error messages, so a failure names which statistic it came from.
 ///
-/// Applied uniformly to every statistic this adapter reconstructs (latency,
-/// connect, stall): the Design states every one of these seven checks "for
-/// each statistic", not only for the one that decides `latency_exact`, so
-/// there is exactly one reconstruction routine here, never a stricter one for
-/// latency and a looser one for the rest. See the module doc's own honest
-/// flag about what this means for `sequencer.blocking` specifically.
+/// `floor` decides whether [`MIN_PERCENTILE_ENTRIES`] is enforced; every
+/// OTHER check below runs unconditionally for every statistic this adapter
+/// reconstructs (latency, connect, stall), so there is exactly one
+/// reconstruction routine here, never a separate one per statistic. See the
+/// module doc's "the floor is LATENCY-only" section for why the row-count
+/// floor alone is scoped to the statistic that sets `latency_exact`.
 ///
 /// # Errors
 /// `BenchError::Parse` on a missing or malformed `count`/`percentiles` field,
-/// fewer than [`MIN_PERCENTILE_ENTRIES`] or more than [`MAX_PERCENTILE_ENTRIES`]
+/// fewer than [`MIN_PERCENTILE_ENTRIES`] entries when `floor` is
+/// [`PercentileFloor::Enforced`], more than [`MAX_PERCENTILE_ENTRIES`]
 /// entries, a non-finite or non-strictly-increasing `percentile`, a
 /// malformed or decreasing `duration`, a decreasing `count`, a `count` past
 /// [`super::MAX_REPORTED_REQUESTS`], or a final reconstructed count that
@@ -623,6 +674,7 @@ fn find_counter(counters: &[Value], name: &str) -> Result<u64, BenchError> {
 fn reconstruct_statistic(
     stat: &serde_json::Map<String, Value>,
     stat_id: &str,
+    floor: PercentileFloor,
 ) -> Result<LatencyRecorder, BenchError> {
     let declared_count = read_u64(
         stat.get("count").ok_or_else(|| {
@@ -641,7 +693,7 @@ fn reconstruct_statistic(
             )
         })?;
 
-    if percentiles.len() < MIN_PERCENTILE_ENTRIES {
+    if floor == PercentileFloor::Enforced && percentiles.len() < MIN_PERCENTILE_ENTRIES {
         return Err(BenchError::parse(
             "nighthawk",
             &format!(
@@ -675,7 +727,18 @@ fn reconstruct_statistic(
 
         // `is_finite()` first: every ordering comparison against `NaN` is
         // false, so `percentile <= prev_percentile` alone would let a `NaN`
-        // slip through as "strictly increasing" on a technicality.
+        // slip through as "strictly increasing" on a technicality. Verified
+        // by execution that this branch is UNREACHABLE via untrusted bytes
+        // in this crate's current dependency configuration: JSON's grammar
+        // has no `NaN` literal, and `serde_json::from_slice` itself rejects
+        // an out-of-range magnitude such as `1e400` ("number out of range")
+        // before ever constructing a `Value`, without the `arbitrary_precision`
+        // feature this workspace does not enable. Kept as defence in depth
+        // against a future dependency change that defers that bound to
+        // `.as_f64()` instead of enforcing it at parse time; see
+        // `tests/loadgen_nighthawk.rs`'s comment above
+        // `parse_rejects_decreasing_percentile_durations` for the full
+        // finding.
         let percentile = entry_obj
             .get("percentile")
             .and_then(Value::as_f64)
@@ -761,11 +824,37 @@ impl LoadGenerator for Nighthawk {
     }
 
     fn version_invocation(&self) -> Invocation {
+        // Carries the SAME five hardening flags `plan` does (`--cap-drop
+        // ALL`, `--security-opt no-new-privileges`, `--read-only`, `--memory
+        // 4g`, `--pids-limit 4096`): this is the FIRST invocation ever run
+        // against a freshly pinned digest, which is precisely the moment a
+        // compromised upstream image is most likely to be executed, so it
+        // must not run with Docker's full default capability set and an
+        // unbounded memory/PID budget just because it is "only a version
+        // probe". See `version_invocation_carries_the_hardening_flags` in
+        // `tests/loadgen_nighthawk.rs` and docs/THREAT-MODEL.md's
+        // "Benchmark tool containers" section.
+        //
+        // Deliberately NOT carried, unlike `plan`: `--network host` (the
+        // version probe makes no network call at all), `--tmpfs
+        // /tmp:...`/`--read-only`'s scratch pairing (nothing here writes),
+        // and `--cpuset-cpus` (no measurement to keep off other cores). Each
+        // omission is an absence of a NEED, not a hardening gap; `plan`'s
+        // own five safety flags above are carried regardless.
         Invocation {
             program: self.runtime.program().to_owned(),
             args: vec![
                 "run".to_owned(),
                 "--rm".to_owned(),
+                "--cap-drop".to_owned(),
+                "ALL".to_owned(),
+                "--security-opt".to_owned(),
+                "no-new-privileges".to_owned(),
+                "--read-only".to_owned(),
+                "--memory".to_owned(),
+                "4g".to_owned(),
+                "--pids-limit".to_owned(),
+                "4096".to_owned(),
                 self.image.clone(),
                 "nighthawk_client".to_owned(),
                 "--version".to_owned(),
@@ -1141,7 +1230,11 @@ impl LoadGenerator for Nighthawk {
                 &format!("missing statistic {STATISTIC_ID_LATENCY}"),
             )
         })?;
-        let latency = reconstruct_statistic(latency_stat, STATISTIC_ID_LATENCY)?;
+        let latency = reconstruct_statistic(
+            latency_stat,
+            STATISTIC_ID_LATENCY,
+            PercentileFloor::Enforced,
+        )?;
         // A statistic cannot legitimately have recorded more samples than
         // the run sent requests at all. Not one of this issue's own nine
         // named invariants, but load-bearing anyway: `fuzz_loadgen_json.rs`
@@ -1161,7 +1254,15 @@ impl LoadGenerator for Nighthawk {
         // `None` is allowed otherwise. The adapter learns the cell's
         // keepalive mode from `ctx.cell`, never from the tool's own output.
         let connect = if let Some(stat) = find_statistic(statistics, STATISTIC_ID_CONNECT) {
-            Some(reconstruct_statistic(stat, STATISTIC_ID_CONNECT)?)
+            // `PercentileFloor::NotEnforced`: see the module doc's "the floor
+            // is LATENCY-only" section. `queue_to_connect` does not set
+            // `latency_exact`, and a `Both`-keepalive cell that reuses
+            // connections may legitimately establish very few of them.
+            Some(reconstruct_statistic(
+                stat,
+                STATISTIC_ID_CONNECT,
+                PercentileFloor::NotEnforced,
+            )?)
         } else {
             if ctx.cell.keepalive == KeepaliveMode::DownstreamClose {
                 return Err(BenchError::parse(
@@ -1188,7 +1289,15 @@ impl LoadGenerator for Nighthawk {
                 ),
             )
         })?;
-        let stall = reconstruct_statistic(stall_stat, STATISTIC_ID_STALL)?;
+        // `PercentileFloor::NotEnforced`: see the module doc's "the floor is
+        // LATENCY-only" section. `sequencer.blocking` does not set
+        // `latency_exact`, and near-zero blocking is the DEFINITION of a
+        // healthy open-loop run, so this statistic is required to be
+        // present and well-formed (invariant 2, enforced by
+        // `find_statistic` returning `None` above) but never to clear a row
+        // count a healthy run cannot meet.
+        let stall =
+            reconstruct_statistic(stall_stat, STATISTIC_ID_STALL, PercentileFloor::NotEnforced)?;
 
         let out_of_range = latency.out_of_range();
         // Saturate mode carries no rate to hold open-loop, matching the
