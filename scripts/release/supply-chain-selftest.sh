@@ -326,6 +326,35 @@ test_licence_check_fails_on_missing_licence() {
 }
 
 # ---------------------------------------------------------------------------
+# 10a. licence_check_skips_on_zero_components
+#
+# #791 NOTE: an SBOM whose own `.components` array is empty (a truncated
+# download, or a malformed generator run) used to fall straight through
+# main()'s loop with total=0, failed=0, print a genuine "0/0 components
+# pass", and exit 0 -- a security tool reading an EMPTY input as a PASS,
+# indistinguishable from a real SBOM that was actually checked. This
+# asserts the dedicated exit code 4 fires instead: distinct from exit 3's
+# "no allowlist found" (an allowlist WAS found and applied here; deriving
+# $empty_components from FIXTURE_SBOM, rather than hand-writing one,
+# guarantees a real deny.toml and licence-exceptions.txt resolve first),
+# and distinct from exit 0's genuine pass.
+# ---------------------------------------------------------------------------
+test_licence_check_skips_on_zero_components() {
+    empty_components="$WORK/zero-components.sbom.json"
+    jq '.components = []' "$FIXTURE_SBOM" > "$empty_components"
+    out="$(sh "$REPO_ROOT/scripts/release/sbom-licence-check.sh" "$empty_components" 2>&1)" && status=0 || status=$?
+    if [ "$status" -ne 4 ]; then
+        fail "licence_check_skips_on_zero_components" "a zero-component SBOM exited $status, want 4 (the dedicated honest-skip code): $out"
+        return
+    fi
+    if printf '%s' "$out" | grep -q "components pass"; then
+        fail "licence_check_skips_on_zero_components" "a zero-component SBOM still printed a vacuous N/0 components pass line: $out"
+        return
+    fi
+    pass "licence_check_skips_on_zero_components"
+}
+
+# ---------------------------------------------------------------------------
 # 11. verify_fails_without_identity_pin
 #
 # THIS IS THE MOST COMMON MISTAKE WITH THIS TOOLING, so this test asserts it
@@ -868,6 +897,68 @@ test_verify_sbom_licence_check_skips_when_no_allowlist_found() {
 }
 
 # ---------------------------------------------------------------------------
+# 12i. verify_sbom_licence_check_skips_when_exceptions_missing
+#
+# #791: 12c's own fixture always copies BOTH deny.toml and
+# licence-exceptions.txt together, so it never reaches the specific case
+# this test exists for -- deny.toml present, licence-exceptions.txt
+# ABSENT -- and 12h's fixture copies NEITHER, so it never reaches it
+# either. Before this fix, sbom-licence-check.sh's exceptions_file default
+# fell through to a REPO_ROOT-derived path assigned UNCONDITIONALLY, with
+# no [ -f ] test (the exact "two directories above me is the repository"
+# assumption #788 fixed for deny_file but never carried over to
+# exceptions_file), so main() proceeded past the missing-file check with
+# an EMPTY exception set and accused this workspace's own aho-corasick,
+# memchr and ryu -- real components of FIXTURE_SBOM, each allowlisted only
+# via a committed exception; see docs/SUPPLY-CHAIN.md section 7 -- of a
+# licence violation, by name: a false tamper alarm on a genuinely
+# compliant artifact. Fetching deny.toml WITHOUT its co-required
+# exceptions file is strictly WORSE than fetching neither, so it must
+# degrade to the identical honest SKIP 12h asserts for the both-absent
+# case, never silently check against an incomplete allowlist.
+#
+# FIXTURE_SBOM (the shared, REAL sbom.sh output generated once at the top
+# of this file) is what makes this fixture genuine, unlike 12h's synthetic
+# components:[] SBOM: it carries the three real dependencies that need
+# the committed exception to pass, so this test can only pass for the
+# right reason.
+# ---------------------------------------------------------------------------
+test_verify_sbom_licence_check_skips_when_exceptions_missing() {
+    dir="$WORK/no-exceptions-fixture"
+    mkdir -p "$dir"
+    cp "$REPO_ROOT/scripts/release/verify.sh" "$dir/verify.sh"
+    cp "$REPO_ROOT/scripts/release/sbom-licence-check.sh" "$dir/sbom-licence-check.sh"
+    cp "$REPO_ROOT/deny.toml" "$dir/deny.toml"
+    # Deliberately NOT copied here: licence-exceptions.txt. That is the
+    # one difference from 12c's fixture, above, and the whole point of
+    # this test.
+    artifact_name="irontraffic-9.9.9-x86_64-unknown-linux-musl.tar.gz"
+    sbom_name="$artifact_name.sbom.json"
+    printf 'no-exceptions fixture artifact content\n' > "$dir/$artifact_name"
+    cp "$FIXTURE_SBOM" "$dir/$sbom_name"
+    ( cd "$dir" && write_sha256sums_line "$artifact_name" )
+
+    out="$(cd "$dir" && sh verify.sh --artifact "$artifact_name" --sbom "$sbom_name" --allow-skipped 2>&1)" && status=0 || status=$?
+    if [ "$status" -ne 0 ]; then
+        fail "verify_sbom_licence_check_skips_when_exceptions_missing" "verify.sh exited nonzero with --allow-skipped despite deny.toml-found/exceptions-missing being a SKIP, not a FAIL: $out"
+        return
+    fi
+    if printf '%s' "$out" | grep -qi "FAILED: sbom licence"; then
+        fail "verify_sbom_licence_check_skips_when_exceptions_missing" "a missing licence-exceptions.txt was reported as a FAILED licence check (accusing a genuinely compliant component) rather than a named skip: $out"
+        return
+    fi
+    if printf '%s' "$out" | grep -qE "aho-corasick|memchr|ryu"; then
+        fail "verify_sbom_licence_check_skips_when_exceptions_missing" "a genuinely compliant component was named in the output at all, meaning the empty exception set was still checked against: $out"
+        return
+    fi
+    if ! printf '%s' "$out" | grep -q "skipped: sbom licence"; then
+        fail "verify_sbom_licence_check_skips_when_exceptions_missing" "the missing exceptions file produced no named skip line at all: $out"
+        return
+    fi
+    pass "verify_sbom_licence_check_skips_when_exceptions_missing"
+}
+
+# ---------------------------------------------------------------------------
 # 13. verify_fails_when_a_check_is_skipped
 #
 # WHY THE DEFAULT IS A FAILURE, not a pass: the party able to serve a
@@ -1267,6 +1358,7 @@ test_sbom_components_are_sorted_by_purl
 test_licence_check_passes_on_real_sbom
 test_licence_check_fails_on_injected_licence
 test_licence_check_fails_on_missing_licence
+test_licence_check_skips_on_zero_components
 test_verify_fails_without_identity_pin
 test_verify_fails_on_tampered_artifact
 test_verify_checksum_ignores_sbom_substring_collision
@@ -1277,6 +1369,7 @@ test_verify_binds_sbom_cargo_lock_sha256_matches
 test_verify_binds_sbom_cargo_lock_sha256_mismatch
 test_verify_checksum_tolerates_hash_in_directory_name
 test_verify_sbom_licence_check_skips_when_no_allowlist_found
+test_verify_sbom_licence_check_skips_when_exceptions_missing
 test_verify_fails_when_a_check_is_skipped
 test_install_verifies_by_default
 test_verify_prints_source_commit
