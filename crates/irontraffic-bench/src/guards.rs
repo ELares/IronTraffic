@@ -154,6 +154,11 @@ fn step_float_gate(result: &RunResult) -> Result<(u64, u64), Validity> {
 /// Step 1: I10. The SUT binary's embedded build profile and worktree
 /// cleanliness, checked on `provenance.sut`, matching the design's own "the
 /// SUT binary's" phrasing.
+///
+/// Does NOT check [`InvariantId::I10`]'s third clause, "features equal the
+/// declared list": see that variant's own doc for why. This function's
+/// narrower scope is deliberate and disclosed there, not an oversight; do
+/// not read the two checks below as the complete invariant.
 fn step_i10(result: &RunResult) -> Option<Validity> {
     if result.provenance.sut.profile != "release" {
         return Some(invalid(

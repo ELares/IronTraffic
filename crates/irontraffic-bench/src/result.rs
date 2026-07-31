@@ -43,8 +43,26 @@ pub enum InvariantId {
     /// `probe_latency.p99_ns * 2 >= latency.p99_ns`: the load client's own
     /// scheduling jitter dominates.
     I9,
-    /// Build profile is `release` and the worktree was clean: the wrong
-    /// build was measured.
+    /// Build profile is `release`, features equal the declared list, and
+    /// the worktree was clean: the wrong build was measured.
+    ///
+    /// The "features equal the declared list" clause is NOT implemented by
+    /// [`crate::guards::step_i10`], which checks only
+    /// `provenance.sut.profile == "release"` and `!provenance.sut.dirty`.
+    /// No declared list exists anywhere in scope for this issue to compare
+    /// against: neither issue #408's own Design, Tests or Public API
+    /// sections (`check_validity`'s signature is given verbatim with no
+    /// feature-list parameter analogous to I12's `expected_command_line`)
+    /// nor `science/benchmarking.md`'s failure-mode-19 mitigation (which
+    /// names profile, feature list and dirty as failure CAUSES, then
+    /// describes only refusing a `dirty` or non-`release` build as the
+    /// actual mitigation) nor `Provenance::recompute_publishable`'s six
+    /// disqualifying conditions define what a "declared list" is or thread
+    /// one in. A future issue that adds a declared feature list and threads
+    /// it into `check_validity` must extend `step_i10` and this doc
+    /// together; until then, do not read this variant's doc, or
+    /// `step_i10`'s narrower scope, as claiming the third clause is
+    /// checked.
     I10,
     /// Warmup samples were never merged into the published histogram: a
     /// warmup measurement published as steady state.
@@ -85,6 +103,20 @@ pub enum Validity {
     Valid,
     /// The number describes the measurement apparatus, not the system under
     /// test.
+    ///
+    /// Carries only `reason`, never a `Detail`, even though issue #408's own
+    /// step-0 design prose and its tests 24 and 25 describe a failed float
+    /// conversion as yielding "a detail naming the field and the value", "a
+    /// detail naming `rps`", and (for a zero origin ceiling) "a detail
+    /// saying the ceiling was never measured". That acceptance requirement
+    /// is unsatisfiable as worded: the issue's own Public API gives this
+    /// variant verbatim as `LoadgenSuspect { reason: SuspectReason }`, with
+    /// no detail field, and its Do NOT list forbids collapsing
+    /// `LoadgenSuspect` into `Invalid`, the only other variant that carries
+    /// a `Detail`. The tests that reference a detail here
+    /// (`non_finite_floats_are_rejected`, `origin_ceiling_non_finite_is_rejected`,
+    /// `zero_origin_ceiling_is_suspect`) assert only `reason`, which is
+    /// everything this variant can carry.
     LoadgenSuspect {
         /// Which apparatus check failed.
         reason: SuspectReason,
