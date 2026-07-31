@@ -62,12 +62,24 @@
 //! `oha.rs`'s `parse_rejects_status_code_key_aliasing` fix established (a
 //! key of `"0200"` or `"+200"` is rejected rather than silently aliased onto
 //! `200`), because this map is exactly as untrusted as oha's own
-//! `statusCodeDistribution`. This module does NOT repeat oha's separate,
-//! heavier `duplicate_key_detail` whole-document walk (a distinct
-//! defence against `serde_json::Value`'s silent last-key-wins behaviour for
-//! a LITERALLY repeated key): none of this issue's own edge cases name that
-//! failure mode for vegeta, and the canonical-rendering check alone already
-//! closes the aliasing class that class of bug actually exploited.
+//! `statusCodeDistribution`.
+//!
+//! **This module DOES now repeat oha's `duplicate_key_detail` whole-document
+//! walk**, as a local copy matching this file's own established "small
+//! local copies" convention (see the byte-class helpers immediately below):
+//! an earlier version of this module declined it on the grounds that "the
+//! canonical-rendering check alone already closes the aliasing class that
+//! class of bug actually exploited." That reasoning does not extend to
+//! `latencies` (PR 815 review, issue #816 SHOULD_FIX 6): the
+//! canonical-rendering check runs only inside the `status_codes` loop, and a
+//! LITERALLY duplicated key like `"99th"` appearing twice is a different
+//! failure mode from a numerically-aliased key like `"0200"` in the first
+//! place; `serde_json::Value`'s map silently keeps only the last value for a
+//! repeated key with no trace of the one it discarded, on `latencies` exactly
+//! as much as on `status_codes`. A repeated `"99th"` key that disagrees with
+//! itself shifted this module's own reconstructed p99 by 7.7 percent on a
+//! probe against this file's own fixture, larger than `cross_check`'s own 5
+//! percent gate, with no error raised at all before this fix.
 //!
 //! # The percentile reconstruction, and what `latencies` is not used for
 //!
@@ -76,9 +88,7 @@
 //! already an INTEGER nanosecond count (Go's `time.Duration` marshals as a
 //! bare `int64`, never through a float), unlike oha's SECONDS-scaled
 //! percentiles. [`Vegeta::parse`] reconstructs a [`crate::LatencyRecorder`]
-//! the same way `oha.rs` reconstructs one from ITS percentile ladder: each
-//! of the four keys is recorded with a weight proportional to the gap since
-//! the previous quantile, and the top slice this covers (`1.0 - 0.99`, one
+//! from this ladder, and the top slice this covers (`1.0 - 0.99`, one
 //! percent) is recorded at `latencies.max` instead of being silently
 //! dropped the way oha's own top `1.0 - 0.9999` slice is documented to be:
 //! vegeta gives this adapter a real `max` field to use for exactly that
@@ -87,6 +97,33 @@
 //! maps them onto a `RawRun` field, and `RawRun::latency_exact` is `false`
 //! here regardless (this reconstruction is an approximation from four
 //! points, not a histogram, exactly like h2load's and oha's).
+//!
+//! **Each key's weight is the difference of two CUMULATIVE rounded counts,
+//! never an independently rounded gap.** An earlier version of this parser
+//! rounded each `(quantile - prev_quantile) * requests_sent` gap on its own,
+//! the way `oha.rs` rounds its own nine-point ladder's gaps; that is wrong
+//! here (PR 815 review, issue #816 BLOCKING 2). Independent per-gap rounding
+//! lets the SAME half-sample round down at one step and up at the next, so
+//! the errors compound instead of cancelling: on this module's own committed
+//! fixture (`requests: 250`), `(0.95 - 0.90) * 250` is `12.499999999999984`
+//! in f64, which rounds to 12 rather than 13, leaving only 247 of the 248
+//! samples `round(0.99 * 250)` should place at or below the 99th percentile.
+//! The one sample this dropped landed at `latencies.max` instead, so
+//! `value_at_quantile(0.99)` (`count_at_quantile = ceil(0.99 * 250) == 248`)
+//! fell into the `max` bucket rather than the 99th, and the reconstructed
+//! p99 collapsed onto `max`, 2.73x vegeta's own reported value, on 832 of a
+//! 2,602-point sweep of `requests`. Recording the DIFFERENCE between two
+//! cumulative, independently rounded running totals instead means each
+//! step's cumulative count is always the nearest integer to the TRUE
+//! cumulative count, so the ladder allocates EXACTLY `round(quantile *
+//! requests_sent)` samples at or below every quantile, with no drift left to
+//! compound by the time `max` absorbs the remainder.
+//! `parse_reconstructs_p99_within_tolerance_of_vegetas_own_value`
+//! (`tests/loadgen_vegeta.rs`) pins the reconstructed p99 against this
+//! fixture's own literal `latencies.99th`, watched to fail against the
+//! independently-rounded form this replaces; before that assertion existed,
+//! the only check on this reconstruction was `samples > 0`, which a mutation
+//! that made the parser never read `latencies.99th` at all still passed.
 //!
 //! # Untrusted input
 //!
@@ -109,6 +146,9 @@
 //! alone, specifically so the verdict does not depend on which tool is
 //! passed first.
 
+use std::collections::HashSet;
+
+use serde::de::{DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
 
 use crate::cell::{BenchCell, Protocol, RateMode};
@@ -156,6 +196,115 @@ pub struct Vegeta {
     pub targets_path: std::path::PathBuf,
     /// Path the runner will write the binary result to.
     pub output_path: std::path::PathBuf,
+}
+
+// ---------------------------------------------------------------------------
+// Duplicate-key detection: a local copy of `oha.rs`'s own
+// `RejectDuplicateKeys`/`RejectDuplicateKeysVisitor`/`duplicate_key_detail`,
+// matching this file's own "small local copies" convention (see the
+// byte-class helpers immediately below), added because the module doc's
+// earlier reasoning for declining it did not extend to `latencies` (PR 815
+// review, issue #816 SHOULD_FIX 6).
+// ---------------------------------------------------------------------------
+
+/// A no-op [`DeserializeSeed`] that walks one JSON value (recursively, for an
+/// array or object) purely to detect a duplicate key, without building
+/// anything. See [`duplicate_key_detail`] for why this walk exists.
+struct RejectDuplicateKeys;
+
+impl<'de> DeserializeSeed<'de> for RejectDuplicateKeys {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::de::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(RejectDuplicateKeysVisitor)
+    }
+}
+
+/// The [`Visitor`] half of [`RejectDuplicateKeys`]. Every scalar variant is a
+/// plain `Ok(())`: only `visit_seq` and `visit_map` recurse, and only
+/// `visit_map` can ever fail.
+struct RejectDuplicateKeysVisitor;
+
+impl<'de> Visitor<'de> for RejectDuplicateKeysVisitor {
+    type Value = ();
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("any JSON value")
+    }
+
+    fn visit_bool<E>(self, _v: bool) -> Result<Self::Value, E> {
+        Ok(())
+    }
+    fn visit_i64<E>(self, _v: i64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+    fn visit_u64<E>(self, _v: u64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+    fn visit_f64<E>(self, _v: f64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+    fn visit_str<E>(self, _v: &str) -> Result<Self::Value, E> {
+        Ok(())
+    }
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while seq.next_element_seed(RejectDuplicateKeys)?.is_some() {}
+        Ok(())
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut seen: HashSet<String> = HashSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !seen.insert(key.clone()) {
+                return Err(A::Error::custom(format!("duplicate key {key}")));
+            }
+            map.next_value_seed(RejectDuplicateKeys)?;
+        }
+        Ok(())
+    }
+}
+
+/// Returns `Some(detail)` only when `bytes` is otherwise well-formed JSON
+/// that contains a duplicate key in some object, at any nesting depth.
+/// `serde_json::Value`'s own `Map` silently keeps only the LAST value for a
+/// repeated key and reports nothing at all: a literal duplicated `"99th"`
+/// entry in `latencies`, or two top-level `latencies` objects, both parse
+/// `Ok` today using whichever entry happens to be spelled last, with no
+/// trace of the one it discarded. This walk runs BEFORE the document ever
+/// becomes a `Value`, so it sees every key exactly as `serde_json`'s own
+/// tokenizer does, for exactly that reason. A local copy of `oha.rs`'s
+/// identically named, identically implemented function.
+///
+/// A genuine JSON syntax error (mismatched brackets, an unterminated
+/// string, and so on) is deliberately reported as `None` here rather than
+/// surfaced from this pass: the caller's own `serde_json::from_slice::<Value>`
+/// call reports it in this module's usual "invalid json: {e}" words, so one
+/// malformed input gets one message, not two differently worded ones.
+/// `serde_json::Error::is_data` is what tells the two apart, because
+/// `serde::de::Error::custom` inside [`RejectDuplicateKeysVisitor`] is the
+/// ONLY place this pass ever builds a Data-category error.
+///
+/// Uses `serde_json`'s own default recursion limit, exactly like the real
+/// parse below: never widened, per this crate's Do NOT list.
+fn duplicate_key_detail(bytes: &[u8]) -> Option<String> {
+    let mut de = serde_json::Deserializer::from_slice(bytes);
+    match RejectDuplicateKeys.deserialize(&mut de) {
+        Err(e) if e.is_data() => Some(format!("duplicate object key: {e}")),
+        Ok(()) | Err(_) => None,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -391,6 +540,18 @@ impl LoadGenerator for Vegeta {
             ));
         }
 
+        // A literal duplicate key anywhere in stdout (a repeated `"99th"` in
+        // `latencies`, or a second top-level `latencies` object) is rejected
+        // here, before the document ever becomes a `Value`: see
+        // `duplicate_key_detail`'s own doc for why `serde_json::Value`'s
+        // silent last-wins behaviour is not good enough at this
+        // untrusted-input boundary. Matches `oha.rs`'s identical check,
+        // added here for the identical reason (PR 815 review, issue #816
+        // SHOULD_FIX 6).
+        if let Some(detail) = duplicate_key_detail(stdout) {
+            return Err(BenchError::parse("vegeta", &detail));
+        }
+
         let value: Value = serde_json::from_slice(stdout)
             .map_err(|e| BenchError::parse("vegeta", &format!("invalid json: {e}")))?;
         let obj = value
@@ -491,24 +652,69 @@ impl LoadGenerator for Vegeta {
         )]
         let requests_sent_f = requests_sent as f64;
         let mut allocated: u64 = 0;
-        let mut prev_quantile = 0.0_f64;
+        let mut prev_cumulative: u64 = 0;
+        let mut prev_value_ns: Option<u64> = None;
         for (key, quantile) in PERCENTILE_KEYS {
             let value_ns = latencies.get(key).and_then(Value::as_u64).ok_or_else(|| {
                 BenchError::parse("vegeta", &format!("missing field latencies.{key}"))
             })?;
-            let gap = quantile - prev_quantile;
+
+            // Percentile values must be monotone non-decreasing as the
+            // quantile increases (matching `oha.rs`'s identical
+            // `latencyPercentiles` check, edge case 8 there): a tool bug or
+            // a mangled fixture producing p99 below p50 would reconstruct a
+            // histogram whose own p50 exceeds its p99, which is not a real
+            // distribution. Not one of issue #413's own named edge cases
+            // for `latencies` (PR 815 review, issue #816 SHOULD_FIX 6), but
+            // the identical object this crate already guards on the sibling
+            // adapter, and the object that produces the number
+            // `cross_check`'s 5 percent gate actually compares.
+            if let Some(prev) = prev_value_ns
+                && value_ns < prev
+            {
+                return Err(BenchError::parse(
+                    "vegeta",
+                    "latencies values are not monotone non-decreasing",
+                ));
+            }
+            prev_value_ns = Some(value_ns);
+
+            // CUMULATIVE rounding, not an independently-rounded-per-gap
+            // weight (PR 815 review, issue #816 BLOCKING 2). Rounding each
+            // `(quantile - prev_quantile) * requests_sent_f` gap on its own
+            // lets the SAME half-sample round down at one step and up at
+            // the next, so the errors compound instead of cancelling: at
+            // `requests_sent = 250` with this fixture's own committed
+            // values, `(0.95 - 0.90) * 250` is `12.499999999999984` in f64,
+            // which rounds to 12, not 13, leaving `allocated == 247`, one
+            // short of `round(0.99 * 250) == 248`. The one sample this
+            // dropped was recorded at `latencies.max` instead of the 99th
+            // bucket, so `value_at_quantile(0.99)` (`count_at_quantile =
+            // ceil(0.99 * 250) == 248`) fell into the `max` bucket instead
+            // of the 99th, and the reconstructed p99 collapsed onto `max`
+            // (2.73x vegeta's own reported value on this exact fixture).
+            // Taking the DIFFERENCE of two cumulative, independently-rounded
+            // running totals instead means each step's cumulative count is
+            // always the nearest integer to the TRUE cumulative count, so
+            // the ladder allocates EXACTLY `round(quantile * requests_sent)`
+            // samples at or below every quantile, with no drift left to
+            // compound by the time `max` absorbs the remainder.
+            // `parse_reconstructs_p99_within_tolerance_of_vegetas_own_value`
+            // below is the regression test; it fails against the
+            // independently-rounded form this replaces.
             #[expect(
                 clippy::cast_possible_truncation,
                 clippy::cast_sign_loss,
-                reason = "gap is in (0.0, 1.0] by construction (PERCENTILE_KEYS's quantiles are \
-                          fixed, strictly increasing literals), and requests_sent_f is \
-                          non-negative, so gap * requests_sent_f is non-negative and at most \
+                reason = "quantile is in (0.0, 1.0] by construction (PERCENTILE_KEYS's quantiles \
+                          are fixed, strictly increasing literals), and requests_sent_f is \
+                          non-negative, so quantile * requests_sent_f is non-negative and at most \
                           requests_sent_f; .round().clamp(...) bounds it before this cast"
             )]
-            let weight = (gap * requests_sent_f).round().clamp(0.0, requests_sent_f) as u64;
+            let cumulative = (quantile * requests_sent_f).round().clamp(0.0, requests_sent_f) as u64;
+            let weight = cumulative.saturating_sub(prev_cumulative);
             recorder.record_n_ns(value_ns, weight);
             allocated = allocated.saturating_add(weight);
-            prev_quantile = quantile;
+            prev_cumulative = cumulative;
         }
         // The top slice this ladder does not cover (`1.0 - 0.99`, one
         // percent) goes to `latencies.max`, which vegeta reports directly:

@@ -218,6 +218,33 @@ fn parse_fixture() {
     assert_eq!(raw.duration_ns, 4_980_002_542);
     assert!(!raw.latency_exact, "vegeta never sets latency_exact");
     assert!(raw.latency.percentiles().samples > 0);
+
+    // Pinned against the fixture's own literal `latencies."99th": 610834`
+    // (PR 815 review, issue #816 BLOCKING 2), matching the precedent
+    // `tests/loadgen_oha.rs`'s own `parse_real_oha_fixture` already sets for
+    // the identical shape of gap: before this assertion existed, the only
+    // check on the reconstructed p99 was `samples > 0`, so a mutation that
+    // made the parser never read `latencies.99th` at all left every test in
+    // every one of this crate's 13 test binaries green, and the independent
+    // per-gap rounding bug this file's own module doc records (the
+    // reconstructed p99 collapsing onto `latencies.max`, 1,669,119 against
+    // this fixture's 610,834, a factor of 2.73) was invisible to the suite
+    // entirely. `HdrHistogram`'s own stated precision guarantee is accuracy
+    // to within 3 significant decimal digits of the true value, never
+    // bit-for-bit equality, matching `tests/hist.rs`'s and
+    // `tests/loadgen_h2load.rs`'s own identically reasoned tolerance.
+    let expected_p99_ns = 610_834.0_f64;
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "p99_ns is well under 2^53 for any run this fixture or this crate's own bounds \
+                  can produce, so this comparison loses no precision that matters"
+    )]
+    let actual_p99_ns = raw.latency.percentiles().p99_ns as f64;
+    let diff = (actual_p99_ns - expected_p99_ns).abs();
+    assert!(
+        diff <= expected_p99_ns * 0.01,
+        "reconstructed p99_ns {actual_p99_ns} not within 1% of the fixture's own {expected_p99_ns}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -253,6 +280,77 @@ fn parse_rejects_status_code_key_aliasing() {
     }
     .parse(&ctx, doc.as_bytes(), b"")
     .expect_err("an aliased status code key (\"0200\" alongside \"200\") must be Err(Parse)");
+    assert!(matches!(err, BenchError::Parse { .. }));
+}
+
+// ---------------------------------------------------------------------------
+// Not one of the issue's own 24 named tests (PR 815 review, issue #816
+// SHOULD_FIX 6): `latencies` is the object that produces the number
+// `cross_check`'s 5 percent gate actually compares, and it had neither of
+// the two defences `oha.rs` grew for the identical shape of object. Both are
+// probed directly here rather than only asserted in prose.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parse_rejects_non_monotone_latencies() {
+    let cell = base_cell();
+    let invocation = base_invocation();
+    let tool = base_tool_stamp();
+    let ctx = base_ctx(&cell, &invocation, &tool);
+
+    // p50 above p90 above p95, then a p99/max drop back to 1: not a real
+    // distribution. Matches `tests/loadgen_oha.rs`'s own
+    // `parse_rejects_non_monotone_percentiles` probe shape for the
+    // identical check on the identical shape of object.
+    let doc = r#"{
+        "latencies": {"50th": 900000, "90th": 800000, "95th": 700000, "99th": 1, "max": 1},
+        "bytes_in": {"total": 100},
+        "requests": 1000,
+        "duration": 1000000000,
+        "status_codes": {"200": 1000}
+    }"#;
+
+    let err = Vegeta {
+        max_workers: 8,
+        targets_path: "t".into(),
+        output_path: "o".into(),
+    }
+    .parse(&ctx, doc.as_bytes(), b"")
+    .expect_err("a non-monotone latencies ladder must be Err(Parse)");
+    assert!(matches!(err, BenchError::Parse { .. }));
+}
+
+#[test]
+fn parse_rejects_duplicate_latencies_key() {
+    let cell = base_cell();
+    let invocation = base_invocation();
+    let tool = base_tool_stamp();
+    let ctx = base_ctx(&cell, &invocation, &tool);
+
+    // A literally repeated "99th" key, deliberately chosen so the SECOND
+    // (last-wins) value, 195000, is still monotone non-decreasing against
+    // its neighbours (180000 <= 195000 <= 250000): this isolates the
+    // duplicate-key defence from the monotonicity check immediately above
+    // it. A document whose duplicated key collapses to a non-monotone
+    // value (this file's own module doc example, "99th": 200000, "99th": 1)
+    // would be caught by monotonicity alone even with the duplicate-key
+    // check removed, which would not prove THIS defence is load-bearing.
+    let doc = r#"{
+        "latencies": {"50th": 100000, "90th": 150000, "95th": 180000, "99th": 190000, "99th": 195000, "max": 250000},
+        "bytes_in": {"total": 100},
+        "requests": 1000,
+        "duration": 1000000000,
+        "status_codes": {"200": 1000}
+    }"#;
+
+    let err = Vegeta {
+        max_workers: 8,
+        targets_path: "t".into(),
+        output_path: "o".into(),
+    }
+    .parse(&ctx, doc.as_bytes(), b"")
+    .expect_err("a duplicated latencies.99th key must be Err(Parse), even when the collapsed \
+                 value is itself monotone");
     assert!(matches!(err, BenchError::Parse { .. }));
 }
 
@@ -352,6 +450,39 @@ fn cross_check_not_comparable() {
     let empty = percentiles(0, 0);
     assert_eq!(
         cross_check(&empty, &empty, 10.0),
+        CrossCheck::NotComparable {
+            reason: NotComparableReason::NoSamples
+        }
+    );
+
+    // Issue #413's own edge case 12, `cross_check` where both p99 values are
+    // 0, distinct from the "two empty recorders" case immediately above:
+    // `samples` here is a healthy 100,000 on both sides, only `p99_ns` is
+    // zero (PR 815 review, issue #816 SHOULD_FIX 2). Reachable through
+    // `Vegeta::parse`: a report whose `latencies` object is all zeros
+    // parses `Ok` with `samples > 0` and `p99 == 0` (nothing in that parser
+    // rejects a zero-valued percentile ladder). The `p99_ns == 0` clauses in
+    // `cross_check`'s step 1 are what catch this before step 4's division;
+    // deleting them does not fail any OTHER test in this file (the
+    // `samples == 0` clause alone already covers the empty-recorder case
+    // above), but it does turn this exact input into a division-by-zero
+    // panic at `max_p99 = 0`, since `arbiter.samples.min(independent.samples)`
+    // (100,000) clears `Percentiles::required_samples(0.99)` and step 3
+    // never fires either.
+    let zero_p99_a = percentiles(0, 100_000);
+    let zero_p99_b = percentiles(0, 100_000);
+    assert_eq!(
+        cross_check(&zero_p99_a, &zero_p99_b, 10.0),
+        CrossCheck::NotComparable {
+            reason: NotComparableReason::NoSamples
+        }
+    );
+    // One side zero, one side healthy: still NoSamples, not a comparison
+    // against a measurement that does not exist.
+    let one_zero_p99 = percentiles(0, 100_000);
+    let healthy = healthy_percentiles(1_000_000);
+    assert_eq!(
+        cross_check(&one_zero_p99, &healthy, 10.0),
         CrossCheck::NotComparable {
             reason: NotComparableReason::NoSamples
         }
