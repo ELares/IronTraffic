@@ -37,14 +37,67 @@
 //! byte-for-byte in `v1.68.1`'s `h2load.cc`). Pinning `1.70.0` merely because
 //! it is the newest release would make every test this issue names fail
 //! against a real binary; pinning `1.68.1` is what makes the fixture, the
-//! parser and a real capture agree. **Nobody in this environment could
-//! install and run either version to confirm this directly (no package
-//! manager, no `autoconf`, and `h2load`'s own build additionally needs
-//! `libnghttp2`, OpenSSL, `libev` and `c-ares`): `tests/fixtures/h2load-output.txt`
-//! is therefore RECONSTRUCTED from `v1.68.1`'s own published source, not
-//! captured, exactly like `nighthawk.rs`'s fixture and for the identical
-//! reason. Re-verify against a real `h2load 1.68.1` run before this parser is
-//! trusted for a real cell.**
+//! parser and a real capture agree, PROVIDED HTTP/3 is selected the way
+//! `1.68.1` actually supports it, not the way the Design section spells it
+//! (see the section immediately below: the two requirements are otherwise
+//! mutually exclusive across the whole release history). **Nobody in this
+//! environment could install and run either version to confirm this
+//! directly (no package manager, no `autoconf`, and `h2load`'s own build
+//! additionally needs `libnghttp2`, OpenSSL, `libev` and `c-ares`):
+//! `tests/fixtures/h2load-output.txt` is therefore RECONSTRUCTED from
+//! `v1.68.1`'s own published source, not captured, exactly like
+//! `nighthawk.rs`'s fixture and for the identical reason. Re-verify against
+//! a real `h2load 1.68.1` run before this parser is trusted for a real
+//! cell.**
+//!
+//! # HTTP/3 is selected through `--alpn-list`, never `--h3`, on the pinned `1.68.1`
+//!
+//! **This is a deliberate, evidence-backed DEVIATION from issue #413's own
+//! Design section**, which writes the H3 branch of the invocation as
+//! `[--h1 | (default h2) | --h3]`. An earlier version of this adapter
+//! emitted exactly that literal flag, and it does not work: `--h3` is
+//! ABSENT from `v1.68.1`'s `getopt_long` table (`src/h2load.cc`, dumped in
+//! full over HTTPS from the pinned tag on 2026-07-31; the only occurrence of
+//! the string `"h3"` anywhere in the 3,408-line file is the ALPN comparison
+//! at line 1137, `if ("h3"sv != proto && "h3-29"sv != proto)`). `--h3` first
+//! appears in `v1.69.0` (`{"h3", no_argument, &flag, 24}`), which is the SAME
+//! release that deletes the `time for request:`/`time to 1st byte:` labels
+//! this parser reads. No `nghttp2` release both accepts `--h3` and prints
+//! the summary shape this module needs: bumping the pin to get the flag
+//! breaks the parser, and keeping the pin to keep the parser breaks the
+//! flag. A real `h2load 1.68.1` given `--h3` rejects the whole command line
+//! with an unrecognized-option error, so every H3 cell this adapter planned
+//! before this fix was unrunnable. This was found by an adversarial review
+//! of PR 815 (issue #816, BLOCKING 1), reading the pinned tag's own source
+//! rather than assuming the Design section's flag spelling was still
+//! current.
+//!
+//! `1.68.1` selects HTTP/3 a different way, and this adapter now uses it:
+//! `Config::is_quic()` returns `true` only when `alpn_list[0]` is `"h3"` or
+//! `"h3-29"` (`src/h2load.cc:162-165`), and `alpn_list` is populated from
+//! `--alpn-list` (`getopt_long` id 19, `required_argument`; the handler is
+//! `config.alpn_list = util::parse_config_str_list(std::string_view{optarg});`).
+//! [`H2Load::plan`] therefore emits `--alpn-list` followed by [`H3_ALPN_TOKEN`]
+//! (`"h3"`) for [`Protocol::H3`] instead of `--h3`. This is the ONLY
+//! invocation this adapter's pinned version can actually run and still
+//! produce the output shape this parser reads, so it is the resolution
+//! chosen over moving the pin.
+//!
+//! # The fixture's own arithmetic now matches every relation `print_stats` guarantees
+//!
+//! The same PR 815 review (issue #816 BLOCKING 3) found
+//! `tests/fixtures/h2load-output.txt` arithmetically IMPOSSIBLE as any real
+//! `1.68.1` output: it read `0 failed` alongside `20 5xx`, which
+//! `print_stats`'s own `req_not_issued` fold-in makes `total ==
+//! succeeded + failed` an identity no real run can violate, and its
+//! `340.14KB/s` was the SI 1000-based figure a human computes by hand, not
+//! `util::utos_funit`'s own 1024-based one (`332.17KB/s`). Both are fixed;
+//! see `tests/loadgen_h2load.rs`'s own module doc, "Every relation 1.68.1's
+//! own `print_stats` guarantees, enforced here," for the arithmetic and for
+//! the one review claim about this fixture (the `req/s` row's decimal
+//! precision) that a full read of `print_stats` shows was already correct
+//! and was therefore left unchanged, with the `std::cout` state-persistence
+//! evidence for why.
 //!
 //! # `finished in` is parsed as seconds-only, a narrower rule than the tool's
 //! # own duration formatter
@@ -141,6 +194,14 @@ pub const MAX_H2LOAD_LINES: usize = 4096;
 
 /// Largest single h2load output line the parser will read, in bytes.
 pub const MAX_H2LOAD_LINE_BYTES: usize = 1024;
+
+/// The `--alpn-list` value this adapter emits to select HTTP/3 on the pinned
+/// `1.68.1`, which has no `--h3` flag at all. `Config::is_quic()` in that
+/// release (`src/h2load.cc:162-165`) returns `true` only when
+/// `alpn_list[0]` is `"h3"` or `"h3-29"`; this adapter always names the
+/// non-draft `"h3"` token. See this module's own doc, "HTTP/3 is selected
+/// through `--alpn-list`", for the full evidence trail.
+const H3_ALPN_TOKEN: &str = "h3";
 
 /// The h2load adapter: protocol-level cells and the TTFB decomposition.
 ///
@@ -723,7 +784,14 @@ impl LoadGenerator for H2Load {
         match cell.protocol {
             Protocol::H1 => args.push("--h1".to_owned()),
             Protocol::H2 => {} // h2load's default over plaintext; never relied on silently, but nothing to add.
-            Protocol::H3 => args.push("--h3".to_owned()),
+            // NOT `--h3`: the pinned `1.68.1` has no such flag (see this
+            // module's own doc, "HTTP/3 is selected through `--alpn-list`").
+            // `--alpn-list h3` is what makes `Config::is_quic()` return
+            // `true` in that release.
+            Protocol::H3 => {
+                args.push("--alpn-list".to_owned());
+                args.push(H3_ALPN_TOKEN.to_owned());
+            }
         }
 
         args.push("--header".to_owned());

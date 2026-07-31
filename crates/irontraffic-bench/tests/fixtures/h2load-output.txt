@@ -1,6 +1,6 @@
 
-finished in 35.00s, 2857.14 req/s, 340.14KB/s
-requests: 100000 total, 100000 started, 100000 done, 99980 succeeded, 0 failed, 0 errored, 0 timeout
+finished in 35.00s, 2857.14 req/s, 332.17KB/s
+requests: 100000 total, 100000 started, 100000 done, 99980 succeeded, 20 failed, 0 errored, 0 timeout
 status codes: 99980 2xx, 0 3xx, 0 4xx, 20 5xx
 traffic: 11.35MB (11905000) total, 285.16KB (292000) headers (space savings 12.34%), 10.49MB (11000000) data
                      min         max         mean         sd        +/- sd

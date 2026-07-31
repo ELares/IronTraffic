@@ -14,6 +14,65 @@
 //! entails. `parse_fixture` below is an authority on this parser's OWN
 //! reading of that shape, not evidence that the shape matches a real
 //! `h2load 1.68.1` run.
+//!
+//! # Every relation `1.68.1`'s own `print_stats` guarantees, enforced here
+//!
+//! An earlier version of this fixture was not merely reconstructed, it was
+//! arithmetically IMPOSSIBLE as any `h2load 1.68.1` output (PR 815 review,
+//! issue #816 BLOCKING 3), which defeats the point of checking this parser
+//! against it at all. Three relations `print_stats`
+//! (`nghttp2/nghttp2`'s `src/h2load.cc`, the pinned tag) guarantees for every
+//! real run are now enforced by construction in this fixture:
+//!
+//! 1. **`requests:`'s `total == succeeded + failed`, always, by
+//!    construction.** `print_stats` computes `req_not_issued = req_todo -
+//!    req_status_success - req_failed` and then does `req_failed +=
+//!    req_not_issued` BEFORE printing, so the printed `failed` field is
+//!    algebraically `total - succeeded` no matter what. This fixture's
+//!    `99980 succeeded, 20 failed` sums to the `100000 total`; the previous
+//!    `0 failed` could never come from a real run reporting `20 5xx` (a 5xx
+//!    sets `status_success = 0`, which `on_stream_close` counts as
+//!    `req_failed`, forcing `failed >= 20` on its own, independent of the
+//!    `total`/`succeeded` identity).
+//! 2. **`finished in`'s throughput is 1024-based, via `util::utos_funit`,
+//!    never the SI 1000-based figure a human would compute by hand.** With
+//!    `bytes_total = 11905000` and `duration = 35.00s`,
+//!    `bps = 11905000 / 35 = 340142` (truncated to `int64_t`, matching
+//!    `print_stats`'s own cast), and `340142 / 1024 = 332.17`, so this
+//!    fixture reads `332.17KB/s`. The `traffic:` line's own `11.35MB`,
+//!    `285.16KB` and `10.49MB` prefixes were ALREADY 1024-based correctly
+//!    (confirmed by the same arithmetic against their own parenthesised
+//!    exact counts) and are unchanged.
+//!
+//! **What was checked and left alone, because it is already correct.** The
+//! `req/s` row's `min`/`max`/`mean`/`sd` columns (`2800.00   2900.00
+//! 2857.14   25.30`) do NOT pass through `util::dtos` the way the three
+//! timing rows' columns do (those go through `util::format_duration`, which
+//! builds its own string via `dtos` internally, independent of `std::cout`'s
+//! state); they are raw `double`s written straight to `std::cout` via
+//! `operator<<`. The review that found the two relations above also flagged
+//! this row as unable to "carry forced two decimal places," reading that as
+//! a THIRD defect. Reading `print_stats` in full shows otherwise:
+//! `std::cout << std::fixed << std::setprecision(2)` is set once, at the very
+//! start of this same function (immediately before the `finished in` line),
+//! and C++ `ostream` format flags and precision are STATE on the stream
+//! object, persisting across every subsequent `std::cout <<` statement in
+//! the function until something explicitly changes them again; nothing here
+//! ever does. The `req/s` row's raw doubles are therefore printed with
+//! exactly the same `fixed`, 2-decimal formatting already active from the
+//! very first line, so `2800.00`/`2900.00`/`2857.14`/`25.30` is what a real
+//! `1.68.1` run prints, not `2800`/`2900`/`2857.14`/`25.3`. This row is left
+//! unchanged from what the review's own diff would have produced, because
+//! changing it would make the fixture WRONG rather than right; see this
+//! file's `req_s_row_min_max_mean_sd_are_fixed_two_decimal_by_construction`
+//! test below, and `crates/irontraffic-bench/src/loadgen/h2load.rs`'s own
+//! module doc, for the reasoning restated where the parser itself lives.
+//!
+//! This fixture remains a RECONSTRUCTION, not a capture: nothing in this
+//! implementation environment can build or run a real `h2load`, so nobody
+//! has confirmed these relations against an actual binary, only against
+//! `1.68.1`'s own published source. Re-verify against a real run before this
+//! parser is trusted for a real cell.
 
 use irontraffic_bench::{
     BenchCell, BenchError, CacheMode, CellId, H2Load, Invocation, KeepaliveMode, LoadGenerator,
@@ -239,6 +298,18 @@ fn fixed_rate_is_unsupported() {
 // 4. protocol_flags
 // ---------------------------------------------------------------------------
 
+// Issue #413's own Design section spells the H3 branch as a literal `--h3`
+// flag. That flag does not exist in the pinned h2load `1.68.1` at all (PR 815
+// review, issue #816 BLOCKING 1): `--h3` first appears in `v1.69.0`, the same
+// release that deletes the summary labels `H2Load::parse` reads, so no
+// `nghttp2` release both accepts `--h3` and prints the shape this parser
+// needs. `H2Load::plan` therefore emits `--alpn-list h3` for `Protocol::H3`
+// instead (`Config::is_quic()` in `1.68.1` returns true only when
+// `alpn_list[0]` is the h3 ALPN token); see `h2load.rs`'s own module doc,
+// "HTTP/3 is selected through `--alpn-list`", for the full evidence trail.
+// This test asserts the ACTUAL flag surface, a deliberate deviation from the
+// issue's literal text, not the `--h3` spelling that would make a real
+// `h2load 1.68.1` reject the command line outright.
 #[test]
 fn protocol_flags() {
     let h2load = base_h2load();
@@ -250,18 +321,28 @@ fn protocol_flags() {
     let h1 = h2load.plan(&h1_cell, &target, &run).expect("valid cell");
     assert!(h1.args.iter().any(|a| a == "--h1"));
     assert!(!h1.args.iter().any(|a| a == "--h3"));
+    assert!(!h1.args.iter().any(|a| a == "--alpn-list"));
 
     let mut h2_cell = base_cell();
     h2_cell.protocol = Protocol::H2;
     let h2 = h2load.plan(&h2_cell, &target, &run).expect("valid cell");
     assert!(!h2.args.iter().any(|a| a == "--h1"));
     assert!(!h2.args.iter().any(|a| a == "--h3"));
+    assert!(!h2.args.iter().any(|a| a == "--alpn-list"));
 
     let mut h3_cell = base_cell();
     h3_cell.protocol = Protocol::H3;
     let h3 = h2load.plan(&h3_cell, &target, &run).expect("valid cell");
     assert!(!h3.args.iter().any(|a| a == "--h1"));
-    assert!(h3.args.iter().any(|a| a == "--h3"));
+    // NOT `--h3`: the pinned 1.68.1 has no such flag. HTTP/3 is selected
+    // through `--alpn-list h3` instead.
+    assert!(!h3.args.iter().any(|a| a == "--h3"));
+    let alpn_pos = h3
+        .args
+        .iter()
+        .position(|a| a == "--alpn-list")
+        .expect("H3 must emit --alpn-list, the only way 1.68.1 selects HTTP/3");
+    assert_eq!(h3.args.get(alpn_pos + 1), Some(&"h3".to_owned()));
 }
 
 // ---------------------------------------------------------------------------
@@ -298,6 +379,17 @@ fn streams_per_connection_mapping() {
         cell.protocol = protocol;
         let invocation = h2load.plan(&cell, &target, &run).expect("valid cell");
         assert_eq!(m_value(&invocation.args), "100", "{protocol:?}");
+        // `-m`'s value is fixed by protocol alone (see `plan`'s own comment),
+        // independent of which flag selects H3: this holds whether H3 is
+        // requested through `--h3` (h2load.cc's `getopt_long`, id 'm', is
+        // parsed before the protocol match either way) or, as this adapter
+        // now emits for the pinned 1.68.1 (see `protocol_flags` and
+        // `h2load.rs`'s own module doc), `--alpn-list h3`. Confirmed here
+        // rather than assumed: the H3 invocation never carries the
+        // nonexistent `--h3` flag at all.
+        if protocol == Protocol::H3 {
+            assert!(!invocation.args.iter().any(|a| a == "--h3"));
+        }
     }
 }
 
@@ -338,12 +430,115 @@ fn parse_fixture() {
     assert_eq!(raw.requests_sent, 100_000);
     assert_eq!(raw.responses_ok, 99_980);
     assert_eq!(raw.bytes_received, 11_905_000);
+    // Pinned against the fixture's own literal `finished in 35.00s` (PR 815
+    // review, issue #816 SHOULD_FIX 1): before this assertion existed, a
+    // mutation of `parse_finished_in_token`'s scale factor from
+    // 1_000_000_000 to 1_000_000 (reading "35.00s" as 35 MILLISECONDS, a
+    // 1000x error in the denominator of every requests-per-second figure
+    // this run would ever publish) left every test in every one of this
+    // crate's 13 test binaries green. This is the identical hole
+    // `tests/loadgen_oha.rs:977` records PR 799 closing for the `oha`
+    // adapter, three files over.
+    assert_eq!(raw.duration_ns, 35_000_000_000);
+    // Pinned against the fixture's own literal `20 failed, 0 errored, 0
+    // timeout` (same review, same SHOULD_FIX). NOTE what this alone does
+    // and does not prove: this fixture's `errored` and `timeout` are
+    // legitimately 0 (a real `1.68.1` run reporting the `20 5xx` this
+    // fixture's own `status codes:` line carries has no transport-level
+    // connection failures to report; see this file's own module doc, "Every
+    // relation 1.68.1's own print_stats guarantees"), so this assertion
+    // alone cannot distinguish `errors_u128 = failed + errored + timeout`
+    // from `errors_u128 = failed` alone: both equal 20 here.
+    // `parse_errors_sums_failed_errored_and_timeout` below, a deliberately
+    // synthetic (not fixture-realistic) probe, is what actually exercises
+    // the three-way sum with all three terms non-zero and distinct.
+    assert_eq!(raw.errors, 20);
     assert!(
         !raw.latency_exact,
         "invariant 1: h2load never sets latency_exact"
     );
     assert!(raw.ttfb.is_some(), "invariant 2: ttfb must be present");
     assert!(raw.connect.is_some());
+}
+
+// ---------------------------------------------------------------------------
+// Not one of the issue's own 24 named tests (PR 815 review, issue #816
+// SHOULD_FIX 1). This document is a DELIBERATELY SYNTHETIC arithmetic probe,
+// not a claim about what a real h2load run produces: `tests/fixtures/h2load-output.txt`
+// itself cannot exercise `errors_u128`'s three-way sum with `failed`,
+// `errored` and `timeout` all non-zero and distinct, because a real
+// `1.68.1` run's own `print_stats` forces `total == succeeded + failed`
+// exactly (see this file's own module doc), and this crate's Parsing table
+// treats `errored`/`timeout` as ADDITIVE on top of `failed` rather than a
+// breakdown within it, so a genuine capture with non-zero `errored` or
+// `timeout` alongside a non-zero `failed` would need `succeeded + failed +
+// errored + timeout` to exceed `total`, which `H2Load::parse`'s own
+// "counters are inconsistent" check refuses. This synthetic document
+// deliberately violates the realism `tests/fixtures/h2load-output.txt` was
+// just fixed to honour (BLOCKING 3), on purpose, to isolate the ONE formula
+// this test exists to pin.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parse_errors_sums_failed_errored_and_timeout() {
+    let text = "finished in 10.00s, 100.00 req/s, 12.50KB/s\n\
+         requests: 1000 total, 1000 started, 1000 done, 800 succeeded, 100 failed, 50 errored, 25 timeout\n\
+         status codes: 800 2xx, 0 3xx, 0 4xx, 100 5xx\n\
+         traffic: 11.35MB (11905000) total, 285.16KB (292000) headers (space savings 12.34%), 10.49MB (11000000) data\n\
+         time for request:  239us  11.85ms  602us  351us  89.35%\n\
+         time for connect:  120us   980us   310us   95us   91.20%\n\
+         time to 1st byte:  180us  9.40ms  450us  210us  88.10%\n";
+
+    let cell = base_cell();
+    let invocation = base_invocation();
+    let tool = base_tool_stamp();
+    let ctx = base_ctx(&cell, &invocation, &tool);
+
+    let raw = base_h2load()
+        .parse(&ctx, text.as_bytes(), b"")
+        .expect("well-formed synthetic fixture");
+
+    // 100 + 50 + 25 = 175, distinct from `failed` alone (100): this is what
+    // distinguishes the three-term sum the Design's own Parsing table
+    // specifies ("failed, errored and timeout summed") from a mutation that
+    // narrows it to `failed` alone, which the shipped fixture's own
+    // legitimately-zero `errored`/`timeout` cannot (100 + 0 + 0 == 100
+    // either way).
+    assert_eq!(raw.errors, 175);
+    assert_eq!(raw.responses_ok, 800);
+    assert_eq!(raw.requests_sent, 1_000);
+}
+
+// ---------------------------------------------------------------------------
+// Not one of the issue's own 24 named tests: pins the module doc's own claim
+// (this file's "Every relation 1.68.1's own print_stats guarantees, enforced
+// here" section) that a real 1.68.1 run's `req/s` row carries its
+// `min`/`max`/`mean`/`sd` columns fixed to 2 decimal places, because
+// `std::cout`'s `fixed`/`setprecision(2)` state (set once, at the very start
+// of `print_stats`) persists across every later `std::cout <<` statement in
+// that function, including this row's raw, unformatted `double`s. This is a
+// LITERAL-TEXT check on the fixture file itself, not on `H2Load::parse`
+// (which never reads this row at all: see the "Every other line ... is
+// tolerated and skipped" comment in `h2load.rs`), so a future edit that
+// silently regressed the fixture's own consistency with that claim would
+// still be caught.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn req_s_row_min_max_mean_sd_are_fixed_two_decimal_by_construction() {
+    let text = std::str::from_utf8(FIXTURE_BYTES).expect("fixture is utf-8");
+    let row = text
+        .lines()
+        .find(|l| l.starts_with("req/s"))
+        .expect("fixture has a req/s row");
+    assert!(
+        row.contains("2800.00")
+            && row.contains("2900.00")
+            && row.contains("2857.14")
+            && row.contains("25.30"),
+        "req/s row must carry two fixed decimal places on min/max/mean/sd, per this file's own \
+         module doc: {row:?}"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -485,7 +680,11 @@ fn parse_rejects_duplicate_label() {
 /// the SAME literal integers this file's own row-level unit test pins.
 #[test]
 fn parse_handles_mixed_time_units() {
-    let text = "finished in 35.00s, 2857.14 req/s, 340.14KB/s\n\
+    // 332.17KB/s, not 340.14KB/s: `util::utos_funit` is 1024-based
+    // (11,905,000 bytes / 35s = 340,142.857 B/s, / 1024 = 332.17KB/s), the
+    // same correction `tests/fixtures/h2load-output.txt` needed (PR 815
+    // review, issue #816 BLOCKING 3).
+    let text = "finished in 35.00s, 2857.14 req/s, 332.17KB/s\n\
          requests: 1000 total, 1000 started, 1000 done, 1000 succeeded, 0 failed, 0 errored, 0 timeout\n\
          status codes: 1000 2xx, 0 3xx, 0 4xx, 0 5xx\n\
          traffic: 11.35MB (11905000) total, 285.16KB (292000) headers (space savings 12.34%), 10.49MB (11000000) data\n\
