@@ -349,8 +349,10 @@ fn parse_rejects_duplicate_latencies_key() {
         output_path: "o".into(),
     }
     .parse(&ctx, doc.as_bytes(), b"")
-    .expect_err("a duplicated latencies.99th key must be Err(Parse), even when the collapsed \
-                 value is itself monotone");
+    .expect_err(
+        "a duplicated latencies.99th key must be Err(Parse), even when the collapsed \
+                 value is itself monotone",
+    );
     assert!(matches!(err, BenchError::Parse { .. }));
 }
 

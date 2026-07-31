@@ -710,7 +710,9 @@ impl LoadGenerator for Vegeta {
                           non-negative, so quantile * requests_sent_f is non-negative and at most \
                           requests_sent_f; .round().clamp(...) bounds it before this cast"
             )]
-            let cumulative = (quantile * requests_sent_f).round().clamp(0.0, requests_sent_f) as u64;
+            let cumulative = (quantile * requests_sent_f)
+                .round()
+                .clamp(0.0, requests_sent_f) as u64;
             let weight = cumulative.saturating_sub(prev_cumulative);
             recorder.record_n_ns(value_ns, weight);
             allocated = allocated.saturating_add(weight);
