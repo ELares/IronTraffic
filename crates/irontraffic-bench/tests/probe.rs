@@ -50,7 +50,7 @@ use std::alloc::{GlobalAlloc, Layout, System};
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::process::{Child, Command, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -65,21 +65,49 @@ use proptest::prelude::*;
 // ---------------------------------------------------------------------------
 // Test 10's counting global allocator.
 //
-// Filters by THREAD NAME, not a plain process wide counter: `cargo test`
+// Filters by the SPECIFIC probe thread's OS level identity, not a plain
+// process wide counter and not (any more) a thread NAME match: `cargo test`
 // runs every `#[test]` function in this binary concurrently, on its own
 // thread, by default, and a plain global counter would attribute sibling
 // tests' allocations (building fixtures, spawning child processes, their own
-// probes) to this test's measurement window. `ProbeHandle::spawn` always
-// names its dedicated thread `"it-probe"`, so filtering on that name is what
-// makes the count mean "this probe's own steady-state loop", not "every
-// allocation anywhere in the binary right now".
+// probes) to this test's measurement window.
+//
+// A thread NAME match (`std::thread::current().name() == Some("it-probe")`)
+// was tried first, because `ProbeHandle::spawn` always names its dedicated
+// thread `"it-probe"`. It is not enough: EVERY probe in this file shares
+// that same name, so it cannot tell `zero_allocations_in_steady_state`'s own
+// probe thread apart from a DIFFERENT test's probe thread. That gap is
+// invisible for the three paths this file's own wrapper helpers
+// (`spawn_probe`, `finish_probe`, `reset_recorders_locked`) cover, because in
+// each of those the OWNING test thread holds `ALLOC_SENSITIVE` (below)
+// across the exact instant its own probe thread allocates. It is NOT
+// invisible for a probe thread that terminates ON ITS OWN mid test (reaches
+// `expected_requests`, or aborts): nothing is inside a wrapper at that
+// moment, so its exit path allocation (a `LatencyRecorder` clone, then
+// dropping `RunArgs`, which owns `config.host`/`config.path` and the
+// `StallTracker`'s own histogram) lands wherever `on_probe_thread` says
+// "it-probe", including inside a wholly unrelated counting window. Watched
+// live: a pristine, unmutated tree failed `zero_allocations_in_steady_state`
+// 1 run in 6 with "observed 10 across 5703 requests", the exact count this
+// repo's own round one report attributed to the (then still open)
+// `reset_recorders` gap before that one was locked.
+//
+// `ALLOC_TARGET_THREAD`, set once by `zero_allocations_in_steady_state`
+// itself right after it spawns its own probe (before any counting window
+// opens), closes this the rest of the way: a `ThreadId` is unique per
+// thread for the life of the process, so comparing against a captured ONE
+// cannot confuse this test's own probe thread with any other test's,
+// self-terminating or not.
 // ---------------------------------------------------------------------------
 
 static COUNTING: AtomicBool = AtomicBool::new(false);
 static PROBE_ALLOCATIONS: AtomicUsize = AtomicUsize::new(0);
+static ALLOC_TARGET_THREAD: OnceLock<std::thread::ThreadId> = OnceLock::new();
 
 fn on_probe_thread() -> bool {
-    std::thread::current().name() == Some("it-probe")
+    ALLOC_TARGET_THREAD
+        .get()
+        .is_some_and(|&target| std::thread::current().id() == target)
 }
 
 struct CountingAllocator;
@@ -242,24 +270,32 @@ fn real_time() -> SharedTime {
     Arc::new(SystemTimeSource::new())
 }
 
-/// Excludes every OTHER test's `ProbeHandle::spawn` (which allocates four
-/// ~216 KiB recorders) and `ProbeHandle::finish` (which drops them) from
-/// running at the same instant as `zero_allocations_in_steady_state`'s own
-/// counting window.
+/// Narrows every OTHER test's `ProbeHandle::spawn` (which allocates four
+/// ~216 KiB recorders) and `ProbeHandle::finish` (which drops them) away
+/// from running at the same instant as `zero_allocations_in_steady_state`'s
+/// own counting window.
 ///
-/// `cargo test` runs every function in this file concurrently by default,
-/// and `ProbeHandle::spawn` always names its thread `"it-probe"` (see the
-/// counting allocator's own doc comment), so a sibling test's spawn or
-/// teardown landing inside the zero-allocation test's window would inflate
-/// its count for a reason that has nothing to do with the probe's
-/// steady-state loop. Watched to fail: before this lock existed, a full
-/// parallel `cargo test` run of this file reported 10 allocations across
-/// 10,422 requests, while the SAME test run alone (`--test-threads=1`)
-/// reported 0; adding this lock (held briefly by every OTHER test's own
-/// spawn/finish, and held by `zero_allocations_in_steady_state` for its
-/// whole body) made the parallel run report 0 too. This only serialises the
-/// brief allocating instants, never the multi-second steady-state loops
-/// themselves (which are, by this same property, safe to run concurrently).
+/// `cargo test` runs every function in this file concurrently by default.
+/// Before `on_probe_thread` compared thread IDENTITY (`ALLOC_TARGET_THREAD`,
+/// see the counting allocator's own doc comment), this lock was the ONLY
+/// thing standing between a sibling test's spawn or teardown and a false
+/// count, because every probe's thread shares the literal name `"it-probe"`.
+/// Watched to fail, in that shape: before this lock existed, a full parallel
+/// `cargo test` run of this file reported 10 allocations across 10,422
+/// requests, while the SAME test run alone (`--test-threads=1`) reported 0.
+///
+/// The thread ID comparison now makes that particular failure structurally
+/// impossible on its own: a `ThreadId` is unique for the life of the
+/// process, so no OTHER test's probe thread, whatever it is doing, can ever
+/// equal the one `zero_allocations_in_steady_state` captured for itself.
+/// This lock stays anyway, held briefly by every OTHER test's own
+/// spawn/finish and held by `zero_allocations_in_steady_state` for its whole
+/// body: it costs nothing (uncontended in practice) and keeps this file's
+/// allocating instants narrow in general, rather than leaning on thread
+/// identity as the ONLY guard against a future change to how those instants
+/// overlap. It only ever serialises the brief allocating instants, never the
+/// multi-second steady-state loops themselves (which are, by this same
+/// property, safe to run concurrently).
 static ALLOC_SENSITIVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[allow(
@@ -283,11 +319,8 @@ fn finish_probe(handle: ProbeHandle) -> Result<ProbeOutcome, BenchError> {
 /// `reset_recorders`, briefly under [`ALLOC_SENSITIVE`], for exactly the same
 /// reason [`spawn_probe`] and [`finish_probe`] are: it reconstructs four
 /// ~216 KiB recorders on the SAME `"it-probe"`-named thread every probe in
-/// this file's own steady-state loop runs on, and `on_probe_thread`'s check
-/// (a thread NAME match) cannot distinguish one test's `"it-probe"` thread
-/// from another's when several run concurrently, which `cargo test`'s
-/// default parallelism means happens on every run. Found live: a longer,
-/// looping `zero_allocations_in_steady_state` (issue #802's `SHOULD_FIX` 5)
+/// this file's own steady-state loop runs on. Found live: a longer, looping
+/// `zero_allocations_in_steady_state` (issue #802's `SHOULD_FIX` 5)
 /// intermittently observed thousands of allocations that were not its own,
 /// traced to `reset_recorders_discards_and_returns_count`'s UN-guarded
 /// direct call landing inside the counted window of a wholly different
@@ -393,6 +426,72 @@ fn stub_close_after(n: u64) -> SocketAddr {
                 }
             }
             let _ = stream.shutdown(std::net::Shutdown::Both); // it-allow: no-swallowed-error reason: test stub cleanup; the socket is being abandoned either way
+        }
+    });
+    addr
+}
+
+#[allow(
+    clippy::expect_used,
+    reason = "test-support setup, not itself a #[test] fn: binding a loopback port on 127.0.0.1:0 does not fail on a working test host"
+)]
+/// Answers requests in strict GLOBAL issuance order, keyed by a shared
+/// counter rather than per connection, so the alternation below holds
+/// whether or not the probe reconnects between one request and the next.
+/// EVEN indexed requests get a bodiless-looking `304 Not Modified` head
+/// (no `Content-Length`), followed, after `delay`, by `late_body` written
+/// onto that SAME socket regardless of whether anything is still reading
+/// it. ODD indexed requests get an ordinary, well framed
+/// `200`/`Content-Length: 0`. Used by the round two regression test for
+/// issue #410's BLOCKING 1: a probe that (incorrectly) treats the 304 as a
+/// framing-safe zero-length body keeps the connection open across the
+/// alternation boundary, so the late body lands as the front of the very
+/// next response this stub writes; a probe that refuses it, and reconnects,
+/// never can, because the two requests are then served over TWO DIFFERENT
+/// sockets with no bytes shared between them.
+fn stub_not_modified_then_late_body(delay: Duration, late_body: &'static [u8]) -> SocketAddr {
+    let listener =
+        TcpListener::bind("127.0.0.1:0").expect("stub_not_modified_then_late_body: bind");
+    let addr = listener
+        .local_addr()
+        .expect("stub_not_modified_then_late_body: local_addr");
+    let next_index = Arc::new(AtomicU64::new(0));
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let next_index = Arc::clone(&next_index);
+            std::thread::spawn(move || {
+                loop {
+                    if !drain_one_request_head(&mut stream) {
+                        return;
+                    }
+                    let index = next_index.fetch_add(1, Ordering::SeqCst);
+                    if index.is_multiple_of(2) {
+                        if stream
+                            .write_all(b"HTTP/1.1 304 Not Modified\r\n\r\n")
+                            .is_err()
+                        {
+                            return;
+                        }
+                        // Spawned separately so writing the late body never
+                        // blocks this connection's own ability to serve a
+                        // NEXT request immediately, which is exactly what a
+                        // still-open connection (the unfixed bug's own
+                        // behaviour) would do in a real desynchronization.
+                        if let Ok(mut late) = stream.try_clone() {
+                            std::thread::spawn(move || {
+                                std::thread::sleep(delay);
+                                let _ = late.write_all(late_body); // it-allow: no-swallowed-error reason: a fixed probe has already reconnected and closed this socket by now, so this write failing (broken pipe) is the EXPECTED outcome, not a test-support setup failure
+                            });
+                        }
+                    } else if stream
+                        .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n")
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+            });
         }
     });
     addr
@@ -552,38 +651,81 @@ fn stub_refuses() -> SocketAddr {
 // ---------------------------------------------------------------------------
 #[test]
 fn probe_hits_target_rate() {
+    // Declared at the top of the function, ahead of every statement, per
+    // `clippy::items_after_statements`. See the comment below the
+    // `spawn_it_origin` call for what these configure and why.
+    const RATE_HZ: u64 = 100;
+    const WINDOW: Duration = Duration::from_secs(2);
+
     let origin = spawn_it_origin(&[]);
-    // 6,000 requests at 100 rps: the issue's own acceptance criterion is "a
-    // 60 second probe against it-origin achieves between 98 and 102 requests
-    // per second", stated at 60 seconds specifically because that is the
-    // scale at which a fixed measurement margin (see `elapsed` below) stops
-    // mattering. Before issue #802's SHOULD_FIX 2, this test measured only
-    // `issued` (a COUNT, satisfied even by an infinitely fast, completely
-    // unpaced probe, since the loop always stops at `expected_requests`
-    // regardless of how quickly it got there) and never `elapsed` (a RATE):
-    // watched to fail, a no-op `wait_until` passed this test outright.
+    // Round two of issue #802/#805: the previous version of this test ran
+    // the probe to its OWN natural completion (a 6,000 request schedule at
+    // 100 rps, 60 seconds) via `run_for`, then divided `issued` by the wall
+    // clock `elapsed`. That measured nothing about pacing, because
+    // `run_for`'s `settle_for` sleep elapses UNCONDITIONALLY, whether or not
+    // the probe has already reached `expected_requests`: a well-paced probe
+    // that finishes its own schedule in ~60.0s and a completely unpaced one
+    // that blows through the same 6,000 requests in milliseconds both make
+    // `run_for` block for essentially the same ~60.5s, which pins `elapsed`
+    // to a near constant. That, combined with `issued` being hard-capped at
+    // 6,000 by the loop itself, made the achieved-rate ceiling of the
+    // 98.0..=102.0 window UNREACHABLE by construction (issued / 60.5s tops
+    // out at 99.17) and its floor reduce to a bare `issued >= 5,929` count.
+    // Watched to fail: with `wait_until` made a no-op, this exact test
+    // passed in 60.74s.
+    //
+    // The fix samples ISSUED VOLUME inside a short, fixed real-clock window
+    // taken well before the schedule's own 60 second horizon, rather than
+    // waiting for the schedule to exhaust itself. `expected_requests` stays
+    // at 6,000, the issue's own literal number, specifically so it is NOT
+    // reachable within this short window at the true 100 rps pace and so it
+    // cannot cap `issued` the way it did before: `finish()` (inside
+    // `run_for`) instead interrupts the probe mid-schedule, at whatever
+    // request it is on (`stop_requested` is checked once per loop
+    // iteration, so the interruption lands within one request's own
+    // inter-arrival gap of the deadline below). A correctly paced probe
+    // therefore issues close to `WINDOW * rate_hz` requests, win or lose;
+    // an unpaced one has no such ceiling in this window and blows straight
+    // through it (measured directly, for this exact configuration and
+    // window, while writing this fix: 202 paced vs 6,000 unpaced).
+    //
+    // Plain integer arithmetic (RATE_HZ * whole seconds), not a float
+    // conversion: exact, and there is no cast to narrow back down from.
+    let expected_in_window = RATE_HZ * WINDOW.as_secs();
     let config = ProbeConfig {
-        rate_hz: 100,
+        rate_hz: RATE_HZ,
         expected_requests: 6_000,
         ..base_config(origin.addr)
     };
     let started = Instant::now();
     let handle = spawn_probe(config, real_time()).expect("spawns against a live origin");
-    // 6,000 requests at 100 rps is a 60 second schedule; wait past that so
-    // the probe reaches expected_requests on its own before finish() joins
-    // it. The 500ms margin over the nominal 60 seconds becomes under a 1%
-    // contributor to the elapsed time measured below, which is the entire
-    // reason this test runs at 60 seconds rather than the 10 seconds it used
-    // before: at 10 seconds the identical margin would have pulled the
-    // computed rate below 98 even for a probe pacing correctly (watched: a
-    // 10 second/1,000 request version of this same measurement computed
-    // ~95.2 rps against a probe that was, by every other measure, on time).
-    let outcome = run_for(handle, Duration::from_millis(60_500));
+    let outcome = run_for(handle, WINDOW);
     let elapsed = started.elapsed();
 
+    // +/- 20% around the requests a correctly paced 100 rps probe sends in
+    // a 2 second window: generous enough to absorb host scheduling jitter
+    // over a short window (an unpaced probe against this same 6,000
+    // request ceiling issues thousands here, not hundreds, so this margin
+    // never risks conflating the two).
+    #[expect(
+        clippy::integer_division,
+        reason = "expected_in_window * 4 is always a multiple of 5 for the RATE_HZ/WINDOW this \
+                  test configures (200 * 4 = 800), so this loses no precision; it is an exact \
+                  80% floor, not an approximation"
+    )]
+    let low = expected_in_window * 4 / 5;
+    #[expect(
+        clippy::integer_division,
+        reason = "expected_in_window * 6 is always a multiple of 5 for the RATE_HZ/WINDOW this \
+                  test configures (200 * 6 = 1200), so this loses no precision; it is an exact \
+                  120% ceiling, not an approximation"
+    )]
+    let high = expected_in_window * 6 / 5;
     assert!(
-        (5_880..=6_120).contains(&outcome.issued),
-        "issued {} must be within 2% of 6000",
+        (low..=high).contains(&outcome.issued),
+        "issued {} over {elapsed:?} must be close to the {expected_in_window} requests a probe \
+         correctly paced at {RATE_HZ} rps sends in a {WINDOW:?} window; a materially higher \
+         count means the probe is not pacing at all",
         outcome.issued
     );
     assert_eq!(
@@ -596,9 +738,11 @@ fn probe_hits_target_rate() {
     )]
     let achieved_rate = outcome.issued as f64 / elapsed.as_secs_f64();
     assert!(
-        (98.0..=102.0).contains(&achieved_rate),
-        "achieved rate {achieved_rate:.2} rps (issued {} over {elapsed:?}) must be within 2% of \
-         100 rps, per the issue's own acceptance criterion",
+        (75.0..=125.0).contains(&achieved_rate),
+        "achieved rate {achieved_rate:.2} rps (issued {} over {elapsed:?}) must be close to the \
+         configured {RATE_HZ} rps; unlike the round one version of this test, expected_requests \
+         (6,000) is unreachable in this {WINDOW:?} window at the true pace, so it cannot mask an \
+         unpaced probe behind an unreachable ceiling",
         outcome.issued
     );
     // The issue's Design section states the stall bracket is closed for
@@ -912,6 +1056,65 @@ fn well_formed_non_200_response_is_counted_bad_not_ok() {
     );
 }
 
+/// Not one of the issue's 16 named tests. Round two of issue #410's review
+/// demonstrated LIVE that `scan_response_head`'s former `304` exception was
+/// the original missing-`Content-Length` defect wearing a status code: a
+/// peer answering a bodiless-looking `304` head and then writing a real body
+/// a moment later desynchronized the next exchange, because the exception
+/// let the exchange complete (and keep the connection) at the head
+/// terminator, before that body ever arrived. A unit test that only feeds
+/// the scanner a bare head, as `wire.rs`'s own tests do, cannot see this: the
+/// leak is a property of TWO exchanges sharing ONE socket, which needs a
+/// real connection.
+///
+/// `stub_not_modified_then_late_body` answers every EVEN indexed request
+/// with exactly that shape and every ODD indexed request with an ordinary,
+/// well-framed `200`. The fix (refusing the `304` like any other missing
+/// length, which forces `needs_reconnect: true`) makes every single request
+/// land on a BRAND NEW socket, so the two request kinds can never share a
+/// buffer: `bad` must land on every even index and `ok` on every odd one,
+/// with no exceptions and no bleed-through in either direction. Watched to
+/// fail against a reintroduced `None if status == 304 => 0` in `wire.rs`:
+/// the late body corrupts the odd-indexed exchange that follows it (this
+/// file's module doc comment's `MISFRAME` shape), which flips that
+/// exchange's classification away from the deterministic split asserted
+/// below.
+#[test]
+fn not_modified_with_a_late_body_forces_a_reconnect_not_a_leak() {
+    let addr = stub_not_modified_then_late_body(Duration::from_millis(30), b"XXXXXXXXXX");
+    let config = ProbeConfig {
+        rate_hz: 10,
+        expected_requests: 6,
+        ..base_config(addr)
+    };
+    let handle = spawn_probe(config, real_time()).expect("spawns against the stub");
+    // 6 requests at 10 rps is a 0.6 second schedule; 2 seconds is a
+    // generous margin over that plus the six 30ms late-body delays.
+    let outcome = run_for(handle, Duration::from_secs(2));
+
+    assert_eq!(outcome.issued, 6, "the full schedule must complete");
+    assert_eq!(
+        outcome.bad, 3,
+        "the three EVEN indexed 304-with-late-body exchanges must every one be refused, \
+         not merely most of them"
+    );
+    assert_eq!(
+        outcome.ok, 3,
+        "the three ODD indexed, ordinarily well-framed 200 exchanges must every one still be \
+         counted ok, proving the preceding 304's late body never bled into them"
+    );
+    assert_eq!(
+        outcome.errors, 0,
+        "a refused head is a framing refusal, not an I/O error"
+    );
+    assert!(
+        outcome.reconnects >= 3,
+        "each of the three refusals must force a reconnect (a fresh socket is exactly what \
+         makes the leak structurally impossible), got {}",
+        outcome.reconnects
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 9. reset_recorders_discards_and_returns_count
 // ---------------------------------------------------------------------------
@@ -977,6 +1180,16 @@ fn zero_allocations_in_steady_state() {
         ..base_config(origin.addr)
     };
     let handle = ProbeHandle::spawn(config, real_time()).expect("spawns");
+    // Captured before COUNTING is ever set true below, so `on_probe_thread`
+    // has a real target for every round: this is what makes the count
+    // attribute to THIS probe's own thread rather than to whichever thread
+    // in the process happens to be named `"it-probe"` at the moment. See
+    // the counting allocator's own doc comment for the failure this closes
+    // (a DIFFERENT test's probe self-terminating, and so allocating on its
+    // own exit path, mid way through this test's window).
+    ALLOC_TARGET_THREAD
+        .set(handle.thread_id())
+        .expect("zero_allocations_in_steady_state runs its #[test] fn body, and therefore this line, at most once per test binary invocation");
 
     // Let startup (the connect, and whatever one-off setup happens before
     // the request loop) settle before measuring: this window is meant to be
