@@ -2060,16 +2060,27 @@ all (`Nighthawk` is the arbiter specifically because it is not code this project
 is in `science/benchmarking.md` and `crates/irontraffic-bench/src/loadgen/nighthawk.rs`'s own module
 doc, not repeated here; this section is only about what running it costs.
 
-**The digest pin is the actual control, and it is enforced by construction, not by convention.**
-`Nighthawk::from_pin` is the ONLY constructor this type has, and it is the only code path that ever
-builds the `image` field: it reads `bench/tools/nighthawk.digest`, trims ASCII whitespace, and
+**The digest pin is the actual control, and `Nighthawk::from_pin` is the only path that enforces
+it.** `Nighthawk::from_pin` reads `bench/tools/nighthawk.digest`, trims ASCII whitespace, and
 requires the remainder to match `^sha256:[0-9a-f]{64}$` exactly, byte for byte, with no fallback to a
 tag on any error path (a missing file, a malformed digest, or a tag such as `latest` are each a
 distinct `Err`, never a warning that lets construction proceed anyway). There is no
-`--skip-digest-check` escape hatch, and no code anywhere in this crate joins `image_repo` with a tag
+`--skip-digest-check` escape hatch, and no code anywhere in `from_pin` joins `image_repo` with a tag
 string. A digest is content-addressed and immutable; a tag is a mutable pointer an upstream compromise
 or a build re-run can silently repoint, which is exactly the property a "pinned" benchmark cannot
 tolerate: a run whose tool changed underneath it between two invocations is not a comparison.
+**This is enforced by construction only when a caller goes through `from_pin`, not by the type
+system**: `Nighthawk`'s three fields (`runtime`, `image`, `client_cores`) are `pub`, per this issue's
+own Public API section, so any code in this crate CAN build one directly with a struct literal and an
+arbitrary `image` string, bypassing every check above. `tests/loadgen_nighthawk.rs`'s own
+`base_nighthawk` helper and `fuzz/fuzz_targets/fuzz_loadgen_json.rs` both do exactly this,
+deliberately, so that `plan`/`parse` are testable and fuzzable without a real digest file on disk. The
+guarantee this project actually has is narrower than "enforced by construction": every REAL caller in
+`{{bench-runner-and-repetition}}`'s driver binary is required to build its one production `Nighthawk`
+through `from_pin`, and nothing here stops a future caller from constructing one another way. If that
+guarantee ever needs to be type-enforced rather than conventional, the fields would need to become
+private with accessors; this issue's own Public API section specifies them `pub`, so that change is
+out of scope here and is not claimed.
 
 **`image_repo` and `client_cores` are interpolated into a `docker run`/`podman run` argument vector,
 and this is an argument-injection surface even though the vector itself is not a shell-injection
@@ -2081,10 +2092,30 @@ sees the first token that is not one. A value of `--privileged` in the `image_re
 consumed by the runtime as a FLAG, and the following literal `nighthawk_client` token is read as the
 image name instead: a real privilege escalation reached through a field that looks like inert
 configuration. `Nighthawk::from_pin` validates both fields once, at construction (length cap,
-character class, and a `starts_with('-')`/leading-`.` rejection), so `plan` can never be reached with
-an unvalidated field: `crates/irontraffic-bench/tests/loadgen_nighthawk.rs`'s
-`from_pin_rejects_flag_shaped_fields` pins this for both fields against `--privileged`, a bare `-v`,
-and (for `image_repo`) a leading `.` and an oversized string.
+character class, and a `starts_with('-')`/leading-`.` rejection), so `plan` cannot be reached with an
+unvalidated field WHEN THE ADAPTER WAS BUILT THROUGH `from_pin`, exactly like the digest pin above:
+`crates/irontraffic-bench/tests/loadgen_nighthawk.rs`'s `from_pin_rejects_flag_shaped_fields` pins
+this for both fields against `--privileged`, a bare `-v`, and (for `image_repo`) a leading `.` and an
+oversized string. A `Nighthawk` built by struct literal, as this crate's own tests and fuzz target do,
+carries none of these guarantees, which is why neither of them treats a struct-literal instance's
+`plan()` output as evidence of anything beyond "the argument vector renders whatever fields it is
+given".
+
+**Both invocation-building methods carry the digest pin, and both carry the same five hardening
+flags.** `Nighthawk` has two methods that build a `docker run`/`podman run` command: `plan` (the actual
+measurement run) and
+`version_invocation` (`nighthawk_client --version`, run once per pin to confirm the probed binary
+identifies itself as Nighthawk before any cell is measured). Both read `self.image`, so both carry
+whatever digest the adapter was constructed with; there is no second, less-pinned invocation path. An
+earlier revision of this adapter gave `version_invocation` none of the five hardening flags below,
+reasoning that a version probe "only" prints a string; that reasoning was wrong precisely because the
+version probe is the FIRST invocation ever run against a freshly pinned digest, which is the moment a
+compromised upstream image is most likely to be executed. `version_invocation` now carries
+`--cap-drop ALL`, `--security-opt no-new-privileges`, `--read-only`, `--memory 4g` and
+`--pids-limit 4096`, the same five flags `plan` carries below. It does not carry `--network host`
+(the version probe makes no network call), the `--tmpfs` scratch pairing (nothing here writes), or
+`--cpuset-cpus` (there is no measurement to keep off other cores). Each omission is an absence of a
+need, not a hardening gap.
 
 **Why `--network host` is a deliberate measurement requirement, not an oversight, and the one
 isolation boundary this invocation deliberately gives up.** A bridge network's NAT adds a hop with its
