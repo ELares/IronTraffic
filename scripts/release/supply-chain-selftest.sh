@@ -505,33 +505,56 @@ test_verify_version_regex_handles_aarch64() {
 # ---------------------------------------------------------------------------
 # 12c. verify_runs_standalone_outside_repo
 #
-# docs/SUPPLY-CHAIN.md documents downloading verify.sh (and
-# sbom-licence-check.sh) STANDALONE, beside the tarball, with no repository
-# checkout: "curl the script beside the tarball, then
-# `sh verify.sh --artifact <tarball>`". verify.sh used to compute a
-# "repository root" two directories above itself and `cd` there before
-# using a relative --artifact path, which is correct only when the script
-# still sits inside scripts/release/ of a checkout; run the documented way,
-# that `cd` landed two levels above the actual download directory, and the
-# relative artifact path no longer resolved. Every OTHER test in this file
-# invokes verify.sh with an ABSOLUTE artifact path from inside the repo,
-# which is structurally blind to this: this test is the one that is not.
+# docs/SUPPLY-CHAIN.md documents downloading the artifact, its SBOM,
+# verify.sh, sbom-licence-check.sh, deny.toml AND licence-exceptions.txt
+# into ONE flat directory with no repository checkout anywhere on the
+# machine, then running `sh verify.sh --artifact <tarball> --sbom <sbom>`
+# (section 3's flagship command; --sbom is not an afterthought there, it is
+# the headline form). verify.sh used to compute a "repository root" two
+# directories above itself and `cd` there before using a relative
+# --artifact path, which is correct only when the script still sits inside
+# scripts/release/ of a checkout; run the documented way, that `cd` landed
+# two levels above the actual download directory, and the relative
+# artifact path no longer resolved.
+#
+# THIS FIXTURE USED TO COPY ONLY verify.sh AND NEVER PASS --sbom (#788):
+# that is precisely why sbom-licence-check.sh's OWN identical
+# two-directories-above-itself default for deny.toml survived fixing
+# verify.sh's chdir. Copying sbom-licence-check.sh, deny.toml and
+# licence-exceptions.txt in too, and asserting the licence check actually
+# PASSES (not merely "does not crash"), is what closes that gap: run
+# exactly as documented from this bare directory, a genuinely good
+# artifact and a genuine (real, workspace-generated) SBOM must produce a
+# real, passing licence check, not a false "not a subset of the allowlist"
+# tamper alarm accusing the artifact of what was actually this script's own
+# inability to find its allowlist.
 # ---------------------------------------------------------------------------
 test_verify_runs_standalone_outside_repo() {
     dir="$WORK/standalone-fixture"
     mkdir -p "$dir"
     cp "$REPO_ROOT/scripts/release/verify.sh" "$dir/verify.sh"
+    cp "$REPO_ROOT/scripts/release/sbom-licence-check.sh" "$dir/sbom-licence-check.sh"
+    cp "$REPO_ROOT/deny.toml" "$dir/deny.toml"
+    cp "$REPO_ROOT/scripts/release/licence-exceptions.txt" "$dir/licence-exceptions.txt"
     artifact_name="irontraffic-9.9.9-x86_64-unknown-linux-musl.tar.gz"
+    sbom_name="$artifact_name.sbom.json"
     printf 'standalone fixture artifact content\n' > "$dir/$artifact_name"
+    # FIXTURE_SBOM (the shared, REAL sbom.sh output built at the top of
+    # this file) carries irontraffic:target = FIXTURE_TARGET
+    # ("x86_64-unknown-linux-musl"), matching $artifact_name's own target
+    # segment, so the sbom-binding target comparison inside verify.sh
+    # passes for a genuine reason below, not merely because nothing
+    # compared it.
+    cp "$FIXTURE_SBOM" "$dir/$sbom_name"
     ( cd "$dir" && write_sha256sums_line "$artifact_name" )
 
     # A subshell, not the current shell: `cd` here must not leak into the
     # rest of this script. `sh verify.sh` (not an absolute script path)
-    # AND a relative --artifact both matter: the reviewer's own repro used
-    # exactly this shape.
-    out="$(cd "$dir" && sh verify.sh --artifact "$artifact_name" --allow-skipped 2>&1)" && status=0 || status=$?
+    # AND a relative --artifact/--sbom both matter: the reviewer's own
+    # repro used exactly this shape.
+    out="$(cd "$dir" && sh verify.sh --artifact "$artifact_name" --sbom "$sbom_name" --allow-skipped 2>&1)" && status=0 || status=$?
     if [ "$status" -ne 0 ]; then
-        fail "verify_runs_standalone_outside_repo" "verify.sh failed when run standalone (no repo checkout) with a relative --artifact path: $out"
+        fail "verify_runs_standalone_outside_repo" "verify.sh failed when run standalone (no repo checkout), the documented --artifact/--sbom flow: $out"
         return
     fi
     if ! printf '%s' "$out" | grep -q "checksum: done"; then
@@ -540,6 +563,34 @@ test_verify_runs_standalone_outside_repo() {
     fi
     if printf '%s' "$out" | grep -qi "no such file"; then
         fail "verify_runs_standalone_outside_repo" "verify.sh reported a missing file despite the artifact sitting right next to it: $out"
+        return
+    fi
+    # #788's own reproduction, inverted into an assertion: sbom-licence-
+    # check.sh used to look for deny.toml two directories above this bare
+    # directory, found nothing there, and verify.sh reported "FAILED: sbom
+    # licence: not a subset of the allowlist" / "error: no such deny.toml"
+    # over a deny.toml sitting right beside it the whole time.
+    if printf '%s' "$out" | grep -qi "no such deny.toml"; then
+        fail "verify_runs_standalone_outside_repo" "sbom-licence-check.sh could not find deny.toml despite it sitting right next to it: $out"
+        return
+    fi
+    if ! printf '%s' "$out" | grep -q "sbom licence: subset of the allowlist"; then
+        fail "verify_runs_standalone_outside_repo" "sbom licence check did not genuinely pass (deny.toml/licence-exceptions.txt were not actually resolved beside the script): $out"
+        return
+    fi
+    # This standalone run has no .intoto.bundle anywhere (real network,
+    # deliberately never reached: no real release named "9.9.9" exists),
+    # so provenance is genuinely unreachable and the cargo_lock_sha256
+    # half of the sbom binding check has nothing authoritative to compare
+    # against. verify.sh's own header promises --allow-skipped "prints one
+    # named line per skipped check", and this is the one place in this
+    # file where that specific check is naturally, honestly unreachable
+    # (not a fabricated fixture): asserting its named skip line appears
+    # here, rather than being silently dropped from the summary, is what
+    # this test's own --allow-skipped exit-0 assertion above cannot tell
+    # apart from "there was nothing else to check".
+    if ! printf '%s' "$out" | grep -q "skipped: sbom binding: cargo_lock_sha256"; then
+        fail "verify_runs_standalone_outside_repo" "cargo_lock_sha256 binding was silently omitted from the summary instead of a named skip: $out"
         return
     fi
     pass "verify_runs_standalone_outside_repo"
@@ -583,6 +634,237 @@ test_verify_binds_sbom_to_artifact_target() {
         return
     fi
     pass "verify_binds_sbom_to_artifact_target"
+}
+
+# ---------------------------------------------------------------------------
+# 12e/12f. verify_binds_sbom_cargo_lock_sha256_matches / _mismatch
+#
+# Invariant 8's OTHER other half. The only binding fixture above (12d)
+# points IT_RELEASE_BASE_URL at an unreachable .invalid host so that the
+# whole run stays network-free, which also means verify.sh's own
+# provenance step never verifies there: provenance_cargo_lock_sha256 stays
+# unset, and verify.sh's second, independent binding comparison (the
+# cargo_lock_sha256 block) is never reached by ANY test. If sbom.sh
+# silently stopped emitting irontraffic:cargo_lock_sha256, or verify.sh's
+# own comparison were simply deleted, every test in this file would stay
+# green.
+#
+# Reaching it needs a verified provenance, which needs `cosign
+# verify-blob-attestation` to succeed. A REAL Fulcio-issued signature is
+# only obtainable inside GitHub Actions with an ambient OIDC token (see
+# build_real_signed_fixture's own header, below), and even there,
+# verify.sh's own --certificate-identity-regexp is pinned to refs/tags/v*
+# only, which a same-repository pull request's own identity can never
+# match (test 17's own subject) -- so a fixture built that way could never
+# reach this comparison EITHER, on any pull request, ever. Neither
+# obstacle has anything to do with what this pair of tests is actually
+# checking: verify.sh's own LOCAL string comparison between two values it
+# has already decoded, not cosign's cryptography. A `cosign` stub on PATH
+# that unconditionally exits 0 for verify-blob-attestation takes the
+# cryptography out of the way (the same technique used to probe this bug
+# in the first place, and the same shape as this file's own `iuname` stub
+# for install.sh's end-to-end test, above), while a hand-built,
+# well-formed `<artifact>.intoto.bundle` supplies the DSSE payload
+# verify.sh decodes and compares FOR REAL, straight from the local file --
+# so this reaches the comparison for real, is free of network, and is free
+# of any ambient GitHub Actions identity, unlike tests 14/15/17.
+#
+# build_cargo_lock_binding_fixture writes an artifact, a matching
+# SHA256SUMS line, and a genuinely well-formed .intoto.bundle whose
+# subject digest is the REAL sha256 of the artifact it just wrote (so
+# verify.sh's own, un-stubbed digest comparison at step 3 passes for a
+# genuine reason) and whose cargoLockSha256 is whatever the caller passed
+# in; it does not build or place the SBOM itself, since the two tests below
+# need different (matching vs. mismatching) SBOM-side values.
+# ---------------------------------------------------------------------------
+build_cargo_lock_binding_fixture() {
+    dir="$1"
+    provenance_cargo_lock_sha256="$2"
+    mkdir -p "$dir/stub-bin"
+    cat > "$dir/stub-bin/cosign" <<'EOF'
+#!/bin/sh
+# Stands in for a real cosign, for these two tests only (PATH-scoped):
+# unconditionally accepts any verify-blob-attestation/verify-blob call.
+# verify.sh decodes the actual binding data itself, straight out of the
+# local .intoto.bundle's own DSSE payload, so this stub controls nothing
+# about what is being compared -- only whether cosign's OWN cryptographic
+# check (deliberately out of scope for these tests; see their header) is
+# treated as having passed.
+case "$1" in
+    verify-blob-attestation|verify-blob) exit 0 ;;
+    *) exit 1 ;;
+esac
+EOF
+    chmod +x "$dir/stub-bin/cosign"
+
+    artifact="$dir/irontraffic-9.9.9-x86_64-unknown-linux-musl.tar.gz"
+    printf 'cargo-lock-binding fixture artifact content\n' > "$artifact"
+    write_sha256sums_line "$artifact"
+
+    artifact_sha256="$(sha256_of "$artifact")"
+    payload_json="$(jq -n --arg sha "$artifact_sha256" --arg cl "$provenance_cargo_lock_sha256" '
+        {
+            subject: [ { digest: { sha256: $sha } } ],
+            predicate: {
+                invocation: {
+                    configSource: {
+                        digest: { sha1: "0000000000000000000000000000000000000000" },
+                        uri: "git+https://github.com/ELares/IronTraffic@refs/heads/selftest-fixture"
+                    },
+                    parameters: { cargoLockSha256: $cl, dirty: "false" }
+                },
+                builder: { id: "https://github.com/ELares/IronTraffic/.github/workflows/ci.yml@refs/heads/selftest-fixture" }
+            }
+        }')"
+    payload_b64="$(printf '%s' "$payload_json" | base64 | tr -d '\n')"
+    jq -n --arg payload "$payload_b64" '{dsseEnvelope: {payload: $payload}}' > "$artifact.intoto.bundle"
+
+    printf '%s' "$artifact" > "$dir/artifact-path.txt"
+}
+
+test_verify_binds_sbom_cargo_lock_sha256_matches() {
+    dir="$WORK/cargo-lock-match-fixture"
+    mkdir -p "$dir"
+    printf 'selftest cargo lock fixture value (match)\n' > "$dir/lockval"
+    cargo_lock_sha256="$(sha256_of "$dir/lockval")"
+    build_cargo_lock_binding_fixture "$dir" "$cargo_lock_sha256"
+    artifact="$(cat "$dir/artifact-path.txt")"
+
+    sbom="$dir/irontraffic-9.9.9-x86_64-unknown-linux-musl.tar.gz.sbom.json"
+    jq -n --arg target "x86_64-unknown-linux-musl" --arg cl "$cargo_lock_sha256" \
+        '{"$schema": "http://cyclonedx.org/schema/bom-1.6.schema.json", bomFormat: "CycloneDX",
+          specVersion: "1.6", version: 1,
+          metadata: { properties: [ { name: "irontraffic:target", value: $target },
+                                     { name: "irontraffic:cargo_lock_sha256", value: $cl } ] },
+          components: []}' > "$sbom"
+
+    out="$(PATH="$dir/stub-bin:$PATH" IT_RELEASE_BASE_URL="https://verify-cargo-lock-fixture.invalid/releases" \
+        sh "$REPO_ROOT/scripts/release/verify.sh" --artifact "$artifact" --sbom "$sbom" --allow-skipped 2>&1)" && status=0 || status=$?
+    if [ "$status" -ne 0 ]; then
+        fail "verify_binds_sbom_cargo_lock_sha256_matches" "verify.sh failed despite a genuinely matching cargo_lock_sha256: $out"
+        return
+    fi
+    if ! printf '%s' "$out" | grep -q "provenance: verified"; then
+        fail "verify_binds_sbom_cargo_lock_sha256_matches" "provenance did not verify, so the cargo_lock_sha256 comparison this test exists to reach was never even attempted: $out"
+        return
+    fi
+    if ! printf '%s' "$out" | grep -q "sbom binding: cargo_lock_sha256 matches the artifact's own provenance"; then
+        fail "verify_binds_sbom_cargo_lock_sha256_matches" "cargo_lock_sha256 binding success line did not print: $out"
+        return
+    fi
+    pass "verify_binds_sbom_cargo_lock_sha256_matches"
+}
+
+test_verify_binds_sbom_cargo_lock_sha256_mismatch() {
+    dir="$WORK/cargo-lock-mismatch-fixture"
+    mkdir -p "$dir"
+    printf 'selftest cargo lock fixture value (provenance side)\n' > "$dir/lockval"
+    provenance_cargo_lock_sha256="$(sha256_of "$dir/lockval")"
+    build_cargo_lock_binding_fixture "$dir" "$provenance_cargo_lock_sha256"
+    artifact="$(cat "$dir/artifact-path.txt")"
+
+    printf 'selftest cargo lock fixture value (sbom side, DIFFERENT)\n' > "$dir/lockval-sbom"
+    sbom_cargo_lock_sha256="$(sha256_of "$dir/lockval-sbom")"
+
+    sbom="$dir/irontraffic-9.9.9-x86_64-unknown-linux-musl.tar.gz.sbom.json"
+    jq -n --arg target "x86_64-unknown-linux-musl" --arg cl "$sbom_cargo_lock_sha256" \
+        '{"$schema": "http://cyclonedx.org/schema/bom-1.6.schema.json", bomFormat: "CycloneDX",
+          specVersion: "1.6", version: 1,
+          metadata: { properties: [ { name: "irontraffic:target", value: $target },
+                                     { name: "irontraffic:cargo_lock_sha256", value: $cl } ] },
+          components: []}' > "$sbom"
+
+    out="$(PATH="$dir/stub-bin:$PATH" IT_RELEASE_BASE_URL="https://verify-cargo-lock-fixture.invalid/releases" \
+        sh "$REPO_ROOT/scripts/release/verify.sh" --artifact "$artifact" --sbom "$sbom" --allow-skipped 2>&1)" && status=0 || status=$?
+    if [ "$status" -eq 0 ]; then
+        fail "verify_binds_sbom_cargo_lock_sha256_mismatch" "verify.sh exited 0 despite a genuinely mismatching cargo_lock_sha256: $out"
+        return
+    fi
+    if ! printf '%s' "$out" | grep -q "sbom binding: sbom's cargo_lock_sha256"; then
+        fail "verify_binds_sbom_cargo_lock_sha256_mismatch" "failure did not name the cargo_lock_sha256 binding check: $out"
+        return
+    fi
+    pass "verify_binds_sbom_cargo_lock_sha256_mismatch"
+}
+
+# ---------------------------------------------------------------------------
+# 12g. verify_checksum_tolerates_hash_in_directory_name
+#
+# verify.sh's checksum step used to pipe the awk selector's matched line
+# through `sed "s#$sums_dir/##"` to strip a directory prefix that, per 12a's
+# own header, a real SHA256SUMS line never actually carries: awk's exact
+# `$2 == name` match can only ever succeed against a line whose second
+# field ALREADY equals the bare basename. That `sed` used `#` as its own
+# program delimiter while also interpolating $sums_dir, UNESCAPED, into
+# that same program: a download directory whose own name contains a
+# literal `#` broke the substitution, sed's own error was swallowed by
+# `2>/dev/null`, $this_line came out empty, and a perfectly good artifact
+# was reported "not listed in SHA256SUMS". Removing the (provably
+# redundant; see 12a) sed entirely, rather than escaping it, is what this
+# fixture guards: its own directory name is chosen specifically to contain
+# `#`.
+# ---------------------------------------------------------------------------
+test_verify_checksum_tolerates_hash_in_directory_name() {
+    dir="$WORK/hash#in#dirname"
+    mkdir -p "$dir"
+    artifact="$dir/irontraffic-9.9.9-x86_64-unknown-linux-musl.tar.gz"
+    printf 'hash-in-dirname fixture artifact content\n' > "$artifact"
+    write_sha256sums_line "$artifact"
+
+    out="$(sh "$REPO_ROOT/scripts/release/verify.sh" --artifact "$artifact" --allow-skipped 2>&1)" && status=0 || status=$?
+    if [ "$status" -ne 0 ]; then
+        fail "verify_checksum_tolerates_hash_in_directory_name" "verify.sh failed against a genuine artifact merely because its own directory name contains '#': $out"
+        return
+    fi
+    if ! printf '%s' "$out" | grep -q "checksum: done"; then
+        fail "verify_checksum_tolerates_hash_in_directory_name" "checksum step did not report done: $out"
+        return
+    fi
+    pass "verify_checksum_tolerates_hash_in_directory_name"
+}
+
+# ---------------------------------------------------------------------------
+# 12h. verify_sbom_licence_check_skips_when_no_allowlist_found
+#
+# #788's own honest-degrade half, exercised on its own (12c above always
+# has a deny.toml to find, so it never reaches sbom-licence-check.sh's
+# exit-3 branch or verify.sh's handling of it). This fixture copies
+# verify.sh and sbom-licence-check.sh into a bare directory but
+# deliberately WITHOUT deny.toml or licence-exceptions.txt anywhere either
+# beside them or two directories above (a fresh mktemp tree has neither):
+# a good artifact and a well-formed SBOM must produce a named SKIP, never
+# a FAILED line that reads as though the SBOM's own licence set was
+# checked and found wanting.
+# ---------------------------------------------------------------------------
+test_verify_sbom_licence_check_skips_when_no_allowlist_found() {
+    dir="$WORK/no-allowlist-fixture"
+    mkdir -p "$dir"
+    cp "$REPO_ROOT/scripts/release/verify.sh" "$dir/verify.sh"
+    cp "$REPO_ROOT/scripts/release/sbom-licence-check.sh" "$dir/sbom-licence-check.sh"
+    artifact_name="irontraffic-9.9.9-x86_64-unknown-linux-musl.tar.gz"
+    sbom_name="$artifact_name.sbom.json"
+    printf 'no-allowlist fixture artifact content\n' > "$dir/$artifact_name"
+    jq -n --arg target "x86_64-unknown-linux-musl" \
+        '{"$schema": "http://cyclonedx.org/schema/bom-1.6.schema.json", bomFormat: "CycloneDX",
+          specVersion: "1.6", version: 1,
+          metadata: { properties: [ { name: "irontraffic:target", value: $target } ] },
+          components: []}' > "$dir/$sbom_name"
+    ( cd "$dir" && write_sha256sums_line "$artifact_name" )
+
+    out="$(cd "$dir" && sh verify.sh --artifact "$artifact_name" --sbom "$sbom_name" --allow-skipped 2>&1)" && status=0 || status=$?
+    if [ "$status" -ne 0 ]; then
+        fail "verify_sbom_licence_check_skips_when_no_allowlist_found" "verify.sh exited nonzero with --allow-skipped despite a missing allowlist being a SKIP, not a FAIL: $out"
+        return
+    fi
+    if printf '%s' "$out" | grep -qi "FAILED: sbom licence"; then
+        fail "verify_sbom_licence_check_skips_when_no_allowlist_found" "a missing allowlist was reported as a FAILED licence check (blaming the artifact) rather than a named skip: $out"
+        return
+    fi
+    if ! printf '%s' "$out" | grep -q "skipped: sbom licence"; then
+        fail "verify_sbom_licence_check_skips_when_no_allowlist_found" "the missing allowlist produced no named skip line at all: $out"
+        return
+    fi
+    pass "verify_sbom_licence_check_skips_when_no_allowlist_found"
 }
 
 # ---------------------------------------------------------------------------
@@ -991,6 +1273,10 @@ test_verify_checksum_ignores_sbom_substring_collision
 test_verify_version_regex_handles_aarch64
 test_verify_runs_standalone_outside_repo
 test_verify_binds_sbom_to_artifact_target
+test_verify_binds_sbom_cargo_lock_sha256_matches
+test_verify_binds_sbom_cargo_lock_sha256_mismatch
+test_verify_checksum_tolerates_hash_in_directory_name
+test_verify_sbom_licence_check_skips_when_no_allowlist_found
 test_verify_fails_when_a_check_is_skipped
 test_install_verifies_by_default
 test_verify_prints_source_commit
