@@ -22,3 +22,11 @@
 # neither of which is a configuration change. ArcSwap::store appears in exactly one function,
 # TlsMaterialCell::publish, both defined in this one file.
 crates/irontraffic-tls/src/store/publish.rs
+#
+# Not an ArcSwap publisher (issue #407, bench-provenance-capture): the one
+# `.store(` in this file is `AtomicBool::store` on a plain `Arc<AtomicBool>`
+# flag two bounded-probe drain threads use to tell the main thread a byte
+# cap was exceeded. There is no ArcSwap, no config snapshot, and no torn-read
+# hazard this rule protects against here; it is caught only because the rule
+# is deliberately over-broad (see the rule's own header comment).
+crates/irontraffic-bench/src/provenance.rs
