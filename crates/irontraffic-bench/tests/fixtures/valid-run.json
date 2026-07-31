@@ -1,0 +1,136 @@
+{
+  "cell": "base",
+  "cell_def": {
+    "id": "base",
+    "protocol": "h1",
+    "tls": "off",
+    "payload_bytes": 1024,
+    "routes": 1,
+    "path_corpus": "single_hot",
+    "connections": 64,
+    "upstreams": 1,
+    "filter_depth": 0,
+    "cache": "bypass",
+    "keepalive": "both",
+    "rate": "saturate"
+  },
+  "provenance": {
+    "utc_date": "2026-07-24T00:00:00Z",
+    "hardware": "Example CPU, 8c/16t, 32 GiB",
+    "cpu_model": "Example CPU",
+    "cpu_arch": "aarch64",
+    "physical_cores": 8,
+    "physical_cores_assumed": false,
+    "logical_cores": 16,
+    "mem_bytes": 34359738368,
+    "instance_type": null,
+    "burstable": false,
+    "kernel": "6.1.0-generic",
+    "clocksource": "tsc",
+    "governor": "performance",
+    "thermal_throttle_count": 0,
+    "ulimit_nofile": 1048576,
+    "ip_local_port_range": [
+      32768,
+      60999
+    ],
+    "sut": {
+      "name": "irontraffic",
+      "version": "0.1.0",
+      "git_sha": "0a1b2c3d4e5f",
+      "dirty": false,
+      "profile": "release",
+      "features": [],
+      "stamp_source": "embedded"
+    },
+    "origin": {
+      "name": "it-origin",
+      "version": "0.1.0",
+      "git_sha": "0a1b2c3d4e5f",
+      "dirty": false,
+      "profile": "release",
+      "features": [],
+      "stamp_source": "embedded"
+    },
+    "loadgen": {
+      "name": "nighthawk",
+      "version": "1.0.0",
+      "image_digest": null
+    },
+    "warmup_seconds": 5,
+    "measure_seconds": 60,
+    "repetitions": 1,
+    "publishable": true,
+    "unpublishable_reasons": []
+  },
+  "rps": 50000.0,
+  "latency": {
+    "p50_ns": 500000,
+    "p90_ns": 1000000,
+    "p99_ns": 2000000,
+    "p999_ns": 3000000,
+    "p9999_ns": 4000000,
+    "max_ns": 5000000,
+    "samples": 600000
+  },
+  "probe_latency": {
+    "p50_ns": 300000,
+    "p90_ns": 600000,
+    "p99_ns": 1200000,
+    "p999_ns": 1500000,
+    "p9999_ns": 1800000,
+    "max_ns": 2000000,
+    "samples": 60000
+  },
+  "ttfb": {
+    "p50_ns": 100000,
+    "p90_ns": 200000,
+    "p99_ns": 400000,
+    "p999_ns": 600000,
+    "p9999_ns": 800000,
+    "max_ns": 1000000,
+    "samples": 600000
+  },
+  "connect": {
+    "p50_ns": 50000,
+    "p90_ns": 100000,
+    "p99_ns": 200000,
+    "p999_ns": 300000,
+    "p9999_ns": 400000,
+    "max_ns": 500000,
+    "samples": 64
+  },
+  "stall": {
+    "p50_ns": 0,
+    "p90_ns": 0,
+    "p99_ns": 50000,
+    "p999_ns": 60000,
+    "p9999_ns": 70000,
+    "max_ns": 80000,
+    "samples": 600000
+  },
+  "cpu_seconds_per_request": null,
+  "rss_bytes": 200000000,
+  "pss_bytes": 180000000,
+  "bytes_received": 1024000000,
+  "payload_bytes": 1024,
+  "total_requests": 1000000,
+  "status_counts": {
+    "200": 1000000
+  },
+  "origin_ceiling_rps": 100000.0,
+  "direct_rps": 90000.0,
+  "client_cpu_max_pct": 45.0,
+  "sut_cores": 8,
+  "catchup_burst_count": 0,
+  "out_of_range": 0,
+  "stall_out_of_range": 0,
+  "stall_backwards_count": 0,
+  "warmup_samples_discarded": 500,
+  "deepest_percentile": "p99",
+  "bottleneck": "cpu",
+  "validity": {
+    "kind": "valid"
+  },
+  "command_line": "it-loadgen --cell base --rate saturate --duration 60 --warmup 5"
+}

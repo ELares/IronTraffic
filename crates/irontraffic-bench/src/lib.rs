@@ -21,14 +21,19 @@
 
 mod cell;
 mod error;
+mod guards;
 mod hist;
 mod provenance;
+mod result;
 
 pub use cell::{
     BenchCell, CacheMode, CellId, KeepaliveMode, PathCorpus, Protocol, RESERVED_STEMS, RateMode,
     TlsMode,
 };
 pub use error::{BenchError, Detail, MAX_DETAIL_BYTES};
+pub use guards::{
+    MAX_CLIENT_CPU_PCT, MAX_IQR_PERMILLE, MAX_ORIGIN_UTILISATION_PERMILLE, check_validity,
+};
 pub use hist::{
     HIGH_NS, LOW_NS, LatencyRecorder, MAX_HGRM_BYTES, MAX_HGRM_LINE_BYTES, MAX_HGRM_LINES,
     MAX_HGRM_TOTAL_COUNT, Percentiles, SIGNIFICANT_DIGITS, high_ns_ceiling,
@@ -38,4 +43,8 @@ pub use provenance::{
     PROBE_OUTPUT_CAP, PROBE_TIMEOUT_SECONDS, Provenance, SMALL_FILE_CAP, StampSource, ToolStamp,
     capture_build_stamp, format_utc_date, is_burstable, normalize_instance_type, parse_cpuinfo,
     parse_meminfo, read_bounded, render_hardware, resolve_cpu_model,
+};
+pub use result::{
+    Bottleneck, DeepestPercentile, InvariantId, MAX_COMMAND_LINE, RunResult, SuspectReason,
+    Validity,
 };
