@@ -84,8 +84,14 @@ fn debt_accumulation() {
     assert_eq!(first.count, 1);
 
     let jumped = schedule.releasable_at(100_000_000);
-    assert_eq!(jumped.debt, 1_000, "100 ms at 10 kHz owes exactly 1,000 requests");
-    assert_eq!(jumped.count, 64, "first post-jump call is capped at burst_cap");
+    assert_eq!(
+        jumped.debt, 1_000,
+        "100 ms at 10 kHz owes exactly 1,000 requests"
+    );
+    assert_eq!(
+        jumped.count, 64,
+        "first post-jump call is capped at burst_cap"
+    );
 
     let mut counts = vec![jumped.count];
     loop {
@@ -179,7 +185,10 @@ fn catchup_is_o1_after_a_long_stall() {
     let release = schedule.releasable_at(one_hour_ns);
     let elapsed = start.elapsed();
 
-    assert_eq!(release.count, 64, "capped release, same as the steady-state cost");
+    assert_eq!(
+        release.count, 64,
+        "capped release, same as the steady-state cost"
+    );
     assert!(
         elapsed < std::time::Duration::from_millis(1),
         "releasable_at after a one hour stall took {elapsed:?}, which means entitlement was \
@@ -197,12 +206,20 @@ fn max_index_boundary() {
     let schedule_fast = Schedule::new(0, 1_000_000, 64).expect("valid schedule");
     assert_eq!(schedule_fast.max_index(), 18_446_744_073_709_551);
     assert!(schedule_fast.due_ns(schedule_fast.max_index()).is_some());
-    assert!(schedule_fast.due_ns(schedule_fast.max_index() + 1).is_none());
+    assert!(
+        schedule_fast
+            .due_ns(schedule_fast.max_index() + 1)
+            .is_none()
+    );
 
     let schedule_slow = Schedule::new(0, 1, 64).expect("valid schedule");
     assert_eq!(schedule_slow.max_index(), 18_446_744_073);
     assert!(schedule_slow.due_ns(schedule_slow.max_index()).is_some());
-    assert!(schedule_slow.due_ns(schedule_slow.max_index() + 1).is_none());
+    assert!(
+        schedule_slow
+            .due_ns(schedule_slow.max_index() + 1)
+            .is_none()
+    );
 
     assert_ne!(
         schedule_fast.max_index(),
@@ -245,11 +262,19 @@ fn stall_tracker_brackets_outermost() {
     tracker.on_blocked(100);
     tracker.on_blocked(200);
     tracker.on_unblocked(500);
-    assert_eq!(tracker.recorder().len(), 1, "must not read as an empty, healthy run");
+    assert_eq!(
+        tracker.recorder().len(),
+        1,
+        "must not read as an empty, healthy run"
+    );
     assert_eq!(tracker.recorder().percentiles().max_ns, 400);
 
     tracker.on_unblocked(600);
-    assert_eq!(tracker.recorder().len(), 1, "an on_unblocked with no open interval is a no-op");
+    assert_eq!(
+        tracker.recorder().len(),
+        1,
+        "an on_unblocked with no open interval is a no-op"
+    );
 }
 
 #[test]
@@ -272,7 +297,11 @@ fn stall_tracker_survives_backwards_time() {
 
     assert_eq!(tracker.backwards_count(), 1);
     assert_eq!(tracker.out_of_range(), 0);
-    assert_eq!(tracker.recorder().len(), 1, "the backwards call must still record a sample");
+    assert_eq!(
+        tracker.recorder().len(),
+        1,
+        "the backwards call must still record a sample"
+    );
     assert_eq!(
         tracker.recorder().percentiles().max_ns,
         LOW_NS,
@@ -291,15 +320,25 @@ fn stall_beyond_sixty_seconds_is_counted_not_dropped() {
     tracker.on_blocked(0);
     tracker.on_unblocked(61_000_000_000);
 
-    assert_eq!(tracker.out_of_range(), 1, "a lost stall sample must never read as zero");
-    assert!(tracker.recorder().is_empty(), "the sample must not be clamped into the top bucket");
+    assert_eq!(
+        tracker.out_of_range(),
+        1,
+        "a lost stall sample must never read as zero"
+    );
+    assert!(
+        tracker.recorder().is_empty(),
+        "the sample must not be clamped into the top bucket"
+    );
 
     // A publishable run is exactly the invariant this out-of-range count
     // exists to police: a nonzero StallTracker::out_of_range means the run
     // must be rejected, matching how {{bench-run-result-and-validity-guards}}
     // is specified to treat `stall_out_of_range`.
     let publishable = tracker.out_of_range() == 0;
-    assert!(!publishable, "a run whose worst stall fell off the histogram must not publish");
+    assert!(
+        !publishable,
+        "a run whose worst stall fell off the histogram must not publish"
+    );
 }
 
 #[test]
@@ -308,8 +347,14 @@ fn rate_and_cap_validation() {
     // (0, 1000, MAX_BURST_CAP + 1) are all Err(BenchError::Cell(_)); (0,
     // 1000, MAX_BURST_CAP) is Ok.
     assert!(matches!(Schedule::new(0, 0, 64), Err(BenchError::Cell(_))));
-    assert!(matches!(Schedule::new(0, 50_000_001, 64), Err(BenchError::Cell(_))));
-    assert!(matches!(Schedule::new(0, 1000, 0), Err(BenchError::Cell(_))));
+    assert!(matches!(
+        Schedule::new(0, 50_000_001, 64),
+        Err(BenchError::Cell(_))
+    ));
+    assert!(matches!(
+        Schedule::new(0, 1000, 0),
+        Err(BenchError::Cell(_))
+    ));
     assert!(matches!(
         Schedule::new(0, 1000, MAX_BURST_CAP + 1),
         Err(BenchError::Cell(_))
@@ -328,7 +373,10 @@ fn entitlement_is_exact_at_a_non_dividing_rate() {
     assert_eq!(first.count, 1);
 
     let second = schedule.releasable_at(333_333_333);
-    assert_eq!(second.count, 1, "request 1 is exactly due at 333_333_333 ns");
+    assert_eq!(
+        second.count, 1,
+        "request 1 is exactly due at 333_333_333 ns"
+    );
 }
 
 #[test]
@@ -346,7 +394,10 @@ fn exhausted_schedule_stops_releasing() {
         let release = schedule.releasable_at(u64::MAX);
         total_released += release.count;
     }
-    assert_eq!(total_released, 6, "indices 0 through 5, six requests in total");
+    assert_eq!(
+        total_released, 6,
+        "indices 0 through 5, six requests in total"
+    );
 
     for _ in 0..4 {
         let release = schedule.releasable_at(u64::MAX);
@@ -392,7 +443,10 @@ fn due_ns_survives_a_long_history_of_stalls_and_repayment() {
     for _ in 0..2_000 {
         let jump_ns = rng.next() % 10_000; // small stalls, well under 50 ms
         now_ns += jump_ns;
-        assert!(now_ns < expected_due_ns, "test setup must not reach far_future_index's due time");
+        assert!(
+            now_ns < expected_due_ns,
+            "test setup must not reach far_future_index's due time"
+        );
         let _ = schedule.releasable_at(now_ns);
         // Immediate re-poll at the identical instant, the shape a caller
         // spinning on a stale next_wake_ns would produce.
@@ -422,21 +476,33 @@ fn released_indices_include_a_capped_multi_index_release() {
     let release = schedule.releasable_at(200_000);
     assert_eq!(release.first_index, 0);
     assert_eq!(release.count, 64, "capped at burst_cap");
-    assert!(release.debt > release.count, "debt must exceed count for this to be a real cap");
+    assert!(
+        release.debt > release.count,
+        "debt must exceed count for this to be a real cap"
+    );
 
     let mut expected_next = release.count;
     let mut total_released = release.count;
     loop {
         let next = schedule.releasable_at(200_000);
-        assert_eq!(next.first_index, expected_next, "released indices must stay contiguous");
+        assert_eq!(
+            next.first_index, expected_next,
+            "released indices must stay contiguous"
+        );
         expected_next += next.count;
         total_released += next.count;
         if next.count == 0 {
             break;
         }
     }
-    assert_eq!(total_released, 201, "indices 0..=200, due_ns(200) == 200_000 exactly");
-    assert!(total_released > 64, "must not read as a healthy, uncapped single release");
+    assert_eq!(
+        total_released, 201,
+        "indices 0..=200, due_ns(200) == 200_000 exactly"
+    );
+    assert!(
+        total_released > 64,
+        "must not read as a healthy, uncapped single release"
+    );
 }
 
 // ---------------------------------------------------------------------------
