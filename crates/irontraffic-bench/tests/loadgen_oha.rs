@@ -1409,3 +1409,75 @@ fn parse_rejects_non_finite_or_negative_percentile() {
         "expected the percentile finite/non-negative guard to reject this input; got: {detail}"
     );
 }
+
+/// `SHOULD_FIX` finding 8 (1 of 3): neither `PathCorpus::UniformRandom` nor
+/// `PathCorpus::AdversarialWorstCase` was ever planned by any test, so
+/// deleting `--max-repeat 4` (the issue's own explicit Do NOT: "Do NOT
+/// omit --max-repeat 4 when --rand-regex-url is present") while keeping
+/// `--rand-regex-url` left the previous suite green.
+#[test]
+fn plan_non_single_hot_path_corpus_adds_max_repeat_and_rand_regex_url() {
+    let run = base_run();
+    for corpus in [PathCorpus::UniformRandom, PathCorpus::AdversarialWorstCase] {
+        let mut cell = base_cell();
+        cell.path_corpus = corpus;
+        let mut target = base_target();
+        target.path_expr = "/[a-z]{1,10}".to_owned();
+        let args = Oha
+            .plan(&cell, &target, &run)
+            .unwrap_or_else(|e| panic!("{corpus:?} cell must plan: {e}"))
+            .args;
+        find_subsequence(&args, &["--max-repeat", "4", "--rand-regex-url"]).unwrap_or_else(|| {
+            panic!(
+                "{corpus:?}: --max-repeat 4 and --rand-regex-url must appear adjacently and in \
+                 order, got {args:?}"
+            )
+        });
+    }
+
+    let single_hot_args = Oha
+        .plan(&base_cell(), &base_target(), &run)
+        .expect("SingleHot plans")
+        .args;
+    assert!(
+        !single_hot_args.iter().any(|a| a == "--rand-regex-url"),
+        "SingleHot must never add --rand-regex-url"
+    );
+}
+
+/// `SHOULD_FIX` finding 8 (2 of 3): the `Protocol::H2` mapping-table row
+/// (`--http2`) was never planned by any test, so deleting it for an H2
+/// cell would silently measure H1 while the cell claims H2, and the
+/// previous suite would not have noticed.
+#[test]
+fn plan_h2_protocol_adds_http2_flag() {
+    let mut cell = base_cell();
+    cell.protocol = Protocol::H2;
+    let args = Oha
+        .plan(&cell, &base_target(), &base_run())
+        .expect("H2 cell plans")
+        .args;
+    let idx = find_subsequence(&args, &["json", "--http2", "-c"])
+        .expect("--http2 must sit between the output-format flags and -c for an H2 cell");
+    assert!(idx < args.len());
+}
+
+/// `SHOULD_FIX` finding 8 (3 of 3): `saturate_is_unsupported` and
+/// `h3_is_unsupported` call `supports` directly; no test called `plan`
+/// itself with a cell `supports` refuses, so deleting `plan`'s own
+/// `self.supports(cell)?` gate would have left the previous suite green.
+#[test]
+fn plan_refuses_a_cell_supports_rejects() {
+    let mut cell = base_cell();
+    cell.protocol = Protocol::H3;
+    let err = Oha
+        .plan(&cell, &base_target(), &base_run())
+        .expect_err("plan must itself refuse a cell supports rejects, not only supports");
+    let BenchError::Cell(msg) = err else {
+        panic!("expected BenchError::Cell");
+    };
+    assert!(
+        msg.contains("protocol"),
+        "expected the message to name protocol, got: {msg}"
+    );
+}
