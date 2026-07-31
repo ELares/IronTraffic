@@ -34,7 +34,7 @@ core_affinity = { workspace = true }
 # (`PreciseMono`, `SharedTime`) the probe thread reads instead of calling
 # `std::time::Instant::now` directly. Already on main from `time-source-seam`
 # (#5).
-irontraffic-time = { path = "../irontraffic-time" }
+irontraffic-time = { path = "../irontraffic-time", version = "0.1.0" }
 # The `oha` load-generator adapter's output parser (`src/loadgen/oha.rs`)
 # deserialises the tool's captured JSON stdout. Moved here from
 # dev-dependencies by `bench-loadgen-oha-adapter` (#411): `bench-crate-and-cell-model`
@@ -59,7 +59,7 @@ criterion = { workspace = true }
 # (a real `it-origin` on an ephemeral port) cannot compile otherwise. Test-only:
 # never a normal dependency, and `irontraffic-bench`'s own production code
 # never names it.
-irontraffic-origin = { path = "../irontraffic-origin" }
+irontraffic-origin = { path = "../irontraffic-origin", version = "0.1.0" }
 
 [[bench]]
 name = "harness"
