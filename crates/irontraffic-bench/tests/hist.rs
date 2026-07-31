@@ -33,6 +33,7 @@ use irontraffic_bench::{
     BenchError, HIGH_NS, LOW_NS, LatencyRecorder, MAX_HGRM_BYTES, MAX_HGRM_LINE_BYTES,
     MAX_HGRM_LINES, MAX_HGRM_TOTAL_COUNT, Percentiles,
 };
+use proptest::strategy::Strategy;
 
 /// `HdrHistogram`'s own stated precision guarantee is accuracy to within
 /// `SIGNIFICANT_DIGITS` (3) significant decimal digits of the true value,
@@ -126,6 +127,53 @@ fn high_boundary_is_in_range() {
     r.record_ns(HIGH_NS);
     assert_eq!(r.out_of_range(), 0);
     assert_eq!(r.len(), 1);
+    // Pinned against the LITERAL 60_028_878_847, independently measured
+    // (`hdrhistogram::Histogram::highest_equivalent(HIGH_NS)` on this
+    // crate's fixed LOW_NS/SIGNIFICANT_DIGITS configuration), not against
+    // `high_ns_ceiling()` itself: comparing the SUT's own output to a second
+    // call into the SAME function under test would prove nothing about
+    // whether that function computes the right answer. This is issue #782
+    // BLOCKING 1's core fact: a single sample recorded AT HIGH_NS reads back
+    // ABOVE HIGH_NS, because `hdrhistogram` reports a bucket's highest
+    // equivalent value, not the literal recorded value.
+    assert_eq!(r.percentiles().max_ns, 60_028_878_847);
+}
+
+#[test]
+fn high_boundary_round_trips_through_hgrm() {
+    // Regression test for issue #782 BLOCKING 1: a `.hgrm` written from a
+    // recorder holding a sample AT `HIGH_NS` used to be REJECTED by
+    // `read_hgrm`, because `write_hgrm` reports that sample's bucket as
+    // `60_028_878_847` (see `high_boundary_is_in_range`), which is above
+    // `HIGH_NS` (60_000_000_000). Before the fix this test's `write_hgrm`
+    // call already succeeds (it always did); it is `read_hgrm` on that exact
+    // output that used to return
+    // `Err(Parse { tool: "hgrm", detail: "value column exceeds HIGH_NS" })`.
+    let mut r = recorder();
+    r.record_ns(HIGH_NS);
+
+    let mut buf = Vec::new();
+    r.write_hgrm(&mut buf)
+        .expect("write_hgrm to a Vec<u8> cannot fail");
+    let text = std::str::from_utf8(&buf).expect("write_hgrm always writes valid utf-8");
+    assert!(
+        text.contains("60028878847.000"),
+        "fixture precondition: write_hgrm must actually emit the too-high bucket value for \
+         this test to exercise the bug it regresses; got:\n{text}"
+    );
+
+    let back = LatencyRecorder::read_hgrm(&buf)
+        .expect("write_hgrm's own output for a sample AT HIGH_NS must read back");
+    assert_eq!(
+        back.len(),
+        1,
+        "the sample must be recorded, not diverted to out_of_range"
+    );
+    assert_eq!(back.out_of_range(), 0);
+    // Pinned against the same literal as `high_boundary_is_in_range`: the
+    // read-back recorder's sample and the original both land in HIGH_NS's
+    // own bucket, so both report the identical bucket ceiling.
+    assert_eq!(back.percentiles().max_ns, 60_028_878_847);
 }
 
 #[test]
@@ -234,11 +282,70 @@ fn merged_p99_differs_from_averaged_p99() {
 }
 
 #[test]
+fn percentiles_span_distinct_orders_of_magnitude() {
+    // Issue #782 BLOCKING 2: `p999_ns` and `p9999_ns` can each be computed
+    // from the WRONG quantile with every other test in this file green,
+    // because no OTHER fixture has a distribution where p99, p999 and p9999
+    // differ. `single_sample_collapses` makes all six quantiles equal, so it
+    // cannot tell WHICH quantile a field queried. `hgrm_round_trip` compares
+    // `restored.p999_ns` against `original.p999_ns`, so an identical
+    // mutation on both the writer and reader path cancels exactly.
+    // `percentiles_are_monotone`'s OWN generator was separately vacuous (see
+    // its comment below). This fixture is six groups sized so p50, p90, p99,
+    // p999, p9999 and max each land in a DIFFERENT histogram bucket, with
+    // enough margin from each cumulative boundary that HdrHistogram's own
+    // rank rounding cannot move a percentile into its neighbour's group.
+    //
+    // The six expected values are LITERALS, independently measured from
+    // this exact fixture against a bare `hdrhistogram::Histogram` (not
+    // derived from `Percentiles::required_samples` or any other expression
+    // this crate computes), and pinned via `assert_within_3sig` rather than
+    // `assert_eq!` for the same reason every other percentile assertion in
+    // this file is: HdrHistogram's 3-significant-digit guarantee is a
+    // bound, not an equality. Watched to fail (see issue #782's own
+    // methodology): mutating `p999_ns` to `value_at_quantile(0.99)` or
+    // `p9999_ns` to `value_at_quantile(0.999)`, the two mutations BLOCKING 2
+    // reports as surviving every other test in this file, both fail this
+    // assertion with the actual value off by two, respectively one, orders
+    // of magnitude.
+    let mut r = recorder();
+    r.record_n_ns(1_000, 700_000);
+    r.record_n_ns(100_000, 250_000);
+    r.record_n_ns(10_000_000, 45_000);
+    r.record_n_ns(1_000_000_000, 4_500);
+    r.record_n_ns(10_000_000_000, 800);
+    r.record_n_ns(45_000_000_000, 10);
+    let p = r.percentiles();
+    assert_eq!(p.samples, 1_000_310, "fixture precondition");
+
+    assert_within_3sig(p.p50_ns, 1_000, "heavy tail p50, group 1 of 6");
+    assert_within_3sig(p.p90_ns, 100_000, "heavy tail p90, group 2 of 6");
+    assert_within_3sig(p.p99_ns, 10_000_000, "heavy tail p99, group 3 of 6");
+    assert_within_3sig(p.p999_ns, 1_000_000_000, "heavy tail p999, group 4 of 6");
+    assert_within_3sig(p.p9999_ns, 10_000_000_000, "heavy tail p9999, group 5 of 6");
+    assert_within_3sig(p.max_ns, 45_000_000_000, "heavy tail max, group 6 of 6");
+
+    // Each field must land in a DIFFERENT bucket: strictly increasing, not
+    // merely non-decreasing, which is what distinguishes this fixture from
+    // the vacuous all-out-of-range draws `percentiles_are_monotone`'s old
+    // generator produced.
+    assert!(p.p50_ns < p.p90_ns);
+    assert!(p.p90_ns < p.p99_ns);
+    assert!(p.p99_ns < p.p999_ns);
+    assert!(p.p999_ns < p.p9999_ns);
+    assert!(p.p9999_ns < p.max_ns);
+}
+
+#[test]
 fn hgrm_round_trip() {
     let mut r = recorder();
     // A mixed distribution: a dense low cluster, a mid cluster and a sparse
-    // tail, 100,000 samples in total, so the round trip exercises more than
-    // one bucket.
+    // tail, plus one sample AT HIGH_NS (issue #782 BLOCKING 1: HIGH_NS's own
+    // bucket reads back above HIGH_NS, which is exactly the case
+    // `high_boundary_round_trips_through_hgrm` isolates; this fixture proves
+    // it also survives inside a larger, mixed round trip, not only alone).
+    // 100,001 samples in total, so the round trip exercises more than one
+    // bucket.
     for i in 0..80_000u64 {
         r.record_ns(100 + (i % 500));
     }
@@ -248,7 +355,8 @@ fn hgrm_round_trip() {
     for i in 0..1_000u64 {
         r.record_ns(10_000_000 + i);
     }
-    assert_eq!(r.len(), 100_000, "fixture precondition");
+    r.record_ns(HIGH_NS);
+    assert_eq!(r.len(), 100_001, "fixture precondition");
 
     let mut buf = Vec::new();
     r.write_hgrm(&mut buf)
@@ -269,26 +377,59 @@ fn hgrm_round_trip() {
 
 #[test]
 fn hgrm_rejects_malformed() {
-    let cases: [(&str, &str); 5] = [
-        ("short line", "1.000 0.5 100\n"),
-        ("non-numeric value", "abc 0.500000000000 100 2.00\n"),
-        ("percentile above 1", "1.000 1.500000000000 100 2.00\n"),
+    // Six cases, each asserted against its OWN `detail` text, not merely the
+    // `BenchError::Parse { tool: "hgrm", .. }` variant: a variant-only
+    // assertion is satisfiable by ANY rejection reason, so it cannot prove
+    // which guard actually fired. The sixth case (a decreasing `Percentile`
+    // column) is issue #782 SHOULD_FIX 8: `read_hgrm`'s own doc comment
+    // lists "a non-monotone percentile column" among the errors it returns,
+    // and the guard is real (confirmed below and by the watched-to-fail
+    // mutation this test's history records), but before this case existed
+    // nothing constructed one, so deleting the guard left the suite green.
+    let cases: [(&str, &str, &str); 6] = [
+        (
+            "short line",
+            "1.000 0.5 100\n",
+            "line has fewer than four fields",
+        ),
+        (
+            "non-numeric value",
+            "abc 0.500000000000 100 2.00\n",
+            "value column is not a number",
+        ),
+        (
+            "percentile above 1",
+            "1.000 1.500000000000 100 2.00\n",
+            "percentile column is not finite or is outside [0, 1]",
+        ),
         (
             "decreasing total count",
             "1.000 0.100000000000 100 2.00\n2.000 0.200000000000 50 2.00\n",
+            "total count column decreased",
         ),
         (
             "value above HIGH_NS",
             "70000000000.000 0.500000000000 100 2.00\n",
+            "value column exceeds the recorder's representable range",
+        ),
+        (
+            "decreasing percentile column",
+            "1.000 0.900000000000 5 10.00\n2.000 0.100000000000 9 1.11\n",
+            "percentile column is not monotone",
         ),
     ];
-    for (label, text) in cases {
+    for (label, text, expected_detail) in cases {
         let err = LatencyRecorder::read_hgrm(text.as_bytes())
             .err()
             .unwrap_or_else(|| panic!("{label}: expected Err, got Ok"));
+        let BenchError::Parse { tool, detail } = &err else {
+            panic!("{label}: expected BenchError::Parse, got {err:?}");
+        };
+        assert_eq!(*tool, "hgrm", "{label}");
         assert!(
-            matches!(err, BenchError::Parse { tool: "hgrm", .. }),
-            "{label}: expected BenchError::Parse {{ tool: \"hgrm\", .. }}, got {err:?}"
+            detail.as_str().contains(expected_detail),
+            "{label}: expected detail to contain {expected_detail:?}, got {:?}",
+            detail.as_str()
         );
     }
 }
@@ -363,10 +504,30 @@ fn hgrm_rejects_oversized_input() {
 
 #[test]
 fn hgrm_rejects_over_long_line() {
-    let line = vec![b'1'; MAX_HGRM_LINE_BYTES + 1];
+    // Issue #782 SHOULD_FIX 6: the OLD fixture (`vec![b'1'; MAX_HGRM_LINE_BYTES + 1]`, a single
+    // token with no whitespace) tested nothing about the bound it is named for. With the
+    // MAX_HGRM_LINE_BYTES check deleted entirely, that SAME input is rejected anyway by "line has
+    // fewer than four fields", identically satisfying `matches!(err, BenchError::Parse { .. })`,
+    // so the suite stayed green with the check gone (confirmed: `cargo test` still reported
+    // `22 passed`). This fixture is instead a well-formed four-field row padded PAST the bound in
+    // its last (unparsed) field, so deleting the check would make it parse successfully instead
+    // of erroring, and the assertion is on the error's own `detail` text, which the per-line bound
+    // and the four-field check produce DIFFERENT text for.
+    let base = "1.000 0.500000000000 1 2.00";
+    let padding = "9".repeat(MAX_HGRM_LINE_BYTES + 1 - base.len());
+    let line = format!("{base}{padding}");
     assert_eq!(line.len(), MAX_HGRM_LINE_BYTES + 1, "fixture precondition");
-    let err = LatencyRecorder::read_hgrm(&line).expect_err("must exceed MAX_HGRM_LINE_BYTES");
-    assert!(matches!(err, BenchError::Parse { tool: "hgrm", .. }));
+    let err =
+        LatencyRecorder::read_hgrm(line.as_bytes()).expect_err("must exceed MAX_HGRM_LINE_BYTES");
+    let BenchError::Parse { tool, detail } = &err else {
+        panic!("expected BenchError::Parse, got {err:?}");
+    };
+    assert_eq!(*tool, "hgrm");
+    assert!(
+        detail.as_str().contains("MAX_HGRM_LINE_BYTES"),
+        "expected the per-line bound (not the four-field check) to reject this input; got: {}",
+        detail.as_str()
+    );
 }
 
 #[test]
@@ -405,6 +566,52 @@ fn hgrm_rejects_absurd_total_count() {
     let err = LatencyRecorder::read_hgrm(u64_max.as_bytes())
         .expect_err("u64::MAX must be Err, not a wrapped or rounded value");
     assert!(matches!(err, BenchError::Parse { tool: "hgrm", .. }));
+}
+
+#[test]
+fn record_n_ns_zero_count_is_a_true_no_op() {
+    // Issue #782 SHOULD_FIX 7: `record_n_ns`'s `if count == 0 { return; }` guard is load-bearing
+    // on the untrusted `read_hgrm` path (see `hgrm_zero_delta_row_cannot_inject_a_fabricated_max`
+    // below), not merely an optimisation, because `hdrhistogram::Histogram::record_n` updates its
+    // own min/max tracking even when called with `count == 0`. Deleting the guard leaves the
+    // whole suite green (confirmed: `cargo test` still reports `22 passed`), but changes
+    // observable behaviour: with the guard, recording 1_000 then a ZERO-count record at 5_000_000
+    // leaves `max_ns` at 1_000; without it, `max_ns` becomes 5_001_215.
+    let mut r = recorder();
+    r.record_ns(1_000);
+    r.record_n_ns(5_000_000, 0);
+    assert_eq!(r.len(), 1, "the zero-count call must not add a sample");
+    assert_within_3sig(
+        r.percentiles().max_ns,
+        1_000,
+        "a zero-count record_n_ns call must not move max_ns",
+    );
+}
+
+#[test]
+fn hgrm_zero_delta_row_cannot_inject_a_fabricated_max() {
+    // The untrusted-path version of the test above. `read_hgrm` computes
+    // `count_delta = total - prev_total`, which is 0 for any row repeating the previous
+    // cumulative `TotalCount`, and `read_hgrm` never requires the `Value` column itself to be
+    // non-decreasing (only `Percentile` and `TotalCount` are checked for monotonicity). So a
+    // hand-edited two-row file whose second row repeats the first row's `TotalCount` at a far
+    // larger `Value` must NOT inject that `Value` into the recorder's published maximum: with the
+    // `count == 0` guard in place, `record_n_ns` never touches `hdrhistogram`'s min/max tracking
+    // for that second row at all.
+    let text = "1000.000 0.500000000000 5 2.00\n50000000000.000 0.900000000000 5 10.00\n";
+    let r = LatencyRecorder::read_hgrm(text.as_bytes())
+        .expect("both rows are individually well formed");
+    assert_eq!(
+        r.len(),
+        5,
+        "fixture precondition: only the first row's count_delta (5 - 0) is nonzero"
+    );
+    assert_within_3sig(
+        r.percentiles().max_ns,
+        1_000,
+        "the second row's zero count_delta must not inject its Value (50 seconds) as the \
+         recorder's max",
+    );
 }
 
 #[test]
@@ -488,6 +695,45 @@ fn permutation_of(len: usize, mut seed: u64) -> Vec<usize> {
     indices
 }
 
+/// Strategy for `hgrm_parse_is_total` (issue #782 `SHOULD_FIX` 5): MOSTLY
+/// well-formed `.hgrm` row text, one to five rows with a strictly ascending
+/// quantile and cumulative total (so every row's monotonicity checks pass
+/// and every row contributes at least one sample), rendered with the SAME
+/// four whitespace-separated fields `parse_hgrm_row` reads, plus a minority
+/// (10%) of fully adversarial raw strings (the narrowed generator this
+/// replaces, `[0-9 .\n]{0,64}`) so the "never panics, always Ok-or-Err"
+/// property this test primarily exists for keeps exercising genuinely
+/// malformed input too, not only well-formed rows.
+#[allow(
+    clippy::expect_used,
+    reason = "test-only strategy constructor, not itself a #[test] fn: the regex literal below \
+              is fixed and this crate's own, so it cannot fail to compile"
+)]
+fn hgrm_like_text() -> impl proptest::strategy::Strategy<Value = String> {
+    use std::fmt::Write as _;
+
+    let well_formed = proptest::collection::vec((1_u64..=HIGH_NS, 1_u64..=10_000u64), 1..=5)
+        .prop_map(|rows| {
+            let n = rows.len();
+            let mut total: u64 = 0;
+            let mut out = String::new();
+            for (i, (value, count_delta)) in rows.into_iter().enumerate() {
+                total += count_delta;
+                #[allow(
+                    clippy::cast_precision_loss,
+                    reason = "n is bounded to 1..=5 by the generator above and i < n, so this \
+                              division is a small, exact-enough f64 fraction in (0.0, 1.0]"
+                )]
+                let quantile = (i + 1) as f64 / n as f64;
+                let _ = writeln!(out, "{value}.000 {quantile:.12} {total} 9.99");
+            }
+            out
+        });
+    let adversarial = proptest::string::string_regex("[0-9 .\n]{0,64}")
+        .expect("fixed regex literal always compiles");
+    proptest::prop_oneof![9 => well_formed, 1 => adversarial]
+}
+
 proptest::proptest! {
     #[test]
     fn merge_is_order_independent(
@@ -512,6 +758,30 @@ proptest::proptest! {
         let baseline_percentiles = baseline.percentiles();
         let baseline_out_of_range = baseline.out_of_range();
 
+        // Issue #782 SHOULD_FIX 9: every assertion below this line compares
+        // `merged` against `baseline`, both produced by the SAME merge code
+        // starting from the SAME "fresh recorder, merge each group in turn"
+        // pattern (the production shape: issue #405 names it directly,
+        // "Per-worker recorders are merged after the run"). That proves the
+        // eight orders agree with EACH OTHER, never that any of them are
+        // RIGHT: a merge that silently drops every group (for example, one
+        // that only adds `other`'s counts when `self` is already non-empty,
+        // which starts false for a freshly constructed recorder and stays
+        // false forever after) makes `baseline` and every `merged` all
+        // equally, identically empty, and the whole property holds
+        // trivially. This line anchors the property to the actual input:
+        // `baseline`'s sample count must equal the number of values the
+        // fixture itself recorded, a literal computed from `groups`, not
+        // from anything `LatencyRecorder` itself returns.
+        #[allow(
+            clippy::cast_possible_truncation,
+            reason = "each group is bounded to 0..=500 elements and there are at most 8 groups \
+                      by the generator above, so the true sum is at most 4,000, comfortably \
+                      inside u64 and inside usize on every platform this crate targets"
+        )]
+        let expected_samples = groups.iter().map(Vec::len).sum::<usize>() as u64;
+        proptest::prop_assert_eq!(baseline_percentiles.samples, expected_samples);
+
         for seed in 0_u64..8 {
             let order = permutation_of(recorders.len(), seed ^ 0x9E37_79B9_7F4A_7C15);
             let mut merged = recorder();
@@ -530,7 +800,32 @@ proptest::proptest! {
     }
 
     #[test]
-    fn percentiles_are_monotone(samples in proptest::collection::vec(proptest::num::u64::ANY, 0..=2000)) {
+    fn percentiles_are_monotone(samples in proptest::collection::vec(
+        // Issue #782 SHOULD_FIX 4: the old generator, uniform over the FULL
+        // `u64` range, drew from a recordable band only 6e10 wide out of
+        // 2^64, so P(a draw is in range) was 3.25e-9 and this property test
+        // was, in 256 default cases, essentially never able to record a
+        // single sample: EVERY case fell through to the empty-histogram
+        // path, `0 <= 0 <= 0 <= 0 <= 0 <= 0`, an assertion that can never
+        // fail regardless of whether `percentiles()` is correct. Measured
+        // directly on the OLD generator (proptest's own deterministic
+        // sampler, 256 cases): 0 of 264,818 draws in range.
+        //
+        // This generator is instead MOSTLY in range (90%) with a deliberate
+        // minority out of range (10%), so the monotone chain has a real
+        // distribution to be monotone about on almost every case, while
+        // `p.samples + r.out_of_range() == recorded_calls` (issue #405
+        // invariant 3) still gets genuine out-of-range draws to add up, not
+        // only the all-in-range or all-out-of-range extremes. Measured the
+        // same way on THIS generator: 255 of 256 cases record at least one
+        // in-range sample, 226,052 of 251,277 total draws (90.0%) in range,
+        // matching the 9:1 weighting below.
+        proptest::prop_oneof![
+            9 => 1_u64..=HIGH_NS,
+            1 => (HIGH_NS + 1)..=u64::MAX,
+        ],
+        0..=2000,
+    )) {
         let mut r = recorder();
         for &v in &samples {
             r.record_ns(v);
@@ -550,21 +845,29 @@ proptest::proptest! {
     }
 
     #[test]
-    fn hgrm_parse_is_total(text in proptest::string::string_regex("[0-9 .\n]{0,64}").unwrap()) {
+    fn hgrm_parse_is_total(text in hgrm_like_text()) {
         // The issue names "arbitrary ASCII of up to 4 KB" as the generator.
         // Measured directly (200,000 draws against this shipped parser):
         // that generator reaches `Ok` only 0.049% of the time, an EXPECTED
-        // 0.13 hits per default 256-case run, which is the same "reaches its
-        // interesting branch under once per run" shape this codebase has hit
-        // before (see the module doc and #756). `[0-9 .\n]{0,64}` draws from
-        // the alphabet a `.hgrm` line actually branches on (digits, the
-        // decimal point, the field separator, the line terminator) at a
-        // short length, so a large fraction of draws land close to the
-        // validity boundary: measured the same way, 2.09%, an expected 5.35
-        // hits per 256-case run. The "never panics, always Ok-or-Err"
-        // property this test primarily exists for is still exercised on
-        // every single case regardless of which arm is taken; this
-        // generator additionally gives the "on Ok" arm a real chance to run.
+        // 0.13 hits per default 256-case run. The PR's first fix narrowed it
+        // to `[0-9 .\n]{0,64}`, measured at 2.09% Ok (5.35 hits per run), but
+        // issue #782 SHOULD_FIX 5 found that fix moved the wrong number: of
+        // 200,000 draws against THAT generator, only 14 (0.007%, an expected
+        // 0.02 per 256-case run) were `Ok` with any sample actually
+        // recorded, and 0 had more than one distinct value, so the
+        // assertions inside the `if let Ok` arm below were themselves still
+        // "reaches its interesting branch under once per run" (the same
+        // defect class, one level deeper). `hgrm_like_text` fixes THAT
+        // number: measured the same way (200,000 draws, proptest's own
+        // sampler): Ok 90.1% (an expected 230.7 hits per 256-case run),
+        // Ok-with-at-least-one-sample 89.9% (230.2 per run), and
+        // Ok-with-a-spread-distribution (more than one distinct value, the
+        // only shape where the monotone chain below can distinguish
+        // anything) 59.2% (151.4 per run), because the well-formed arm
+        // renders at least one, and usually several, syntactically valid,
+        // monotone rows. The "never panics, always Ok-or-Err" property this
+        // test primarily exists for is still exercised on every single case
+        // regardless of which arm is taken, including the adversarial 10%.
         if let Ok(r) = LatencyRecorder::read_hgrm(text.as_bytes()) {
             let p = r.percentiles();
             proptest::prop_assert!(p.p50_ns <= p.p90_ns);
