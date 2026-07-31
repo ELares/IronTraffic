@@ -1085,15 +1085,32 @@ fn well_formed_non_200_response_is_counted_bad_not_ok() {
 /// `stub_not_modified_then_late_body` answers every EVEN indexed request
 /// with exactly that shape and every ODD indexed request with an ordinary,
 /// well-framed `200`. The fix (refusing the `304` like any other missing
-/// length, which forces `needs_reconnect: true`) makes every single request
-/// land on a BRAND NEW socket, so the two request kinds can never share a
-/// buffer: `bad` must land on every even index and `ok` on every odd one,
-/// with no exceptions and no bleed-through in either direction. Watched to
-/// fail against a reintroduced `None if status == 304 => 0` in `wire.rs`:
-/// the late body corrupts the odd-indexed exchange that follows it (this
-/// file's module doc comment's `MISFRAME` shape), which flips that
-/// exchange's classification away from the deterministic split asserted
-/// below.
+/// length, which forces `needs_reconnect: true`) makes every single refused
+/// request land on a BRAND NEW socket, which is what makes the leak
+/// structurally impossible.
+///
+/// Round three of #807 corrected this doc comment and the assertions below.
+/// `issued == 6`, `bad == 3`, `ok == 3` and `errors == 0` all hold IDENTICALLY
+/// whether or not the `304` exception is reinstated: the leaked body plus the
+/// next request's head (`XXXXXXXXXXHTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n`,
+/// with no separator between them, this file's module doc comment's
+/// `MISFRAME` shape) reparses cleanly as `Complete(status: 200)` under the
+/// loose status-line scanner. The corruption is silent, not a
+/// misclassification, so `ok == 3` is satisfied BY the leak, not violated by
+/// it; the previous wording here claiming it "flips that exchange's
+/// classification" and "prov[es] the preceding 304's late body never bled
+/// into them" was false in both places.
+///
+/// The one thing that DOES discriminate the two worlds is whether a refusal
+/// forces a reconnect. Reinstating the exception makes a `304` a `Complete`
+/// outcome with `needs_reconnect: false` (the connection, and its buffered
+/// leak, survive); the fix makes it `Bad` with `needs_reconnect: true` (a
+/// brand-new socket per refusal). Every `bad` exchange in this stub comes
+/// from that one refusal path and nothing else forces a reconnect here, so
+/// `reconnects` must equal `bad` exactly: that equality, not `ok`/`bad`
+/// themselves, is the load-bearing assertion below. Watched to fail against a
+/// reintroduced `None if status == 304 => 0` in `wire.rs`: `reconnects` drops
+/// to 0 while `bad` stays 3.
 #[test]
 fn not_modified_with_a_late_body_forces_a_reconnect_not_a_leak() {
     let addr = stub_not_modified_then_late_body(Duration::from_millis(30), b"XXXXXXXXXX");
@@ -1116,17 +1133,26 @@ fn not_modified_with_a_late_body_forces_a_reconnect_not_a_leak() {
     assert_eq!(
         outcome.ok, 3,
         "the three ODD indexed, ordinarily well-framed 200 exchanges must every one still be \
-         counted ok, proving the preceding 304's late body never bled into them"
+         counted ok; NOTE this holds identically whether or not the 304 exception is \
+         reinstated (see the doc comment above), so this assertion alone does not prove the \
+         leak is fixed"
     );
     assert_eq!(
         outcome.errors, 0,
         "a refused head is a framing refusal, not an I/O error"
     );
-    assert!(
-        outcome.reconnects >= 3,
-        "each of the three refusals must force a reconnect (a fresh socket is exactly what \
-         makes the leak structurally impossible), got {}",
+    assert_eq!(
+        outcome.reconnects, 3,
+        "each of the three refusals must force EXACTLY one reconnect apiece (a fresh socket is \
+         exactly what makes the leak structurally impossible), got {}",
         outcome.reconnects
+    );
+    assert_eq!(
+        outcome.reconnects, outcome.bad,
+        "reconnects must track bad exactly here (every bad exchange in this stub comes from \
+         the same refusal path, and nothing else in this run forces a reconnect); THIS is the \
+         assertion that actually discriminates the fix from the leak it replaces, since ok and \
+         bad alone hold identically in both worlds"
     );
 }
 

@@ -54,6 +54,50 @@
 //! a conditional request; this probe never sends one, so that cost is
 //! nothing this probe can ever pay.
 //!
+//! # That "nothing this probe can ever pay" claim is true of `304` alone
+//!
+//! RFC 9112 Section 6.3 item 1 groups three statuses together as "always
+//! terminated by the first empty line ... regardless of the header fields
+//! present": `1xx`, `204` and `304`. The paragraph above is honest about
+//! `304`, because RFC 9110 Section 15.4.5 makes it the answer to a
+//! CONDITIONAL request and this probe's request builder never sends one.
+//! It does not extend to the other two. A conforming peer CAN answer this
+//! probe's bare, unconditional `GET` with an ordinary `204 No Content`, and
+//! CAN precede its final response with an unsolicited `1xx` (RFC 8297's
+//! `103 Early Hints` does not require the client to have asked for it), and
+//! RFC 9112 Section 6.2 forbids that peer from sending `Content-Length` on
+//! either one. So this scanner's blanket refusal really does refuse output
+//! a well-behaved peer can produce for those two, unlike `304`. Concretely:
+//! `irontraffic_http`'s own H1 serializer (`h1/serialize.rs`) implements
+//! exactly that RFC rule for `1xx`, `204` and `304` alike, so a probe run
+//! against a route of this very project's own conforming server configured
+//! to answer `204` has no way to satisfy this scanner.
+//!
+//! The choice is fail-closed anyway, and it is deliberate, not an
+//! oversight left over from generalizing the `304` fix: this probe exists
+//! to publish latency, never to be a general-purpose HTTP client; its
+//! request builder never issues a conditional `GET` and never asks for
+//! early hints; and a probe that silently defaults an ambiguous body
+//! boundary to zero on ANY status, `204` and `1xx` included, is the exact
+//! failure the rest of this module doc comment exists to prevent. A future
+//! issue that needs this probe to measure a route answering `204` or a
+//! `1xx` should extend this scanner's exception to those two cases
+//! specifically, with the same kind of live, two-exchange test this
+//! module's `304` fix required to prove no leak, rather than reintroducing
+//! a bare zero default. Recorded as a decision, not left as a silent gap:
+//! see IronTraffic issue #807.
+//!
+//! The same tension shows up one crate over, in the in-tree fixture this
+//! whole test suite drives: `it-origin --status 304 --body-bytes 0`
+//! (`crates/irontraffic-origin/src/config.rs`) is a supported invocation
+//! that omits `Content-Length` on exactly that one status
+//! (`crates/irontraffic-origin/src/response.rs`), which this scanner now
+//! refuses unconditionally. `it-origin` already refuses `--status 204`
+//! outright for the analogous reason, so the symmetric fix is to reject
+//! `--status 304 --body-bytes 0` the same way; left to a follow-up issue
+//! against `irontraffic-origin` itself, since that crate is outside this
+//! issue's own Files table.
+//!
 //! The identical silent-zero failure is reachable through a header name this
 //! scanner fails to recognise for a reason that has nothing to do with what
 //! header it is: `Content-Length : 5` (a space before the colon) is read as
