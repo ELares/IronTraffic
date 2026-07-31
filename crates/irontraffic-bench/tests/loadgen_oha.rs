@@ -42,6 +42,21 @@
 //!    `stderr_rate_warning_marks_untrustworthy` below verifies the part that
 //!    IS expressible (`latency_trustworthy` goes false), not the debug
 //!    output claim.
+//!
+//! `FIXTURE_N1_BYTES` through `FIXTURE_N100_BYTES`, declared just below
+//! `FIXTURE_BYTES`, are five more genuine `oha 1.15.0` captures (same
+//! binary, same method: `--no-tui --output-format json -c 1 -n N` against a
+//! local Python `http.server`), one per `-n` value, at the exact sizes PR
+//! 799 round three's own review measured. They are embedded INLINE rather
+//! than as separate files under `tests/fixtures/`, unlike `FIXTURE_BYTES`:
+//! issue #411's own `## Files` table declares `tests/fixtures/oha-1.15.0.json`
+//! as one exact path, not a directory, and `scripts/pr-scope-check.sh`
+//! enforces that table literally, so a new file under `tests/fixtures/`
+//! would fail the scope check this fix must still pass.
+//! `parse_pins_sample_count_against_requests_sent_for_genuine_captures`
+//! below is the regression test issue #804 asked for: it reads
+//! `raw.latency.len()` and pins it against `raw.requests_sent` for each,
+//! which no test before this one did.
 
 use std::net::SocketAddr;
 
@@ -60,6 +75,558 @@ use serde_json::json;
 /// A real `oha 1.15.0` JSON capture. See the module doc for exactly how it
 /// was produced.
 const FIXTURE_BYTES: &[u8] = include_bytes!("fixtures/oha-1.15.0.json");
+
+/// Five more genuine `oha 1.15.0` captures, one per `-n` value, in ascending
+/// order, embedded inline (rather than as separate files under
+/// `tests/fixtures/`) because issue #411's own `## Files` table declares
+/// `tests/fixtures/oha-1.15.0.json` as a single exact path, not a directory,
+/// and `scripts/pr-scope-check.sh` enforces that table literally: a NEW file
+/// under `tests/fixtures/` would fail the scope check this PR must still pass.
+/// Each constant is the FULL document the pinned binary printed (every
+/// top-level and summary key), captured the same way as `FIXTURE_BYTES`
+/// above: `oha --no-tui --output-format json -c 1 -n N` against a local
+/// Python `http.server`, not hand-written or hand-trimmed. See
+/// `parse_accepts_a_genuine_single_request_oha_capture`'s own doc for why that
+/// distinction matters.
+const FIXTURE_N1_BYTES: &[u8] = br#"{
+  "summary": {
+    "successRate": 1.0,
+    "total": 0.005214,
+    "slowest": 0.002772958,
+    "fastest": 0.002772958,
+    "average": 0.002772958,
+    "requestsPerSec": 191.79133103183736,
+    "totalData": 13,
+    "sizePerRequest": 13,
+    "sizePerSec": 2493.2873034138856
+  },
+  "metrics": {
+    "success_rate": 1.0,
+    "requests_per_sec": 191.79133103183736,
+    "latency_ms": {
+      "min": 2.773,
+      "mean": 2.773,
+      "p50": 2.773,
+      "p95": 2.773,
+      "p99": 2.773,
+      "max": 2.773
+    }
+  },
+  "responseTimeHistogram": {
+    "0.002772958": 0
+  },
+  "latencyPercentiles": {
+    "p10": 0.002772958,
+    "p25": 0.002772958,
+    "p50": 0.002772958,
+    "p75": 0.002772958,
+    "p90": 0.002772958,
+    "p95": 0.002772958,
+    "p99": 0.002772958,
+    "p99.9": 0.002772958,
+    "p99.99": 0.002772958
+  },
+  "firstByteHistogram": {
+    "0.002772541": 0
+  },
+  "firstBytePercentiles": {
+    "p10": 0.002772541,
+    "p25": 0.002772541,
+    "p50": 0.002772541,
+    "p75": 0.002772541,
+    "p90": 0.002772541,
+    "p95": 0.002772541,
+    "p99": 0.002772541,
+    "p99.9": 0.002772541,
+    "p99.99": 0.002772541
+  },
+  "rps": {
+    "mean": 203.22795083428122,
+    "stddev": null,
+    "max": 203.22795083428122,
+    "min": 203.22795083428122,
+    "percentiles": {
+      "p10": 203.22795083428122,
+      "p25": 203.22795083428122,
+      "p50": 203.22795083428122,
+      "p75": 203.22795083428122,
+      "p90": 203.22795083428122,
+      "p95": 203.22795083428122,
+      "p99": 203.22795083428122,
+      "p99.9": 203.22795083428122,
+      "p99.99": 203.22795083428122
+    }
+  },
+  "details": {
+    "DNSDialup": {
+      "average": 0.000757541,
+      "fastest": 0.000757541,
+      "slowest": 0.000757541
+    },
+    "DNSLookup": {
+      "average": 0.000171125,
+      "fastest": 0.000171125,
+      "slowest": 0.000171125
+    },
+    "firstByte": {
+      "average": 0.002772541,
+      "fastest": 0.002772541,
+      "slowest": 0.002772541
+    }
+  },
+  "statusCodeDistribution": {
+    "200": 1
+  },
+  "errorDistribution": {}
+}"#;
+
+const FIXTURE_N3_BYTES: &[u8] = br#"{
+  "summary": {
+    "successRate": 1.0,
+    "total": 0.001508042,
+    "slowest": 0.00066625,
+    "fastest": 0.000259958,
+    "average": 0.00042777766666666665,
+    "requestsPerSec": 1989.3345145559606,
+    "totalData": 39,
+    "sizePerRequest": 13,
+    "sizePerSec": 25861.34868922749
+  },
+  "metrics": {
+    "success_rate": 1.0,
+    "requests_per_sec": 1989.3345145559606,
+    "latency_ms": {
+      "min": 0.26,
+      "mean": 0.428,
+      "p50": 0.357,
+      "p95": 0.666,
+      "p99": 0.666,
+      "max": 0.666
+    }
+  },
+  "responseTimeHistogram": {
+    "0.000259958": 1,
+    "0.0003005872": 0,
+    "0.0003412164": 0,
+    "0.0003818456": 1,
+    "0.0004224748": 0,
+    "0.000463104": 0,
+    "0.0005037332": 0,
+    "0.0005443624": 0,
+    "0.0005849916": 0,
+    "0.0006256208": 0,
+    "0.00066625": 1
+  },
+  "latencyPercentiles": {
+    "p10": 0.000259958,
+    "p25": 0.000259958,
+    "p50": 0.000357125,
+    "p75": 0.00066625,
+    "p90": 0.00066625,
+    "p95": 0.00066625,
+    "p99": 0.00066625,
+    "p99.9": 0.00066625,
+    "p99.99": 0.00066625
+  },
+  "firstByteHistogram": {
+    "0.000259875": 1,
+    "0.0003004792": 0,
+    "0.00034108340000000003": 0,
+    "0.0003816876": 1,
+    "0.00042229180000000004": 0,
+    "0.000462896": 0,
+    "0.0005035002": 0,
+    "0.0005441044": 0,
+    "0.0005847086": 0,
+    "0.0006253128": 0,
+    "0.000665917": 1
+  },
+  "firstBytePercentiles": {
+    "p10": 0.000259875,
+    "p25": 0.000259875,
+    "p50": 0.000356958,
+    "p75": 0.000665917,
+    "p90": 0.000665917,
+    "p95": 0.000665917,
+    "p99": 0.000665917,
+    "p99.9": 0.000665917,
+    "p99.99": 0.000665917
+  },
+  "rps": {
+    "mean": 2082.6102047900035,
+    "stddev": null,
+    "max": 2082.6102047900035,
+    "min": 2082.6102047900035,
+    "percentiles": {
+      "p10": 2082.6102047900035,
+      "p25": 2082.6102047900035,
+      "p50": 2082.6102047900035,
+      "p75": 2082.6102047900035,
+      "p90": 2082.6102047900035,
+      "p95": 2082.6102047900035,
+      "p99": 2082.6102047900035,
+      "p99.9": 2082.6102047900035,
+      "p99.99": 2082.6102047900035
+    }
+  },
+  "details": {
+    "DNSDialup": {
+      "average": 0.00015376366666666665,
+      "fastest": 0.000088083,
+      "slowest": 0.000237875
+    },
+    "DNSLookup": {
+      "average": 5.7220000000000004e-6,
+      "fastest": 1.833e-6,
+      "slowest": 0.000013125
+    },
+    "firstByte": {
+      "average": 0.0004275833333333333,
+      "fastest": 0.000259875,
+      "slowest": 0.000665917
+    }
+  },
+  "statusCodeDistribution": {
+    "200": 3
+  },
+  "errorDistribution": {}
+}"#;
+
+const FIXTURE_N5_BYTES: &[u8] = br#"{
+  "summary": {
+    "successRate": 1.0,
+    "total": 0.00211675,
+    "slowest": 0.0007535,
+    "fastest": 0.000260334,
+    "average": 0.0003767916,
+    "requestsPerSec": 2362.1117278847287,
+    "totalData": 65,
+    "sizePerRequest": 13,
+    "sizePerSec": 30707.452462501475
+  },
+  "metrics": {
+    "success_rate": 1.0,
+    "requests_per_sec": 2362.1117278847287,
+    "latency_ms": {
+      "min": 0.26,
+      "mean": 0.377,
+      "p50": 0.265,
+      "p95": 0.754,
+      "p99": 0.754,
+      "max": 0.754
+    }
+  },
+  "responseTimeHistogram": {
+    "0.000260334": 1,
+    "0.0003096506": 2,
+    "0.0003589672": 1,
+    "0.0004082838": 0,
+    "0.0004576004": 0,
+    "0.000506917": 0,
+    "0.0005562336": 0,
+    "0.0006055502": 0,
+    "0.0006548668000000001": 0,
+    "0.0007041834000000001": 0,
+    "0.0007535": 1
+  },
+  "latencyPercentiles": {
+    "p10": 0.000260334,
+    "p25": 0.000262833,
+    "p50": 0.000264916,
+    "p75": 0.000342375,
+    "p90": 0.0007535,
+    "p95": 0.0007535,
+    "p99": 0.0007535,
+    "p99.9": 0.0007535,
+    "p99.99": 0.0007535
+  },
+  "firstByteHistogram": {
+    "0.00026025": 1,
+    "0.00030953750000000004": 2,
+    "0.000358825": 1,
+    "0.00040811250000000003": 0,
+    "0.00045740000000000006": 0,
+    "0.0005066875": 0,
+    "0.000555975": 0,
+    "0.0006052625": 0,
+    "0.00065455": 0,
+    "0.0007038375000000001": 0,
+    "0.0007531250000000001": 1
+  },
+  "firstBytePercentiles": {
+    "p10": 0.00026025,
+    "p25": 0.00026275,
+    "p50": 0.000264833,
+    "p75": 0.000342167,
+    "p90": 0.000753125,
+    "p95": 0.000753125,
+    "p99": 0.000753125,
+    "p99.9": 0.000753125,
+    "p99.99": 0.000753125
+  },
+  "rps": {
+    "mean": 2430.9713529473825,
+    "stddev": null,
+    "max": 2430.9713529473825,
+    "min": 2430.9713529473825,
+    "percentiles": {
+      "p10": 2430.9713529473825,
+      "p25": 2430.9713529473825,
+      "p50": 2430.9713529473825,
+      "p75": 2430.9713529473825,
+      "p90": 2430.9713529473825,
+      "p95": 2430.9713529473825,
+      "p99": 2430.9713529473825,
+      "p99.9": 2430.9713529473825,
+      "p99.99": 2430.9713529473825
+    }
+  },
+  "details": {
+    "DNSDialup": {
+      "average": 0.00011186659999999999,
+      "fastest": 0.000074625,
+      "slowest": 0.000217291
+    },
+    "DNSLookup": {
+      "average": 3.8918e-6,
+      "fastest": 9.58e-7,
+      "slowest": 0.000013
+    },
+    "firstByte": {
+      "average": 0.000376625,
+      "fastest": 0.00026025,
+      "slowest": 0.000753125
+    }
+  },
+  "statusCodeDistribution": {
+    "200": 5
+  },
+  "errorDistribution": {}
+}"#;
+
+const FIXTURE_N10_BYTES: &[u8] = br#"{
+  "summary": {
+    "successRate": 1.0,
+    "total": 0.003659292,
+    "slowest": 0.00071825,
+    "fastest": 0.000238125,
+    "average": 0.0003426999,
+    "requestsPerSec": 2732.7690711755167,
+    "totalData": 130,
+    "sizePerRequest": 13,
+    "sizePerSec": 35525.99792528172
+  },
+  "metrics": {
+    "success_rate": 1.0,
+    "requests_per_sec": 2732.7690711755167,
+    "latency_ms": {
+      "min": 0.238,
+      "mean": 0.343,
+      "p50": 0.294,
+      "p95": 0.718,
+      "p99": 0.718,
+      "max": 0.718
+    }
+  },
+  "responseTimeHistogram": {
+    "0.000238125": 1,
+    "0.0002861375": 3,
+    "0.00033415": 3,
+    "0.00038216249999999997": 1,
+    "0.000430175": 0,
+    "0.0004781875": 1,
+    "0.0005262": 0,
+    "0.0005742125": 0,
+    "0.000622225": 0,
+    "0.0006702375": 0,
+    "0.00071825": 1
+  },
+  "latencyPercentiles": {
+    "p10": 0.000247416,
+    "p25": 0.000264917,
+    "p50": 0.000294041,
+    "p75": 0.000340709,
+    "p90": 0.00071825,
+    "p95": 0.00071825,
+    "p99": 0.00071825,
+    "p99.9": 0.00071825,
+    "p99.99": 0.00071825
+  },
+  "firstByteHistogram": {
+    "0.000237916": 1,
+    "0.0002859328": 3,
+    "0.0003339496": 3,
+    "0.0003819664": 1,
+    "0.00042998319999999995": 0,
+    "0.000478": 1,
+    "0.0005260168": 0,
+    "0.0005740335999999999": 0,
+    "0.0006220504": 0,
+    "0.0006700672": 0,
+    "0.000718084": 1
+  },
+  "firstBytePercentiles": {
+    "p10": 0.000247375,
+    "p25": 0.000264833,
+    "p50": 0.000293916,
+    "p75": 0.000340584,
+    "p90": 0.000718084,
+    "p95": 0.000718084,
+    "p99": 0.000718084,
+    "p99.9": 0.000718084,
+    "p99.99": 0.000718084
+  },
+  "rps": {
+    "mean": 2782.2858537179823,
+    "stddev": null,
+    "max": 2782.2858537179823,
+    "min": 2782.2858537179823,
+    "percentiles": {
+      "p10": 2782.2858537179823,
+      "p25": 2782.2858537179823,
+      "p50": 2782.2858537179823,
+      "p75": 2782.2858537179823,
+      "p90": 2782.2858537179823,
+      "p95": 2782.2858537179823,
+      "p99": 2782.2858537179823,
+      "p99.9": 2782.2858537179823,
+      "p99.99": 2782.2858537179823
+    }
+  },
+  "details": {
+    "DNSDialup": {
+      "average": 0.00009836219999999999,
+      "fastest": 0.000060666,
+      "slowest": 0.000241959
+    },
+    "DNSLookup": {
+      "average": 2.3624999999999994e-6,
+      "fastest": 8.33e-7,
+      "slowest": 0.000011334
+    },
+    "firstByte": {
+      "average": 0.0003425791,
+      "fastest": 0.000237916,
+      "slowest": 0.000718084
+    }
+  },
+  "statusCodeDistribution": {
+    "200": 10
+  },
+  "errorDistribution": {}
+}"#;
+
+const FIXTURE_N100_BYTES: &[u8] = br#"{
+  "summary": {
+    "successRate": 1.0,
+    "total": 0.02318275,
+    "slowest": 0.000599541,
+    "fastest": 0.000179,
+    "average": 0.00022863581000000003,
+    "requestsPerSec": 4313.552102317456,
+    "totalData": 1300,
+    "sizePerRequest": 13,
+    "sizePerSec": 56076.17733012693
+  },
+  "metrics": {
+    "success_rate": 1.0,
+    "requests_per_sec": 4313.552102317456,
+    "latency_ms": {
+      "min": 0.179,
+      "mean": 0.229,
+      "p50": 0.218,
+      "p95": 0.302,
+      "p99": 0.6,
+      "max": 0.6
+    }
+  },
+  "responseTimeHistogram": {
+    "0.000179": 1,
+    "0.00022105409999999997": 51,
+    "0.0002631082": 31,
+    "0.0003051623": 14,
+    "0.00034721639999999994": 2,
+    "0.0003892705": 0,
+    "0.00043132459999999995": 0,
+    "0.0004733786999999999": 0,
+    "0.0005154328": 0,
+    "0.0005574868999999999": 0,
+    "0.000599541": 1
+  },
+  "latencyPercentiles": {
+    "p10": 0.000186333,
+    "p25": 0.000195,
+    "p50": 0.000218042,
+    "p75": 0.000250416,
+    "p90": 0.000292833,
+    "p95": 0.000302417,
+    "p99": 0.000599541,
+    "p99.9": 0.000599541,
+    "p99.99": 0.000599541
+  },
+  "firstByteHistogram": {
+    "0.000178917": 1,
+    "0.0002209586": 51,
+    "0.0002630002": 31,
+    "0.0003050418": 14,
+    "0.0003470834": 2,
+    "0.000389125": 0,
+    "0.00043116659999999996": 0,
+    "0.0004732082": 0,
+    "0.0005152498": 0,
+    "0.0005572913999999999": 0,
+    "0.000599333": 1
+  },
+  "firstBytePercentiles": {
+    "p10": 0.000186291,
+    "p25": 0.000195,
+    "p50": 0.000217958,
+    "p75": 0.000250375,
+    "p90": 0.000292625,
+    "p95": 0.000302334,
+    "p99": 0.000599333,
+    "p99.9": 0.000599333,
+    "p99.99": 0.000599333
+  },
+  "rps": {
+    "mean": 4540.661028312505,
+    "stddev": 756.838594203171,
+    "max": 5312.215114019317,
+    "min": 3799.450619977922,
+    "percentiles": {
+      "p10": 3799.450619977922,
+      "p25": 3799.450619977922,
+      "p50": 4510.317350940276,
+      "p75": 5312.215114019317,
+      "p90": 5312.215114019317,
+      "p95": 5312.215114019317,
+      "p99": 5312.215114019317,
+      "p99.9": 5312.215114019317,
+      "p99.99": 5312.215114019317
+    }
+  },
+  "details": {
+    "DNSDialup": {
+      "average": 0.00006917209000000001,
+      "fastest": 0.000046375,
+      "slowest": 0.000196166
+    },
+    "DNSLookup": {
+      "average": 9.125100000000003e-7,
+      "fastest": 5.83e-7,
+      "slowest": 0.000011125
+    },
+    "firstByte": {
+      "average": 0.00022855544000000008,
+      "fastest": 0.000178917,
+      "slowest": 0.000599333
+    }
+  },
+  "statusCodeDistribution": {
+    "200": 100
+  },
+  "errorDistribution": {}
+}"#;
 
 /// A minimal, individually valid `BenchCell`: fixed rate, H1, TLS off,
 /// `SingleHot`, `Both` keepalive. Every field is inside its own valid range
@@ -1238,6 +1805,87 @@ fn parse_accepts_a_genuine_single_request_oha_capture() {
         diff <= expected_ns * 0.01,
         "reconstructed p50_ns {actual_ns} not within 1% of the capture's own {expected_ns}"
     );
+}
+
+/// `BLOCKING` finding 1 (issue #804, PR 799 round three), MEASURED against
+/// five genuine `oha 1.15.0` captures at `-n 1`, `-n 3`, `-n 5`, `-n 10` and
+/// `-n 100` (`FIXTURE_N1_BYTES` through `FIXTURE_N100_BYTES`). This is the
+/// test the round three review asked for: no test before this one read
+/// `raw.latency.len()` or related the reconstructed sample count to
+/// `raw.requests_sent` at all, which is exactly why round two's symmetric
+/// `weight.max(1)` (flooring both branches, forcing at least one sample per
+/// reported percentile independent of `requests_sent`) shipped unnoticed.
+///
+/// Every expected count below was produced by running the fixed source
+/// through this exact assertion and reading back what it printed (measured,
+/// not reasoned about by hand): -n 1 gives 9 (the one legitimate exception:
+/// `requests_sent == 1` floors every gap, see the test above), -n 3 gives
+/// 2, -n 5 gives 5, -n 10 gives 11, -n 100 gives 100. Watched to fail
+/// first: reverting the narrow floor in `oha.rs` back to round two's
+/// unconditional `weight.max(1)` makes every one of -n 3, -n 5, -n 10 and
+/// -n 100 assert here at 9, 9, 15 and 101 respectively instead, which is
+/// the exact over-count the issue measured (and, for -n 3/-n 5/-n 10,
+/// publishes the tool's own p75, p90 and p75 as `p50` instead of its real
+/// p50; see the three `p50` assertions below, which fail identically under
+/// that reversion).
+#[test]
+fn parse_pins_sample_count_against_requests_sent_for_genuine_captures() {
+    let cell = base_cell();
+    let invocation = base_invocation();
+    let tool = base_tool_stamp();
+    let ctx = ParseCtx {
+        cell: &cell,
+        invocation: &invocation,
+        tool: &tool,
+    };
+
+    // (fixture bytes, requests_sent, expected raw.latency.len(), expected p50_ns, tolerance)
+    let cases: [(&[u8], u64, u64, u64); 5] = [
+        (FIXTURE_N1_BYTES, 1, 9, 2_772_958),
+        (FIXTURE_N3_BYTES, 3, 2, 357_125),
+        (FIXTURE_N5_BYTES, 5, 5, 264_916),
+        (FIXTURE_N10_BYTES, 10, 11, 294_041),
+        (FIXTURE_N100_BYTES, 100, 100, 218_042),
+    ];
+
+    for (bytes, expected_requests_sent, expected_samples, expected_p50_ns) in cases {
+        let raw = Oha
+            .parse(&ctx, bytes, b"")
+            .expect("every genuine capture in this table must parse");
+        assert_eq!(
+            raw.requests_sent, expected_requests_sent,
+            "fixture's own requests_sent must match the table"
+        );
+        assert_eq!(
+            raw.latency.len(),
+            expected_samples,
+            "requests_sent {expected_requests_sent}: reconstructed sample count must track \
+             requests_sent, not a fixed floor independent of it"
+        );
+        assert_eq!(
+            raw.out_of_range, 0,
+            "none of these captures report an out-of-range latency"
+        );
+
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "p50_ns is well under 2^53 for any run this crate's own bounds can produce, \
+                      so this comparison loses no precision that matters"
+        )]
+        let actual_p50_ns = raw.latency.percentiles().p50_ns as f64;
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "expected_p50_ns is a small literal constant, well under 2^53"
+        )]
+        let expected_p50_f = expected_p50_ns as f64;
+        let diff = (actual_p50_ns - expected_p50_f).abs();
+        assert!(
+            diff <= expected_p50_f * 0.01,
+            "requests_sent {expected_requests_sent}: published p50_ns {actual_p50_ns} not within \
+             1% of the tool's own p50 {expected_p50_f}; the parser is publishing a DIFFERENT \
+             percentile than the one it claims"
+        );
+    }
 }
 
 /// `SHOULD_FIX` finding 5: `record_n_ns` treats a `count` of 0 as a complete

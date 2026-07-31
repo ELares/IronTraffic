@@ -29,7 +29,7 @@ use serde_json::Value;
 
 use crate::cell::{BenchCell, KeepaliveMode, PathCorpus, Protocol, RateMode, TlsMode};
 use crate::error::BenchError;
-use crate::hist::LatencyRecorder;
+use crate::hist::{HIGH_NS, LatencyRecorder};
 use crate::provenance::ToolStamp;
 
 use super::{Invocation, MAX_HOST_BYTES, MAX_PATH_EXPR_BYTES, MAX_REPORTED_REQUESTS};
@@ -809,20 +809,56 @@ impl LoadGenerator for Oha {
             // treats a `count` of 0 as a complete no-op BY ITS OWN CONTRACT
             // (so a repeated no-op call never perturbs `max_ns`), which for
             // a small `requests_sent` can round `weight` itself all the way
-            // down to 0 for EITHER an out-of-range percentile (silently
-            // dropping the exact tail-truncation signal invariant I7
-            // depends on, edge case 9) or an in-range one (round two's own
-            // review: a genuine `requests_sent == 1` oha capture rounds
-            // every one of the nine gaps to 0, so a `weight`-only call would
-            // reconstruct an entirely empty histogram and publish
-            // `p50 == p99 == max == 0` ns for a real, ordinary run).
-            // `weight.max(1)` floors both cases alike: every reported
-            // percentile is counted at least once, independent of how thin
-            // its own reconstructed slice would otherwise be. `requests_sent
-            // == 0` is rejected earlier, above, before this loop runs, so
-            // this floor never manufactures a sample for a document that
-            // legitimately describes zero requests.
-            recorder.record_n_ns(value_ns, weight.max(1));
+            // down to 0.
+            //
+            // PR 799 round three (issue #804), MEASURED: flooring `weight`
+            // to at least 1 on BOTH branches unconditionally (round two's
+            // shipped fix) makes every run record at least one sample per
+            // reported percentile (9), independent of how many requests the
+            // tool actually issued. Against genuine `oha 1.15.0` captures,
+            // that inflation shifts the PUBLISHED percentile up one step
+            // for every run under 556 requests (n=3 publishes the tool's
+            // own p75 as p50, +88.6%; n=5 publishes p90, +80.1%; n=100
+            // publishes p75, +9.5%), because 556 is exactly where the
+            // smallest of the nine gaps, `0.0009 * requests_sent`, first
+            // reaches 0.5 on its own. A sweep over requests_sent = 1..=700
+            // found 311 run sizes where the un-floored reconstruction
+            // published the tool's own p50 and the symmetric floor did not,
+            // and zero run sizes in the other direction.
+            //
+            // The floor is therefore applied ONLY in the two cases that
+            // need it, never unconditionally:
+            //
+            //   - `value_ns > HIGH_NS` (round one's original branch): an
+            //     out-of-range percentile whose own weight rounds to 0
+            //     would otherwise silently vanish from `out_of_range` with
+            //     no trace, defeating the exact tail-truncation signal
+            //     invariant I7 depends on (edge case 9). Flooring here
+            //     costs nothing: an out-of-range sample never enters the
+            //     published latency histogram, only the `out_of_range`
+            //     counter.
+            //   - `requests_sent == 1`: the ONE case where all nine gaps
+            //     legitimately round to 0 no matter what (the largest gap,
+            //     0.25, times 1 is still below the 0.5 rounding threshold),
+            //     so a `weight`-only call would reconstruct an entirely
+            //     empty histogram and publish `p50 == p99 == max == 0` ns
+            //     for a real, ordinary single-request run (round two's own
+            //     review, a genuine capture). There is no other way for a
+            //     single real sample to be recorded at all.
+            //
+            // For every OTHER `requests_sent`, `weight` is used exactly as
+            // rounded: an in-range percentile whose slice of the run is
+            // thin enough to round to 0 is recorded as 0, honestly, rather
+            // than manufactured into a sample that was never measured.
+            // `requests_sent == 0` is rejected earlier, above, before this
+            // loop runs, so no floor here ever manufactures a sample for a
+            // document that legitimately describes zero requests.
+            let effective_weight = if value_ns > HIGH_NS || requests_sent == 1 {
+                weight.max(1)
+            } else {
+                weight
+            };
+            recorder.record_n_ns(value_ns, effective_weight);
             prev_quantile = quantile;
         }
 
