@@ -11,7 +11,7 @@
 use std::collections::BTreeMap;
 
 use irontraffic_bench::{
-    BenchCell, Bottleneck, BuildStamp, CacheMode, CellId, DeepestPercentile, InvariantId,
+    BenchCell, Bottleneck, BuildStamp, CacheMode, CellId, DeepestPercentile, Detail, InvariantId,
     KeepaliveMode, MAX_COMMAND_LINE, PathCorpus, Percentiles, Protocol, Provenance, RateMode,
     RunResult, StampSource, SuspectReason, TlsMode, ToolStamp, Validity, check_validity,
 };
@@ -890,6 +890,79 @@ fn round_trip_serde_for_an_invalid_result() {
     let json = serde_json::to_string(&r).expect("an Invalid RunResult must serialise");
     let back: RunResult = serde_json::from_str(&json).expect("the serialised form must parse");
     assert_eq!(r, back);
+}
+
+// ---------------------------------------------------------------------------
+// Hostile-detail security property (issue #796 finding 1).
+// ---------------------------------------------------------------------------
+
+/// The PR body justifies hand-writing `Serialize`/`Deserialize` for
+/// `crate::error::Detail` in `result.rs` (rather than deriving them in
+/// `error.rs`) entirely on the claim that a hand-edited `validity.detail`
+/// field in a committed result file is routed through `Detail::new`, so it
+/// gets clipped and sanitised rather than reconstructing the private
+/// `String` field directly from hostile bytes. `round_trip_serde_for_an_invalid_result`
+/// does NOT check this claim: it round-trips a `Detail` the guard itself
+/// already produced, which is already clipped and sanitised, so it passes
+/// identically whether or not deserialisation is routed through
+/// `Detail::new`. This test attacks the field directly, the way a pull
+/// request author hand-editing a committed result file would: it starts from
+/// a real `RunResult`, serialises it, then splices a HOSTILE raw string
+/// straight into the `validity.detail` JSON field (never through
+/// `Detail::new`, never through the Rust type system) before deserialising,
+/// and `assert_eq!`s the deserialised bytes against `Detail::new` called on
+/// that same raw input.
+///
+/// The payload is deliberately both over `MAX_DETAIL_BYTES` (256) long AND
+/// carries control bytes (an ANSI screen-clear/cursor-home, a bare `\r`
+/// followed by a forged log line, a bare `\n`, NUL) plus non-ASCII UTF-8, so
+/// this exercises both of `Detail::new`'s jobs, clip first and then
+/// sanitise, not just one.
+#[test]
+fn hostile_detail_field_cannot_bypass_detail_new() {
+    let mut r = base_result();
+    r.validity = Validity::Invalid {
+        violated: InvariantId::I12,
+        detail: Detail::new("placeholder, overwritten below via raw JSON"),
+    };
+
+    let mut value: serde_json::Value =
+        serde_json::to_value(&r).expect("a RunResult must serialise to a JSON value");
+
+    let raw = format!(
+        "\x1b[2J\x1b[1;1H\rFORGED LOG LINE: root shell opened\n\0{}caf\u{e9} \u{4e2d}\u{6587}{}",
+        "x".repeat(50),
+        "y".repeat(400)
+    );
+    assert!(
+        raw.len() > 256,
+        "the fixture must exceed MAX_DETAIL_BYTES to exercise the clip, not just the sanitise"
+    );
+
+    value["validity"]["detail"] = serde_json::Value::String(raw.clone());
+    let hostile_json = serde_json::to_string(&value).expect("the mutated Value must serialise");
+
+    let back: RunResult = serde_json::from_str(&hostile_json)
+        .expect("a hostile but well-formed validity.detail must still deserialise");
+
+    let Validity::Invalid { detail, .. } = back.validity else {
+        panic!("validity must still be Invalid {{ violated: I12, .. }} after the round trip");
+    };
+
+    let expected = Detail::new(&raw);
+    assert_eq!(
+        detail.as_str().as_bytes(),
+        expected.as_str().as_bytes(),
+        "a hand-edited validity.detail in a committed result file must be clipped and sanitised \
+         byte for byte identically to Detail::new(&raw), not reconstructed straight from the \
+         hostile string; see issue #796 finding 1"
+    );
+    // Restates the two properties `Detail::new` guarantees, pinned directly
+    // on the DESERIALISED value rather than only on a value the guard itself
+    // produced (which is already known-good and proves nothing about the
+    // deserialisation path).
+    assert!(detail.as_str().len() <= 256);
+    assert!(detail.as_str().bytes().all(|b| (0x20..=0x7E).contains(&b)));
 }
 
 // ---------------------------------------------------------------------------
