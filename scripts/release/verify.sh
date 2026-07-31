@@ -400,19 +400,32 @@ main() {
             fi
 
             # sbom-licence-check.sh's own exit 3 is a distinct SKIPPED
-            # signal (#788): no deny.toml allowlist was found anywhere it
-            # knows to look, which says nothing about the SBOM's own
-            # licence set and must not be reported as though it does. Only
-            # exit 1 ("a real check ran and failed") becomes a FAILED line
-            # here; exit 3 becomes a named skip, same as every other check
-            # in this script that could not be performed.
+            # signal (#788, widened by #791): either no deny.toml
+            # allowlist was found anywhere it knows to look, OR deny.toml
+            # was found but licence-exceptions.txt was not (deny.toml
+            # alone is not enough; see its own header comment), and either
+            # way this says nothing about the SBOM's own licence set and
+            # must not be reported as though it does. This script cannot
+            # tell the two apart without re-parsing sbom-licence-check.sh's
+            # own stderr, so the reason names both files rather than
+            # guessing which one was missing. Only exit 1 ("a real check
+            # ran and failed") becomes a FAILED line here; exit 3 and exit
+            # 4 each become their own named skip, same as every other
+            # check in this script that could not be performed. Exit 4
+            # (#791 NOTE) is the SBOM's own fault, not the allowlist's: an
+            # allowlist WAS found, but the SBOM declares zero components,
+            # so a security tool reporting a vacuous "pass" over nothing
+            # would be worse than naming the gap.
             sbom_licence_status=0
             sh "$SCRIPT_DIR/sbom-licence-check.sh" "$sbom" >"$work/sbom-licence.log" 2>&1 || sbom_licence_status=$?
             if [ "$sbom_licence_status" -eq 0 ]; then
                 checked=$((checked + 1))
-                echo "sbom licence: subset of the allowlist"
+                allowlist_applied="$(grep -m1 '^applied: ' "$work/sbom-licence.log" | sed 's/^applied: //')"
+                echo "sbom licence: subset of the allowlist ($allowlist_applied)"
             elif [ "$sbom_licence_status" -eq 3 ]; then
-                note_skip "sbom licence" "no deny.toml allowlist found; see docs/SUPPLY-CHAIN.md section 3"
+                note_skip "sbom licence" "no deny.toml allowlist or licence-exceptions.txt found; see docs/SUPPLY-CHAIN.md section 3"
+            elif [ "$sbom_licence_status" -eq 4 ]; then
+                note_skip "sbom licence" "SBOM declares zero components; nothing to check its licence set against"
             else
                 note_fail "sbom licence: not a subset of the allowlist (see below)"
                 cat "$work/sbom-licence.log" >&2

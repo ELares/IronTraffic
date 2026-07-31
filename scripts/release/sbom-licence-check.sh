@@ -19,10 +19,28 @@
 #                     allowlist says nothing about the SBOM it was supposed
 #                     to be checked against, and must never be reported
 #                     with wording that blames the artifact)
-#   exceptions-file  same two-tier default, but a missing exceptions file
-#                     is not fatal on its own (see main(), below): it only
-#                     matters once a deny_file was actually found and a
-#                     component needs an exception to pass
+#   exceptions-file  same two-tier default as deny-toml; when a deny_file
+#                     was found (by either means) but no exceptions_file
+#                     exists by DEFAULT anywhere this script knows to
+#                     look, that ALSO exits 3 as the same honest SKIP
+#                     (#791: deny.toml alone is not enough, and checking
+#                     against an incomplete allowlist would falsely accuse
+#                     a component that only passes via a committed
+#                     exception). An EXPLICIT, missing exceptions_file
+#                     argument is the one case that stays non-fatal (see
+#                     main(), below): a caller who named a path themselves
+#                     is treated as deliberately opting out of exceptions,
+#                     not as "nothing was published here"
+#
+# Exit codes: 0 pass, 1 a real check ran and found a violation (or a real
+# misconfiguration, e.g. an explicit path that does not exist), 2 bad
+# usage, 3 no allowlist was found to check against (#788, widened by #791
+# to cover deny.toml-found-but-no-exceptions-file), 4 an allowlist WAS
+# found and applied but the SBOM itself declares zero components, so there
+# is nothing in it to check (#791 NOTE). 3 and 4 are both honest SKIPs,
+# never a licence-violation FAILURE, but are kept distinct because they
+# name different facts: 3 means this script found no allowlist, 4 means it
+# found one and had nothing to point it at.
 #
 # Splitting is purely lexical (edge case 2): split on the words OR and AND,
 # on parentheses, and on "/" (see sbom.sh's own comment on the same
@@ -200,10 +218,20 @@ main() {
             deny_file="$REPO_ROOT/deny.toml"
         fi
     fi
+    # #791: this two-tier default used to assign the REPO_ROOT-derived
+    # fallback UNCONDITIONALLY, with no [ -f ] test, the exact "two
+    # directories above me is the repository" assumption #788 was filed
+    # over and fixed for deny_file above but never carried over here. An
+    # explicit, missing exceptions_file argument is still deliberately
+    # left for main()'s own [ -f "$exceptions_file" ] check below to treat
+    # as "no exceptions" rather than a hard error (see this function's own
+    # usage comment, above): only the DEFAULT lookup gets the guard, so a
+    # still-empty $exceptions_file here means neither candidate exists,
+    # not merely that one was checked and rejected.
     if [ -z "$exceptions_file" ]; then
         if [ -f "$SCRIPT_DIR/licence-exceptions.txt" ]; then
             exceptions_file="$SCRIPT_DIR/licence-exceptions.txt"
-        else
+        elif [ -f "$REPO_ROOT/scripts/release/licence-exceptions.txt" ]; then
             exceptions_file="$REPO_ROOT/scripts/release/licence-exceptions.txt"
         fi
     fi
@@ -239,6 +267,42 @@ main() {
         exit 1
     fi
 
+    if [ -z "$exceptions_file" ]; then
+        # #791: deny.toml WAS found (both checks above already returned or
+        # exited otherwise) but no licence-exceptions.txt anywhere this
+        # script knows to look by default, either beside this script or at
+        # the repository root. This PR's own body already says the two
+        # files "are also necessary together, not deny.toml alone" (#788),
+        # and the three committed exceptions are "load bearing for the
+        # real closure to pass at all": proceeding past this point with an
+        # EMPTY exception set would silently accuse a genuinely compliant
+        # component that only passes via a committed exception (e.g.
+        # aho-corasick, memchr, ryu; see docs/SUPPLY-CHAIN.md section 7) of
+        # a licence violation, by name. That is strictly WORSE than
+        # finding no deny.toml at all, so it gets the identical honest
+        # SKIP, and the identical exit code 3, rather than a FAILURE that
+        # blames the artifact for this script's own incomplete allowlist.
+        echo "skipped: sbom-licence-check: deny.toml was found, but no" >&2
+        echo "  licence-exceptions.txt beside this script ($SCRIPT_DIR) or at the" >&2
+        echo "  repository root ($REPO_ROOT/scripts/release); deny.toml alone is not" >&2
+        echo "  enough to check the SBOM's licences against without risking a false" >&2
+        echo "  accusation against a component that only passes via a committed" >&2
+        echo "  exception. See docs/SUPPLY-CHAIN.md section 3 for how to fetch" >&2
+        echo "  licence-exceptions.txt alongside deny.toml." >&2
+        exit 3
+    fi
+
+    # #791 SHOULD_FIX: name which allowlist was actually applied. Both
+    # deny_file and exceptions_file are resolved via a two-tier lookup
+    # (beside this script, then the repository root) that a shadowed or
+    # substituted file elsewhere on the machine could silently win over
+    # the real one; before this line, neither a passing nor a failing run
+    # ever printed a path, so that substitution was invisible in the one
+    # screen a user reads. Printed to STDOUT (verify.sh's --sbom step
+    # captures this script's combined stdout+stderr and echoes it back on
+    # a pass), not merely a code comment.
+    echo "applied: deny.toml=$deny_file, licence-exceptions.txt=$exceptions_file"
+
     # Edge case 12, applied here too: a licence check that parses an
     # over-large document before this cap would be exactly the unbounded
     # work the cap on sbom.sh's own output exists to prevent.
@@ -273,6 +337,25 @@ main() {
         echo "error: could not parse $sbom_file as a CycloneDX document:" >&2
         cat "$work/jq.err" >&2
         exit 1
+    fi
+
+    # #791 NOTE: a component-less SBOM (an empty `.components` array, e.g.
+    # a truncated download or a malformed generator run) used to fall
+    # straight through the loop below with total=0, failed=0, and print
+    # "0/0 components pass" followed by a genuine exit 0 -- a security
+    # tool reading an EMPTY input as a PASS, indistinguishable from a real
+    # SBOM that was actually checked. This is deliberately its OWN exit
+    # code (4), distinct from exit 3's "no allowlist to check against":
+    # here an allowlist WAS found and applied (see the "applied:" line
+    # above), there is simply nothing in THIS SBOM to check it against,
+    # which is a different fact and would be misreported by exit 3's own
+    # "no deny.toml allowlist or licence-exceptions.txt found" wording.
+    if [ ! -s "$components_file" ]; then
+        echo "skipped: sbom-licence-check: $sbom_file declares zero components;" >&2
+        echo "  nothing to check its licence set against. If this artifact" >&2
+        echo "  genuinely has no dependencies, that is itself worth confirming" >&2
+        echo "  by hand, not by this check's silent, vacuous success." >&2
+        exit 4
     fi
 
     total=0
