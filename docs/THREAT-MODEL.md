@@ -2160,6 +2160,109 @@ should be read as a template for running an unpinned or lightly-sandboxed third-
 this project's data plane actually terminates untrusted traffic; it applies to this one, deliberately
 isolated, disposable class of host and to no other.
 
+## The h2load and vegeta adapters, and the cross-check gate (`bench-loadgen-h2load-and-vegeta-crosscheck`, #413)
+
+*Status: `H2Load::plan`/`H2Load::parse`, `Vegeta::plan`/`Vegeta::parse` and `cross_check` ship in
+`irontraffic-bench`; the driver binary that actually spawns either command line, and the release
+process that calls `cross_check` once per protocol cell, are later M17 work. This section is written
+now, in the same pull request that introduces both parsers, per `CONTRIBUTING.md`'s new-parser rule.*
+
+**Two more untrusted-input parsers join `CellId::parse`, `LatencyRecorder::read_hgrm`, `Oha::parse`
+and `Nighthawk::parse`.** `H2Load::parse` reads a fixed, line-by-line label table over h2load's own
+text summary (never a loose regex sweep, so a future h2load version that adds a line this parser does
+not recognise is tolerated, and one that silently repeats a label this parser DOES recognise is
+`Err(Parse)` naming both line numbers, not a silent per-thread-block misread). `Vegeta::parse` reads a
+fixed set of JSON fields the same way `Oha::parse` does. Both are bounded on the same axes every other
+adapter's parser is: `MAX_TOOL_OUTPUT_BYTES`/`MAX_TOOL_STDERR_BYTES` at the trait boundary, plus
+`H2Load`'s own tighter `MAX_H2LOAD_OUTPUT_BYTES` (1 MiB), `MAX_H2LOAD_LINES` (4,096) and
+`MAX_H2LOAD_LINE_BYTES` (1,024), each checked before the bytes they bound are ever split or scanned,
+so a runaway or hostile tool costs a comparison, not a scan.
+
+**Every duration and timing number both parsers read is parsed with integer arithmetic, never through
+a floating-point conversion.** This is the identical class of defect the Nighthawk protobuf-duration
+parser and the `.hgrm` codec both close, restated here because `h2load`'s own summary line
+(`time for request:  239us  11.85ms  602us  351us  89.35%`) mixes three different unit suffixes within
+one row: the standard library's own floating-point string parser accepts `nan`, `inf` and `1e309`, and
+casting a not-a-number floating value to an unsigned integer yields `0` in Rust, so a corrupted or
+hostile column would otherwise become a zero-nanosecond sample in a histogram this crate would go on to
+report percentiles from. `grep -n "parse::<f64>\|as f64" crates/irontraffic-bench/src/loadgen/h2load.rs`
+returning nothing is an acceptance criterion of the issue that shipped this parser, checked in CI, not
+merely a code-review preference.
+
+**`cross_check` is the actual security surface this issue exists to ship, not a side effect of adding a
+second load generator.** Two independently written tools agreeing on p99 is the only cheap check
+against a systematic error in this project's own harness that a second run of the SAME harness would
+never reveal; a gate that cannot FIRE is worse than no gate at all, because it certifies an agreement
+that was never tested and the number it blesses becomes a published performance claim in
+`science/benchmarking.md`. Three properties make the difference between a gate that works and one that
+silently always reports agreement:
+
+1. **The client-CPU saturation check is ordered `is_finite()` first, unconditionally, before any
+   ordering comparison.** `NaN >= 80.0` evaluates to `false` in Rust (every comparison against `NaN`
+   is), so a saturation guard written only with `>=` would let a `NaN` CPU reading sail straight past
+   it and into the ordinary agree/disagree arithmetic below, reporting the two tools as agreeing on the
+   strength of a measurement that does not exist. A missing or failed CPU sample is exactly how a `NaN`
+   reaches this function in the first place, which is precisely the input this check exists to catch.
+   `cross_check_rejects_non_finite_cpu` (`tests/loadgen_vegeta.rs`) and the
+   `cross_check_is_symmetric_and_bounded` property test (which draws `cpu` from arbitrary `f64`
+   INCLUDING `NaN` and both infinities, not only the plausible `0.0..=100.0` range) both pin this.
+2. **The tolerance ratio's numerator is widened to `u128` before the multiply, not narrowed after
+   it.** `Percentiles` values are deserialised from committed result files a pull request author can
+   hand-edit, so `p99_ns` can legitimately be `u64::MAX`. `u64::MAX * 1000` computed in `u64` wraps to a
+   small number that lands inside the 50 permille tolerance and reports `Agree`, on a pull request whose
+   whole point was to LOOK healthy. Computing `|a.p99_ns - b.p99_ns| as u128 * 1000` before dividing by
+   `max(a.p99_ns, b.p99_ns) as u128` cannot wrap for any `u64` input, and the quotient is provably at
+   most 1,000 (the numerator can never exceed the denominator), so the final narrowing cast to `u32`
+   cannot truncate either. `cross_check_does_not_wrap_on_extreme_percentiles` pins `u64::MAX` against
+   `1` directly; the property test sweeps `0..=u64::MAX` for both sides on every run.
+3. **A `raise CROSS_CHECK_TOLERANCE_PERMILLE` fix is out of scope by design, not merely discouraged.**
+   The public constant exists so the tolerance is visible and reviewable, not adjustable per release to
+   make a red run green: this issue's own Do NOT list states the rule directly, and nothing in this
+   crate reads the constant from an environment variable, a config file, or a command-line flag. A
+   disagreement is defined as something to INVESTIGATE before publishing, and the investigation is the
+   value the whole cross-check exists to produce; moving the goalpost instead would make the gate exist
+   in name only.
+
+**`Zero` and `absent` are both defined outcomes, never silently read as agreement.** Either recorder
+having `samples == 0`, or either `p99_ns == 0`, is `NotComparable { NoSamples }` (step 1, checked before
+the ratio is ever computed, so this is a defined outcome rather than a division by zero the arithmetic
+happens to survive); `min(arbiter.samples, independent.samples)` below `Percentiles::required_samples(0.99)`
+is `NotComparable { TooFewSamples }` (the MINIMUM of the two counts, not only the independent tool's,
+for the identical symmetry reason the u128 widening exists: checking one side alone would make the
+verdict depend on which tool is passed as which argument). Every `NotComparableReason` is a distinct,
+named enum variant a caller must match on; there is no code path that turns "the data needed to compare
+was missing" into `Agree`.
+
+**The comparison is symmetric by construction, and the property test checks it directly, not just for
+one hand-picked pair.** The tolerance ratio's denominator is `max(arbiter.p99_ns, independent.p99_ns)`,
+never the arbiter's value alone; dividing by the arbiter's own p99 instead (the "obvious" reading of
+"relative to the true value") would make the verdict depend on which tool is passed as `arbiter` and
+which as `independent`, which this issue's own Do NOT list forbids directly. `cross_check_is_symmetric_and_bounded`
+asserts `cross_check(a, b, cpu) == cross_check(b, a, cpu)` for `p99_ns` drawn from the FULL `0..=u64::MAX`
+range on both sides (not only plausible latency magnitudes, per the same "a stranger can edit this file"
+reasoning as point 2 above) and `cpu` drawn from arbitrary `f64`, so the property is checked far outside
+the range any real run would ever produce, not merely for the one pair issue #413's own worked example
+names.
+
+**`vegeta`'s `-max-workers` bound exists to stop the cross-check tool from becoming the thing it
+measures.** Left unbounded, vegeta spawns workers until its OWN client process is the bottleneck, which
+would make the "independent tool" side of the comparison describe vegeta's own scheduling rather than
+the system under test: `Vegeta::plan` refuses to build a command line at all (`BenchError::Cell`) when
+`max_workers` is `0` (a zero cap attacks at zero requests per second and would report a successful,
+empty run as healthy) or above `MAX_VEGETA_WORKERS` (65,536; a four-billion worker cap is the unbounded
+case spelled differently, not a bound). This is a measurement-integrity control, not a memory-safety
+one: nothing about a large `-max-workers` value can corrupt this process's own memory, since the value
+is rendered as one more command-line argument string, never allocated against locally.
+
+**h2load has no certificate-validation override at all, unlike every other tool in this crate.**
+`oha` has `--insecure`; `Nighthawk`'s own module doc already flags the identical gap for a different
+reason. `h2load`'s `--help` output and its `getopt_long` option table (checked directly against the
+pinned `v1.68.1` source) have no `-k`, `--insecure`, or `--cacert` of any kind. A TLS cell measured
+against this harness's self-signed fixture certificate will therefore fail closed for a reason this
+adapter's own flag surface has no answer to, rather than silently skip verification; this is an honest
+absence, not a workaround this adapter's code should paper over by, for example, disabling verification
+some other way this issue does not ask for.
+
 ## Installation and release artifacts
 
 `scripts/install.sh` is a `curl | sh` channel: it places an executable file on a user's machine and

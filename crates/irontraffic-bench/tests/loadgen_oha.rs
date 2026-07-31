@@ -880,7 +880,7 @@ fn saturate_is_unsupported() {
     let mut cell = base_cell();
     cell.rate = RateMode::Saturate;
     let err = Oha.supports(&cell).expect_err("saturate must be refused");
-    assert!(matches!(err, Unsupported::RateMode { tool: "oha" }));
+    assert!(matches!(err, Unsupported::RateMode { tool: "oha", .. }));
 }
 
 // ---------------------------------------------------------------------------

@@ -49,3 +49,23 @@ expect_version_contains = "nighthawk"
 [oha]
 role = "sweep"
 version = "1.15.0"
+
+# h2load 1.68.1: the LAST `nghttp2/nghttp2` tag whose `h2load.cc` still prints the
+# "finished in"/"requests:"/"status codes:"/"traffic:"/"time for request:" text shape
+# this adapter's parser reads. `v1.69.0` (2026-04-19) onward replaces that whole
+# summary with a differently laid out table with none of those labels; see
+# `crates/irontraffic-bench/src/loadgen/h2load.rs`'s own module doc for the tag-by-tag
+# evidence trail. h2load's own build needs `libnghttp2`, OpenSSL, `libev` and `c-ares`,
+# none installable in this implementation environment, so the fixture this pin is
+# checked against is RECONSTRUCTED, not captured; re-verify against a real run.
+[h2load]
+role = "protocol-level saturate cells and TTFB decomposition"
+version = "1.68.1"
+
+# vegeta 12.13.0: confirmed genuinely, a real binary built locally with
+# `go install github.com/tsenart/vegeta/v12@v12.13.0` (no docker/podman needed,
+# unlike Nighthawk) attacking a local HTTP server; see
+# `crates/irontraffic-bench/tests/loadgen_vegeta.rs`'s own module doc.
+[vegeta]
+role = "independent release cross-check at a moderate fixed rate"
+version = "12.13.0"
