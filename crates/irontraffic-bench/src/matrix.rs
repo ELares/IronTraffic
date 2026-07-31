@@ -447,6 +447,27 @@ fn adv_entry(
 /// `BenchCell` can express) is left to `{{bench-runner-and-repetition}}`,
 /// which is the first issue that actually spawns a client against a real
 /// route table.
+///
+/// **The stronger, previously undisclosed consequence:** for two of these
+/// eight ids, "closest existing field value" does not merely approximate the
+/// shape, it lands on a `BenchCell` that is BYTE IDENTICAL, across all
+/// eleven fields and `rate_plan`, to a cell already elsewhere in this
+/// registry: `adv.last_segment_10k` equals `routes.10000.sat`, and
+/// `adv.header_flood` equals `base.sat`. Both are therefore a real
+/// duplicate-measurement risk of exactly the shape this issue's own Design
+/// section forbids ("two ids for one set of parameters means running the
+/// same measurement twice and publishing it as two points"), on top of the
+/// one pair the issue itself sanctions by name (`adv.reload_under_load`
+/// equalling `base`, because it IS the base cell plus periodic reloads).
+/// Accepted here, rather than deferring the two ids or adding a
+/// `BenchCell` field neither this issue's Public API section nor its Files
+/// table names, because a runner-level shape field is `{{bench-runner-and-repetition}}`'s
+/// concern, not this issue's; `registry_duplicate_parameter_sets_are_all_sanctioned`
+/// in `tests/matrix.rs` is what keeps this list closed and explicit rather
+/// than open-ended: any FOURTH collision that appears without being added to
+/// that test's sanctioned list fails the build. See the review finding on
+/// PR 819 ("the two adversarial cells are duplicates, not merely
+/// unexpressible").
 fn adversarial_entries(base: &BenchCell) -> Result<Vec<MatrixEntry>, BenchError> {
     let base_sat = CellId::parse("base.sat")?;
     Ok(vec![
@@ -590,12 +611,19 @@ pub fn registry() -> Result<Vec<MatrixEntry>, BenchError> {
 /// Looks up one entry by id.
 ///
 /// # Errors
-/// `BenchError::Cell` naming the id when it is not in the registry.
+/// `BenchError::Parse` naming the id when it is not in the registry, not
+/// `BenchError::Cell`: `Cell`'s payload is a `&'static str` and cannot carry a
+/// value that varies per call, the identical `&'static str` limitation
+/// `resolve_rate`'s own doc comment already documents for the same reason.
+/// This issue's own Public API section names `BenchError::Cell` here, which
+/// this deliberately deviates from for the reason above; see the review
+/// finding on PR 819 ("`entry()`'s documented 'naming the id' clause is
+/// unmet and undisclosed").
 pub fn entry(id: &CellId) -> Result<MatrixEntry, BenchError> {
     registry()?
         .into_iter()
         .find(|e| &e.cell.id == id)
-        .ok_or(BenchError::Cell("cell id is not in the registry"))
+        .ok_or_else(|| BenchError::parse("matrix", &format!("cell id {id} is not in the registry")))
 }
 
 /// The entries one `--suite <name>` selects, in registry order.
