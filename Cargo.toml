@@ -194,6 +194,18 @@ aws-lc-rs = "1"
 # platform this workspace targets (Linux `sched_setaffinity`, macOS
 # `thread_policy_set`), no C build, MIT/Apache-2.0 dual licensed.
 core_affinity = "0.8"
+# dev-only: expands the two committed corpus regex files in
+# `crates/irontraffic-bench/tests/matrix.rs` (test 7a,
+# `bench-matrix-cells-and-corpora`) with the SAME crate and the SAME
+# `max_repeat` bound the pinned `oha 1.15.0` release uses internally, which
+# is the whole point of that test: it is the authority on whether oha's own
+# regex expansion silently clamps a COUNTED repetition the way it clamps an
+# unbounded one. Version matches oha 1.15.0's own manifest exactly
+# (`rand_regex = "0.19.0"`, read directly from
+# https://github.com/hatoo/oha/blob/v1.15.0/Cargo.toml); this issue is the
+# FIRST to pin it. Test 7a, in `crates/irontraffic-bench/tests/matrix.rs`, is
+# its only consumer in the workspace.
+rand_regex = "0.19.0"
 
 [workspace.lints.rust]
 # A proxy parses attacker-controlled bytes on every request. There is no

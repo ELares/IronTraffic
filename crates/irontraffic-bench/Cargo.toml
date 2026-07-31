@@ -43,6 +43,10 @@ irontraffic-time = { path = "../irontraffic-time", version = "0.1.0" }
 # (#417) and `reload.rs` in `bench-config-reload-under-load` (#420) both
 # depend on it staying a normal dependency; a crate does not need both.
 serde_json = { workspace = true }
+# `corpus::path_samples` draws from `irontraffic_rand::Rng`, seeded, never
+# from `rand` (`bench-matrix-cells-and-corpora`, #414): `rand::` is banned
+# outside `crates/irontraffic-rand` by the `determinism-seam` invariant lint.
+irontraffic-rand = { path = "../irontraffic-rand", version = "0.1.0" }
 
 [dev-dependencies]
 proptest = { workspace = true }
@@ -60,6 +64,28 @@ criterion = { workspace = true }
 # never a normal dependency, and `irontraffic-bench`'s own production code
 # never names it.
 irontraffic-origin = { path = "../irontraffic-origin", version = "0.1.0" }
+# Test 7a (`bench-matrix-cells-and-corpora`, #414) expands the two committed
+# corpus regex files with the SAME crate and the SAME `max_repeat` bound the
+# pinned `oha` release uses; see the workspace `Cargo.toml`'s own comment on
+# `rand_regex` for why. `rand_regex` needs a caller-supplied `rand::Rng` and
+# does not re-export `rand` itself, so this direct `rand` entry is the
+# minimal glue that lets test 7a name a concrete RNG type
+# (`rand::rngs::StdRng`) at all; it is not named in this issue's own Cargo.toml
+# Files table row, which enumerates only `rand_regex` and `sha2`, because the
+# need for it follows from `rand_regex`'s own public API rather than being a
+# separate design choice. `it-allow: determinism-seam reason: test 7a must
+# expand with the same crate and the same bound the pinned oha release uses,
+# which is the whole point of the test` marks every use of it in
+# `tests/matrix.rs`; it must never appear under `src/`.
+rand = "0.10"
+# The workspace `Cargo.toml` pins the version; see its own comment for the
+# full rationale and the exact provenance of the `0.19.0` pin.
+rand_regex = { workspace = true }
+# Hashes the resolved command line for each entry in `bench/cells.snapshot`
+# (test 7, invariant I12): `sha2 = "0.10"` is already pinned in the workspace
+# `Cargo.toml` by `cluster-derived-session-ticketer` (#120), so this takes it
+# via `workspace = true` rather than restating the version.
+sha2 = { workspace = true }
 
 [[bench]]
 name = "harness"

@@ -1,0 +1,16 @@
+# Adversarial worst-case path corpus for the published benchmark matrix.
+#
+# This is the w = 3 instance (the base cell's 1,000 routes) of a generated
+# family: corpus::path_expr(PathCorpus::AdversarialWorstCase, routes) derives
+# the regex for any other power-of-ten route count by substituting the digit
+# count in the {3} group below. Paired with the SharedPrefix route shape
+# (corpus::route_table), the GitHub-like shape (most routes sharing the
+# dynamic prefix /repos/acme/rNNN/issues/) chosen to force the deepest trie
+# descent and the largest number of predicate evaluations over a maximal
+# shared prefix. Every expansion of this regex names exactly one route in
+# that table.
+#
+# Any tool that expands this pattern with an unbounded repetition operator
+# (this one has none) must pass --max-repeat 4, so a future edit that adds
+# one is still bounded. See MAX_REGEX_REPEAT in crates/irontraffic-bench/src/corpus.rs.
+/repos/acme/r[0-9]{3}/issues/[0-9]{1,6}/(comments|reviews|files)
