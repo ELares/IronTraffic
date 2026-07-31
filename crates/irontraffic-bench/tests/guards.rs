@@ -451,9 +451,22 @@ fn i7_covers_the_stall_histogram() {
     let v = check_validity(&r, None, None);
     assert_invalid!(&v, InvariantId::I7);
     if let Validity::Invalid { detail, .. } = v {
+        // Issue #796 finding 2: `"stall"` alone is a substring of the
+        // literal `stall_out_of_range={}` that the format string appends
+        // UNCONDITIONALLY, so it is satisfied even when the `which` phrase
+        // names the WRONG histogram. Pin on the whole phrase, and require
+        // the wrong-histogram phrase be ABSENT, so a mutation that swaps
+        // which arm fires (verified live: renaming this arm's phrase to
+        // "the latency histogram" passed every test before this fix) is
+        // caught.
         assert!(
-            detail.as_str().contains("stall"),
+            detail.as_str().contains("the stall histogram"),
             "detail must name the stall histogram specifically, got {detail}"
+        );
+        assert!(
+            !detail.as_str().contains("the latency histogram"),
+            "detail must not name the latency histogram when only stall_out_of_range fired, \
+             got {detail}"
         );
     }
 }
@@ -535,7 +548,14 @@ fn i12_command_line_drift() {
 
 #[test]
 fn i12_rejects_a_hostile_command_line() {
-    let too_long = "a".repeat(MAX_COMMAND_LINE + 1);
+    // Issue #796 finding 3: the literal 4097, NOT `MAX_COMMAND_LINE + 1`.
+    // Building the over-long fixture from the same constant the guard
+    // compares against means the two move together, so the fixture cannot
+    // pin the bound: changing `MAX_COMMAND_LINE` to any other value (caught
+    // live: 4096 -> 8192) passed every test.
+    // `i12_max_command_line_is_pinned_at_4096` below pins the constant
+    // itself and the exact boundary.
+    let too_long = "a".repeat(4097);
     let ansi = "it-loadgen --cell base \x1b[2J\x1b[1;1H --rate saturate".to_owned();
     let newline = "it-loadgen --cell base\n--rate saturate".to_owned();
 
@@ -549,6 +569,27 @@ fn i12_rejects_a_hostile_command_line() {
             assert!(detail.as_str().bytes().all(|b| (0x20..=0x7E).contains(&b)));
         }
     }
+}
+
+/// Issue #796 finding 3: `MAX_COMMAND_LINE`'s 4096 byte bound, given
+/// verbatim in issue #408's Public API, was previously compared only
+/// against itself: the hostile fixture above was built as
+/// `MAX_COMMAND_LINE + 1`, so changing the constant to any other value, or
+/// changing the guard's `>` to `>=`, passed every test (both verified live
+/// before this fix). Pins the constant against a literal and covers the
+/// exact boundary, which nothing else exercises: exactly 4096 printable
+/// ASCII bytes must PASS.
+#[test]
+fn i12_max_command_line_is_pinned_at_4096() {
+    assert_eq!(MAX_COMMAND_LINE, 4096);
+
+    let mut passing = base_result();
+    passing.command_line = "a".repeat(4096);
+    assert_eq!(check_validity(&passing, None, None), Validity::Valid);
+
+    let mut failing = base_result();
+    failing.command_line = "a".repeat(4097);
+    assert_invalid!(&check_validity(&failing, None, None), InvariantId::I12);
 }
 
 // ---------------------------------------------------------------------------
