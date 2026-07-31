@@ -18,7 +18,22 @@ thiserror = { workspace = true }
 # `rustix::process::getrlimit(Resource::Nofile)` for `Provenance::ulimit_nofile`.
 # No C build, no `unsafe` in our code.
 rustix = { workspace = true, features = ["process"] }
+# `LatencyRecorder` in `src/hist.rs`: a library type that `probe`, `loadgen`,
+# `result` and `aggregate` all name, so this is a normal dependency, never a
+# dev-dependency. `default-features = false` drops `serialization`, `sync`
+# and, with them, `flate2`, `base64` and `crossbeam-channel`: every call this
+# module makes (`record`, `record_n`, `add`, `value_at_quantile`, `max`,
+# `len`, `iter_quantiles`) is in the crate core, and the committed artifact is
+# the text `.hgrm`, never the binary serialisation.
+hdrhistogram = { workspace = true }
 
 [dev-dependencies]
 serde_json = { workspace = true }
 proptest = { workspace = true }
+# Benchmarks: the `record_ns`, `merge` and `percentiles` criterion targets in
+# `benches/harness.rs`.
+criterion = { workspace = true }
+
+[[bench]]
+name = "harness"
+harness = false
