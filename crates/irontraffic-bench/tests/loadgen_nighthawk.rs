@@ -34,9 +34,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use irontraffic_bench::{
     BenchCell, BenchError, CacheMode, CellId, ContainerRuntime, Invocation, KeepaliveMode,
-    LoadGenerator, MAX_PERCENTILE_ENTRIES, MAX_REPORTED_REQUESTS, MIN_PERCENTILE_ENTRIES,
-    Nighthawk, ParseCtx, PathCorpus, Protocol, RateMode, RunParams, Scheme, Target, TlsMode,
-    ToolStamp,
+    LoadGenerator, MAX_PERCENTILE_ENTRIES, MAX_REPORTED_REQUESTS, MAX_TOOL_OUTPUT_BYTES,
+    MIN_PERCENTILE_ENTRIES, Nighthawk, ParseCtx, PathCorpus, Protocol, RateMode, RunParams, Scheme,
+    Target, TlsMode, ToolStamp,
 };
 use serde_json::{Value, json};
 
@@ -1125,6 +1125,554 @@ fn parse_rejects_a_latency_count_inconsistent_with_requests_sent() {
     );
     let detail = expect_parse_detail(&err);
     assert!(detail.contains("requests_sent"), "{detail}");
+}
+
+// ---------------------------------------------------------------------------
+// Fix for PR 812's BLOCKING 1: the MIN_PERCENTILE_ENTRIES floor is now
+// applied only to the statistic that sets latency_exact
+// (request_to_response). These two tests are the direct demonstration: each
+// is watched to FAIL against the OLD uniform floor (5 rows and 3 rows are
+// both well short of MIN_PERCENTILE_ENTRIES's 64) and to PASS now that the
+// floor is scoped to latency alone. See nighthawk.rs's module doc, "the
+// floor is LATENCY-only" section.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parse_low_blocking_run_is_ok() {
+    let nh = base_nighthawk();
+    let cell = base_cell();
+    let invocation = base_invocation();
+    let tool = base_tool_stamp();
+    let ctx = ParseCtx {
+        cell: &cell,
+        invocation: &invocation,
+        tool: &tool,
+    };
+
+    // A healthy open-loop run is DEFINED by having little or no
+    // coordinated-omission blocking, so sequencer.blocking legitimately
+    // carries far fewer rows than a busy statistic: an HdrHistogram
+    // percentile iterator cannot emit more distinct rows than it recorded
+    // samples. 5 rows for 5 samples is the fully-saturated case (every
+    // sample its own distinct duration).
+    let mut global = make_global_result();
+    let healthy_blocking = make_statistic("sequencer.blocking", 5, 5);
+    replace_statistic(&mut global, "sequencer.blocking", healthy_blocking);
+    let doc = make_document(&[global]);
+
+    let raw = nh.parse(&ctx, &doc, b"").expect(
+        "a healthy, low-blocking run must still parse: near-zero blocking is what a \
+                 healthy open-loop run looks like, not a reason to discard the latency it \
+                 measured",
+    );
+    assert!(raw.latency_exact);
+    let stall = raw
+        .stall
+        .expect("sequencer.blocking must still be present and reconstructed");
+    assert_eq!(stall.len(), 5);
+}
+
+#[test]
+fn parse_low_connect_sample_run_is_ok() {
+    let nh = base_nighthawk();
+    let cell = base_cell();
+    let invocation = base_invocation();
+    let tool = base_tool_stamp();
+    let ctx = ParseCtx {
+        cell: &cell,
+        invocation: &invocation,
+        tool: &tool,
+    };
+
+    // A `Both`-keepalive cell that reuses connections may legitimately open
+    // very few of them relative to the request count; queue_to_connect does
+    // not set latency_exact, so it carries the same NotEnforced floor as
+    // sequencer.blocking, for the same reason.
+    let mut global = make_global_result();
+    let few_connects = make_statistic("benchmark_http_client.queue_to_connect", 3, 3);
+    replace_statistic(
+        &mut global,
+        "benchmark_http_client.queue_to_connect",
+        few_connects,
+    );
+    let doc = make_document(&[global]);
+
+    let raw = nh
+        .parse(&ctx, &doc, b"")
+        .expect("a run that opened only 3 connections under connection reuse must still parse");
+    let connect = raw
+        .connect
+        .expect("queue_to_connect must still be present and reconstructed");
+    assert_eq!(connect.len(), 3);
+}
+
+// ---------------------------------------------------------------------------
+// SHOULD_FIX: named invariants 3 and 4, and latency_trustworthy, had zero
+// test coverage in either direction (PR 813 finding 5 / review item 5).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parse_rejects_statistic_count_mismatch() {
+    // Isolates invariant 4 (`assert_eq!(reconstructed.len(), statistic.count)`)
+    // from the separate requests_sent cross-check
+    // `parse_rejects_a_latency_count_inconsistent_with_requests_sent`
+    // exercises: this uses sequencer.blocking, which has no requests_sent
+    // cross-check at all, so ONLY the statistic's own internal reconciliation
+    // can reject this document.
+    let nh = base_nighthawk();
+    let cell = base_cell();
+    let invocation = base_invocation();
+    let tool = base_tool_stamp();
+    let ctx = ParseCtx {
+        cell: &cell,
+        invocation: &invocation,
+        tool: &tool,
+    };
+
+    let mut global = make_global_result();
+    // Percentiles reconcile to 5, but the statistic declares "count": "999".
+    let mismatched = make_statistic_with_counts("sequencer.blocking", &[1, 2, 3, 4, 5], 999);
+    replace_statistic(&mut global, "sequencer.blocking", mismatched);
+    let doc = make_document(&[global]);
+
+    let err = nh.parse(&ctx, &doc, b"").expect_err(
+        "a statistic whose declared count disagrees with its own reconstructed percentile \
+         ladder must not parse",
+    );
+    let detail = expect_parse_detail(&err);
+    assert!(detail.contains("reconstructed count"), "{detail}");
+    assert!(
+        detail.contains("does not equal the declared count"),
+        "{detail}"
+    );
+}
+
+#[test]
+fn parse_requires_connect_for_downstream_close() {
+    // Invariant 3, the DownstreamClose-required direction. No existing test
+    // mentioned KeepaliveMode::DownstreamClose at all before this one.
+    let nh = base_nighthawk();
+    let mut cell = base_cell();
+    cell.keepalive = KeepaliveMode::DownstreamClose;
+    let invocation = base_invocation();
+    let tool = base_tool_stamp();
+    let ctx = ParseCtx {
+        cell: &cell,
+        invocation: &invocation,
+        tool: &tool,
+    };
+
+    let mut global = make_global_result();
+    remove_statistic(&mut global, "benchmark_http_client.queue_to_connect");
+    let doc = make_document(&[global]);
+
+    let err = nh
+        .parse(&ctx, &doc, b"")
+        .expect_err("a DownstreamClose cell with no queue_to_connect statistic must not parse");
+    let detail = expect_parse_detail(&err);
+    assert!(detail.contains("DownstreamClose"), "{detail}");
+}
+
+#[test]
+fn parse_allows_missing_connect_for_both_keepalive() {
+    // Invariant 3, the OTHER direction: `Both` keepalive must NOT require
+    // queue_to_connect. `parse_fixture_is_exact` only ever exercises the
+    // fixture, which always carries queue_to_connect, so this direction of
+    // the invariant had no coverage either.
+    let nh = base_nighthawk();
+    let cell = base_cell(); // KeepaliveMode::Both
+    let invocation = base_invocation();
+    let tool = base_tool_stamp();
+    let ctx = ParseCtx {
+        cell: &cell,
+        invocation: &invocation,
+        tool: &tool,
+    };
+
+    let mut global = make_global_result();
+    remove_statistic(&mut global, "benchmark_http_client.queue_to_connect");
+    let doc = make_document(&[global]);
+
+    let raw = nh
+        .parse(&ctx, &doc, b"")
+        .expect("Both keepalive must tolerate a missing queue_to_connect statistic");
+    assert!(raw.connect.is_none());
+}
+
+#[test]
+fn parse_latency_trustworthy_for_fixed_rate() {
+    let nh = base_nighthawk();
+    let mut cell = base_cell();
+    cell.rate = RateMode::Fixed(50_000);
+    let invocation = base_invocation();
+    let tool = base_tool_stamp();
+    let ctx = ParseCtx {
+        cell: &cell,
+        invocation: &invocation,
+        tool: &tool,
+    };
+
+    let raw = nh
+        .parse(&ctx, FIXTURE_BYTES, b"")
+        .expect("the checked-in fixture must parse");
+    assert!(
+        raw.latency_trustworthy,
+        "a fixed-rate, open-loop run's latency must be trustworthy"
+    );
+}
+
+#[test]
+fn parse_latency_untrustworthy_for_saturate() {
+    let nh = base_nighthawk();
+    let mut cell = base_cell();
+    cell.rate = RateMode::Saturate;
+    // `ctx.invocation` is not consulted by `parse` for `latency_trustworthy`
+    // (only `ctx.cell.rate` is), so reusing the fixed-rate `base_invocation`
+    // here changes nothing about what this test proves.
+    let invocation = base_invocation();
+    let tool = base_tool_stamp();
+    let ctx = ParseCtx {
+        cell: &cell,
+        invocation: &invocation,
+        tool: &tool,
+    };
+
+    let raw = nh
+        .parse(&ctx, FIXTURE_BYTES, b"")
+        .expect("the checked-in fixture must parse regardless of rate mode");
+    assert!(
+        !raw.latency_trustworthy,
+        "saturate mode is a throughput measurement, not a trustworthy latency one"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// SHOULD_FIX: only the sha256: prefix of the digest shape was tested; exact
+// length, hex class and lowercase-only each survived mutation (PR 813
+// finding 6 / review item 6).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn from_pin_rejects_malformed_digest_shapes() {
+    let dir = DigestDir::new();
+    let digest64 = valid_digest_body();
+
+    let cases: [(&str, String); 4] = [
+        (
+            "63 hex digits: one short of the exact 64",
+            digest64[..63].to_owned(),
+        ),
+        (
+            "65 hex digits: one past the exact 64",
+            format!("{digest64}a"),
+        ),
+        (
+            "64 characters but the last is not a hex digit",
+            format!("{}g", &digest64[..63]),
+        ),
+        ("64 hex digits but uppercase", digest64.to_uppercase()),
+    ];
+    for (label, body) in cases {
+        let path = dir.write(&format!("sha256:{body}\n"));
+        match Nighthawk::from_pin(
+            ContainerRuntime::Docker,
+            &path,
+            "envoyproxy/nighthawk-dev",
+            "0-3",
+        ) {
+            Ok(_) => panic!("{label}: must be rejected"),
+            Err(e) => {
+                let _ = expect_parse_detail(&e);
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SHOULD_FIX: version_invocation carried the digest but none of the five
+// hardening flags plan carries (PR 813 finding 4 / review item 4).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn version_invocation_carries_the_hardening_flags() {
+    let invocation = base_nighthawk().version_invocation();
+    assert_eq!(invocation.program, "docker");
+    assert!(find_subsequence(&invocation.args, &["--cap-drop", "ALL"]).is_some());
+    assert!(find_subsequence(&invocation.args, &["--security-opt", "no-new-privileges"]).is_some());
+    assert!(invocation.args.iter().any(|a| a == "--read-only"));
+    assert!(find_subsequence(&invocation.args, &["--memory", "4g"]).is_some());
+    assert!(find_subsequence(&invocation.args, &["--pids-limit", "4096"]).is_some());
+    assert!(!invocation.args.iter().any(|a| a == "--privileged"));
+    assert!(!invocation.args.iter().any(|a| a == "-v"));
+    assert!(!invocation.args.iter().any(|a| a == "--volume"));
+    // The digest is still carried on this path too.
+    assert!(invocation.args.iter().any(|a| a.contains("@sha256:")));
+}
+
+// ---------------------------------------------------------------------------
+// NOTE: eight further guards survived mutation with no test holding them
+// (PR 813 finding 7 / review item 7). Each test below is the direct,
+// isolated coverage for one of them.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn parse_rejects_non_monotone_percentiles() {
+    // M23 (part 1): a repeated percentile value is not STRICTLY increasing.
+    let nh = base_nighthawk();
+    let cell = base_cell();
+    let invocation = base_invocation();
+    let tool = base_tool_stamp();
+    let ctx = ParseCtx {
+        cell: &cell,
+        invocation: &invocation,
+        tool: &tool,
+    };
+
+    let mut global = make_global_result();
+    let bad_stat = json!({
+        "id": "sequencer.blocking",
+        "count": "10",
+        "percentiles": [
+            {"percentile": 0.5, "count": "4", "duration": "0.000004000s"},
+            {"percentile": 0.5, "count": "10", "duration": "0.000005000s"},
+        ],
+    });
+    replace_statistic(&mut global, "sequencer.blocking", bad_stat);
+    let doc = make_document(&[global]);
+
+    let err = nh
+        .parse(&ctx, &doc, b"")
+        .expect_err("a repeated percentile value must not parse");
+    let detail = expect_parse_detail(&err);
+    assert!(detail.contains("strictly increasing"), "{detail}");
+}
+
+// M23's `is_finite()` guard (documented in `nighthawk.rs` as protection
+// against a NaN percentile) has NO dedicated test here, and deliberately so:
+// I confirmed by execution that it cannot be reached through untrusted
+// bytes at all in this crate's current configuration. JSON's own grammar has
+// no NaN literal, and an out-of-range magnitude such as `1e400` (which, if
+// silently converted, would be the one route to `f64::INFINITY`) is instead
+// rejected by `serde_json::from_slice` itself, one layer before this parser
+// ever runs (`serde_json::Error` "number out of range"), confirmed against
+// this exact crate's dependency tree (`serde_json` without the
+// `arbitrary_precision` feature, which is not enabled anywhere in this
+// workspace's `Cargo.lock`). The check is retained as defence in depth
+// against a future dependency change that defers that bound to `.as_f64()`
+// instead of enforcing it at parse time, not because it is reachable today;
+// `parse_rejects_non_monotone_percentiles` below is the real, reachable
+// coverage for the comparison itself.
+
+#[test]
+fn parse_rejects_decreasing_percentile_durations() {
+    // M24: a duration that decreases between two consecutive rows.
+    let nh = base_nighthawk();
+    let cell = base_cell();
+    let invocation = base_invocation();
+    let tool = base_tool_stamp();
+    let ctx = ParseCtx {
+        cell: &cell,
+        invocation: &invocation,
+        tool: &tool,
+    };
+
+    let mut global = make_global_result();
+    let bad_stat = json!({
+        "id": "sequencer.blocking",
+        "count": "10",
+        "percentiles": [
+            {"percentile": 0.5, "count": "4", "duration": "0.000005000s"},
+            {"percentile": 0.9, "count": "10", "duration": "0.000004000s"},
+        ],
+    });
+    replace_statistic(&mut global, "sequencer.blocking", bad_stat);
+    let doc = make_document(&[global]);
+
+    let err = nh
+        .parse(&ctx, &doc, b"")
+        .expect_err("a decreasing duration must not parse");
+    let detail = expect_parse_detail(&err);
+    assert!(detail.contains("non-decreasing"), "{detail}");
+}
+
+#[test]
+fn parse_rejects_per_entry_count_over_max_isolated() {
+    // M21 / invariant 9, isolated from the separate requests_sent
+    // cross-check `parse_rejects_absurd_statistic_count` actually triggers
+    // (that test's own absurd count is compensated by the +4-slack
+    // requests_sent check, so it does not isolate this one, per PR 813
+    // finding 7). requests_sent is set to exactly MAX_REPORTED_REQUESTS (the
+    // largest value the requests_sent check itself allows), and the
+    // statistic's final count is MAX_REPORTED_REQUESTS + 1 (the smallest
+    // value invariant 9 can catch): MAX_REPORTED_REQUESTS + 1 does not
+    // exceed requests_sent (MAX_REPORTED_REQUESTS) + 4, so only invariant 9
+    // itself can reject this document.
+    let nh = base_nighthawk();
+    let cell = base_cell();
+    let invocation = base_invocation();
+    let tool = base_tool_stamp();
+    let ctx = ParseCtx {
+        cell: &cell,
+        invocation: &invocation,
+        tool: &tool,
+    };
+
+    let over_max = MAX_REPORTED_REQUESTS + 1;
+    let counts = count_ladder(64, over_max);
+    let mut global = make_global_result();
+    let absurd = make_statistic_with_counts(
+        "benchmark_http_client.request_to_response",
+        &counts,
+        over_max,
+    );
+    replace_statistic(
+        &mut global,
+        "benchmark_http_client.request_to_response",
+        absurd,
+    );
+    set_field(
+        &mut global,
+        "counters",
+        Value::Array(vec![
+            make_counter("upstream_rq_total", MAX_REPORTED_REQUESTS),
+            make_counter("benchmark.http_2xx", MAX_REPORTED_REQUESTS),
+            make_counter("benchmark.pool_connection_failure", 0),
+            make_counter("benchmark.stream_resets", 0),
+            make_counter("upstream_cx_rx_bytes_total", 1),
+        ]),
+    );
+    let doc = make_document(&[global]);
+
+    let err = nh.parse(&ctx, &doc, b"").expect_err(
+        "a percentile entry claiming more than MAX_REPORTED_REQUESTS samples must not parse, \
+         even when requests_sent is large enough that the separate requests_sent cross-check \
+         cannot catch it",
+    );
+    let detail = expect_parse_detail(&err);
+    assert!(detail.contains("MAX_REPORTED_REQUESTS"), "{detail}");
+}
+
+#[test]
+fn parse_rejects_inconsistent_counters() {
+    // M36: the u128 counter-consistency guard, which also prevents the
+    // `requests_sent - accounted` subtraction from underflowing.
+    let nh = base_nighthawk();
+    let cell = base_cell();
+    let invocation = base_invocation();
+    let tool = base_tool_stamp();
+    let ctx = ParseCtx {
+        cell: &cell,
+        invocation: &invocation,
+        tool: &tool,
+    };
+
+    let mut global = make_global_result();
+    set_field(
+        &mut global,
+        "counters",
+        Value::Array(vec![
+            make_counter("upstream_rq_total", 1000),
+            make_counter("benchmark.http_2xx", 1000),
+            make_counter("benchmark.pool_connection_failure", 500),
+            make_counter("benchmark.stream_resets", 0),
+            make_counter("upstream_cx_rx_bytes_total", 130_000),
+        ]),
+    );
+    let doc = make_document(&[global]);
+
+    let err = nh.parse(&ctx, &doc, b"").expect_err(
+        "responses_ok (1000) plus errors (500) exceeding requests_sent (1000) must not parse",
+    );
+    let detail = expect_parse_detail(&err);
+    assert!(detail.contains("counters are inconsistent"), "{detail}");
+}
+
+#[test]
+fn parse_rejects_oversized_stdout() {
+    // Edge case 16 / M40: the byte cap is checked on the slice length
+    // BEFORE any deserialisation, so this is not valid JSON at all.
+    let nh = base_nighthawk();
+    let cell = base_cell();
+    let invocation = base_invocation();
+    let tool = base_tool_stamp();
+    let ctx = ParseCtx {
+        cell: &cell,
+        invocation: &invocation,
+        tool: &tool,
+    };
+
+    let oversized = vec![b'a'; MAX_TOOL_OUTPUT_BYTES + 1];
+    let err = nh
+        .parse(&ctx, &oversized, b"")
+        .expect_err("stdout past MAX_TOOL_OUTPUT_BYTES must not parse");
+    let detail = expect_parse_detail(&err);
+    assert!(detail.contains("MAX_TOOL_OUTPUT_BYTES"), "{detail}");
+}
+
+#[test]
+fn parse_rejects_zero_execution_duration() {
+    // M39: `"0s"` parses cleanly as a protobuf Duration (0 nanoseconds) but
+    // is rejected by the SEPARATE zero-duration guard in `parse` itself.
+    let nh = base_nighthawk();
+    let cell = base_cell();
+    let invocation = base_invocation();
+    let tool = base_tool_stamp();
+    let ctx = ParseCtx {
+        cell: &cell,
+        invocation: &invocation,
+        tool: &tool,
+    };
+
+    let mut global = make_global_result();
+    set_field(&mut global, "execution_duration", json!("0s"));
+    let doc = make_document(&[global]);
+
+    let err = nh
+        .parse(&ctx, &doc, b"")
+        .expect_err("a zero execution_duration must not parse");
+    let detail = expect_parse_detail(&err);
+    assert!(detail.contains("zero duration_ns"), "{detail}");
+}
+
+#[test]
+fn parse_rejects_empty_output() {
+    // Edge case 4 / M37.
+    let nh = base_nighthawk();
+    let cell = base_cell();
+    let invocation = base_invocation();
+    let tool = base_tool_stamp();
+    let ctx = ParseCtx {
+        cell: &cell,
+        invocation: &invocation,
+        tool: &tool,
+    };
+
+    let err = nh
+        .parse(&ctx, b"", b"")
+        .expect_err("empty stdout must not parse");
+    let detail = expect_parse_detail(&err);
+    assert!(detail.contains("empty output"), "{detail}");
+}
+
+#[test]
+fn parse_rejects_empty_results() {
+    // Edge case 5 / M38.
+    let nh = base_nighthawk();
+    let cell = base_cell();
+    let invocation = base_invocation();
+    let tool = base_tool_stamp();
+    let ctx = ParseCtx {
+        cell: &cell,
+        invocation: &invocation,
+        tool: &tool,
+    };
+
+    let doc = make_document(&[]);
+    let err = nh
+        .parse(&ctx, &doc, b"")
+        .expect_err("a results array with no entries is not a run");
+    let detail = expect_parse_detail(&err);
+    assert!(detail.contains("results is empty"), "{detail}");
 }
 
 // ---------------------------------------------------------------------------
