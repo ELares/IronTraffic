@@ -390,6 +390,24 @@ impl ProbeHandle {
             )
         })
     }
+
+    /// The OS level identity of this probe's own dedicated thread.
+    ///
+    /// Every probe names its thread `"it-probe"` (see [`ProbeHandle::spawn`]'s
+    /// own `std::thread::Builder::new().name(...)` call, the one place that
+    /// name is ever written), so a caller that needs to tell ONE specific
+    /// probe's thread apart from another concurrently running probe's own
+    /// identically named thread cannot do it by name. `pub`, beyond issue
+    /// #410's own Public API section, for exactly that reason: this crate's
+    /// own test suite (`tests/probe.rs`'s `zero_allocations_in_steady_state`)
+    /// runs a counting global allocator filtered by thread identity, and a
+    /// name match cannot distinguish this test's own probe thread from a
+    /// DIFFERENT test's probe thread that happens to be exiting (and so
+    /// allocating, on its own drop path) at the same real instant.
+    #[must_use]
+    pub fn thread_id(&self) -> std::thread::ThreadId {
+        self.join.thread().id()
+    }
 }
 
 /// Pins the current thread to `core_id`, if given, and reports whether that
