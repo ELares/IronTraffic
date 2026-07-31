@@ -91,14 +91,27 @@ fn adapters() -> [&'static dyn LoadGenerator; 1] {
 /// Also asserts issue #411's invariants 3 and 9
 /// (`sum(status_counts) + errors == requests_sent`, computed in `u128` so
 /// two hostile buckets near `u64::MAX` cannot wrap the identity into
-/// holding): this is the assertion that would have caught PR 799 review
-/// finding 1 (status-code key aliasing, "0200" and "+200" both parsing to
-/// 200) BY FUZZING rather than only by inspection. Before that finding was
-/// fixed, an aliased key made this parser return `Ok` with a `RawRun` whose
-/// status map summed to less than `requests_sent - errors`, and this
-/// target's previous contract (duration, request cap, percentile
-/// monotonicity only) could never reach that class of bug: none of those
-/// three checks reads `status_counts` at all.
+/// holding). Before PR 799 review finding 1 (status-code key aliasing,
+/// "0200" and "+200" both parsing to 200) was fixed, an aliased key made
+/// this parser return `Ok` with a `RawRun` whose status map summed to less
+/// than `requests_sent - errors`, and this target's previous contract
+/// (duration, request cap, percentile monotonicity only) could never catch
+/// that: none of those three checks reads `status_counts` at all. This
+/// assertion is a REGRESSION CONTRACT on that class, correct and worth
+/// keeping, and NOT a discovery mechanism: round two's review handed the
+/// reverted parser the aliasing input directly and confirmed this assertion
+/// aborts on it, then ran three separate campaigns totalling 8,974,995
+/// executions against the still-vulnerable parser (the shipped six seeds at
+/// the PR's own `-runs=200000` extended to 25 minutes, those seeds plus a
+/// full-size seed one `ChangeByte` from the bug, and a single 257-byte
+/// minimal seed one byte from the bug at `-max_len=400`) and found zero
+/// crashes. The reason is structural, not a budget shortfall: an aliased
+/// key such as "0200" takes exactly the same parser branches as the
+/// canonical "200", so libFuzzer has no coverage gradient to climb toward
+/// the bug, and finding this class by fuzzing alone would require blind
+/// luck on a specific byte. This assertion would catch a REGRESSION of the
+/// fix (the parser check in `oha.rs` that actually closes the class), not
+/// discover the class in the first place.
 fn check_ok_raw_run(raw: &RawRun) {
     assert!(raw.duration_ns > 0, "an Ok parse must never yield a zero duration");
     assert!(
