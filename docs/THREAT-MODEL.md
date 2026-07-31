@@ -2002,6 +2002,48 @@ file (the driver binary, the bench xtask CLI and run script, and the matrix regi
 `validate()` itself after deserialising rather than trusting the wire format to have enforced it
 already.
 
+**`LatencyRecorder::read_hgrm` (#405) parses the `.hgrm` percentile text format, a second untrusted
+parser in this crate alongside `CellId::parse`.** A `.hgrm` file is a committed run artifact any pull
+request author can hand-edit, so `read_hgrm` makes no assumption that the harness's own `write_hgrm`
+produced the bytes it is given, and is bounded on four axes with no axis implied by the others: total
+input bytes (`MAX_HGRM_BYTES`, 8 MiB, checked on the slice length before a single byte is split, so an
+oversized input costs one comparison), line count (`MAX_HGRM_LINES`, 1,000,000), bytes per line
+(`MAX_HGRM_LINE_BYTES`, 512), and the cumulative sample count the file claims (`MAX_HGRM_TOTAL_COUNT`,
+`10^12`). A cap on lines alone still admits one line with no newline in it at the full 8 MiB, and a cap
+on bytes alone still admits a file claiming `u64::MAX` samples of a single value, which is why all four
+are independent, separately tested bounds rather than one derived from another.
+
+**A `NaN` in the `Value` column defeats every range check written with `>`, so `is_finite()` runs
+FIRST, unconditionally, before any ordering comparison.** Every comparison against `f64::NAN` is
+false, so `if value > high_ns_ceiling() as f64 { reject }` alone would accept `NaN`, and `NaN as u64`
+is `0` in Rust: an ordering-only check would silently inject a fabricated zero-nanosecond sample into
+a published distribution's head. The `Percentile` column gets the identical treatment for the
+identical reason. `TotalCount` is parsed with `str::parse::<u64>` directly, never routed through
+`f64`, because `f64` cannot represent consecutive integers above `2^53` and a count parsed as a float
+and cast back would be silently wrong at exactly the magnitudes `MAX_HGRM_TOTAL_COUNT` polices.
+
+**The `count == 0` early return in `record_n_ns` is load-bearing on this untrusted path, not merely an
+optimisation.** `hdrhistogram::Histogram::record_n` updates its own min/max tracking even when called
+with `count == 0`, so without this guard a `.hgrm` row whose cumulative `TotalCount` repeats the
+previous row's (a zero `count_delta`, which `read_hgrm` never forbids, since only the `Percentile` and
+`TotalCount` columns are checked for monotonicity, never `Value`) could inject an arbitrary `Value`
+into the recorder's tracked maximum despite contributing zero samples: a hand-edited two-row file
+whose second row repeats the first row's `TotalCount` at a far larger `Value` would otherwise publish
+a maximum no sample in the file actually produced.
+
+**`read_hgrm`'s `Value` upper bound is `high_ns_ceiling()`, not the published `HIGH_NS`, which widens
+what this parser accepts without widening what `record_ns`/`record_n_ns` will ever RECORD as in
+range.** `hdrhistogram` reports `max()` and `value_at_quantile()` as a histogram bucket's highest
+equivalent value, never the literal recorded value, so a genuinely in-range sample recorded at or near
+`HIGH_NS` reads back, and therefore round-trips through `write_hgrm`, at up to `high_ns_ceiling()`,
+ABOVE `HIGH_NS` itself (see that constant's doc in `src/hist.rs` for the mechanism; #782 BLOCKING 1).
+A `Value` above `high_ns_ceiling()` cannot have come from ANY sample `record_ns`/`record_n_ns` would
+ever have accepted, so it is still rejected. `read_hgrm` floors an accepted row's `value_ns` to
+`HIGH_NS` before calling `record_n_ns` (a proven no-op for the ordinary case, since `HIGH_NS` and
+anything up to `high_ns_ceiling()` are the SAME histogram bucket), specifically so `record_n_ns`'s own
+`> HIGH_NS` out-of-range guard, unchanged, does not divert a row `write_hgrm` wrote as recorded into
+`out_of_range` on the way back in.
+
 ## Installation and release artifacts
 
 `scripts/install.sh` is a `curl | sh` channel: it places an executable file on a user's machine and
