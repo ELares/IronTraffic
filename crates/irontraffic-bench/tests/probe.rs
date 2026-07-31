@@ -702,30 +702,37 @@ fn probe_hits_target_rate() {
     let outcome = run_for(handle, WINDOW);
     let elapsed = started.elapsed();
 
-    // +/- 20% around the requests a correctly paced 100 rps probe sends in
-    // a 2 second window: generous enough to absorb host scheduling jitter
-    // over a short window (an unpaced probe against this same 6,000
-    // request ceiling issues thousands here, not hundreds, so this margin
-    // never risks conflating the two).
-    #[expect(
-        clippy::integer_division,
-        reason = "expected_in_window * 4 is always a multiple of 5 for the RATE_HZ/WINDOW this \
-                  test configures (200 * 4 = 800), so this loses no precision; it is an exact \
-                  80% floor, not an approximation"
-    )]
-    let low = expected_in_window * 4 / 5;
-    #[expect(
-        clippy::integer_division,
-        reason = "expected_in_window * 6 is always a multiple of 5 for the RATE_HZ/WINDOW this \
-                  test configures (200 * 6 = 1200), so this loses no precision; it is an exact \
-                  120% ceiling, not an approximation"
-    )]
-    let high = expected_in_window * 6 / 5;
+    // Round three of issue #802/#805/#410 (#807): the `160..=240` two-sided
+    // window this test previously enforced here (+/- 20% of
+    // `expected_in_window`) is not independent of `elapsed`. The probe paces
+    // off an ABSOLUTE schedule with uncapped catch-up (`schedule.due_ns(i)`,
+    // then `wait_until`, which returns at once when the due time has already
+    // passed), so across every observation gathered while diagnosing this,
+    // `issued == floor(elapsed * RATE_HZ) + 1` exactly. A `160..=240` window
+    // on `issued` is therefore, by substitution, the assertion
+    // `1.59s <= elapsed <= 2.39s`: that the test harness's own spawn, sleep
+    // and join overhead stays under ~390ms of this WINDOW's 2s budget. That
+    // is not a property of pacing, and it flaked under load: measured under
+    // 3x CPU oversubscription, 6 of 8 full-suite runs failed this exact
+    // window with `issued` at 249..253 while `achieved_rate` (below) stayed
+    // inside 100.15..100.36, i.e. correctly paced by the issue's own 2%
+    // acceptance criterion the whole time.
+    //
+    // The achieved-rate assertion below is the one that actually measures
+    // pacing (it is scale-invariant: the ratio holds whether `elapsed` is
+    // 2.01s idle or 2.5s under 3x oversubscription), so this window is
+    // replaced with a wide, one-sided sanity bound instead of a second,
+    // narrower copy of the same check. Across 34 observations spanning idle
+    // to 3x oversubscription, a correctly paced probe never issued more than
+    // 253 requests in this WINDOW; an unpaced probe (`wait_until` mutated
+    // into a no-op) is capped only by `expected_requests` and issues 6,000.
+    // 1,000 sits three orders of margin below that unpaced ceiling and
+    // comfortably above every paced observation on record.
     assert!(
-        (low..=high).contains(&outcome.issued),
-        "issued {} over {elapsed:?} must be close to the {expected_in_window} requests a probe \
-         correctly paced at {RATE_HZ} rps sends in a {WINDOW:?} window; a materially higher \
-         count means the probe is not pacing at all",
+        outcome.issued < 1_000,
+        "issued {} in a {WINDOW:?} window configured for {RATE_HZ} rps (~{expected_in_window} \
+         expected at the true pace) is nowhere near a correctly paced count; a value anywhere \
+         near expected_requests (6,000) means the probe is not pacing at all",
         outcome.issued
     );
     assert_eq!(
@@ -737,12 +744,20 @@ fn probe_hits_target_rate() {
         reason = "outcome.issued is at most a few thousand here, far below f64's 2^53 exact-integer range"
     )]
     let achieved_rate = outcome.issued as f64 / elapsed.as_secs_f64();
+    // The issue's own literal acceptance criterion: "A 60 second probe
+    // against it-origin achieves between 98 and 102 requests per second."
+    // Measured across 34 observations spanning idle to 3x CPU
+    // oversubscription, achieved_rate ranged 100.012..100.361: this band
+    // passed every single one of those runs, including all six that failed
+    // the old count window, so it is the assertion that actually
+    // discriminates pacing without also encoding a harness-overhead budget.
     assert!(
-        (75.0..=125.0).contains(&achieved_rate),
-        "achieved rate {achieved_rate:.2} rps (issued {} over {elapsed:?}) must be close to the \
-         configured {RATE_HZ} rps; unlike the round one version of this test, expected_requests \
-         (6,000) is unreachable in this {WINDOW:?} window at the true pace, so it cannot mask an \
-         unpaced probe behind an unreachable ceiling",
+        (98.0..=102.0).contains(&achieved_rate),
+        "achieved rate {achieved_rate:.2} rps (issued {} over {elapsed:?}) must be within 2% of \
+         the configured {RATE_HZ} rps (the issue's own 98..=102 acceptance criterion); unlike \
+         the round one version of this test, expected_requests (6,000) is unreachable in this \
+         {WINDOW:?} window at the true pace, so it cannot mask an unpaced probe behind an \
+         unreachable ceiling",
         outcome.issued
     );
     // The issue's Design section states the stall bracket is closed for
