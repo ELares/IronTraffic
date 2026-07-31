@@ -137,20 +137,30 @@ fn digit_width(max_index: u32) -> u32 {
 }
 
 /// Returns `Some(w)` when `routes == 10^w` for some `w` reachable from
-/// [`MAX_ROUTES`], `None` otherwise. `routes == 1` (`10^0`) is accepted.
+/// [`MAX_ROUTES`], `None` otherwise. `routes == 1` (`10^0`, `w == 0`) is
+/// accepted BY THIS FUNCTION; [`path_expr`] separately refuses `routes == 1`
+/// before ever calling this (see that function's own doc for why `w == 0`
+/// cannot be reconciled with [`route_table`]'s rendering, and its own doc
+/// links the review finding this refusal fixes).
 fn power_of_ten_width(routes: u32) -> Option<u32> {
+    if routes == 0 {
+        return None;
+    }
     let mut w: u32 = 0;
     let mut p: u32 = 1;
     loop {
         if p == routes {
             return Some(w);
         }
-        if p > routes || w >= 9 {
+        if p > routes {
             return None;
         }
-        // 10^9 fits comfortably in u32 (10^9 < 4.3e9), so this never
-        // overflows before the `w >= 9` check above stops the loop.
-        p *= 10;
+        // `checked_mul` rather than a `w >= 9` cap: 10^9 fits comfortably in
+        // u32 (10^9 < 4.3e9) and MAX_ROUTES (1,000,000) is far below it, so
+        // this only ever overflows on its way to discovering `routes` is not
+        // a power of ten at all, at which point returning `None` is exactly
+        // the right answer anyway.
+        p = p.checked_mul(10)?;
         w += 1;
     }
 }
@@ -374,16 +384,41 @@ fn read_corpus_pattern(
 /// The width of the index group is `log10(routes)`, so every expansion
 /// names exactly one route in [`route_table`] for the paired shape: `Flat`
 /// for `UniformRandom`, `SharedPrefix` for `AdversarialWorstCase`. `routes`
-/// must be a power of ten.
+/// must be a power of ten, and additionally `UniformRandom` and
+/// `AdversarialWorstCase` (but not `SingleHot`) refuse `routes == 1` (see
+/// below).
+///
+/// # `routes == 1` is refused for the two file-backed corpora, not silently degenerate
+///
+/// A single-route table has exactly one valid index (`0`). `SingleHot`
+/// renders that index by ordinary INTEGER formatting
+/// (`format!("{:0width$}", 0)`), which, being a MINIMUM width, always
+/// renders `0`'s own digit regardless of `width`, so it agrees with
+/// `route_table` at `routes == 1` without any special case.
+/// `UniformRandom` and `AdversarialWorstCase`, in contrast, vary their index
+/// with a REPEATED CHARACTER CLASS read from a committed file, which draws a
+/// uniformly random value from its alphabet on every repetition; no repeat
+/// count reconciles that with `route_table`'s rendering at `routes == 1`:
+/// zero repetitions (the naive `w = log10(1) = 0`) emits no digit at all, so
+/// the corpus becomes `/api/v1/r/xxxxxxxx` against the generated
+/// `/api/v1/r0/{id}`; one repetition (`w = 1`) emits a uniformly random
+/// digit `0`..`9`, nine of which name no route in a one-route table. Both
+/// were measured to silently 404 before this refusal existed. Rather than
+/// accept either silent mismatch, these two corpora refuse `routes == 1` by
+/// name. See the review finding on PR 819 ("`path_expr` at `routes = 1`
+/// silently yields a degenerate corpus that matches no route") and
+/// `path_expr_refuses_a_single_route` in this module's own tests, which
+/// pins this.
 ///
 /// # Errors
 /// `BenchError::Io` when the committed corpus file cannot be read (a
 /// truncated checkout is the only way this happens: the files are
-/// committed). `BenchError::Cell` when `routes` is not a power of ten.
-/// `BenchError::Parse` when a committed corpus file exists but is malformed
-/// (oversized, has no pattern line, or a byte outside the printable-ASCII
-/// bound): the two shipped files never trigger this, and it exists only as
-/// defence in depth against a future hand edit.
+/// committed). `BenchError::Cell` when `routes` is not a power of ten, or
+/// (for `UniformRandom`/`AdversarialWorstCase` only) is exactly 1 (see
+/// above). `BenchError::Parse` when a committed corpus file exists but is
+/// malformed (oversized, has no pattern line, or a byte outside the
+/// printable-ASCII bound): the two shipped files never trigger this, and it
+/// exists only as defence in depth against a future hand edit.
 pub fn path_expr(corpus: PathCorpus, routes: u32) -> Result<String, BenchError> {
     let w = power_of_ten_width(routes).ok_or(BenchError::Cell("routes must be a power of ten"))?;
     match corpus {
@@ -392,11 +427,29 @@ pub fn path_expr(corpus: PathCorpus, routes: u32) -> Result<String, BenchError> 
             let width = w as usize;
             Ok(format!("/api/v1/r{:0width$}/00000000", 0))
         }
-        PathCorpus::UniformRandom => read_corpus_pattern(PATHS_UNIFORM_REL, PATHS_UNIFORM_NAME, w),
+        PathCorpus::UniformRandom => {
+            refuse_single_route(routes)?;
+            read_corpus_pattern(PATHS_UNIFORM_REL, PATHS_UNIFORM_NAME, w)
+        }
         PathCorpus::AdversarialWorstCase => {
+            refuse_single_route(routes)?;
             read_corpus_pattern(PATHS_ADVERSARIAL_REL, PATHS_ADVERSARIAL_NAME, w)
         }
     }
+}
+
+/// Refuses `routes == 1` for the two file-backed corpora. See [`path_expr`]'s
+/// own doc comment (the `routes == 1` section) for why a class-based corpus
+/// cannot express a single-route table's sole index.
+fn refuse_single_route(routes: u32) -> Result<(), BenchError> {
+    if routes == 1 {
+        return Err(BenchError::Cell(
+            "routes == 1 has no expressible corpus in this grammar: a repeated character class \
+             cannot always draw the literal index 0 that route_table renders for a single-route \
+             table",
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -823,8 +876,35 @@ fn draw_repeat(rng: &mut irontraffic_rand::Rng, min: u32, max: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        Elem, digit_width, max_expansion, nearest_real_world_size, parse_elems, power_of_ten_width,
+        Elem, digit_width, max_expansion, nearest_real_world_size, parse_elems, path_expr,
+        power_of_ten_width,
     };
+    use crate::cell::PathCorpus;
+
+    /// `SHOULD_FIX` finding 7 on PR 819: `path_expr` must refuse `routes == 1`
+    /// by name, for the two file-backed corpora only, rather than silently
+    /// return a corpus that does not name the sole generated route. See
+    /// `path_expr`'s own doc comment for why, and why `SingleHot` is
+    /// different.
+    #[test]
+    fn path_expr_refuses_a_single_route() {
+        for corpus in [PathCorpus::UniformRandom, PathCorpus::AdversarialWorstCase] {
+            let err = path_expr(corpus, 1)
+                .expect_err(&format!("path_expr({corpus:?}, 1) must be refused"));
+            let msg = err.to_string().to_lowercase();
+            assert!(
+                msg.contains("routes == 1") || msg.contains("single-route"),
+                "error {err} for path_expr({corpus:?}, 1) does not explain the refusal"
+            );
+        }
+
+        // SingleHot renders its index by ordinary integer formatting, not a
+        // repeated character class, so it agrees with route_table at
+        // routes == 1 without any special case and must NOT be refused.
+        let single_hot = path_expr(PathCorpus::SingleHot, 1)
+            .expect("path_expr(SingleHot, 1) must still succeed");
+        assert_eq!(single_hot, "/api/v1/r0/00000000");
+    }
 
     #[test]
     fn digit_width_matches_expected_powers_of_ten() {
@@ -838,6 +918,11 @@ mod tests {
 
     #[test]
     fn power_of_ten_width_accepts_and_rejects() {
+        // routes == 1 is 10^0 and this function accepts it as such (w == 0);
+        // path_expr separately refuses routes == 1 for a reason specific to
+        // ITS OWN grammar (see path_expr's own doc and
+        // path_expr_refuses_a_single_route in this module's own tests), not
+        // because power_of_ten_width's arithmetic is wrong here.
         assert_eq!(power_of_ten_width(1), Some(0));
         assert_eq!(power_of_ten_width(10), Some(1));
         assert_eq!(power_of_ten_width(1_000), Some(3));
