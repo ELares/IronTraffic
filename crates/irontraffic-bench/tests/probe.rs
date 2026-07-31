@@ -280,6 +280,32 @@ fn finish_probe(handle: ProbeHandle) -> Result<ProbeOutcome, BenchError> {
     handle.finish()
 }
 
+/// `reset_recorders`, briefly under [`ALLOC_SENSITIVE`], for exactly the same
+/// reason [`spawn_probe`] and [`finish_probe`] are: it reconstructs four
+/// ~216 KiB recorders on the SAME `"it-probe"`-named thread every probe in
+/// this file's own steady-state loop runs on, and `on_probe_thread`'s check
+/// (a thread NAME match) cannot distinguish one test's `"it-probe"` thread
+/// from another's when several run concurrently, which `cargo test`'s
+/// default parallelism means happens on every run. Found live: a longer,
+/// looping `zero_allocations_in_steady_state` (issue #802's `SHOULD_FIX` 5)
+/// intermittently observed thousands of allocations that were not its own,
+/// traced to `reset_recorders_discards_and_returns_count`'s UN-guarded
+/// direct call landing inside the counted window of a wholly different
+/// test. `zero_allocations_in_steady_state` itself must keep calling
+/// `handle.reset_recorders()` directly, never through this wrapper: it
+/// already holds `ALLOC_SENSITIVE` for its entire body, and `std::sync::
+/// Mutex` is not reentrant.
+#[allow(
+    clippy::expect_used,
+    reason = "test-support setup, not itself a #[test] fn: acquiring this file's own uncontended-in-practice mutex does not fail on a working test host"
+)]
+fn reset_recorders_locked(handle: &ProbeHandle) -> Result<u64, BenchError> {
+    let _guard = ALLOC_SENSITIVE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    handle.reset_recorders()
+}
+
 /// Lets a spawned probe run for (at least) `settle_for` real wall-clock time
 /// before signalling it to stop and joining it.
 ///
@@ -527,24 +553,66 @@ fn stub_refuses() -> SocketAddr {
 #[test]
 fn probe_hits_target_rate() {
     let origin = spawn_it_origin(&[]);
+    // 6,000 requests at 100 rps: the issue's own acceptance criterion is "a
+    // 60 second probe against it-origin achieves between 98 and 102 requests
+    // per second", stated at 60 seconds specifically because that is the
+    // scale at which a fixed measurement margin (see `elapsed` below) stops
+    // mattering. Before issue #802's SHOULD_FIX 2, this test measured only
+    // `issued` (a COUNT, satisfied even by an infinitely fast, completely
+    // unpaced probe, since the loop always stops at `expected_requests`
+    // regardless of how quickly it got there) and never `elapsed` (a RATE):
+    // watched to fail, a no-op `wait_until` passed this test outright.
     let config = ProbeConfig {
         rate_hz: 100,
-        expected_requests: 1_000,
+        expected_requests: 6_000,
         ..base_config(origin.addr)
     };
+    let started = Instant::now();
     let handle = spawn_probe(config, real_time()).expect("spawns against a live origin");
-    // 1,000 requests at 100 rps is a 10 second run; wait past that so the
-    // probe reaches expected_requests on its own before finish() joins it.
-    let outcome = run_for(handle, Duration::from_millis(10_500));
+    // 6,000 requests at 100 rps is a 60 second schedule; wait past that so
+    // the probe reaches expected_requests on its own before finish() joins
+    // it. The 500ms margin over the nominal 60 seconds becomes under a 1%
+    // contributor to the elapsed time measured below, which is the entire
+    // reason this test runs at 60 seconds rather than the 10 seconds it used
+    // before: at 10 seconds the identical margin would have pulled the
+    // computed rate below 98 even for a probe pacing correctly (watched: a
+    // 10 second/1,000 request version of this same measurement computed
+    // ~95.2 rps against a probe that was, by every other measure, on time).
+    let outcome = run_for(handle, Duration::from_millis(60_500));
+    let elapsed = started.elapsed();
 
     assert!(
-        (980..=1_020).contains(&outcome.issued),
-        "issued {} must be within 2% of 1000",
+        (5_880..=6_120).contains(&outcome.issued),
+        "issued {} must be within 2% of 6000",
         outcome.issued
     );
     assert_eq!(
         outcome.ok, outcome.issued,
         "every request against a healthy origin must be ok"
+    );
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "outcome.issued is at most a few thousand here, far below f64's 2^53 exact-integer range"
+    )]
+    let achieved_rate = outcome.issued as f64 / elapsed.as_secs_f64();
+    assert!(
+        (98.0..=102.0).contains(&achieved_rate),
+        "achieved rate {achieved_rate:.2} rps (issued {} over {elapsed:?}) must be within 2% of \
+         100 rps, per the issue's own acceptance criterion",
+        outcome.issued
+    );
+    // The issue's Design section states the stall bracket is closed for
+    // EVERY request, including the near-zero ones, specifically so a p99
+    // computed only from the late requests is not a p99 of anything (see
+    // invariant I8, `stall.p99 * 20 <= latency.p99`). This run is healthy
+    // (`ok == issued`, asserted above, so no error or reconnect path ever
+    // skips closing the bracket), so a sample must exist for every single
+    // issued request, not merely a nonempty recorder.
+    assert_eq!(
+        outcome.stall.len(),
+        outcome.issued,
+        "a stall sample must be recorded for every request, including near-zero ones, on a \
+         healthy run"
     );
 }
 
@@ -633,9 +701,24 @@ fn connect_is_recorded_separately() {
     );
     let connect_p50 = outcome.connect.percentiles().p50_ns;
     let latency_p50 = outcome.latency.percentiles().p50_ns;
+    // TWO-SIDED: the upper bound alone (unchanged from before issue #802's
+    // BLOCKING finding 2) is satisfied by a real measurement AND by a
+    // regression that records a constant (near) zero for every connect
+    // sample, because `LatencyRecorder::record_ns(0)` floors to `LOW_NS`
+    // (1ns), which still reads as "not empty" and "well under 5ms". The
+    // lower bound is what a constant-zero regression cannot pass: a real
+    // loopback TCP connect (socket() and connect() syscalls plus a
+    // three-way handshake) measured in the 97,000 to 128,000ns range across
+    // repeated runs on this project's own dev host, so 1,000ns (1
+    // microsecond) is three orders of magnitude below any real measurement
+    // and comfortably above the floored value a constant-zero mutation
+    // would produce; watched to fail against `args.connect.record_ns(0);`
+    // in place of the real measurement.
     assert!(
-        connect_p50 < 5_000_000,
-        "a loopback connect ({connect_p50} ns) must be well under 5ms"
+        (1_000..5_000_000).contains(&connect_p50),
+        "connect p50 {connect_p50} ns must be a real, nonzero loopback connect measurement \
+         (above 1us) and well under 5ms; a value at or near 1ns means connect samples are being \
+         recorded as a constant (near) zero instead of measured"
     );
     assert!(
         latency_p50 > 20_000_000,
@@ -790,6 +873,45 @@ fn chunked_response_is_bad() {
     );
 }
 
+/// Not one of the issue's 16 named tests. `probe.rs:554`'s
+/// `ok: head.status == 200` is the line that decides whether a published run
+/// says its requests succeeded, and before issue #802's `SHOULD_FIX` 3 no test
+/// exercised a well-framed NON-200 response: `bad` was only ever reached
+/// through a framing refusal (`chunked_response_is_bad`,
+/// `absurd_content_length_is_bad`), where `ExchangeOutcome` hardcodes
+/// `ok: false` regardless of what the status comparison would have said, so
+/// the comparison itself was never evaluated against anything but 200.
+/// `it-origin --status <CODE>` exists precisely to drive this
+/// (`crates/irontraffic-origin/src/main.rs`), so this test uses it directly:
+/// a well-formed 500 (framing-safe, `Content-Length` present) must be
+/// counted `bad`, never `ok`. Watched to fail against `head.status >= 200`
+/// in place of `head.status == 200`.
+#[test]
+fn well_formed_non_200_response_is_counted_bad_not_ok() {
+    let origin = spawn_it_origin(&["--status", "500"]);
+    let config = ProbeConfig {
+        rate_hz: 20,
+        expected_requests: 10,
+        ..base_config(origin.addr)
+    };
+    let handle = spawn_probe(config, real_time()).expect("spawns against a live origin");
+    // 10 requests at 20 rps is a 0.5 second schedule.
+    let outcome = run_for(handle, Duration::from_secs(1));
+
+    assert_eq!(
+        outcome.ok, 0,
+        "a well-formed 500 response must never count as ok"
+    );
+    assert_eq!(
+        outcome.bad, outcome.issued,
+        "every well-formed, non-200 exchange must be classified bad, not merely nonzero"
+    );
+    assert_eq!(
+        outcome.errors, 0,
+        "a well-formed response is not an I/O error, whatever its status"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 9. reset_recorders_discards_and_returns_count
 // ---------------------------------------------------------------------------
@@ -804,9 +926,8 @@ fn reset_recorders_discards_and_returns_count() {
     let handle = spawn_probe(config, real_time()).expect("spawns");
 
     std::thread::sleep(Duration::from_secs(3));
-    let discarded = handle
-        .reset_recorders()
-        .expect("the probe thread acknowledges the reset");
+    let discarded =
+        reset_recorders_locked(&handle).expect("the probe thread acknowledges the reset");
     assert!(
         (240..=360).contains(&discarded),
         "discarded {discarded} must be close to the 300 requests issued in the first 3 seconds at 100 rps"
@@ -826,6 +947,13 @@ fn reset_recorders_discards_and_returns_count() {
 // ---------------------------------------------------------------------------
 #[test]
 fn zero_allocations_in_steady_state() {
+    // Bounds for the accumulate-until-satisfied loop below. Declared at the
+    // top of the function, ahead of every statement, per
+    // `clippy::items_after_statements`.
+    const TARGET_SAMPLES: u64 = 5_000;
+    const ROUND_MS: u64 = 150;
+    const MAX_ROUNDS: u32 = 40;
+
     // Held for this whole test, not just around spawn/finish (see
     // ALLOC_SENSITIVE's own doc comment): every OTHER test in this file
     // routes its own spawn and finish through spawn_probe/finish_probe,
@@ -837,9 +965,15 @@ fn zero_allocations_in_steady_state() {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
 
     let origin = spawn_it_origin(&[]);
+    // `expected_requests` is deliberately far larger than anything up to
+    // `MAX_ROUNDS` rounds below could consume at ANY achievable host
+    // throughput: reaching it mid-test would tear the probe down (and
+    // reconstruct its recorders) before `finish()` is ever called, which is
+    // exactly the allocation this test exists to rule out of the counted
+    // window.
     let config = ProbeConfig {
         rate_hz: 50_000,
-        expected_requests: 40_000,
+        expected_requests: 2_000_000,
         ..base_config(origin.addr)
     };
     let handle = ProbeHandle::spawn(config, real_time()).expect("spawns");
@@ -847,30 +981,86 @@ fn zero_allocations_in_steady_state() {
     // Let startup (the connect, and whatever one-off setup happens before
     // the request loop) settle before measuring: this window is meant to be
     // the steady-state loop, which the Design section says contains no
-    // reset, and this comment says so.
+    // reset, and this comment says so. `reset_recorders` is called at the
+    // BOUNDARY of a round, never inside one: each call reconstructs four
+    // ~216 KiB recorders on the "it-probe" thread, which is precisely the
+    // kind of allocation this test exists to prove the STEADY-STATE loop
+    // never performs, so every call below happens strictly before
+    // `PROBE_ALLOCATIONS` starts counting or strictly after it stops.
     std::thread::sleep(Duration::from_millis(80));
+    handle
+        .reset_recorders()
+        .expect("the probe thread acknowledges the settle-window reset");
 
-    PROBE_ALLOCATIONS.store(0, Ordering::Relaxed);
-    COUNTING.store(true, Ordering::Relaxed);
-    // At 50,000 requests per second this covers comfortably more than the
-    // 5,000 requests the issue's own acceptance criterion names, while
-    // `expected_requests` (40,000) stays far larger than what completes in
-    // this window, so the probe thread is still mid-loop (not tearing down
-    // its recorders) when counting stops below.
-    std::thread::sleep(Duration::from_millis(200));
-    COUNTING.store(false, Ordering::Relaxed);
-    let allocations = PROBE_ALLOCATIONS.load(Ordering::Relaxed);
+    // ACCUMULATE across rounds until at least TARGET_SAMPLES requests have
+    // actually been issued during counted time, rather than assume a single
+    // fixed-length window buys them.
+    //
+    // Before issue #802's SHOULD_FIX 5, this test slept a FIXED 200ms and
+    // asserted `issued >= 5_000` afterwards: a precondition on the HOST
+    // sustaining roughly 25,000 real loopback HTTP exchanges per second
+    // inside that exact window, not a property of the code under test. The
+    // review reproduced this failing on an otherwise clean, unmutated tree
+    // (`issued only 3590`), which is this repo's own documented flaky-test
+    // shape. A single-shot "calibrate once, then sleep the estimated
+    // duration" replacement was tried while writing this fix and ALSO
+    // flaked (a 100ms calibration measured 31,020 rps; the very next 210ms
+    // window, sized from that estimate with a 30% margin, delivered only
+    // 4,875): a short window's throughput on a host running the rest of
+    // this file's tests concurrently is simply too noisy to extrapolate
+    // from a single sample.
+    //
+    // This instead runs fixed, modest `ROUND_MS` rounds back to back,
+    // summing `window_issued` (and `allocations`) across them, and stops the
+    // moment the running total clears `TARGET_SAMPLES`. Every round's
+    // `reset_recorders` call happens strictly outside `COUNTING`'s own
+    // on-window (see above), so accumulating across many small rounds is
+    // exactly as sound as one large one, and bounds worst-case host-speed
+    // sensitivity by `MAX_ROUNDS` rather than by guessing a single
+    // safety-margined duration up front.
+    let mut total_issued: u64 = 0;
+    let mut total_allocations: usize = 0;
+    let mut rounds_run: u32 = 0;
+    for _ in 0..MAX_ROUNDS {
+        rounds_run += 1;
+        PROBE_ALLOCATIONS.store(0, Ordering::Relaxed);
+        COUNTING.store(true, Ordering::Relaxed);
+        std::thread::sleep(Duration::from_millis(ROUND_MS));
+        COUNTING.store(false, Ordering::Relaxed);
+        total_allocations += PROBE_ALLOCATIONS.load(Ordering::Relaxed);
 
-    let outcome = handle.finish().expect("probe thread does not panic");
+        // Read off exactly how many requests were issued during THIS round,
+        // from the same generation-swap mechanism that bounds it: this reset
+        // happens strictly after `COUNTING` was already turned off, so it
+        // cannot itself inflate `total_allocations`, and it can only ever
+        // OVER-count the round slightly (a request that completed in the
+        // brief gap between the sleep ending and this call lands here too),
+        // never under-count it.
+        let round_issued = handle
+            .reset_recorders()
+            .expect("the probe thread acknowledges the round reset");
+        total_issued = total_issued.saturating_add(round_issued);
+
+        // A nonzero allocation is already a definitive failure; further
+        // rounds cannot un-observe it, and stopping here keeps a failing run
+        // fast rather than burning through the remaining rounds first.
+        if total_allocations != 0 || total_issued >= TARGET_SAMPLES {
+            break;
+        }
+    }
+
+    handle.finish().expect("probe thread does not panic");
     assert!(
-        outcome.issued >= 5_000,
-        "the measured window must cover at least 5,000 requests; issued only {}",
-        outcome.issued
+        total_issued >= TARGET_SAMPLES,
+        "the measured window must cover at least {TARGET_SAMPLES} requests; only {total_issued} \
+         were actually issued across {rounds_run} rounds of {ROUND_MS}ms each ({MAX_ROUNDS} \
+         rounds available), which points at a host too slow to sustain this test's own \
+         precondition rather than a defect in the code under test"
     );
     assert_eq!(
-        allocations, 0,
-        "the probe's steady-state loop must allocate exactly 0 times; observed {allocations} across {} requests",
-        outcome.issued
+        total_allocations, 0,
+        "the probe's steady-state loop must allocate exactly 0 times; observed \
+         {total_allocations} across {total_issued} requests over {rounds_run} rounds"
     );
 }
 
@@ -944,6 +1134,22 @@ fn stall_tracker_fires_on_a_stalled_origin() {
         "latency p99 {latency_p99} ns must exceed 500ms by the last of 8 requests against a \
          200ms-per-exchange origin the probe has fallen behind on; a value near 200ms would mean \
          latency was measured from send time instead of due time"
+    );
+    // The identical due-versus-send discriminator, but for `ttfb`. Before
+    // issue #802's SHOULD_FIX 1 this file held the coordinated-omission
+    // property for `latency` (immediately above) but never for `ttfb`, even
+    // though `ProbeOutcome::ttfb`'s own doc comment makes the same
+    // due-time claim: `args.ttfb.record_ns(exchange.ttfb_ns.saturating_sub(due))`
+    // measured from `send_now` instead of `due` survived the whole suite
+    // (watched to fail: it does, reporting a ttfb p99 pinned near the single
+    // exchange's own ~200ms round trip rather than growing with the probe's
+    // widening lateness).
+    let ttfb_p99 = outcome.ttfb.percentiles().p99_ns;
+    assert!(
+        ttfb_p99 > 500_000_000,
+        "ttfb p99 {ttfb_p99} ns must exceed 500ms by the last of 8 requests against a \
+         200ms-per-exchange origin the probe has fallen behind on; a value near 200ms would mean \
+         ttfb was measured from send time instead of due time"
     );
     // Discriminates the Design section's own named mistake: closing the
     // stall bracket after the RESPONSE instead of after the write records
@@ -1133,6 +1339,25 @@ fn dead_target_aborts_after_a_live_start() {
 /// at all, and appends a random tail, so `Complete`, `Bad` (every reason)
 /// and `NeedMore` are all reached often, alongside a smaller share of pure
 /// uniform-random buffers for genuine no-panic fuzzing.
+///
+/// The header arm is WEIGHTED, not the plain unweighted `prop_oneof!` this
+/// used before the absent-`Content-Length` fix (issue #802's BLOCKING
+/// finding 1): with a plain 1-in-7 draw per arm, exactly two arms
+/// (`Content-Length: 0`, `Content-Length: 100`) reach `Complete`, since a
+/// missing header and an unrelated `X-Ordinary-Header` now both refuse with
+/// `BadReason::MissingContentLength` instead of defaulting. That drops
+/// `Complete`'s reachability to exactly the 5% floor
+/// `response_like_bytes_reaches_every_outcome` checks against (`0.7 * 0.5
+/// (valid status) * 0.5 (terminated) * 2/7 (legit header) = 5.0%`), which
+/// makes a 2,000-sample run pass or fail on noise alone (watched to fail:
+/// mean and floor coincide exactly, so roughly half of otherwise-correct
+/// runs would report `Complete` under 100). The two legitimate
+/// `Content-Length` arms are weighted 4 each against 1 for every other arm
+/// (including the new space-before-colon smuggling shape below) so `Complete`
+/// settles at a deliberately unambiguous 10% instead
+/// (`0.7 * 0.5 * 0.5 * 8/14 = 10.0%`, roughly seven standard deviations above
+/// the 5% floor over 2,000 samples), without changing what the floor itself
+/// checks for.
 fn response_like_bytes() -> impl Strategy<Value = Vec<u8>> {
     let structured = (
         prop_oneof![
@@ -1142,13 +1367,14 @@ fn response_like_bytes() -> impl Strategy<Value = Vec<u8>> {
             Just("HTTP/1.1 2000 way too many digits".to_owned()),
         ],
         prop_oneof![
-            Just(Some("Content-Length: 0".to_owned())),
-            Just(Some("Content-Length: 100".to_owned())),
-            Just(Some("Content-Length: 18446744073709551615".to_owned())),
-            Just(Some(format!("Content-Length: {}", "9".repeat(30)))),
-            Just(Some("Transfer-Encoding: chunked".to_owned())),
-            Just(Some("X-Ordinary-Header: value".to_owned())),
-            Just(None::<String>),
+            4 => Just(Some("Content-Length: 0".to_owned())),
+            4 => Just(Some("Content-Length: 100".to_owned())),
+            1 => Just(Some("Content-Length: 18446744073709551615".to_owned())),
+            1 => Just(Some(format!("Content-Length: {}", "9".repeat(30)))),
+            1 => Just(Some("Transfer-Encoding: chunked".to_owned())),
+            1 => Just(Some("X-Ordinary-Header: value".to_owned())),
+            1 => Just(Some("Content-Length : 5".to_owned())),
+            1 => Just(None::<String>),
         ],
         proptest::collection::vec(any::<u8>(), 0..=512),
         proptest::bool::ANY,
@@ -1184,8 +1410,9 @@ fn response_like_bytes() -> impl Strategy<Value = Vec<u8>> {
 /// pass vacuously by never running. This samples the exact strategy that
 /// test uses, 2,000 times, through the same `TestRunner` proptest itself
 /// uses, and asserts each of the three `ScanOutcome` variants is reached at
-/// least 5% of the time (a generous floor: the analysis in this file's own
-/// design notes puts `Complete` at roughly 12% and `Bad` well above that).
+/// least 5% of the time (a generous floor: the analysis in
+/// `response_like_bytes`'s own doc comment puts `Complete` at roughly 10%
+/// and `Bad` well above that).
 #[test]
 fn response_like_bytes_reaches_every_outcome() {
     use proptest::strategy::ValueTree as _;
