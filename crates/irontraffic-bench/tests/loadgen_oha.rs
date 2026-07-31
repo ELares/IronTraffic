@@ -1081,3 +1081,130 @@ fn parse_rejects_status_code_key_aliasing() {
         );
     }
 }
+
+/// `SHOULD_FIX` finding 3: a literal duplicate JSON key is accepted with
+/// silent last-wins. `{"200":100,"200":7}` previously parsed as a 7-request
+/// run, discarding the 100 responses under the first occurrence with no
+/// error at all.
+#[test]
+fn parse_rejects_duplicate_status_code_key() {
+    let cell = base_cell();
+    let invocation = base_invocation();
+    let tool = base_tool_stamp();
+    let ctx = ParseCtx {
+        cell: &cell,
+        invocation: &invocation,
+        tool: &tool,
+    };
+
+    let text = concat!(
+        r#"{"summary":{"total":2.0,"totalData":1000},"#,
+        r#""statusCodeDistribution":{"200":100,"200":7},"#,
+        r#""errorDistribution":{},"#,
+        r#""latencyPercentiles":{"p10":0.0001,"p25":0.0002,"p50":0.0003,"p75":0.0004,"p90":0.0005,"p95":0.0006,"p99":0.0007,"p99.9":0.0008,"p99.99":0.0009}}"#,
+    );
+    let err = Oha
+        .parse(&ctx, text.as_bytes(), b"")
+        .expect_err("a literal duplicate statusCodeDistribution key must be rejected");
+    let detail = expect_parse_detail(&err);
+    assert!(
+        detail.contains("duplicate"),
+        "expected the duplicate-key guard to reject this input; got: {detail}"
+    );
+}
+
+/// `SHOULD_FIX` finding 3, other half: two top-level `summary` objects
+/// previously parsed `Ok` using the SECOND one's duration and byte count,
+/// so an attacker or a corrupt tool could append a second summary and
+/// rewrite the published duration and `bytes_received` while the first,
+/// plausible-looking one is what a human reading the file sees.
+#[test]
+fn parse_rejects_duplicate_summary_object() {
+    let cell = base_cell();
+    let invocation = base_invocation();
+    let tool = base_tool_stamp();
+    let ctx = ParseCtx {
+        cell: &cell,
+        invocation: &invocation,
+        tool: &tool,
+    };
+
+    let text = concat!(
+        r#"{"summary":{"total":2.0,"totalData":1000},"#,
+        r#""summary":{"total":9.0,"totalData":5},"#,
+        r#""statusCodeDistribution":{"200":100},"#,
+        r#""errorDistribution":{},"#,
+        r#""latencyPercentiles":{"p10":0.0001,"p25":0.0002,"p50":0.0003,"p75":0.0004,"p90":0.0005,"p95":0.0006,"p99":0.0007,"p99.9":0.0008,"p99.99":0.0009}}"#,
+    );
+    let err = Oha.parse(&ctx, text.as_bytes(), b"").expect_err(
+        "two top-level summary objects must be rejected, not silently resolved to the second",
+    );
+    let detail = expect_parse_detail(&err);
+    assert!(
+        detail.contains("duplicate"),
+        "expected the duplicate-key guard to reject this input; got: {detail}"
+    );
+}
+
+/// `SHOULD_FIX` finding 4: for a small enough `requests_sent`, every one of
+/// the nine percentile gaps can independently round to a weight of 0, so an
+/// entirely empty reconstruction previously parsed `Ok` with
+/// `p50 == p99 == max == 0` ns, indistinguishable from a genuinely
+/// instantaneous run. A single response and an ordinary 1ms to 9ms
+/// percentile chain reproduces it: every gap (0.10, 0.15, 0.25, 0.25, 0.15,
+/// 0.05, 0.04, 0.009, 0.0001) times `requests_sent` (1) is below 0.5 and
+/// rounds to 0.
+#[test]
+fn parse_rejects_a_reconstruction_with_zero_recorded_samples() {
+    let cell = base_cell();
+    let invocation = base_invocation();
+    let tool = base_tool_stamp();
+    let ctx = ParseCtx {
+        cell: &cell,
+        invocation: &invocation,
+        tool: &tool,
+    };
+
+    let text = r#"{"summary":{"total":2.0,"totalData":13},"statusCodeDistribution":{"200":1},"errorDistribution":{},"latencyPercentiles":{"p10":0.001,"p25":0.002,"p50":0.003,"p75":0.004,"p90":0.005,"p95":0.006,"p99":0.007,"p99.9":0.008,"p99.99":0.009}}"#;
+    let err = Oha.parse(&ctx, text.as_bytes(), b"").expect_err(
+        "a reconstruction with zero recorded and zero out-of-range samples must be rejected",
+    );
+    let detail = expect_parse_detail(&err);
+    assert!(
+        detail.contains("zero"),
+        "expected the empty-reconstruction guard to reject this input; got: {detail}"
+    );
+}
+
+/// `SHOULD_FIX` finding 5: `record_n_ns` treats a `count` of 0 as a complete
+/// no-op, so a percentile reading above `HIGH_NS` (60 seconds) whose own
+/// reconstructed weight rounds to 0 previously vanished from
+/// `out_of_range` with no trace, defeating the I7 tail-truncation signal
+/// edge case 9 depends on. `p99.99`'s own gap (0.9999 - 0.999 = 0.0001)
+/// times 100 responses is 0.01, which rounds to a weight of 0, yet its
+/// reported value (1e30 seconds) is far above `HIGH_NS`.
+#[test]
+fn parse_marks_out_of_range_even_when_its_own_weight_rounds_to_zero() {
+    let cell = base_cell();
+    let invocation = base_invocation();
+    let tool = base_tool_stamp();
+    let ctx = ParseCtx {
+        cell: &cell,
+        invocation: &invocation,
+        tool: &tool,
+    };
+
+    let mut hostile = valid_value();
+    hostile["statusCodeDistribution"] = json!({ "200": 100 });
+    hostile["latencyPercentiles"]["p99.99"] = json!(1e30);
+    let bytes = serde_json::to_vec(&hostile).expect("serialises");
+
+    let raw = Oha
+        .parse(&ctx, &bytes, b"")
+        .expect("a hostile top percentile does not itself make the run unparseable");
+    assert!(
+        raw.out_of_range > 0,
+        "an above-HIGH_NS percentile must be counted even when its own reconstructed weight \
+         rounds to zero"
+    );
+}

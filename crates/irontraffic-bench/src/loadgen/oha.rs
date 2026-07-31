@@ -22,13 +22,14 @@
 //! module assumes; if a future pinned version changes a key, fix this parser
 //! against a freshly captured fixture, not the other way around.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
+use serde::de::{DeserializeSeed, Error as _, MapAccess, SeqAccess, Visitor};
 use serde_json::Value;
 
 use crate::cell::{BenchCell, KeepaliveMode, PathCorpus, Protocol, RateMode, TlsMode};
 use crate::error::BenchError;
-use crate::hist::LatencyRecorder;
+use crate::hist::{HIGH_NS, LatencyRecorder};
 use crate::provenance::ToolStamp;
 
 use super::{Invocation, MAX_HOST_BYTES, MAX_PATH_EXPR_BYTES, MAX_REPORTED_REQUESTS};
@@ -176,6 +177,105 @@ fn unsupported_to_cell_error(u: &Unsupported) -> BenchError {
         Unsupported::Connections { .. } => {
             BenchError::Cell("too many connections for this adapter")
         }
+    }
+}
+
+/// A no-op [`DeserializeSeed`] that walks one JSON value (recursively, for an
+/// array or object) purely to detect a duplicate key, without building
+/// anything. See [`duplicate_key_detail`] for why this walk exists.
+struct RejectDuplicateKeys;
+
+impl<'de> DeserializeSeed<'de> for RejectDuplicateKeys {
+    type Value = ();
+
+    fn deserialize<D>(self, deserializer: D) -> Result<Self::Value, D::Error>
+    where
+        D: serde::de::Deserializer<'de>,
+    {
+        deserializer.deserialize_any(RejectDuplicateKeysVisitor)
+    }
+}
+
+/// The [`Visitor`] half of [`RejectDuplicateKeys`]. Every scalar variant is a
+/// plain `Ok(())`: only `visit_seq` and `visit_map` recurse, and only
+/// `visit_map` can ever fail.
+struct RejectDuplicateKeysVisitor;
+
+impl<'de> Visitor<'de> for RejectDuplicateKeysVisitor {
+    type Value = ();
+
+    fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("any JSON value")
+    }
+
+    fn visit_bool<E>(self, _v: bool) -> Result<Self::Value, E> {
+        Ok(())
+    }
+    fn visit_i64<E>(self, _v: i64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+    fn visit_u64<E>(self, _v: u64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+    fn visit_f64<E>(self, _v: f64) -> Result<Self::Value, E> {
+        Ok(())
+    }
+    fn visit_str<E>(self, _v: &str) -> Result<Self::Value, E> {
+        Ok(())
+    }
+    fn visit_unit<E>(self) -> Result<Self::Value, E> {
+        Ok(())
+    }
+
+    fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+    where
+        A: SeqAccess<'de>,
+    {
+        while seq.next_element_seed(RejectDuplicateKeys)?.is_some() {}
+        Ok(())
+    }
+
+    fn visit_map<A>(self, mut map: A) -> Result<Self::Value, A::Error>
+    where
+        A: MapAccess<'de>,
+    {
+        let mut seen: HashSet<String> = HashSet::new();
+        while let Some(key) = map.next_key::<String>()? {
+            if !seen.insert(key.clone()) {
+                return Err(A::Error::custom(format!("duplicate key {key}")));
+            }
+            map.next_value_seed(RejectDuplicateKeys)?;
+        }
+        Ok(())
+    }
+}
+
+/// Returns `Some(detail)` only when `bytes` is otherwise well-formed JSON
+/// that contains a duplicate key in some object, at any nesting depth.
+/// `serde_json::Value`'s own `Map` silently keeps only the LAST value for a
+/// repeated key and reports nothing at all: a literal duplicated
+/// `"200"` entry in `statusCodeDistribution`, or two top-level `summary`
+/// objects, both parse `Ok` today using whichever entry happens to be
+/// spelled last, with no trace of the one it discarded. This walk runs
+/// BEFORE the document ever becomes a `Value`, so it sees every key exactly
+/// as `serde_json`'s own tokenizer does, for exactly that reason.
+///
+/// A genuine JSON syntax error (mismatched brackets, an unterminated
+/// string, and so on) is deliberately reported as `None` here rather than
+/// surfaced from this pass: the caller's own `serde_json::from_slice::<Value>`
+/// call reports it in this module's usual "invalid json: {e}" words, so one
+/// malformed input gets one message, not two differently worded ones.
+/// `serde_json::Error::is_data` is what tells the two apart, because
+/// `serde::de::Error::custom` inside [`RejectDuplicateKeysVisitor`] is the
+/// ONLY place this pass ever builds a Data-category error.
+///
+/// Uses `serde_json`'s own default recursion limit, exactly like the real
+/// parse below: never widened, per this crate's Do NOT list.
+fn duplicate_key_detail(bytes: &[u8]) -> Option<String> {
+    let mut de = serde_json::Deserializer::from_slice(bytes);
+    match RejectDuplicateKeys.deserialize(&mut de) {
+        Err(e) if e.is_data() => Some(format!("duplicate object key: {e}")),
+        Ok(()) | Err(_) => None,
     }
 }
 
@@ -396,6 +496,16 @@ impl LoadGenerator for Oha {
         let stderr_has_rate_warning = RATE_WARNING_SUBSTRINGS
             .iter()
             .any(|w| contains_bytes(stderr, w.as_bytes()));
+
+        // A literal duplicate key anywhere in stdout (a repeated
+        // `"200"` in `statusCodeDistribution`, or a second top-level
+        // `summary` object) is rejected here, before the document ever
+        // becomes a `Value`: see `duplicate_key_detail`'s own doc for why
+        // `serde_json::Value`'s silent last-wins behaviour is not good
+        // enough at this untrusted-input boundary.
+        if let Some(detail) = duplicate_key_detail(stdout) {
+            return Err(BenchError::parse("oha", &detail));
+        }
 
         // `serde_json::from_slice` validates UTF-8 itself (edge case 7: no
         // lossy conversion, ever) and enforces its own built-in 128-level
@@ -660,9 +770,41 @@ impl LoadGenerator for Oha {
             // `record_n_ns` itself, never clamped into the top bucket: see
             // edge case 9, "a percentile above 60 seconds... fails
             // invariant I7 and invalidates the run rather than silently
-            // truncating."
-            recorder.record_n_ns(value_ns, weight);
+            // truncating." `record_n_ns` treats a `count` of 0 as a
+            // complete no-op BY ITS OWN CONTRACT (so a repeated no-op call
+            // never perturbs `max_ns`), which for a small `requests_sent`
+            // can round `weight` itself all the way down to 0 even for a
+            // percentile value that IS above HIGH_NS, silently dropping the
+            // exact tail-truncation signal I7 depends on. `weight.max(1)`
+            // applies ONLY on this branch, so an out-of-range percentile is
+            // always counted at least once, independent of how thin its own
+            // reconstructed slice would otherwise be; the in-range branch's
+            // weight, including a legitimate 0, is untouched.
+            if value_ns > HIGH_NS {
+                recorder.record_n_ns(value_ns, weight.max(1));
+            } else {
+                recorder.record_n_ns(value_ns, weight);
+            }
             prev_quantile = quantile;
+        }
+
+        // A run whose latency reconstruction produced neither an in-range
+        // sample nor an out-of-range one is not a measurement of anything.
+        // For a small enough `requests_sent`, every one of the nine
+        // weighted gaps above can independently round to 0, so an entirely
+        // empty `LatencyRecorder` would otherwise still parse `Ok` and
+        // publish p50 == p99 == p99.99 == max == 0 ns as though it were a
+        // real, healthy run. A run whose whole recorded mass legitimately
+        // landed ABOVE HIGH_NS is a DIFFERENT, already-handled case:
+        // `out_of_range` being nonzero (guaranteed nonzero the instant any
+        // percentile is out of range, by the branch immediately above) is
+        // exactly what invariant I7 exists to invalidate downstream, so
+        // that case is not rejected a second time here.
+        if recorder.is_empty() && recorder.out_of_range() == 0 {
+            return Err(BenchError::parse(
+                "oha",
+                "latency reconstruction produced zero recorded and zero out-of-range samples",
+            ));
         }
 
         // ttfb, connect and stall are `None` for oha. The Parsing table
