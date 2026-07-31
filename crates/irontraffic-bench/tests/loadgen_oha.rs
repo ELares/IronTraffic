@@ -47,8 +47,9 @@ use std::net::SocketAddr;
 
 use irontraffic_bench::{
     BenchCell, BenchError, CacheMode, CellId, Invocation, KeepaliveMode, LoadGenerator,
-    MAX_REPORTED_REQUESTS, MAX_TOOL_OUTPUT_BYTES, MAX_TOOL_STDERR_BYTES, Oha, ParseCtx, PathCorpus,
-    Protocol, RateMode, RunParams, Scheme, Target, TlsMode, ToolStamp, Unsupported,
+    MAX_REPORTED_REQUESTS, MAX_TOOL_OUTPUT_BYTES, MAX_TOOL_STDERR_BYTES, MAX_VERSION_OUTPUT_BYTES,
+    Oha, ParseCtx, PathCorpus, Protocol, RateMode, RunParams, Scheme, Target, TlsMode, ToolStamp,
+    Unsupported,
 };
 use serde_json::json;
 
@@ -1206,5 +1207,205 @@ fn parse_marks_out_of_range_even_when_its_own_weight_rounds_to_zero() {
         raw.out_of_range > 0,
         "an above-HIGH_NS percentile must be counted even when its own reconstructed weight \
          rounds to zero"
+    );
+}
+
+/// `SHOULD_FIX` finding 6: `parse_version` had zero test coverage. This pins
+/// the real `oha --version` shape: the LAST whitespace-separated token of
+/// `oha 1.15.0\n` is `1.15.0`. Also closes the mutation that takes the
+/// FIRST token instead (which would make every stamp read the literal
+/// version "oha").
+#[test]
+fn parse_version_extracts_last_token() {
+    let stamp = Oha
+        .parse_version(b"oha 1.15.0\n")
+        .expect("a well-formed version probe must parse");
+    assert_eq!(stamp.name, "oha");
+    assert_eq!(stamp.version, "1.15.0");
+}
+
+/// `SHOULD_FIX` finding 6: the extracted version token becomes
+/// `ToolStamp::version`, which is later echoed into the run log and the
+/// published table; a NUL byte or an ANSI escape sequence is rejected
+/// rather than laundered into provenance, matching `validate_target`'s own
+/// rationale for `Target`'s string fields.
+#[test]
+fn parse_version_rejects_non_printable_bytes() {
+    let err = Oha
+        .parse_version(b"oha 1.15.0\0evil")
+        .expect_err("a NUL byte in the version token must be rejected");
+    assert!(expect_parse_detail(&err).contains("non-printable"));
+
+    let err = Oha
+        .parse_version(b"\x1b[2K1.15.0")
+        .expect_err("an ANSI escape sequence in the version token must be rejected");
+    assert!(expect_parse_detail(&err).contains("non-printable"));
+}
+
+/// `SHOULD_FIX` finding 6: an empty probe output and non-UTF-8 bytes are each
+/// rejected, naming a different reason.
+#[test]
+fn parse_version_rejects_empty_and_non_utf8() {
+    let empty_err = Oha
+        .parse_version(b"")
+        .expect_err("empty version output must be rejected");
+    assert!(expect_parse_detail(&empty_err).contains("empty"));
+
+    let non_utf8_err = Oha
+        .parse_version(&[0xFF, 0xFE])
+        .expect_err("non-utf-8 version output must be rejected");
+    assert!(expect_parse_detail(&non_utf8_err).contains("utf-8"));
+}
+
+/// `SHOULD_FIX` finding 6: closes the mutation that drops the
+/// `MAX_VERSION_OUTPUT_BYTES` guard entirely, and pins the boundary on both
+/// sides: exactly at the cap is accepted, one byte past it is rejected.
+#[test]
+fn parse_version_rejects_oversize() {
+    let one_past = vec![b'1'; MAX_VERSION_OUTPUT_BYTES + 1];
+    let err = Oha
+        .parse_version(&one_past)
+        .expect_err("must exceed MAX_VERSION_OUTPUT_BYTES");
+    assert!(expect_parse_detail(&err).contains("MAX_VERSION_OUTPUT_BYTES"));
+
+    let at_bound = vec![b'1'; MAX_VERSION_OUTPUT_BYTES];
+    let stamp = Oha
+        .parse_version(&at_bound)
+        .expect("exactly at the cap must not trip the size guard");
+    assert_eq!(stamp.version.len(), MAX_VERSION_OUTPUT_BYTES);
+}
+
+/// `SHOULD_FIX` finding 7 (1 of 4): the issue's own headline rule, "Do NOT
+/// default a missing JSON field to zero. Name it in the error." Making
+/// `errorDistribution` optional so a missing map silently means zero
+/// errors was previously untested; this pins the rejection.
+#[test]
+fn parse_missing_error_distribution_is_error() {
+    let cell = base_cell();
+    let invocation = base_invocation();
+    let tool = base_tool_stamp();
+    let ctx = ParseCtx {
+        cell: &cell,
+        invocation: &invocation,
+        tool: &tool,
+    };
+
+    let mut missing_errors = valid_value();
+    missing_errors
+        .as_object_mut()
+        .expect("valid_value is an object")
+        .remove("errorDistribution");
+    let bytes = serde_json::to_vec(&missing_errors).expect("serialises");
+    let err = Oha
+        .parse(&ctx, &bytes, b"")
+        .expect_err("a missing errorDistribution must never default to zero errors");
+    let detail = expect_parse_detail(&err);
+    assert!(
+        detail.contains("errorDistribution"),
+        "expected the detail to name errorDistribution, got: {detail}"
+    );
+}
+
+/// `SHOULD_FIX` finding 7 (2 of 4): the 64-distinct-status-code cap (edge
+/// case 5, Bounds table row 5) was previously untested; no test
+/// constructed 65 distinct codes.
+#[test]
+fn parse_rejects_65_distinct_status_codes() {
+    let cell = base_cell();
+    let invocation = base_invocation();
+    let tool = base_tool_stamp();
+    let ctx = ParseCtx {
+        cell: &cell,
+        invocation: &invocation,
+        tool: &tool,
+    };
+
+    let mut codes = serde_json::Map::new();
+    for c in 100..165_u32 {
+        codes.insert(c.to_string(), json!(1));
+    }
+    assert_eq!(codes.len(), 65, "fixture precondition");
+    let mut too_many = valid_value();
+    too_many["statusCodeDistribution"] = serde_json::Value::Object(codes);
+    let bytes = serde_json::to_vec(&too_many).expect("serialises");
+    let err = Oha
+        .parse(&ctx, &bytes, b"")
+        .expect_err("65 distinct status codes must exceed the 64 code cap");
+    let detail = expect_parse_detail(&err);
+    assert!(
+        detail.contains("64"),
+        "expected the status-code cap to reject this input; got: {detail}"
+    );
+}
+
+/// `SHOULD_FIX` finding 7 (3 of 4): the status key range `100..=599` (edge
+/// case 4) was previously exercised only by non-numeric hostile keys, never
+/// by an in-range-format key that is numerically outside the range; this
+/// pins both rejecting sides and both accepting boundaries.
+#[test]
+fn parse_rejects_status_key_outside_100_599_range() {
+    let cell = base_cell();
+    let invocation = base_invocation();
+    let tool = base_tool_stamp();
+    let ctx = ParseCtx {
+        cell: &cell,
+        invocation: &invocation,
+        tool: &tool,
+    };
+
+    for bad_key in ["99", "600"] {
+        let mut bad = valid_value();
+        bad["statusCodeDistribution"] = json!({ bad_key: 100 });
+        let bytes = serde_json::to_vec(&bad).expect("serialises");
+        let err = Oha
+            .parse(&ctx, &bytes, b"")
+            .expect_err("a status key outside 100..=599 must be rejected");
+        let detail = expect_parse_detail(&err);
+        assert!(
+            detail.contains("100..=599"),
+            "expected the status-code range guard to reject key {bad_key}; got: {detail}"
+        );
+    }
+
+    // Exactly-at-cap on both sides: 100 and 599 are both accepted. Count is
+    // 100, not 1, so this does not also trip the unrelated
+    // zero-recorded-samples guard.
+    for good_key in ["100", "599"] {
+        let mut good = valid_value();
+        good["statusCodeDistribution"] = json!({ good_key: 100 });
+        let bytes = serde_json::to_vec(&good).expect("serialises");
+        assert!(
+            Oha.parse(&ctx, &bytes, b"").is_ok(),
+            "status key {good_key} is inside 100..=599 and must be accepted"
+        );
+    }
+}
+
+/// `SHOULD_FIX` finding 7 (4 of 4): the `is_finite`/non-negative guard on
+/// each `latencyPercentiles` value is reachable (unlike `summary.total`'s
+/// own `NaN`/`Infinity` sub-cases): `-1.0` is a valid JSON number literal,
+/// and without this guard it would saturate to 0 ns and be silently
+/// accepted rather than rejected.
+#[test]
+fn parse_rejects_non_finite_or_negative_percentile() {
+    let cell = base_cell();
+    let invocation = base_invocation();
+    let tool = base_tool_stamp();
+    let ctx = ParseCtx {
+        cell: &cell,
+        invocation: &invocation,
+        tool: &tool,
+    };
+
+    let mut negative = valid_value();
+    negative["latencyPercentiles"]["p10"] = json!(-1.0);
+    let bytes = serde_json::to_vec(&negative).expect("serialises");
+    let err = Oha
+        .parse(&ctx, &bytes, b"")
+        .expect_err("a negative latencyPercentiles value must be rejected, not floored to 0 ns");
+    let detail = expect_parse_detail(&err);
+    assert!(
+        detail.contains("not finite or is negative"),
+        "expected the percentile finite/non-negative guard to reject this input; got: {detail}"
     );
 }

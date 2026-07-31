@@ -109,7 +109,12 @@ fn is_host_char(b: u8) -> bool {
 }
 
 /// Printable ASCII excluding space, matching the Bounds table's
-/// `0x21..=0x7E` class for `path_expr`.
+/// `0x21..=0x7E` class for `path_expr`. Reused by `parse_version` below for
+/// the extracted version token: the same forged-log-line and
+/// unpastable-output concern `validate_target`'s own doc explains applies
+/// just as much to a string that becomes `ToolStamp::version`, which is
+/// echoed into the run log and the published table exactly like a `Target`
+/// field is.
 fn is_path_expr_char(b: u8) -> bool {
     (0x21..=0x7E).contains(&b)
 }
@@ -328,6 +333,20 @@ impl LoadGenerator for Oha {
             .split_whitespace()
             .next_back()
             .ok_or_else(|| BenchError::parse("oha", "version output is empty"))?;
+        // This string becomes `ToolStamp::version`, which per issue #411's
+        // own Context is later compared against `bench/tools.toml` and is
+        // echoed into the run log and the published table: the same
+        // forged-log-line risk `validate_target` exists to stop for a
+        // `Target` field applies here too, for a field that previously had
+        // no validation at all. A NUL byte, an ANSI escape sequence such as
+        // a cursor or erase-line control code, or any other non-printable
+        // byte is rejected rather than laundered into provenance.
+        if !version.bytes().all(is_path_expr_char) {
+            return Err(BenchError::parse(
+                "oha",
+                "version output contains a non-printable byte",
+            ));
+        }
         Ok(ToolStamp {
             name: self.name().to_owned(),
             version: version.to_owned(),
