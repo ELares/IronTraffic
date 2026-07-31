@@ -31,7 +31,7 @@ pub use cell::{
 pub use error::{BenchError, Detail, MAX_DETAIL_BYTES};
 pub use hist::{
     HIGH_NS, LOW_NS, LatencyRecorder, MAX_HGRM_BYTES, MAX_HGRM_LINE_BYTES, MAX_HGRM_LINES,
-    MAX_HGRM_TOTAL_COUNT, Percentiles, SIGNIFICANT_DIGITS,
+    MAX_HGRM_TOTAL_COUNT, Percentiles, SIGNIFICANT_DIGITS, high_ns_ceiling,
 };
 pub use provenance::{
     BURSTABLE_PREFIXES, BuildStamp, CaptureInputs, CpuInfoFields, LARGE_FILE_CAP, MAX_CPU_ENTRIES,

@@ -90,6 +90,61 @@ pub const MAX_HGRM_LINE_BYTES: usize = 512;
 /// approach `u64::MAX`.
 pub const MAX_HGRM_TOTAL_COUNT: u64 = 1_000_000_000_000;
 
+/// The largest value [`LatencyRecorder::percentiles`] or `write_hgrm` can ever
+/// REPORT for an in-range sample, and therefore the largest `Value`
+/// [`LatencyRecorder::read_hgrm`] accepts: the highest value in the SAME
+/// histogram bucket [`HIGH_NS`] itself falls into,
+/// `hdrhistogram::Histogram::highest_equivalent(HIGH_NS)`.
+///
+/// `hdrhistogram` reports `max()` and `value_at_quantile()` as a bucket's
+/// highest equivalent value, never the literal recorded value. At
+/// [`SIGNIFICANT_DIGITS`] the bucket containing `HIGH_NS` is `2^25`
+/// nanoseconds wide, so a sample recorded anywhere in the last ~4.7 ms of the
+/// in-range band, including `HIGH_NS` itself, is reported back somewhere in
+/// `HIGH_NS..=high_ns_ceiling()`, ABOVE the published `HIGH_NS`. That is not a
+/// bug in the recorder to fix by lying about the number: it is what a
+/// bucketed histogram's precision guarantee means, and [`LatencyRecorder`] is
+/// constructed with this wider value as its internal `high` specifically so
+/// `hdrhistogram` always has room to report an in-range sample back, however
+/// its own bucket rounding lands.
+///
+/// This does NOT move `record_ns`'s or `record_n_ns`'s own `> HIGH_NS`
+/// out-of-range guard: recording is still governed by the published `HIGH_NS`
+/// exactly as documented, unchanged. This constant only widens how far a
+/// QUERY (`percentiles`, `write_hgrm`, `read_hgrm`) can read back, never what
+/// counts as in range to record.
+///
+/// `high` never moves a bucket boundary, only how many buckets get
+/// allocated: `low` and `SIGNIFICANT_DIGITS` alone determine where `HIGH_NS`
+/// falls, so this is computed against a minimal, disposable scratch histogram
+/// (`high = 2 * LOW_NS`, the smallest value `new_with_bounds` accepts) rather
+/// than a full-size one. Computed once and cached: the inputs are fixed
+/// constants, so the answer can never change within a process.
+///
+/// # Errors
+/// `BenchError::Parse` only if the crate rejects the fixed scratch
+/// configuration (`LOW_NS`, `2 * LOW_NS`, `SIGNIFICANT_DIGITS`), which cannot
+/// happen for these constants and is surfaced rather than unwrapped for the
+/// same reason [`LatencyRecorder::new`] surfaces its own construction error:
+/// the constants might change, and `Histogram::new`'s own contract is not
+/// this module's to assume forever. Never panics.
+pub fn high_ns_ceiling() -> Result<u64, BenchError> {
+    static CEILING: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    if let Some(&cached) = CEILING.get() {
+        return Ok(cached);
+    }
+    let scratch =
+        hdrhistogram::Histogram::<u64>::new_with_bounds(LOW_NS, 2 * LOW_NS, SIGNIFICANT_DIGITS)
+            .map_err(|e| BenchError::parse("hdrhistogram", &e.to_string()))?;
+    let ceiling = scratch.highest_equivalent(HIGH_NS);
+    // `get_or_init` here, not a plain `set`, so a race that computed the
+    // same `ceiling` concurrently (harmless, since this is a pure function
+    // of fixed constants) never hits `set`'s "already initialized" error
+    // path: the racing thread's redundant computation is simply discarded in
+    // favour of whichever thread's `get_or_init` closure actually ran first.
+    Ok(*CEILING.get_or_init(|| ceiling))
+}
+
 /// Latency percentiles in nanoseconds.
 ///
 /// Deliberately carries no mean and no standard deviation. An average latency
@@ -193,14 +248,27 @@ impl LatencyRecorder {
     /// Allocates the counts array for `LOW_NS..=HIGH_NS` at
     /// `SIGNIFICANT_DIGITS`.
     ///
+    /// The underlying `hdrhistogram::Histogram` is constructed with
+    /// [`high_ns_ceiling`], not the bare `HIGH_NS`, so the histogram always
+    /// has room to report an in-range sample back however its own bucket
+    /// rounding lands (see that constant's doc). This does not change the
+    /// counts-array size: `high_ns_ceiling()` is the top of the SAME bucket
+    /// `HIGH_NS` already falls into, so both values need identically 26
+    /// buckets (measured; `high` only decides how many buckets get
+    /// allocated, never where one starts).
+    ///
     /// # Errors
     /// `BenchError::Parse` only if the crate rejects the fixed configuration,
     /// which cannot happen for the constants above and is surfaced rather
     /// than unwrapped: the constants might change, and `Histogram::new`'s own
     /// contract is not this module's to assume forever.
     pub fn new() -> Result<Self, BenchError> {
-        let inner = hdrhistogram::Histogram::new_with_bounds(LOW_NS, HIGH_NS, SIGNIFICANT_DIGITS)
-            .map_err(|e| BenchError::parse("hdrhistogram", &e.to_string()))?;
+        let inner = hdrhistogram::Histogram::new_with_bounds(
+            LOW_NS,
+            high_ns_ceiling()?,
+            SIGNIFICANT_DIGITS,
+        )
+        .map_err(|e| BenchError::parse("hdrhistogram", &e.to_string()))?;
         Ok(Self {
             inner,
             out_of_range: 0,
@@ -272,6 +340,15 @@ impl LatencyRecorder {
 
     /// Answers the six published percentiles and the sample count in one
     /// pass.
+    ///
+    /// `max_ns`, or any of the five quantile fields, MAY exceed `HIGH_NS` by
+    /// up to `high_ns_ceiling() - HIGH_NS` (currently 28,878,847 ns) for a
+    /// distribution whose tail sits in the last ~4.7 ms of the in-range
+    /// band: `hdrhistogram` always reports a bucket's highest equivalent
+    /// value, never the literal recorded value, and `HIGH_NS`'s own bucket
+    /// top is above `HIGH_NS`. This is not out-of-range data leaking through:
+    /// `out_of_range()` still counts only samples that were actually above
+    /// `HIGH_NS` when recorded. See [`high_ns_ceiling`].
     #[must_use]
     pub fn percentiles(&self) -> Percentiles {
         Percentiles {
@@ -412,12 +489,14 @@ impl LatencyRecorder {
     ///
     /// # Errors
     /// `BenchError::Parse` on a malformed line, a non-finite or negative
-    /// `Value`, a `Value` above `HIGH_NS`, a non-monotone percentile column, a
-    /// decreasing total count, a total count above `MAX_HGRM_TOTAL_COUNT`, an
-    /// input longer than `MAX_HGRM_BYTES`, a line longer than
-    /// `MAX_HGRM_LINE_BYTES`, or more than `MAX_HGRM_LINES` lines. Returns
-    /// without mutating any caller state either way: a fresh recorder is
-    /// built internally and only returned on full success.
+    /// `Value`, a `Value` above [`high_ns_ceiling`] (the top of `HIGH_NS`'s
+    /// own bucket: a genuinely in-range sample's `Value` can legitimately
+    /// read back anywhere up to there, never above it), a non-monotone
+    /// percentile column, a decreasing total count, a total count above
+    /// `MAX_HGRM_TOTAL_COUNT`, an input longer than `MAX_HGRM_BYTES`, a line
+    /// longer than `MAX_HGRM_LINE_BYTES`, or more than `MAX_HGRM_LINES`
+    /// lines. Returns without mutating any caller state either way: a fresh
+    /// recorder is built internally and only returned on full success.
     pub fn read_hgrm(input: &[u8]) -> Result<Self, BenchError> {
         // Checked on the slice length, before any split, so an oversized
         // input costs one comparison. See MAX_HGRM_BYTES's own doc comment
@@ -471,7 +550,24 @@ impl LatencyRecorder {
             let count_delta = total - prev_total;
             prev_total = total;
 
-            recorder.record_n_ns(value_ns, count_delta);
+            // `value_ns` is validated above (in `parse_hgrm_row`) against
+            // `high_ns_ceiling()`, not the bare `HIGH_NS`, so it can be as
+            // large as HIGH_NS's own bucket top: `write_hgrm`'s own output
+            // for a genuinely in-range sample can legitimately contain such
+            // a row (see `high_ns_ceiling`'s doc). `record_n_ns`'s
+            // `> HIGH_NS` out-of-range guard is deliberately UNCHANGED
+            // (issue #782 BLOCKING 1's owner decision), so passing that
+            // value straight through would make record_n_ns itself divert
+            // it to `out_of_range`, silently losing a sample `write_hgrm`
+            // wrote as recorded. `.min(HIGH_NS)` avoids that without
+            // touching record_n_ns: `HIGH_NS` and anything up to
+            // `high_ns_ceiling()` are PROVABLY the same histogram bucket
+            // (both within `[lowest_equivalent(HIGH_NS),
+            // highest_equivalent(HIGH_NS)]`), so this floor lands in the
+            // identical counts-array slot the raw value would have, and is
+            // a strict no-op for the overwhelming majority of rows whose
+            // `value_ns` is already `<= HIGH_NS`.
+            recorder.record_n_ns(value_ns.min(HIGH_NS), count_delta);
         }
 
         Ok(recorder)
@@ -524,27 +620,39 @@ fn parse_hgrm_row(line: &[u8]) -> Result<Option<(u64, f64, u64)>, BenchError> {
         .parse()
         .map_err(|_| BenchError::parse("hgrm", "value column is not a number"))?;
     // `is_finite()` FIRST. Every comparison against `NaN` is false, so an
-    // ordering check alone (`value > HIGH_NS as f64`) accepts `NaN`, and
-    // `NaN as u64` is `0` in Rust: an ordering-only check would silently
-    // inject a zero-nanosecond sample. See context fact 8 of issue #405 and
-    // the `hgrm_rejects_non_finite_value` test.
+    // ordering check alone (`value > high_ns_ceiling() as f64`) accepts
+    // `NaN`, and `NaN as u64` is `0` in Rust: an ordering-only check would
+    // silently inject a zero-nanosecond sample. See context fact 8 of issue
+    // #405 and the `hgrm_rejects_non_finite_value` test.
     if !value.is_finite() || value < 0.0 {
         return Err(BenchError::parse(
             "hgrm",
             "value column is not finite or is negative",
         ));
     }
+    // The bound is `high_ns_ceiling()`, NOT the bare `HIGH_NS`: `percentiles`
+    // and `write_hgrm` can legitimately report a bucket's highest equivalent
+    // value for a genuinely in-range sample, which can read up to
+    // `high_ns_ceiling()` (see that constant's doc for why). A `Value`
+    // strictly above `high_ns_ceiling()` cannot come from ANY value
+    // `record_ns`/`record_n_ns` would ever have accepted as in range, so it
+    // is still rejected, exactly as `hgrm_rejects_malformed`'s "value above
+    // HIGH_NS" case (`70000000000.000`, comfortably above the ceiling too)
+    // continues to prove.
     #[expect(
         clippy::cast_precision_loss,
-        reason = "HIGH_NS is 6*10^10, comfortably inside f64's 2^53 exact integer range, \
-                  so this comparison is exact"
+        reason = "high_ns_ceiling() is close to 6*10^10, comfortably inside f64's 2^53 exact \
+                  integer range, so this comparison is exact"
     )]
-    if value > HIGH_NS as f64 {
-        return Err(BenchError::parse("hgrm", "value column exceeds HIGH_NS"));
+    if value > high_ns_ceiling()? as f64 {
+        return Err(BenchError::parse(
+            "hgrm",
+            "value column exceeds the recorder's representable range",
+        ));
     }
     #[expect(
         clippy::cast_possible_truncation,
-        reason = "value is finite, >= 0.0 and <= HIGH_NS as f64 by the two checks \
+        reason = "value is finite, >= 0.0 and <= high_ns_ceiling() as f64 by the two checks \
                   immediately above, so the truncation this cast performs is exactly the \
                   documented lossy value_ns conversion, not an unbounded one"
     )]
