@@ -9,8 +9,20 @@
 # in its own right, per this issue's own "Do NOT" section.
 #
 # Usage: scripts/release/sbom-licence-check.sh <sbom-file> [deny-toml] [exceptions-file]
-#   deny-toml        defaults to deny.toml at the repository root
-#   exceptions-file  defaults to scripts/release/licence-exceptions.txt
+#   deny-toml        when omitted, tried in order: beside THIS script (the
+#                     documented standalone layout, once deny.toml is
+#                     published as a release asset; see #788), then at the
+#                     repository root (a checkout, including the tag-only
+#                     CI step below); if NEITHER exists, this exits 3, a
+#                     distinct "no allowlist to check against" SKIP, never
+#                     a licence-violation FAILURE (#788: a missing
+#                     allowlist says nothing about the SBOM it was supposed
+#                     to be checked against, and must never be reported
+#                     with wording that blames the artifact)
+#   exceptions-file  same two-tier default, but a missing exceptions file
+#                     is not fatal on its own (see main(), below): it only
+#                     matters once a deny_file was actually found and a
+#                     component needs an exception to pass
 #
 # Splitting is purely lexical (edge case 2): split on the words OR and AND,
 # on parentheses, and on "/" (see sbom.sh's own comment on the same
@@ -20,16 +32,34 @@
 # (unversioned) has a committed exception with a written reason.
 set -eu
 
-# REPO_ROOT is used only to build the DEFAULT deny_file/exceptions_file
-# paths below, both already absolute from this `cd ... && pwd`; it does NOT
-# chdir the process. This script is invoked by verify.sh's `--sbom` path
-# ($SCRIPT_DIR-relative, see verify.sh's own header) with an <sbom-file>
-# argument that may be relative to the CALLER's working directory (a
-# standalone `sh verify.sh --sbom irontraffic-<v>-<t>.tar.gz.sbom.json` run
-# beside the downloaded files, per docs/SUPPLY-CHAIN.md). A `cd` here, same
-# as verify.sh's own former bug, would resolve that relative sbom_file
-# against the WRONG directory once this script's own `$0` is not sitting
-# inside a repository checkout.
+# SCRIPT_DIR is where this script itself lives. docs/SUPPLY-CHAIN.md
+# section 3's documented standalone flow curls verify.sh,
+# sbom-licence-check.sh, deny.toml and licence-exceptions.txt into ONE flat
+# directory beside the tarball and its SBOM (no repository checkout
+# anywhere on the machine), so a deny.toml living next to THIS script is
+# checked FIRST, below.
+#
+# REPO_ROOT is a second, fallback default only: two directories above this
+# script, which is where deny.toml actually lives in a checkout, including
+# the tag-only step in ci.yml that runs this script against dist/*.sbom.json
+# from inside one. Neither of these `cd`s the running process; both are
+# used only to build candidate default file PATHS below. This script is
+# invoked by verify.sh's `--sbom` path with an <sbom-file> argument that may
+# be relative to the CALLER's working directory, and a `cd` here, same as
+# verify.sh's own former bug, would resolve that relative sbom_file against
+# the WRONG directory once this script's own `$0` is not sitting inside a
+# repository checkout.
+#
+# A previous version of this comment argued the REPO_ROOT-derived defaults
+# were safe because they are "already absolute". That reasoning was
+# backwards, and is exactly what issue #788 was filed over: being absolute
+# is what made `$REPO_ROOT/deny.toml` resolve, confidently and silently, to
+# a real path TWO LEVELS ABOVE wherever this script was actually downloaded
+# to when run standalone, outside a checkout, rather than failing loudly.
+# Absolute was never what made it correct; the two-tier lookup above, and
+# the honest SKIP (never a FAIL) when even that finds nothing, are what fix
+# it.
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 
 usage() {
@@ -152,14 +182,59 @@ main() {
     preflight
 
     sbom_file="$1"
-    deny_file="${2:-$REPO_ROOT/deny.toml}"
-    exceptions_file="${3:-$REPO_ROOT/scripts/release/licence-exceptions.txt}"
+    deny_file="${2:-}"
+    exceptions_file="${3:-}"
 
     if [ ! -f "$sbom_file" ]; then
         echo "error: no such SBOM file: $sbom_file" >&2
         exit 1
     fi
+
+    # Two-tier default, only when the caller did not name one explicitly
+    # (an explicit, missing deny_file below is still a hard error: that is
+    # a real misconfiguration, not "no allowlist was ever published here").
+    if [ -z "$deny_file" ]; then
+        if [ -f "$SCRIPT_DIR/deny.toml" ]; then
+            deny_file="$SCRIPT_DIR/deny.toml"
+        elif [ -f "$REPO_ROOT/deny.toml" ]; then
+            deny_file="$REPO_ROOT/deny.toml"
+        fi
+    fi
+    if [ -z "$exceptions_file" ]; then
+        if [ -f "$SCRIPT_DIR/licence-exceptions.txt" ]; then
+            exceptions_file="$SCRIPT_DIR/licence-exceptions.txt"
+        else
+            exceptions_file="$REPO_ROOT/scripts/release/licence-exceptions.txt"
+        fi
+    fi
+
+    if [ -z "$deny_file" ]; then
+        # #788: no allowlist anywhere this script knows to look. This is an
+        # HONEST SKIP, not a failure -- a missing deny.toml says nothing
+        # about the SBOM or the artifact it describes. The former behaviour
+        # here (falling through to the "no such deny.toml" error below,
+        # against a path nobody outside a checkout could ever have
+        # populated) is exactly what turned a perfectly good standalone
+        # artifact into "FAILED: sbom licence: not a subset of the
+        # allowlist", a false tamper alarm from the security tool itself.
+        # Exit code 3 is this script's own distinct SKIPPED signal (2 is
+        # already "bad usage", 1 is "a real check ran and failed");
+        # verify.sh's --sbom step reads it and reports a named skip, never
+        # a FAILED line, so a --allow-skipped run still succeeds and a
+        # strict run still surfaces it by name rather than silently passing.
+        echo "skipped: sbom-licence-check: no deny.toml found beside this script" >&2
+        echo "  ($SCRIPT_DIR) or at the repository root ($REPO_ROOT); nothing to" >&2
+        echo "  check the SBOM's licences against. See docs/SUPPLY-CHAIN.md section 3" >&2
+        echo "  for how to fetch deny.toml alongside this script." >&2
+        exit 3
+    fi
     if [ ! -f "$deny_file" ]; then
+        # Only reachable with an EXPLICIT, missing deny_file argument: the
+        # two-tier default above already confirmed each candidate it set
+        # exists before assigning it, so a still-empty $deny_file already
+        # exited 3 above, and a still-missing FILE here can only mean
+        # whoever called this script named a path themselves. A real
+        # misconfiguration, not the "nothing published" case above.
         echo "error: no such deny.toml: $deny_file" >&2
         exit 1
     fi

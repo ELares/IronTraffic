@@ -26,9 +26,12 @@ Every release publishes, per tag:
 - **Four in-toto build provenance attestations**, one per tarball, as `<file>.intoto.bundle` (the
   identical bundle format, holding the DSSE-enveloped statement instead of a plain signature).
 
-`scripts/install.sh` and `scripts/release/verify.sh` are themselves published release assets too
-(alongside the tarballs), so `verify.sh` can be downloaded and run standalone, with no repository
-checkout, the same way `install.sh` already is.
+`scripts/install.sh`, `scripts/release/verify.sh`, and `scripts/release/sbom-licence-check.sh` are
+themselves published release assets too (alongside the tarballs), so `verify.sh` can be downloaded and
+run standalone, with no repository checkout, the same way `install.sh` already is. `deny.toml` and
+`scripts/release/licence-exceptions.txt` are published release assets for the identical reason
+(#788): `sbom-licence-check.sh`'s licence-subset check needs both, and a standalone `--sbom` run has no
+repository checkout to find either one in otherwise.
 
 ## 2. What a signature proves, and what it does not
 
@@ -50,14 +53,23 @@ negative test.
 
 ## 3. The exact verification commands
 
-Download the artifact, its SBOM, and `verify.sh` itself (a signed release asset):
+Download the artifact, its SBOM, `verify.sh`, `sbom-licence-check.sh`, and the two files the licence
+check reads (`deny.toml`'s allowlist and its own exceptions list):
 
 ```sh
 curl -fsSLO https://github.com/ELares/IronTraffic/releases/latest/download/irontraffic-<version>-<target>.tar.gz
 curl -fsSLO https://github.com/ELares/IronTraffic/releases/latest/download/irontraffic-<version>-<target>.tar.gz.sbom.json
 curl -fsSLO https://github.com/ELares/IronTraffic/releases/latest/download/verify.sh
 curl -fsSLO https://github.com/ELares/IronTraffic/releases/latest/download/sbom-licence-check.sh
+curl -fsSLO https://github.com/ELares/IronTraffic/releases/latest/download/deny.toml
+curl -fsSLO https://github.com/ELares/IronTraffic/releases/latest/download/licence-exceptions.txt
 ```
+
+The last two matter only for `--sbom`: `verify.sh --artifact` alone (no `--sbom`) never reads either
+one. `sbom-licence-check.sh` looks for both beside itself first (this same flat directory, once they
+are downloaded into it), the same way `verify.sh` looks for `sbom-licence-check.sh` beside itself;
+without them, the licence check reports itself SKIPPED, by name, rather than failing (#788: a missing
+allowlist says nothing about the artifact and must never be reported as though it does).
 
 Then verify (checksum, signature, and provenance; `--sbom` additionally checks the SBOM's own
 signature and its licence set):
@@ -162,7 +174,8 @@ into the release binary itself.
 | "certificate identity did not match" | Either the artifact was not produced by this project's release workflow, **or you omitted a pin** | Check your `cosign` command carries both `--certificate-identity-regexp` and `--certificate-oidc-issuer`; if it does and this still fails, treat the artifact as untrusted |
 | Provenance subject digest mismatch | The attestation does not describe this exact file | Re-download both the artifact and its attestation together; do not mix files from different versions |
 | A check was skipped and `verify.sh` exited nonzero | No network reached the transparency log, or a companion file (`.bundle`/`.intoto.bundle`) could not be found | This is the correct, safe default; re-run with network access, or pass `--allow-skipped` only if you understand what that check would have caught (see `docs/THREAT-MODEL.md`) |
-| SBOM licence check names a component | A dependency's declared licence, or a compound expression's disjunct, is not on the `deny.toml` allowlist | This should not happen in a published release; report it |
+| "sbom licence" is reported SKIPPED, not FAILED | `sbom-licence-check.sh` found no `deny.toml` beside itself or at a repository root (#788) | Not tampering, and not a licence violation either: fetch `deny.toml` and `licence-exceptions.txt` per section 3 and re-run, or pass `--allow-skipped` if you accept not making this one check |
+| SBOM licence check names a component | A dependency's declared licence, or a compound expression's disjunct, is not on the `deny.toml` allowlist, and `deny.toml` (and, where needed, `licence-exceptions.txt`) WAS found | This should not happen in a published release; report it |
 | `install.sh` refuses | Any of the above, or verification was simply unavailable | Investigate before passing `--no-verify-signature`; that flag is a deliberate downgrade, not a workaround |
 
 ## 7. Our licence allowlist
@@ -170,7 +183,10 @@ into the release binary itself.
 The same allowlist `cargo deny check` gates the build with, read from `deny.toml`'s `[licenses]
 allow` list directly by `scripts/release/sbom-licence-check.sh` (not a copy of it, so the two cannot
 silently drift apart): MIT, Apache-2.0, `Apache-2.0 WITH LLVM-exception`, BSD-2-Clause, BSD-3-Clause,
-ISC, Zlib, Unicode-3.0, CC0-1.0, MIT-0.
+ISC, Zlib, Unicode-3.0, CC0-1.0, MIT-0. Both `deny.toml` (repository root) and
+`scripts/release/licence-exceptions.txt` are published release assets (#788), landing at
+`deny.toml` and `licence-exceptions.txt` respectively, so a standalone `verify.sh --sbom` run (section
+3) can fetch the same allowlist a checkout already has beside it.
 
 Every component's licence set (and every disjunct of a compound SPDX expression, such as
 `MIT OR Apache-2.0` or the legacy `MIT/Apache-2.0` spelling some crates still use) must be a subset of

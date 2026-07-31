@@ -233,7 +233,20 @@ main() {
         # perfectly good artifact. awk's field comparison requires the
         # WHOLE second (whitespace-delimited) field to equal
         # $artifact_basename, which a mere prefix cannot satisfy.
-        if awk -v name="$artifact_basename" '$2 == name' "$sums_file" | sed "s#$sums_dir/##" > "$this_line" 2>/dev/null \
+        #
+        # No `sed "s#$sums_dir/##"` here (there used to be one): a real
+        # release SHA256SUMS is always generated from INSIDE its own
+        # directory (`cd dist && sha256sum *.tar.gz *.sbom.json`), so its
+        # second field is already a bare basename, and awk's exact `$2 ==
+        # name` match above can only ever succeed against a line whose
+        # field already equals $artifact_basename verbatim; a substitution
+        # meant to strip a directory prefix that is never there is a
+        # no-op on every real input. It was not, however, a no-op on
+        # $sums_dir itself: interpolating an unescaped download directory
+        # into a `sed` program that also uses `#` as its own delimiter
+        # broke the substitution (and, with it, the checksum check) for
+        # any directory whose name happens to contain a literal `#`.
+        if awk -v name="$artifact_basename" '$2 == name' "$sums_file" > "$this_line" 2>/dev/null \
             && [ -s "$this_line" ]; then
             checksum_ok=0
             if command -v sha256sum >/dev/null 2>&1; then
@@ -386,9 +399,20 @@ main() {
                 note_skip "sbom signature" "could not locate or download $sbom_basename.bundle"
             fi
 
-            if sh "$SCRIPT_DIR/sbom-licence-check.sh" "$sbom" >"$work/sbom-licence.log" 2>&1; then
+            # sbom-licence-check.sh's own exit 3 is a distinct SKIPPED
+            # signal (#788): no deny.toml allowlist was found anywhere it
+            # knows to look, which says nothing about the SBOM's own
+            # licence set and must not be reported as though it does. Only
+            # exit 1 ("a real check ran and failed") becomes a FAILED line
+            # here; exit 3 becomes a named skip, same as every other check
+            # in this script that could not be performed.
+            sbom_licence_status=0
+            sh "$SCRIPT_DIR/sbom-licence-check.sh" "$sbom" >"$work/sbom-licence.log" 2>&1 || sbom_licence_status=$?
+            if [ "$sbom_licence_status" -eq 0 ]; then
                 checked=$((checked + 1))
                 echo "sbom licence: subset of the allowlist"
+            elif [ "$sbom_licence_status" -eq 3 ]; then
+                note_skip "sbom licence" "no deny.toml allowlist found; see docs/SUPPLY-CHAIN.md section 3"
             else
                 note_fail "sbom licence: not a subset of the allowlist (see below)"
                 cat "$work/sbom-licence.log" >&2
@@ -419,15 +443,42 @@ main() {
             # authoritative to bind against, and the target comparison
             # alone still runs unconditionally, since it needs only the
             # artifact's own (locally known) filename.
+            #
+            # Each comparison reports ONLY what it itself verified, on its
+            # own line, with its own `checked`/`skipped` accounting. A
+            # single joint success line used to be printed from the
+            # cargo_lock_sha256 branch alone, claiming "target and
+            # cargo_lock_sha256 match" even on a run where the target
+            # comparison immediately above had just reported a FAILED
+            # mismatch: a security tool contradicting itself on the one
+            # screen a user reads. Splitting them also means a target-only
+            # pass (no verified provenance to compare cargo_lock_sha256
+            # against at all) is no longer silently invisible: it gets its
+            # own success line and its own `checked` tick instead of being
+            # folded into a sentence about a comparison that never ran.
             # -----------------------------------------------------------
             sbom_target="$(jq -r '(.metadata.properties[]? | select(.name == "irontraffic:target") | .value) // empty' "$sbom" 2>/dev/null || true)"
-            if [ -n "$sbom_target" ] && [ "$sbom_target" != "$target_from_artifact" ]; then
-                note_fail "sbom binding: sbom's target ($sbom_target) does not match the artifact's own target ($target_from_artifact)"
-            elif [ -z "$sbom_target" ]; then
+            if [ -z "$sbom_target" ]; then
                 note_fail "sbom binding: sbom has no irontraffic:target property to bind it to the artifact"
+            elif [ "$sbom_target" != "$target_from_artifact" ]; then
+                note_fail "sbom binding: sbom's target ($sbom_target) does not match the artifact's own target ($target_from_artifact)"
+            else
+                checked=$((checked + 1))
+                echo "sbom binding: target matches the artifact's own filename ($target_from_artifact)"
             fi
 
-            if [ -n "${provenance_cargo_lock_sha256:-}" ]; then
+            if [ -z "${provenance_cargo_lock_sha256:-}" ]; then
+                # verify.sh's own header promise: --allow-skipped prints
+                # one named line per skipped check so the user still sees
+                # exactly what was not checked, rather than a bare "ok".
+                # Without this branch, a run with no verified provenance
+                # (unreachable network, or --sbom given without a
+                # reachable .intoto.bundle) silently omitted the
+                # cargo_lock_sha256 comparison from BOTH the summary
+                # counts and the skip list, which is indistinguishable
+                # from "there was nothing else to check" at a glance.
+                note_skip "sbom binding: cargo_lock_sha256" "no verified provenance to bind the sbom's cargo_lock_sha256 against"
+            else
                 sbom_cargo_lock_sha256="$(jq -r '(.metadata.properties[]? | select(.name == "irontraffic:cargo_lock_sha256") | .value) // empty' "$sbom" 2>/dev/null || true)"
                 if [ -z "$sbom_cargo_lock_sha256" ]; then
                     note_fail "sbom binding: sbom has no irontraffic:cargo_lock_sha256 property to bind it to the artifact's provenance"
@@ -435,7 +486,7 @@ main() {
                     note_fail "sbom binding: sbom's cargo_lock_sha256 ($sbom_cargo_lock_sha256) does not match the artifact's own provenance ($provenance_cargo_lock_sha256)"
                 else
                     checked=$((checked + 1))
-                    echo "sbom binding: target and cargo_lock_sha256 match the artifact's own provenance"
+                    echo "sbom binding: cargo_lock_sha256 matches the artifact's own provenance"
                 fi
             fi
         fi

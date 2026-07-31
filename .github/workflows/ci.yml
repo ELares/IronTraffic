@@ -1391,6 +1391,19 @@ jobs:
           # signature plus a live Rekor search; see sign.sh's own comment)
           # and provenance attestations (`.intoto.bundle`) glob in
           # alongside the tarballs and SHA256SUMS they cover.
+          #
+          # deny.toml and scripts/release/licence-exceptions.txt are
+          # uploaded here too (#788): sbom-licence-check.sh's own default
+          # lookup now tries beside ITSELF first (see that script's own
+          # header), which only ever finds anything there once these two
+          # are published release assets sitting next to it, and
+          # docs/SUPPLY-CHAIN.md section 3's standalone `--sbom` flow
+          # curls them in for exactly that reason. `gh release create`
+          # uploads each under its own base filename, so
+          # `scripts/release/licence-exceptions.txt` here lands at
+          # `licence-exceptions.txt`, matching what sbom-licence-check.sh
+          # looks for beside itself.
+          #
           # `dist/*.bundle` is NOT used here on its own: it would also
           # match every `*.intoto.bundle` (a glob's `*` matches dots), which
           # made `gh release create` see the same attestation file twice,
@@ -1401,4 +1414,5 @@ jobs:
             dist/*.tar.gz.bundle dist/*.sbom.json.bundle dist/SHA256SUMS.bundle \
             dist/*.intoto.bundle \
             scripts/install.sh scripts/release/verify.sh scripts/release/sbom-licence-check.sh \
+            deny.toml scripts/release/licence-exceptions.txt \
             --title "$tag" --generate-notes
