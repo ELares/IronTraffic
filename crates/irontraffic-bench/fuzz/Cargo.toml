@@ -34,3 +34,10 @@ path = "fuzz_targets/fuzz_hgrm_parse.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_loadgen_json"
+path = "fuzz_targets/fuzz_loadgen_json.rs"
+test = false
+doc = false
+bench = false

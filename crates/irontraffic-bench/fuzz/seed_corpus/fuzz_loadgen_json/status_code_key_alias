@@ -1,0 +1,1 @@
+{"summary": {"total": 1.0, "totalData": 100}, "statusCodeDistribution": {"200": 100, "0200": 7}, "errorDistribution": {}, "latencyPercentiles": {"p10": 0.001, "p25": 0.001, "p50": 0.001, "p75": 0.001, "p90": 0.001, "p95": 0.001, "p99": 0.001, "p99.9": 0.001, "p99.99": 0.001}}

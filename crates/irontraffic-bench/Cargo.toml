@@ -26,9 +26,16 @@ rustix = { workspace = true, features = ["process"] }
 # `len`, `iter_quantiles`) is in the crate core, and the committed artifact is
 # the text `.hgrm`, never the binary serialisation.
 hdrhistogram = { workspace = true }
+# The `oha` load-generator adapter's output parser (`src/loadgen/oha.rs`)
+# deserialises the tool's captured JSON stdout. Moved here from
+# dev-dependencies by `bench-loadgen-oha-adapter` (#411): `bench-crate-and-cell-model`
+# (#404) put it under dev-dependencies because nothing under `src/` needed it
+# yet, and this parser is the first. `store.rs` in `bench-xtask-cli-and-run-sh`
+# (#417) and `reload.rs` in `bench-config-reload-under-load` (#420) both
+# depend on it staying a normal dependency; a crate does not need both.
+serde_json = { workspace = true }
 
 [dev-dependencies]
-serde_json = { workspace = true }
 proptest = { workspace = true }
 # Benchmarks: the `record_ns`, `merge` and `percentiles` criterion targets in
 # `benches/harness.rs`.
