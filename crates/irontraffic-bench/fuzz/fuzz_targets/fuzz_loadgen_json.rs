@@ -87,11 +87,29 @@ fn adapters() -> [&'static dyn LoadGenerator; 1] {
 /// Shared, adapter-agnostic assertions on a successful parse. Matches the
 /// issue's own fuzz contract: `duration_ns > 0`, `requests_sent` within
 /// bound, and the reconstructed histogram's percentile chain is monotone.
+///
+/// Also asserts issue #411's invariants 3 and 9
+/// (`sum(status_counts) + errors == requests_sent`, computed in `u128` so
+/// two hostile buckets near `u64::MAX` cannot wrap the identity into
+/// holding): this is the assertion that would have caught PR 799 review
+/// finding 1 (status-code key aliasing, "0200" and "+200" both parsing to
+/// 200) BY FUZZING rather than only by inspection. Before that finding was
+/// fixed, an aliased key made this parser return `Ok` with a `RawRun` whose
+/// status map summed to less than `requests_sent - errors`, and this
+/// target's previous contract (duration, request cap, percentile
+/// monotonicity only) could never reach that class of bug: none of those
+/// three checks reads `status_counts` at all.
 fn check_ok_raw_run(raw: &RawRun) {
     assert!(raw.duration_ns > 0, "an Ok parse must never yield a zero duration");
     assert!(
         raw.requests_sent <= MAX_REPORTED_REQUESTS,
         "an Ok parse must never exceed MAX_REPORTED_REQUESTS"
+    );
+    let status_sum: u128 = raw.status_counts.values().map(|v| u128::from(*v)).sum();
+    assert_eq!(
+        status_sum + u128::from(raw.errors),
+        u128::from(raw.requests_sent),
+        "invariants 3 and 9: sum(status_counts) + errors must equal requests_sent"
     );
     let p = raw.latency.percentiles();
     assert!(p.p50_ns <= p.p90_ns);

@@ -513,6 +513,27 @@ impl LoadGenerator for Oha {
                         &format!("statusCodeDistribution key {key} is not a status code 100..=599"),
                     )
                 })?;
+            // `u16::from_str` accepts a leading `+` and leading zeros, so
+            // "0200" and "+200" both parse to the same `code` as the
+            // canonical "200" while remaining a DIFFERENT JSON key. Without
+            // this check, two such keys would each add their own count into
+            // `status_sum` below while colliding into a single
+            // `status_counts` entry (keyed by `code`, a couple of lines
+            // down), silently dropping one bucket's responses from the
+            // published status map while still counting them into
+            // `requests_sent`, which is exactly how a self-inconsistent
+            // `RawRun` breaking invariants 3 and 9 is built. Comparing
+            // against `code`'s own canonical rendering rejects every
+            // spelling that is not it, which is every spelling that could
+            // alias.
+            if code.to_string() != *key {
+                return Err(BenchError::parse(
+                    "oha",
+                    &format!(
+                        "statusCodeDistribution key {key} is not the canonical rendering of its own status code"
+                    ),
+                ));
+            }
             let count = val.as_u64().ok_or_else(|| {
                 BenchError::parse(
                     "oha",

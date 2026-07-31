@@ -399,6 +399,14 @@ fn parse_fixture() {
     assert_eq!(raw.responses_ok, 600);
     assert_eq!(raw.errors, 1);
     assert_eq!(raw.bytes_received, 7800);
+    // Pinned against the fixture's own literal `"total": 3.001554375`
+    // seconds (PR 799 review finding 2): before this assertion existed,
+    // mutating the SOURCE scale from 1e9 to 1e6 (a 1000x error in the
+    // denominator of every published requests-per-second figure) and
+    // mutating the FIXTURE's own `total` from 3.001554375 to 7.5 both left
+    // every test in this file green. `duration_ns` is asserted nowhere
+    // else in this suite.
+    assert_eq!(raw.duration_ns, 3_001_554_375);
     assert_eq!(raw.status_counts.len(), 1);
     assert_eq!(raw.status_counts.get(&200), Some(&600));
     assert!(!raw.latency_exact);
@@ -1034,4 +1042,42 @@ fn path_expr_boundary_exactly_at_cap_is_ok() {
     target.path_expr = format!("/{}", "a".repeat(4_095));
     assert_eq!(target.path_expr.len(), 4_096, "fixture precondition");
     assert!(Oha.plan(&cell, &target, &run).is_ok());
+}
+
+// ---------------------------------------------------------------------------
+// PR 799 review (issue #800) fixes, in the order the review's own findings
+// are numbered. Each test's doc comment names the finding it closes.
+// ---------------------------------------------------------------------------
+
+/// BLOCKING finding 1: `u16::from_str` accepts a leading zero and a leading
+/// `+`, so "0200" and "+200" both parse to the same code as an existing
+/// canonical "200" key while remaining a DIFFERENT JSON key. Before the
+/// fix, both aliased entries were summed into `requests_sent` while
+/// colliding into a single `status_counts` entry, publishing a
+/// self-inconsistent `RawRun` (`requests_sent=107` against a status map
+/// summing to 100) that broke the issue's own invariants 3 and 9.
+#[test]
+fn parse_rejects_status_code_key_aliasing() {
+    let cell = base_cell();
+    let invocation = base_invocation();
+    let tool = base_tool_stamp();
+    let ctx = ParseCtx {
+        cell: &cell,
+        invocation: &invocation,
+        tool: &tool,
+    };
+
+    for aliased_key in ["0200", "+200"] {
+        let text = format!(
+            r#"{{"summary":{{"total":2.0,"totalData":1000}},"statusCodeDistribution":{{"200":100,"{aliased_key}":7}},"errorDistribution":{{}},"latencyPercentiles":{{"p10":0.0001,"p25":0.0002,"p50":0.0003,"p75":0.0004,"p90":0.0005,"p95":0.0006,"p99":0.0007,"p99.9":0.0008,"p99.99":0.0009}}}}"#
+        );
+        let err = Oha
+            .parse(&ctx, text.as_bytes(), b"")
+            .expect_err("an aliased status-code key must be rejected, not silently collapsed");
+        let detail = expect_parse_detail(&err);
+        assert!(
+            detail.contains(aliased_key),
+            "expected the canonical-rendering guard to name {aliased_key}; got: {detail}"
+        );
+    }
 }
