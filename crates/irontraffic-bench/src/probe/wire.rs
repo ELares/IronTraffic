@@ -32,11 +32,27 @@
 //! whatever status came back, and the connection is kept. Any body bytes the
 //! peer then actually sends are read as the front of the NEXT response,
 //! silently desynchronizing every exchange after it. [`scan_response_head`]
-//! instead refuses this shape with [`BadReason::MissingContentLength`], for
-//! every status except `304`: RFC 9110 Section 8.6 defines a `304` response
-//! as never carrying a body, so the absence of a length on that one status
-//! is not ambiguous, and `it-origin` itself omits the header only for it
-//! (see `crates/irontraffic-origin/src/response.rs`).
+//! refuses this shape with [`BadReason::MissingContentLength`] for EVERY
+//! status, `304` included.
+//!
+//! A `304` carried the one exception this refusal used to make, on the
+//! reasoning that RFC 9110 Section 8.6 defines a `304` as never carrying a
+//! body, so an absent length there is not ambiguous. That reasoning does not
+//! survive contact with who is allowed to send this probe a `304` in the
+//! first place: the probe always issues an unconditional `GET`, so a `304`
+//! is never a legitimate answer to it, and the only party that can produce
+//! one anyway is the system under test, which is exactly the party this
+//! refusal exists to distrust. Proven live (this module's own tests): a peer
+//! that answers a bodiless-looking `304` head and then writes a real body a
+//! moment later desynchronizes the next exchange in precisely the shape the
+//! zero-default paragraph above describes, because the exception let the
+//! head terminator complete the exchange before that body ever arrived. The
+//! exception was also wider than the status code alone, since the loose
+//! status line parser [`parse_status`] uses reaches it for any line it reads
+//! as `304`, not only a well-formed one. Treating `304` like every other
+//! status costs exactly the cases where a real, well-behaved peer answers
+//! a conditional request; this probe never sends one, so that cost is
+//! nothing this probe can ever pay.
 //!
 //! The identical silent-zero failure is reachable through a header name this
 //! scanner fails to recognise for a reason that has nothing to do with what
@@ -110,9 +126,11 @@ pub enum BadReason {
     /// it means whatever sits between the probe and `it-origin` transformed
     /// the response, and the cell is not measuring what it claims to.
     Chunked,
-    /// Neither `Content-Length` nor `Transfer-Encoding` was present, on a
-    /// status other than `304`. See the module doc comment: guessing a
-    /// zero-length body here is the failure this scanner exists to prevent.
+    /// Neither `Content-Length` nor `Transfer-Encoding` was present, on ANY
+    /// status, `304` included. See the module doc comment: guessing a
+    /// zero-length body here is the failure this scanner exists to prevent,
+    /// and a `304` is never a legitimate answer to this probe's own
+    /// unconditional `GET` in the first place.
     MissingContentLength,
 }
 
@@ -323,17 +341,13 @@ fn parse_head(head: &[u8], head_len: usize) -> ScanOutcome {
     if digits_too_long {
         return ScanOutcome::Bad(BadReason::ContentLengthDigitsTooLong);
     }
-    // Neither header was present. `304` is the one status RFC 9110 Section
-    // 8.6 defines as never carrying a body, so its absence of a declared
-    // length is not ambiguous; `it-origin` itself omits the header only for
-    // it (`crates/irontraffic-origin/src/response.rs`). Every other status
-    // is refused rather than assumed empty: see the module doc comment for
-    // why a zero default here is exactly the failure this scanner exists to
-    // prevent.
-    let content_length = match content_length_raw {
-        Some(value) => value,
-        None if status == 304 => 0,
-        None => return ScanOutcome::Bad(BadReason::MissingContentLength),
+    // Neither header was present. Refused on EVERY status, `304` included:
+    // see the module doc comment for why a zero default here is exactly the
+    // failure this scanner exists to prevent, and why `304`'s RFC 9110
+    // Section 8.6 "never carries a body" guarantee is not a reason to trust
+    // this scanner's own peer to have honoured it.
+    let Some(content_length) = content_length_raw else {
+        return ScanOutcome::Bad(BadReason::MissingContentLength);
     };
     if content_length > super::MAX_RESPONSE_BODY_BYTES {
         return ScanOutcome::Bad(BadReason::ContentLengthTooLarge);
@@ -569,21 +583,33 @@ mod tests {
     }
 
     #[test]
-    fn not_modified_without_content_length_is_complete_with_zero_body() {
-        // The one documented, tested exception: RFC 9110 Section 8.6 defines
-        // a 304 response as never carrying a body, so the absence of
-        // Content-Length here is not ambiguous framing. `it-origin` itself
-        // omits the header only for this status
-        // (crates/irontraffic-origin/src/response.rs), so this is the exact
-        // shape a real run can see.
+    fn not_modified_without_content_length_is_now_refused_not_defaulted() {
+        // Formerly `not_modified_without_content_length_is_complete_with_
+        // zero_body`, which pinned a `304` exception to the zero-default
+        // refusal above it. Round two of issue #410's review demonstrated,
+        // live, that the exception was the original defect wearing a status
+        // code: a peer answering a bodiless-looking 304 and then writing a
+        // real body later desynchronizes the next exchange exactly as an
+        // absent Content-Length on any other status did. See the module
+        // doc comment and `tests/probe.rs`'s
+        // `not_modified_with_a_late_body_forces_a_reconnect_not_a_leak` for
+        // the live proof.
         let outcome = scan_response_head(b"HTTP/1.1 304 Not Modified\r\n\r\n");
-        match outcome {
-            ScanOutcome::Complete(head) => {
-                assert_eq!(head.status, 304);
-                assert_eq!(head.content_length, 0);
-            }
-            other => panic!("expected Complete, got {other:?}"),
-        }
+        assert_eq!(outcome, ScanOutcome::Bad(BadReason::MissingContentLength));
+    }
+
+    #[test]
+    fn a_loose_status_line_that_reads_as_304_is_refused_the_same_way() {
+        // The exception this module used to make was wider than the status
+        // code `304` alone: `parse_status` accepts any line with a space
+        // followed by three digits, `HTTP/1.1` prefix or not, so a
+        // desynchronized buffer that merely CONTAINS "304" at the right
+        // offset used to re-parse as a trusted, bodiless 304 forever. With
+        // the exception gone this shape is refused like every other missing
+        // length, which is what actually stops a misframed buffer from
+        // re-synchronizing on garbage.
+        let outcome = scan_response_head(b"x 304 y\r\n\r\n");
+        assert_eq!(outcome, ScanOutcome::Bad(BadReason::MissingContentLength));
     }
 
     #[test]
