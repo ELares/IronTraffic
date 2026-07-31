@@ -375,7 +375,10 @@ impl LoadGenerator for Oha {
             // throughput" that would make this refusal conditional. This is
             // the PRIMARY gate; `parse`'s own `latency_trustworthy` formula
             // is a second, independent line of defence for the same fact.
-            return Err(Unsupported::RateMode { tool: self.name() });
+            return Err(Unsupported::RateMode {
+                tool: self.name(),
+                detail: "cannot produce trustworthy latency in saturate mode",
+            });
         }
         Ok(())
     }

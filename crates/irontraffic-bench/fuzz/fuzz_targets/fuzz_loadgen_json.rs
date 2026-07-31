@@ -67,9 +67,9 @@
 //! files list for this issue does not include `.github/workflows/ci.yml`.
 
 use irontraffic_bench::{
-    BenchCell, CacheMode, CellId, ContainerRuntime, Invocation, KeepaliveMode, LoadGenerator,
-    MAX_REPORTED_REQUESTS, Nighthawk, Oha, ParseCtx, PathCorpus, Protocol, RateMode, RawRun,
-    TlsMode, ToolStamp,
+    BenchCell, CacheMode, CellId, ContainerRuntime, H2Load, Invocation, KeepaliveMode,
+    LoadGenerator, Nighthawk, Oha, ParseCtx, PathCorpus, Protocol, RateMode, RawRun, TlsMode,
+    ToolStamp, Vegeta, MAX_REPORTED_REQUESTS,
 };
 use libfuzzer_sys::fuzz_target;
 
@@ -90,6 +90,21 @@ const OHA_VALID_STDOUT: &[u8] = include_bytes!("../../tests/fixtures/oha-1.15.0.
 /// mutation that happens to reconstruct a whole valid `results` document out
 /// of the stdout-path's arbitrary bytes.
 const NIGHTHAWK_VALID_STDOUT: &[u8] = include_bytes!("../../tests/fixtures/nighthawk-output.json");
+
+/// The h2load fixture `tests/loadgen_h2load.rs` also uses as its own
+/// authority, for the identical reason `NIGHTHAWK_VALID_STDOUT` is: also NOT
+/// a genuine capture (see `src/loadgen/h2load.rs`'s own module doc for why),
+/// only a reconstruction checked against the real `nghttp2` source at the
+/// last tag whose `h2load.cc` still emits this text shape.
+const H2LOAD_VALID_STDOUT: &[u8] = include_bytes!("../../tests/fixtures/h2load-output.txt");
+
+/// The vegeta fixture `tests/loadgen_vegeta.rs` also uses as its own
+/// authority. Unlike `H2LOAD_VALID_STDOUT`, this IS a genuine capture: a
+/// real, locally built `vegeta v12.13.0` (`go install
+/// github.com/tsenart/vegeta/v12@v12.13.0`; no `docker`/`podman` needed)
+/// attacking a local HTTP server, per `tests/loadgen_vegeta.rs`'s own module
+/// doc.
+const VEGETA_VALID_STDOUT: &[u8] = include_bytes!("../../tests/fixtures/vegeta-report.json");
 
 #[allow(
     clippy::expect_used,
@@ -204,7 +219,10 @@ fn fuzz_adapter(adapter: &dyn LoadGenerator, ctx: &ParseCtx<'_>, data: &[u8], va
 /// `seed_corpus/fuzz_loadgen_json/small_run_n10` so it is exercised on
 /// every run, not left to mutation to rediscover.
 fn check_ok_raw_run(raw: &RawRun) {
-    assert!(raw.duration_ns > 0, "an Ok parse must never yield a zero duration");
+    assert!(
+        raw.duration_ns > 0,
+        "an Ok parse must never yield a zero duration"
+    );
     assert!(
         raw.requests_sent <= MAX_REPORTED_REQUESTS,
         "an Ok parse must never exceed MAX_REPORTED_REQUESTS"
@@ -272,4 +290,20 @@ fuzz_target!(|data: &[u8]| {
         client_cores: "0-3".to_owned(),
     };
     fuzz_adapter(&nighthawk, &ctx, data, NIGHTHAWK_VALID_STDOUT);
+
+    // `H2Load` is `Copy` (no owned heap data), like `Oha`, but is not
+    // zero-sized (it carries a `threads: u16` field), so it is constructed
+    // fresh here rather than `const`-promoted the way `Oha`'s own unit
+    // struct is; see the module doc's "ADDING AN ADAPTER" note.
+    let h2load = H2Load { threads: 4 };
+    fuzz_adapter(&h2load, &ctx, data, H2LOAD_VALID_STDOUT);
+
+    // `Vegeta`'s fields are owned (`PathBuf`), like `Nighthawk`'s `String`
+    // fields, so it too is constructed fresh here.
+    let vegeta = Vegeta {
+        max_workers: 8,
+        targets_path: "targets.txt".into(),
+        output_path: "results.bin".into(),
+    };
+    fuzz_adapter(&vegeta, &ctx, data, VEGETA_VALID_STDOUT);
 });

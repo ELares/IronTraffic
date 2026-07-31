@@ -39,13 +39,20 @@ use crate::error::BenchError;
 use crate::hist::LatencyRecorder;
 use crate::provenance::ToolStamp;
 
+mod h2load;
 mod nighthawk;
 mod oha;
+mod vegeta;
+pub use h2load::{H2Load, MAX_H2LOAD_LINE_BYTES, MAX_H2LOAD_LINES, MAX_H2LOAD_OUTPUT_BYTES};
 pub use nighthawk::{
     ContainerRuntime, MAX_COUNTERS, MAX_DURATION_SECONDS, MAX_PERCENTILE_ENTRIES,
     MAX_RESULT_ENTRIES, MAX_STATISTICS, MIN_PERCENTILE_ENTRIES, Nighthawk,
 };
 pub use oha::Oha;
+pub use vegeta::{
+    CROSS_CHECK_TOLERANCE_PERMILLE, CrossCheck, MAX_VEGETA_WORKERS, NotComparableReason, Vegeta,
+    cross_check,
+};
 
 /// Largest tool stdout the parser will accept. Checked on the slice length
 /// before any deserialisation.
@@ -179,10 +186,22 @@ pub enum Unsupported {
         protocol: Protocol,
     },
     /// The tool cannot produce trustworthy latency for this rate mode.
-    #[error("{tool} cannot produce trustworthy latency in saturate mode")]
+    ///
+    /// `detail` carries the ADAPTER-SPECIFIC reason, because "cannot measure
+    /// this rate mode" means something different for every tool that
+    /// refuses one: `Oha` refuses `RateMode::Saturate` because its client
+    /// queueing dominates the number; `H2Load` refuses `RateMode::Fixed`
+    /// because its `--rate` flag means connections per period, not requests
+    /// per period, an unrelated and more dangerous fact a shared, generic
+    /// message would not convey. Added by `bench-loadgen-h2load-and-vegeta-crosscheck`
+    /// (#413): `Oha::supports`'s own call site now passes its original fixed
+    /// wording as `detail` verbatim, so nothing about its behaviour changed.
+    #[error("{tool}: {detail}")]
     RateMode {
         /// Adapter name.
         tool: &'static str,
+        /// Why, specific to the adapter and the rate mode it refused.
+        detail: &'static str,
     },
     /// The tool cannot reach this connection count.
     #[error("{tool} cannot drive {connections} connections")]

@@ -2311,6 +2311,43 @@ instead:
   // it-allow: no-accumulated-sleep reason: <why the deadline form is impossible here>" "$hits"
 
 # ---------------------------------------------------------------------------
+# 27. h2load-no-float: H2Load's own parser must read every h2load duration and
+#     byte-count field with integer arithmetic, never a floating-point
+#     conversion.
+#
+#     WHY THIS EXISTS (issue #413 / PR 815 review, issue #816 NOTE).
+#     `docs/THREAT-MODEL.md`'s own h2load section states that this exact grep
+#     "returning nothing is an acceptance criterion of the issue that shipped
+#     this parser, checked in CI, not merely a code-review preference." That
+#     sentence was not true when it was written: nothing under `scripts/` or
+#     `.github/` ran the grep, so the claim was an unenforced promise in a
+#     permanent shared document, the same shape PR 812's own review flagged.
+#     It is wired in here instead of merely left as prose. The underlying
+#     reason the rule matters: h2load's own summary line (`time for request:
+#     239us  11.85ms  602us  351us  89.35%`) mixes unit suffixes within one
+#     row; Rust's standard-library float parser accepts `nan`, `inf` and
+#     `1e309`, and casting a not-a-number float to an unsigned integer
+#     silently yields `0`, so a corrupted or hostile column would otherwise
+#     become a zero-nanosecond sample this crate goes on to report
+#     percentiles from.
+#
+#     SCOPE. Exactly the one file the claim names, not the whole crate: a
+#     different adapter parsing a genuinely float-typed upstream field (none
+#     currently do; vegeta's `latencies` and oha's `latencyPercentiles` are
+#     each read through `Value::as_u64`/`Value::as_f64` at a JSON boundary,
+#     not a Rust string-to-float parse of a mixed-unit text row) would need
+#     its own justification, not a blanket ban.
+# ---------------------------------------------------------------------------
+hits="$(scan h2load-no-float 'parse::<f64>|as f64' rust_files \
+  | grep -E '^crates/irontraffic-bench/src/loadgen/h2load\.rs:' || true)"
+[ -n "$hits" ] && fail h2load-no-float \
+"h2load's own summary mixes unit suffixes within one row; a floating-point
+parse or cast here can silently turn a corrupted column into a
+zero-nanosecond sample. Read every h2load duration and byte count with
+integer arithmetic instead:
+  // it-allow: h2load-no-float reason: <why a float conversion is safe here>" "$hits"
+
+# ---------------------------------------------------------------------------
 if [ "$FAILED" -ne 0 ]; then
   printf '\ninvariant-lints: FAILED. Each block above names the rule, explains why it\n'
   printf 'exists, and lists the offending lines. Fix the code; do not silence a lint\n'
