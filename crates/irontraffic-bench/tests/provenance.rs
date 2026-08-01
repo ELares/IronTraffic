@@ -491,6 +491,41 @@ fn probe_output_is_capped_and_the_child_is_reaped() {
 // 7f: hostile build-stamp fields.
 // ---------------------------------------------------------------------------
 
+/// Builds the failure message for one of `hostile_build_stamp_fields_are_rejected`'s
+/// three `assert!` calls below, distinguishing a starved fixture-script probe
+/// from a real validation defect rather than letting a bare
+/// `assert!(matches!(..))` discard which variant actually came back: the
+/// fifth member of issue #811's starvation family, surfaced only once this
+/// file's own `reset_recorders_discards_and_returns_count` fix raised the
+/// suite's total wall clock (tracking issue #825 is the sibling gap in that
+/// same fix). `capture_build_stamp` runs the fixture script under
+/// `run_bounded`'s `PROBE_TIMEOUT_SECONDS` wall-clock kill; if the script is
+/// never scheduled in time to run and print its hostile output at all,
+/// `run_bounded` returns `BenchError::Io` before any parsing or field
+/// validation happens, which is starvation, not evidence that `field`'s
+/// validation accepted a hostile value. A variant that is neither `Parse`
+/// nor `Io` is not the starvation shape either, so it is named as a likely
+/// real defect instead. Prints the variant actually received (`{err:?}`) in
+/// both arms, since that is the whole diagnostic the previous bare assertion
+/// discarded.
+#[cfg(unix)]
+fn hostile_field_message(err: &BenchError, field: &str) -> String {
+    match err {
+        BenchError::Io { .. } => format!(
+            "the {field} probe returned {err:?} instead of BenchError::Parse; that is \
+             PROBE_TIMEOUT_SECONDS's own wall-clock kill firing (a starvation failure: the \
+             fixture script was never scheduled in time to run and produce the hostile \
+             {field} value at all, so no parsing or validation ever happened), not evidence \
+             that {field} validation accepts a hostile value"
+        ),
+        other => format!(
+            "the {field} probe returned {other:?} instead of BenchError::Parse, and that is \
+             not the starvation shape either (starvation surfaces as BenchError::Io); this \
+             looks like a real defect in {field} validation"
+        ),
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn hostile_build_stamp_fields_are_rejected() {
@@ -504,7 +539,11 @@ fn hostile_build_stamp_fields_are_rejected() {
     );
     let err = capture_build_stamp(&hostile_version)
         .expect_err("a version containing a space and an @ must be rejected");
-    assert!(matches!(err, BenchError::Parse { .. }));
+    assert!(
+        matches!(err, BenchError::Parse { .. }),
+        "{}",
+        hostile_field_message(&err, "version")
+    );
 
     let many_features = "\"x\",".repeat(10_000);
     let many_features = many_features.trim_end_matches(',');
@@ -516,7 +555,11 @@ fn hostile_build_stamp_fields_are_rejected() {
     );
     let err =
         capture_build_stamp(&hostile_features).expect_err("more than 64 features must be rejected");
-    assert!(matches!(err, BenchError::Parse { .. }));
+    assert!(
+        matches!(err, BenchError::Parse { .. }),
+        "{}",
+        hostile_field_message(&err, "features")
+    );
 
     let hostile_sha = scripts.write_script(
         "hostile_sha.sh",
@@ -526,7 +569,11 @@ fn hostile_build_stamp_fields_are_rejected() {
     );
     let err = capture_build_stamp(&hostile_sha)
         .expect_err("a git_sha containing path traversal characters must be rejected");
-    assert!(matches!(err, BenchError::Parse { .. }));
+    assert!(
+        matches!(err, BenchError::Parse { .. }),
+        "{}",
+        hostile_field_message(&err, "git_sha")
+    );
 }
 
 // ---------------------------------------------------------------------------
