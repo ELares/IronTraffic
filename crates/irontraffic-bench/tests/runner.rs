@@ -124,21 +124,52 @@ fn main() {
             // which uses the --config PATH, not its contents).
             let bind = flag_value(&args, "--bind").expect("--bind required");
             let upstream = flag_value(&args, "--upstream").expect("--upstream required");
-            // Retry-once test support (run_cell's own tests): a sibling
-            // trigger file next to the rendered config, present only when a
-            // test deliberately created it before calling run_cell. Every
-            // OTHER test's config directory never has one (this checks
-            // metadata, not contents), so this is a no-op for them.
-            // run_repetition builds the SUT's argument list itself with no
-            // room for a purpose-built CLI flag, and params.work_dir (and
-            // therefore this rendered config path) is the ONE piece of
-            // per-call state a test already controls that reaches the SUT's
-            // own command line at all.
+            // Retry test support (run_cell's own tests): sibling files next
+            // to the rendered config, present only when a test deliberately
+            // created them before calling run_cell. Every OTHER test's
+            // config directory never has any of these (this checks
+            // metadata, not contents), so this whole block is a no-op for
+            // them. run_repetition builds the SUT's argument list itself
+            // with no room for a purpose-built CLI flag, and
+            // params.work_dir (and therefore this rendered config path) is
+            // the ONE piece of per-call state a test already controls that
+            // reaches the SUT's own command line at all.
             if let Some(config) = flag_value(&args, "--config") {
-                let trigger = std::path::Path::new(&config).with_file_name("force-first-sut-failure");
+                let config_dir = std::path::Path::new(&config)
+                    .parent()
+                    .map(std::path::Path::to_path_buf)
+                    .unwrap_or_else(|| std::path::PathBuf::from("."));
+
+                // Retry-ceiling test support: every invocation that reaches
+                // this point records itself here, regardless of either
+                // trigger below, so a test can assert exactly how many
+                // times run_cell spawned the SUT within one call, by
+                // mechanism rather than by wall-clock timing.
+                let attempts_path = config_dir.join("sut-attempt-count");
+                let previous_attempts: u32 = std::fs::read_to_string(&attempts_path)
+                    .ok()
+                    .and_then(|s| s.trim().parse().ok())
+                    .unwrap_or(0);
+                let _ = std::fs::write(&attempts_path, (previous_attempts + 1).to_string());
+
+                // Consumed on first sight: fails exactly the first attempt
+                // that observes it, and no other.
+                let trigger = config_dir.join("force-first-sut-failure");
                 if std::fs::metadata(&trigger).is_ok() {
                     let _ = std::fs::remove_file(&trigger);
                     eprintln!("fixture: deliberate first-attempt SUT failure (retry-once trigger)");
+                    std::process::exit(7);
+                }
+
+                // NEVER consumed: fails every attempt for as long as it is
+                // present, so a persistently failing SUT can be simulated
+                // without a nonexistent binary path (which cannot record an
+                // attempt count at all, since nothing ever runs).
+                let always_fail = config_dir.join("force-every-sut-failure");
+                if std::fs::metadata(&always_fail).is_ok() {
+                    eprintln!(
+                        "fixture: deliberate persistent SUT failure (retry-ceiling trigger)"
+                    );
                     std::process::exit(7);
                 }
             }
@@ -817,8 +848,24 @@ fn reconciliation_mismatch_fails() {
 // Reviewed finding: run_cell is exported from lib.rs but was never called
 // from any test in the workspace, leaving its own orchestration (the
 // repetition loop, the retry-once policy, the `retried` flag) completely
-// unexercised. These three tests drive run_cell itself, not just
+// unexercised. These four tests drive run_cell itself, not just
 // run_repetition or CellAggregate::from_runs in isolation.
+//
+// Reviewed finding (round 3): the first three of these originally called
+// test_params(<label>, 1, 1), i.e. measure_secs = 1. At test_cell's
+// RateMode::Fixed(2000) that is only ~2000 client requests, and
+// RECONCILE_TOLERANCE_PERMILLE makes the absolute tolerance
+// client_requests / 1000, i.e. ONE request: exactly the case test_cell's own
+// rate comment warns a low rate walks straight into (a single connection
+// still in flight when the client exits fails a perfectly healthy
+// repetition). measure_secs = 3 below (matching repetition_produces_a_result
+// and warmup_samples_are_discarded above) puts the tolerance back to a
+// handful of requests, comfortably above the largest plausible in-flight
+// discrepancy (at most test_cell's own 4 connections). This is the actual
+// mechanism a reviewer measured failing gate-fast.sh on its first run
+// (~1 failure in 8 executions); it is fixed here at its source rather than
+// hedged as host contention, which was the wrong diagnosis: the tolerance
+// window, not the host, was too narrow for these three tests specifically.
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -830,24 +877,20 @@ fn run_cell_aggregates_the_requested_repetition_count() {
     let oha = irontraffic_bench::Oha;
     let ceiling = CeilingProbe;
     let adapters: Vec<&dyn LoadGenerator> = vec![&oha, &ceiling];
-    let params = test_params("run_cell_ok", 1, 1);
+    let params = test_params("run_cell_ok", 1, 3);
     let provenance = test_provenance();
 
-    // Each repetition reconciles a real load client's own request count
-    // against the origin's, within a 0.1 percent tolerance: on a host under
-    // heavy concurrent load (many repetitions' worth of oha, it-origin and
-    // probe processes all competing for CPU at once), a repetition can fail
-    // that reconciliation for real, causing run_cell to retry once and
-    // (rarely) still fail if the retry lands under the same contention.
-    // Either failure below is EITHER host starvation or a genuine defect in
-    // run_cell's own orchestration, not distinguishable from inside this
-    // test.
+    // At measure_secs = 3 (see this section's own header comment) a healthy
+    // repetition's client-versus-origin discrepancy is bounded by at most
+    // test_cell's 4 in-flight connections, well inside the ~6 request
+    // tolerance this duration gives reconcile(); a failure here is therefore
+    // read as a genuine defect, not hedged as indistinguishable host
+    // contention.
     let (aggregate, recorders) = run_cell(&cell, &oha, &adapters, &params, &provenance, 2)
         .unwrap_or_else(|e| {
             panic!(
-                "run_cell must succeed for a healthy fixture proxy, got {e:?} (EITHER a genuine \
-                 run_cell defect OR host contention causing a real reconciliation mismatch under \
-                 concurrent load, not distinguishable from inside this test)"
+                "run_cell must succeed for a healthy fixture proxy at a several-request-wide \
+                 reconciliation tolerance, got {e:?}"
             )
         });
     assert_eq!(
@@ -862,9 +905,9 @@ fn run_cell_aggregates_the_requested_repetition_count() {
     );
     assert!(
         !aggregate.retried,
-        "an all-success run_cell call must report retried: false; if this repetition genuinely \
-         needed a retry under real host contention (not a run_cell defect), that is itself an \
-         honest signal this test cannot separate from a defect from inside itself"
+        "an all-success run_cell call must report retried: false; at this tolerance width a \
+         healthy repetition does not need a retry, so retried: true here is a genuine defect \
+         signal, not an honest ambiguity to hedge away"
     );
 }
 
@@ -877,7 +920,7 @@ fn run_cell_retries_once_then_propagates_a_persistent_failure() {
     let oha = irontraffic_bench::Oha;
     let ceiling = CeilingProbe;
     let adapters: Vec<&dyn LoadGenerator> = vec![&oha, &ceiling];
-    let mut params = test_params("run_cell_retry_persist", 1, 1);
+    let mut params = test_params("run_cell_retry_persist", 1, 3);
     params.sut_binary = PathBuf::from("/nonexistent/binary/does-not-exist");
     let provenance = test_provenance();
 
@@ -901,7 +944,11 @@ fn run_cell_retries_once_then_propagates_a_persistent_failure() {
     // single attempt could also be inflated past this floor, in which case
     // this assertion is inconclusive between host starvation and the
     // retry-once policy silently regressing to zero retries, not a
-    // confident failure of the policy either way.
+    // confident failure of the policy either way. This is a genuine
+    // starvation hedge (unlike the tolerance issue above): wall-clock time
+    // really cannot tell a slow host apart from an extra attempt, which is
+    // exactly why `run_cell_never_retries_a_persistent_failure_more_than_once`
+    // below pins the retry CEILING by mechanism instead.
     assert!(
         elapsed >= Duration::from_secs(16),
         "run_cell took {elapsed:?} against a permanently broken SUT; the retry-once policy \
@@ -921,7 +968,7 @@ fn run_cell_retries_once_and_records_retried_true() {
     let oha = irontraffic_bench::Oha;
     let ceiling = CeilingProbe;
     let adapters: Vec<&dyn LoadGenerator> = vec![&oha, &ceiling];
-    let params = test_params("run_cell_retry_ok", 1, 1);
+    let params = test_params("run_cell_retry_ok", 1, 3);
     let provenance = test_provenance();
 
     // Arrange exactly ONE deliberate SUT failure: the fixture's own "run"
@@ -937,17 +984,19 @@ fn run_cell_retries_once_and_records_retried_true() {
 
     // The retry (the second attempt) is a real repetition against the SAME
     // real oha/it-origin/probe process tree as every other end-to-end test
-    // here, so on a host under heavy concurrent load it can ALSO fail for a
-    // genuine, unrelated reason (reconciliation timing), which run_cell has
-    // no third attempt left to recover from. A failure here is EITHER that
-    // host-contention case OR a real defect in the retry-once policy, not
-    // distinguishable from inside this test.
+    // here. At measure_secs = 1 that repetition's own reconciliation
+    // tolerance was only one request wide (this section's own header
+    // comment), which is what actually produced the reviewer's measured
+    // ~12 percent flake rate; at measure_secs = 3 it is a handful of
+    // requests wide, comfortably above the largest plausible in-flight
+    // discrepancy, so a failure here is read as a genuine defect in the
+    // retry-once policy rather than hedged as indistinguishable host
+    // contention.
     let (aggregate, recorders) = run_cell(&cell, &oha, &adapters, &params, &provenance, 1)
         .unwrap_or_else(|e| {
             panic!(
                 "run_cell must succeed once the one retry clears the deliberate first failure, \
-                 got {e:?} (EITHER the retry-once policy is broken OR the retry itself hit real \
-                 host contention, not distinguishable from inside this test)"
+                 got {e:?}"
             )
         });
     assert_eq!(aggregate.runs.len(), 1);
@@ -955,6 +1004,61 @@ fn run_cell_retries_once_and_records_retried_true() {
     assert!(
         aggregate.retried,
         "a repetition that only passed on retry must set retried: true, not hide it"
+    );
+}
+
+#[test]
+fn run_cell_never_retries_a_persistent_failure_more_than_once() {
+    if !oha_available() {
+        return;
+    }
+    let cell = test_cell("runner_run_cell_retry_ceiling");
+    let oha = irontraffic_bench::Oha;
+    let ceiling = CeilingProbe;
+    let adapters: Vec<&dyn LoadGenerator> = vec![&oha, &ceiling];
+    let params = test_params("run_cell_retry_ceiling", 1, 1);
+    let provenance = test_provenance();
+
+    // Reviewed finding: run_cell_retries_once_then_propagates_a_persistent_failure
+    // above only proves a retry HAPPENED (a wall-clock floor with no
+    // ceiling): replacing run_cell's single retry with a loop of three
+    // further attempts left every existing run_cell test green, so the "at
+    // most once" half of edge case 15 was unverified. The fixture's
+    // "force-every-sut-failure" trigger (see its own comment in
+    // FIXTURE_SOURCE) is never consumed, so every attempt fails for as long
+    // as it is present, and every attempt that reaches the SUT records
+    // itself in a persistent "sut-attempt-count" file next to the rendered
+    // config regardless of which trigger it hits. This pins the exact
+    // number of attempts run_cell makes by mechanism, not by timing: with a
+    // real SUT binary that always fails, the count is a plain integer, not
+    // a duration a slow host could inflate.
+    std::fs::create_dir_all(&params.work_dir).expect("create work_dir for the trigger file");
+    let trigger = params.work_dir.join("force-every-sut-failure");
+    std::fs::write(&trigger, b"trigger").expect("write the retry-ceiling trigger file");
+
+    let outcome = run_cell(&cell, &oha, &adapters, &params, &provenance, 1);
+    assert!(
+        outcome.is_err(),
+        "a persistently failing SUT must still fail run_cell after the one retry edge case 15 \
+         allows"
+    );
+
+    let attempts_path = params.work_dir.join("sut-attempt-count");
+    let attempts_text = std::fs::read_to_string(&attempts_path).unwrap_or_else(|e| {
+        panic!(
+            "the fixture must have recorded at least one SUT attempt at {}: {e}",
+            attempts_path.display()
+        )
+    });
+    let attempts: u32 = attempts_text
+        .trim()
+        .parse()
+        .unwrap_or_else(|e| panic!("sut-attempt-count {attempts_text:?} must parse as u32: {e}"));
+    assert_eq!(
+        attempts, 2,
+        "run_cell must attempt a persistently failing SUT exactly twice (the initial attempt \
+         plus edge case 15's one retry), never a third or further attempt; got {attempts} \
+         recorded attempts"
     );
 }
 

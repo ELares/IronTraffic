@@ -491,7 +491,7 @@ impl Child {
     #[cfg(unix)]
     fn stop_unix(&mut self) {
         let pid = rustix::process::Pid::from_child(&self.process);
-        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::TERM); // it-allow: no-swallowed-error reason: best-effort SIGTERM to the whole process group; the process may already have exited between the caller's own liveness check and this call, and the wait loop below observes the actual outcome regardless // it-allow: no-swallowed-error reason: best-effort SIGTERM to the whole process group; the process may already have exited between the caller's own liveness check and this call, and the wait loop below observes the actual outcome regardless
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::TERM); // it-allow: no-swallowed-error reason: best-effort SIGTERM to the whole process group; the process may already have exited between the caller's own liveness check and this call, and the wait loop below observes the actual outcome regardless
         let start = Instant::now(); // it-allow: determinism-seam reason: measures this teardown call's own 5 second SIGTERM grace budget before escalating to SIGKILL, mirroring crate::provenance's identical poll_until_done pattern; not a request-path time read
         loop {
             match self.process.try_wait() {
@@ -504,7 +504,7 @@ impl Child {
             }
             std::thread::park_timeout(TEARDOWN_POLL_INTERVAL); // it-allow: no-accumulated-sleep reason: a fixed 20ms grace-period poll tick bounded by the start.elapsed() >= TEARDOWN_GRACE deadline check above on every iteration, mirroring crate::provenance's identical poll_until_done pattern; a spurious wakeup only costs one extra tick and never accumulates
         }
-        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL); // it-allow: no-swallowed-error reason: best-effort SIGKILL escalation to the whole process group; the blocking reap immediately below observes the actual outcome regardless of whether the signal reached a still-live process or an already-exited one // it-allow: no-swallowed-error reason: best-effort SIGKILL escalation to the whole process group; the blocking reap immediately below observes the actual outcome regardless of whether the signal reached a still-live process or an already-exited one
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL); // it-allow: no-swallowed-error reason: best-effort SIGKILL escalation to the whole process group; the blocking reap immediately below observes the actual outcome regardless of whether the signal reached a still-live process or an already-exited one
         let _ = self.process.wait(); // it-allow: no-swallowed-error reason: this reaps the child after SIGKILL, which cannot be caught or ignored; stop() has no further action to take whether the wait succeeds or the child had already been reaped by something else
     }
 

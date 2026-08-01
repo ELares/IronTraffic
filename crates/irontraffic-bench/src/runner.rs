@@ -1521,9 +1521,26 @@ mod tests {
         use std::io::{Read, Write};
         use std::net::TcpListener;
         use std::sync::atomic::{AtomicU64, Ordering};
+        use std::time::{Duration, Instant};
 
         let listener =
             TcpListener::bind(("127.0.0.1", 0)).unwrap_or_else(|e| panic!("bind failed: {e}"));
+        // Reviewed finding: the accept loop below used to be a plain
+        // `for _ in 0..accept_budget { listener.accept() ... }` with no
+        // timeout. That is deterministic today only because
+        // read_origin_stats_settled always makes exactly this many reads
+        // when the counter never settles; if the function under test ever
+        // returned early (a different give-up condition, an added early
+        // `Ok` path), nothing would ever connect for the remaining
+        // iterations and this thread would block in `accept()` forever,
+        // wedging `thread::scope`'s own join with no timeout, the same
+        // shape as the `Child::stop` defect this PR's earlier pass removed.
+        // Non-blocking `accept()` polled against a wall-clock deadline
+        // bounds this loop regardless of how many times the function under
+        // test actually reads.
+        listener
+            .set_nonblocking(true)
+            .unwrap_or_else(|e| panic!("set_nonblocking failed: {e}"));
         let addr = listener
             .local_addr()
             .unwrap_or_else(|e| panic!("local_addr failed: {e}"));
@@ -1538,13 +1555,39 @@ mod tests {
         let accept_budget = usize::try_from(SETTLE_MAX_ITERATIONS)
             .unwrap_or_else(|_| panic!("SETTLE_MAX_ITERATIONS must fit in usize"))
             .saturating_add(1);
+        // Comfortably above the settle loop's own ~2 second budget
+        // (SETTLE_MAX_ITERATIONS * SETTLE_POLL_INTERVAL), so a healthy run
+        // never comes close to it; only a wedge (the scenario described
+        // above) or extreme host starvation would ever reach it, and either
+        // way this bound turns a silent hang into a clean, if slow, test
+        // failure instead.
+        let accept_deadline = Instant::now() + Duration::from_secs(10);
 
         let result = std::thread::scope(|scope| {
             scope.spawn(|| {
-                for _ in 0..accept_budget {
-                    let Ok((mut stream, _)) = listener.accept() else {
-                        break;
+                let mut served = 0_usize;
+                while served < accept_budget {
+                    let (mut stream, _addr) = match listener.accept() {
+                        Ok(pair) => pair,
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                            if Instant::now() >= accept_deadline {
+                                break;
+                            }
+                            std::thread::park_timeout(Duration::from_millis(5)); // it-allow: no-accumulated-sleep reason: bounded by accept_deadline on every iteration, a fixed total cap of 10 seconds; guards this test-only fake-origin accept loop against blocking in accept() forever if the function under test ever stopped reading before accept_budget connections arrived
+                            continue;
+                        }
+                        Err(_other) => break,
                     };
+                    served += 1;
+                    // The listener's own non-blocking mode above is not
+                    // inherited by an accepted connection on any platform
+                    // this crate ships on, but stating that explicitly
+                    // rather than relying on it removes any doubt: the
+                    // blocking read/write calls below need a blocking
+                    // stream to behave the same as before this fix.
+                    stream
+                        .set_nonblocking(false)
+                        .unwrap_or_else(|e| panic!("stream set_nonblocking(false) failed: {e}"));
                     let mut buf = [0_u8; 512];
                     let _ = stream.read(&mut buf);
                     let n = counter.fetch_add(1, Ordering::SeqCst);
