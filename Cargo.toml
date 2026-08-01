@@ -167,7 +167,7 @@ arc-swap = "1.9.2"
 # HKDF-Extract/Expand (`hkdf.rs`) runs over for the cluster-derived TLS session
 # ticket key schedule (`cluster-derived-session-ticketer`, #120). Only
 # `irontraffic-tls` names it.
-hmac = "0.12"
+hmac = "0.13"
 # SHA-384, the hash the HKDF above is built on (`cluster-derived-session-ticketer`,
 # #120).
 sha2 = "0.10"
