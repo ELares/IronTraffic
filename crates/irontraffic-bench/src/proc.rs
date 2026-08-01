@@ -105,7 +105,7 @@ const READINESS_EXCERPT_RAW_BYTES: usize = 128;
 
 /// `/proc/<pid>/stat`'s clock-tick unit, assumed rather than read via
 /// `sysconf(_SC_CLK_TCK)`: this is 100 on every Linux target this workspace
-/// ships or tests on (x86_64 and aarch64), and reading the real value would
+/// ships or tests on (`x86_64` and `aarch64`), and reading the real value would
 /// need a `libc`/`sysconf` call this crate's manifest does not authorise.
 /// A wrong assumption here would scale every `cpu_seconds` figure by a fixed
 /// constant factor, not corrupt it in a way that could pass a validity check
@@ -641,8 +641,23 @@ fn read_cpu_seconds(_pid: u32) -> Result<f64, BenchError> {
 
 /// `CLOCK_TICKS_PER_SEC` widened once, so `read_cpu_seconds` never repeats
 /// the narrowing-then-widening dance on every call.
+///
+/// Written as an `f64` literal rather than `CLOCK_TICKS_PER_SEC as f64`, which
+/// `clippy::cast_precision_loss` denies: an unrestricted `u64` really can
+/// exceed `f64`'s 52 bit mantissa, and the lint cannot see that this
+/// particular one is the constant 100. A cast plus an allow would silence the
+/// lint while leaving the same trap for whoever later makes the tick count
+/// dynamic, so the two are tied together instead: the debug assertion below
+/// fails the moment they diverge, which is the only way they can.
 #[cfg(target_os = "linux")]
-const CLOCK_TICKS_PER_SEC_F64: f64 = CLOCK_TICKS_PER_SEC as f64;
+const CLOCK_TICKS_PER_SEC_F64: f64 = 100.0;
+
+#[cfg(target_os = "linux")]
+#[allow(
+    clippy::assertions_on_constants,
+    reason = "the point IS that both sides are constants: this ties the f64 form to the u64               form so a future edit to one and not the other cannot silently scale every               cpu_seconds figure by a fixed factor"
+)]
+const _: () = assert!(CLOCK_TICKS_PER_SEC == 100);
 
 #[cfg(target_os = "linux")]
 fn read_memory(pid: u32) -> Result<(u64, u64), BenchError> {
