@@ -131,7 +131,7 @@ x509-cert = "0.2"
 # Streaming DER walk for CRL parsing: `x509-cert` re-exports `der` transitively, but the CRL
 # walker needs its `SliceReader` and `Reader` traits directly to skip unknown bytes without
 # materializing per-entry structs.
-der = "0.7"
+der = "0.8"
 # RFC 6960 OCSP request/response types (`ocsp-staple-validation-and-updater`, #122):
 # `OCSPRequest`, `OCSPResponse`, `BasicOCSPResponse`, `CertID`, `ResponderID`. Self-described as
 # early-stage upstream, which is why the response validator is fuzzed rather than trusted. This
