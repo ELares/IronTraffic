@@ -37,10 +37,12 @@
 #![deny(missing_docs)]
 
 mod cell;
+mod corpus;
 mod error;
 mod guards;
 mod hist;
 mod loadgen;
+mod matrix;
 mod probe;
 mod provenance;
 mod result;
@@ -49,6 +51,10 @@ mod schedule;
 pub use cell::{
     BenchCell, CacheMode, CellId, KeepaliveMode, PathCorpus, Protocol, RESERVED_STEMS, RateMode,
     TlsMode,
+};
+pub use corpus::{
+    MAX_CORPUS_FILE_BYTES, MAX_REGEX_REPEAT, MAX_ROUTES, MAX_SAMPLE_PATH_BYTES, RouteShape,
+    RouteSpec, path_expr, path_samples, route_table,
 };
 pub use error::{BenchError, Detail, MAX_DETAIL_BYTES};
 pub use guards::{
@@ -66,6 +72,11 @@ pub use loadgen::{
     MAX_TOOL_STDERR_BYTES, MAX_VEGETA_WORKERS, MAX_VERSION_OUTPUT_BYTES, MIN_PERCENTILE_ENTRIES,
     Nighthawk, NotComparableReason, Oha, ParseCtx, RawRun, RunParams, Scheme, Target, Unsupported,
     Vegeta, cross_check,
+};
+pub use matrix::{
+    FIXED_RATE_PERMILLE_OF_SATURATION, MAX_SATURATION_FILE_BYTES, MAX_SATURATION_LINE_BYTES,
+    MAX_SATURATION_LINES, MAX_SATURATION_RPS, MatrixEntry, RatePlan, SaturationTable,
+    UNRESOLVED_RATE, base_cell, entry, registry, resolve_rate, suite,
 };
 pub use probe::{
     BadReason, MAX_CONSECUTIVE_ERRORS, MAX_HEALTHY_RECONNECTS, MAX_REQUEST_BYTES,

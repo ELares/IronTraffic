@@ -1,0 +1,13 @@
+# Uniform-random path corpus for the published benchmark matrix.
+#
+# This is the w = 3 instance (the base cell's 1,000 routes) of a generated
+# family: corpus::path_expr(PathCorpus::UniformRandom, routes) derives the
+# regex for any other power-of-ten route count by substituting the digit
+# count in the {3} group below. Paired with the Flat route shape
+# (corpus::route_table): every expansion of this regex names exactly one
+# route in that table.
+#
+# Any tool that expands this pattern with an unbounded repetition operator
+# (this one has none) must pass --max-repeat 4, so a future edit that adds
+# one is still bounded. See MAX_REGEX_REPEAT in crates/irontraffic-bench/src/corpus.rs.
+/api/v1/r[0-9]{3}/[0-9a-f]{8}

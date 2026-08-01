@@ -1,0 +1,43 @@
+# Fixed, synthetic saturation values used ONLY to compute the pinned
+# command-line hashes in bench/cells.snapshot.
+#
+# This is NOT a measurement. It exists so that invariant I12's pinned hash is
+# stable against the ARGUMENT SHAPE (spelling and order) of a resolved
+# fixed-rate cell's command line, and does not change every time
+# bench/saturation.toml is re-measured on real hardware: hashing against the
+# live table would make every re-measurement look like a drift. Every id
+# below is a `.sat` cell some `PercentOfSaturation` registry entry's
+# `saturation_ref` names; the value (250,000 requests per second) is the
+# same round number for every entry on purpose, to make it obvious at a
+# glance that this table is synthetic rather than a real measurement.
+#
+# Format: one `<cell-id> = <integer>` per line, `#` comments and blank lines
+# ignored, no duplicate key. See SaturationTable::parse in
+# crates/irontraffic-bench/src/matrix.rs.
+base.sat = 250000
+protocol.h2.sat = 250000
+protocol.h3.sat = 250000
+tls.ecdsa_p256.sat = 250000
+tls.rsa2048.sat = 250000
+payload.0.sat = 250000
+payload.8192.sat = 250000
+payload.65536.sat = 250000
+payload.1048576.sat = 250000
+routes.10.sat = 250000
+routes.10000.sat = 250000
+routes.100000.sat = 250000
+corpus.single_hot.sat = 250000
+corpus.adversarial.sat = 250000
+conns.16.sat = 250000
+conns.4096.sat = 250000
+conns.100000.sat = 250000
+upstreams.1.sat = 250000
+upstreams.256.sat = 250000
+filters.0.sat = 250000
+filters.4.sat = 250000
+filters.16.sat = 250000
+cache.all_hit.sat = 250000
+cache.all_miss.sat = 250000
+cache.half_hit.sat = 250000
+keepalive.downstream_close.sat = 250000
+keepalive.no_upstream_pool.sat = 250000

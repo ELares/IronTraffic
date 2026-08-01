@@ -1,0 +1,19 @@
+# Measured saturation points per cell id, in requests per second.
+#
+# EMPTY AT FIRST. Every line here is a MEASUREMENT, produced by actually
+# running the corresponding `.sat` cell (the saturate twin of a fixed-rate
+# cell) and recording the achieved throughput; it must never be guessed or
+# hand-typed. `resolve_rate` refuses to resolve a fixed-rate cell whose
+# `.sat` twin has no entry here, naming the cell that must run first.
+#
+# Format: one `<cell-id> = <integer>` per line, `#` comments and blank lines
+# ignored, no duplicate key (a duplicate is a parse error, not a last-wins
+# overwrite: see SaturationTable::parse in
+# crates/irontraffic-bench/src/matrix.rs). Populated by
+# `{{bench-runner-and-repetition}}`, the first issue that actually spawns a
+# saturate run and records its result.
+#
+# Do NOT confuse this file with bench/saturation.reference.toml, which holds
+# fixed synthetic values used only to compute the pinned command-line hashes
+# in bench/cells.snapshot so that a real re-measurement here never looks like
+# a hash drift.
