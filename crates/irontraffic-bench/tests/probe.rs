@@ -1315,29 +1315,21 @@ const RESET_RATE_HZ: u64 = 100;
     reason = "RESET_RATE_HZ is a small compile-time constant (100), far below f64's 2^53 exact-integer range"
 )]
 const RESET_RATE_CEILING: f64 = RESET_RATE_HZ as f64 * 5.0;
-// Round three of issue #823's review: the rate ceiling above goes quiet
-// under exactly the contention this test exists to tolerate, because a
-// starved host both lowers the achieved rate (the ceiling check's numerator)
-// and stretches the join `finish()` performs (its denominator), so a leak
-// that survives the whole test can still measure a rate under the ceiling.
-// `RESET_GROWTH_CEILING` is a second, load-INDEPENDENT discriminator: under a
-// leak (a swap that never actually replaces the recorder) each round's raw
-// discarded count is the FULL cumulative total since the test began, so it
-// grows with the round number regardless of host throughput; under correct,
-// per-round discarding it does not, whatever the achieved rate. Comparing
-// `accumulate_resets`'s own last round against its first over equal
-// RESET_ROUND_MS sleeps needs no assumption about how fast the host runs.
-const RESET_GROWTH_CEILING: u64 = 3;
-
-/// The per-round counts `accumulate_resets` needs to both clear the sample
-/// floor (`total`) and rule out a leak that a rate ceiling alone cannot see
-/// under load (`first_round`, `last_round`; see `RESET_GROWTH_CEILING`
-/// above).
-struct AccumulatedResets {
-    total: u64,
-    first_round: u64,
-    last_round: u64,
-}
+// KNOWN GAP (tracked in issue #825, do not close with a GitHub keyword): this
+// one-sided rate ceiling goes quiet under exactly the contention this test
+// exists to tolerate, because a starved host both
+// lowers the achieved rate (the ceiling check's numerator) and stretches the
+// join `finish()` performs (its denominator), so a leak that survives the
+// whole test can still measure a rate under the ceiling. A per-round
+// first-vs-last growth discriminator was tried here and reverted: it failed
+// UNMUTATED code 10 times in 22 loaded runs because the probe is open-loop
+// paced from a fixed origin, so a starved round is followed by a catch-up
+// burst the moment it is next scheduled, and per-round counts swing far more
+// than a simple growth check can tell apart from a real leak. See the
+// tracking issue for the untested starting point a future fix should
+// measure before trusting: bounding the SUM of per-round counts against
+// `rate_hz * elapsed_since_spawn`, since the schedule bounds total issuance
+// above and starvation only lowers it.
 
 /// Accumulates real, acknowledged `reset_recorders` counts, starting from
 /// `start`, across small `RESET_ROUND_MS` rounds until the running total
@@ -1355,11 +1347,9 @@ struct AccumulatedResets {
     clippy::panic,
     reason = "test-support setup, not itself a #[test] fn: reset_recorders_discards_and_returns_count is the only caller, and a panic here reports that test's own failure (a hedged starvation-or-reset_recorders-defect message, never a confident one) exactly as if the assertion were written inline"
 )]
-fn accumulate_resets(handle: &ProbeHandle, start: u64, window_name: &str) -> AccumulatedResets {
+fn accumulate_resets(handle: &ProbeHandle, start: u64, window_name: &str) -> u64 {
     let mut total = start;
     let mut rounds = 0u32;
-    let mut first_round = None;
-    let mut last_round: u64;
     for _ in 0..RESET_MAX_ROUNDS {
         rounds += 1;
         std::thread::sleep(Duration::from_millis(RESET_ROUND_MS));
@@ -1373,15 +1363,9 @@ fn accumulate_resets(handle: &ProbeHandle, start: u64, window_name: &str) -> Acc
                  starvation)"
             )
         });
-        first_round.get_or_insert(discarded);
-        last_round = discarded;
         total = total.saturating_add(discarded);
         if total >= RESET_TARGET_SAMPLES {
-            return AccumulatedResets {
-                total,
-                first_round: first_round.unwrap_or(discarded),
-                last_round,
-            };
+            return total;
         }
     }
     panic!(
@@ -1392,31 +1376,6 @@ fn accumulate_resets(handle: &ProbeHandle, start: u64, window_name: &str) -> Acc
          discards (a real defect: a published count stuck at the floor looks identical to \
          starvation from here, so treat this as inconclusive rather than confidently \
          starvation)"
-    );
-}
-
-/// Asserts that `accumulate_resets`'s last round did not grow past
-/// `RESET_GROWTH_CEILING` times its first, the load-independent leak
-/// discriminator described where `RESET_GROWTH_CEILING` is declared. `first
-/// == 0` (the opening round acknowledged a reset before the probe had
-/// issued anything yet, plausible at the very start of window one) is
-/// excluded from the comparison rather than treated as an automatic
-/// failure: a zero baseline makes any nonzero growth read as infinite
-/// without saying anything about a leak.
-fn assert_reset_counts_do_not_grow(accumulated: &AccumulatedResets, window_name: &str) {
-    if accumulated.first_round == 0 {
-        return;
-    }
-    let growth_ceiling = accumulated.first_round.saturating_mul(RESET_GROWTH_CEILING);
-    assert!(
-        accumulated.last_round <= growth_ceiling,
-        "{window_name}'s last round discarded {} requests, more than {RESET_GROWTH_CEILING}x its \
-         own first round's {} over equal {RESET_ROUND_MS}ms sleeps; a per-round count that grows \
-         with the test's own age like this, independent of the host's achieved rate, is what a \
-         reset that returns a count WITHOUT discarding it looks like (each 'discard' reporting \
-         the full cumulative total since the test began rather than just that round's samples)",
-        accumulated.last_round,
-        accumulated.first_round
     );
 }
 
@@ -1438,10 +1397,6 @@ fn reset_recorders_discards_and_returns_count() {
     // Window one: accumulate real, acknowledged reset counts until they
     // clear the floor, rather than presume a fixed sleep buys them.
     let window_one = accumulate_resets(&handle, 0, "window one");
-    // Load-independent leak check: see RESET_GROWTH_CEILING's own doc
-    // comment for why the rate ceiling below cannot be trusted alone under
-    // contention.
-    assert_reset_counts_do_not_grow(&window_one, "window one");
 
     // The reset immediately following the one that closed window one. See
     // the doc comment above for why this, not the floor above, is what
@@ -1471,16 +1426,14 @@ fn reset_recorders_discards_and_returns_count() {
          {boundary_elapsed:?} this test actually took to make that call ({boundary_rate:.1} \
          requests/sec against a {RESET_RATE_HZ} rps configured rate); a rate many times the \
          configured one means this reset returned a count WITHOUT discarding it, i.e. \
-         reset_recorders leaked window one's samples (total {}) across the boundary \
-         instead of clearing them",
-        window_one.total
+         reset_recorders leaked window one's samples (total {window_one}) across the boundary \
+         instead of clearing them"
     );
 
     // Window two: accumulate again, starting from the boundary reset's own
     // contribution, proving recording resumes normally after a reset rather
     // than getting stuck empty.
     let window_two = accumulate_resets(&handle, boundary, "window two");
-    assert_reset_counts_do_not_grow(&window_two, "window two");
 
     // The same rate-not-raw-count check as `boundary` above, exercised
     // through the `finish` path this file's other tests actually use to
@@ -1502,10 +1455,9 @@ fn reset_recorders_discards_and_returns_count() {
         "finish() reported {final_samples} samples over the {final_elapsed:?} this test \
          actually took to make that call ({final_rate:.1} requests/sec against a \
          {RESET_RATE_HZ} rps configured rate), immediately after window two's own last reset \
-         (which itself totalled {}); a rate many times the configured one means that \
+         (which itself totalled {window_two}); a rate many times the configured one means that \
          reset also failed to discard, carrying window two's samples into the final snapshot \
-         instead of clearing them",
-        window_two.total
+         instead of clearing them"
     );
 }
 
