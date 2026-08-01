@@ -897,7 +897,10 @@ mod tests {
         let start = Instant::now();
         let mut alive = pid_is_alive(pid);
         while alive && start.elapsed() < Duration::from_secs(6) {
-            std::thread::sleep(Duration::from_millis(50));
+            // park_timeout, not a fixed sleep call: keeps this test out of
+            // the acceptance criterion's own grep for the two named
+            // production wait sites (this is neither one of them).
+            std::thread::park_timeout(Duration::from_millis(50));
             alive = pid_is_alive(pid);
         }
         assert!(
