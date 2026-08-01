@@ -1056,14 +1056,25 @@ fn zero_expected_requests_is_valid_and_empty() {
 ///
 /// The fix gives the probe thread a real window, several times its own
 /// configured schedule (5 requests at 20rps is 250ms), before cutting it off
-/// via `run_for`, which removes the race without changing what is tested: on
-/// a healthy host the probe still reaches `expected_requests` and stops on
-/// its own long before `SETTLE` elapses (`finish` then joins an
-/// already-finished thread, a documented no-op). The `issued >= 1` and
-/// `errors == 0` assertions below name starvation explicitly and distinctly
-/// from the classification assertions that follow them, so a starved run
-/// reports as starved rather than as a broken guard: the failure mode this
-/// whole family shares (see this file's own history, issue #811).
+/// via `run_for`. Round three of issue #823's review corrected an earlier
+/// claim here that this "removes the race": by construction it does not.
+/// Nothing synchronises "the probe has issued at least one request" with
+/// "this thread signals stop" (`ProbeHandle::spawn` returns as soon as the
+/// probe thread's ready signal fires, before that thread has read a clock or
+/// issued anything), so the same ordering that could lose the race with no
+/// wait at all is still there in principle. What `run_for` actually does is
+/// WIDEN the window that ordering has to be lost in, from a handful of
+/// machine instructions to a full 1.0 to 1.2 second sleep: a
+/// lose-one-scheduling-slice race becomes a get-no-CPU-for-a-full-second
+/// event, overwhelmingly less likely, not eliminated. On a healthy host the
+/// probe reaches `expected_requests` and stops on its own long before
+/// `SETTLE` elapses (`finish` then joins an already-finished thread, a
+/// documented no-op). The `issued >= 1` and `errors == 0` assertions below
+/// exist for the residual case widening does not remove: they name
+/// starvation explicitly and distinctly from the classification assertions
+/// that follow them, so a starved run reports as starved rather than as a
+/// broken guard: the failure mode this whole family shares (see this file's
+/// own history, issue #811).
 #[test]
 fn chunked_response_is_bad() {
     const SETTLE: Duration = Duration::from_millis(1_200);
@@ -1239,9 +1250,18 @@ fn not_modified_with_a_late_body_forces_a_reconnect_not_a_leak() {
 /// The fix, mirroring `zero_allocations_in_steady_state`'s own precedent
 /// (PR 801): accumulate real, acknowledged reset counts across small rounds
 /// until they clear a floor, however many rounds that takes (bounded by
-/// `MAX_ROUNDS`), and fail with a message naming starvation, distinctly from
-/// the assertions that check `reset_recorders`'s own behaviour, when the
-/// floor is never reached.
+/// `MAX_ROUNDS`), and, when the floor is never reached, fail with a message
+/// that HEDGES rather than blames the host: a published count stuck at the
+/// floor looks identical whether the host never sustained enough throughput
+/// or `reset_recorders` is failing to return (or acknowledge) the count it
+/// discards, so the panic says both are possible and inconclusive rather
+/// than naming starvation outright. Round three (issue #823's review of this
+/// PR) corrected an earlier draft that named starvation unconditionally
+/// here: two realistic one-line `reset_recorders` regressions (the discard
+/// count published after the recorder swap instead of before it, so it
+/// always reads the fresh, empty recorder; the ack store deleted entirely)
+/// falsified that draft on a completely idle host with no contention at
+/// all.
 ///
 /// The floor alone would not prove the DISCARD half of "discards and
 /// returns count" though: summing per-round deltas across a growing window
@@ -1295,41 +1315,108 @@ const RESET_RATE_HZ: u64 = 100;
     reason = "RESET_RATE_HZ is a small compile-time constant (100), far below f64's 2^53 exact-integer range"
 )]
 const RESET_RATE_CEILING: f64 = RESET_RATE_HZ as f64 * 5.0;
+// Round three of issue #823's review: the rate ceiling above goes quiet
+// under exactly the contention this test exists to tolerate, because a
+// starved host both lowers the achieved rate (the ceiling check's numerator)
+// and stretches the join `finish()` performs (its denominator), so a leak
+// that survives the whole test can still measure a rate under the ceiling.
+// `RESET_GROWTH_CEILING` is a second, load-INDEPENDENT discriminator: under a
+// leak (a swap that never actually replaces the recorder) each round's raw
+// discarded count is the FULL cumulative total since the test began, so it
+// grows with the round number regardless of host throughput; under correct,
+// per-round discarding it does not, whatever the achieved rate. Comparing
+// `accumulate_resets`'s own last round against its first over equal
+// RESET_ROUND_MS sleeps needs no assumption about how fast the host runs.
+const RESET_GROWTH_CEILING: u64 = 3;
+
+/// The per-round counts `accumulate_resets` needs to both clear the sample
+/// floor (`total`) and rule out a leak that a rate ceiling alone cannot see
+/// under load (`first_round`, `last_round`; see `RESET_GROWTH_CEILING`
+/// above).
+struct AccumulatedResets {
+    total: u64,
+    first_round: u64,
+    last_round: u64,
+}
 
 /// Accumulates real, acknowledged `reset_recorders` counts, starting from
 /// `start`, across small `RESET_ROUND_MS` rounds until the running total
 /// clears `RESET_TARGET_SAMPLES`, rather than presuming a fixed sleep or
-/// round count buys it. Panics with a message naming starvation, distinctly
-/// from an assertion that `reset_recorders` itself is broken, if the target
-/// is never reached within `RESET_MAX_ROUNDS`. `window_name` labels both
+/// round count buys it. If the target is never reached within
+/// `RESET_MAX_ROUNDS`, or the probe thread never acknowledges a round's
+/// reset at all, panics with a message that HEDGES between starvation and a
+/// real `reset_recorders` defect rather than naming starvation outright: see
+/// this function's own doc comment history above for why an unconditional
+/// starvation label is false on at least two realistic one-line regressions
+/// in the very component this test is named for. `window_name` labels both
 /// panic messages.
 #[allow(
     clippy::expect_used,
     clippy::panic,
-    reason = "test-support setup, not itself a #[test] fn: reset_recorders_discards_and_returns_count is the only caller, and a panic here reports that test's own failure (starvation, distinctly from a reset_recorders defect) exactly as if the assertion were written inline"
+    reason = "test-support setup, not itself a #[test] fn: reset_recorders_discards_and_returns_count is the only caller, and a panic here reports that test's own failure (a hedged starvation-or-reset_recorders-defect message, never a confident one) exactly as if the assertion were written inline"
 )]
-fn accumulate_resets(handle: &ProbeHandle, start: u64, window_name: &str) -> u64 {
+fn accumulate_resets(handle: &ProbeHandle, start: u64, window_name: &str) -> AccumulatedResets {
     let mut total = start;
     let mut rounds = 0u32;
+    let mut first_round = None;
+    let mut last_round: u64;
     for _ in 0..RESET_MAX_ROUNDS {
         rounds += 1;
         std::thread::sleep(Duration::from_millis(RESET_ROUND_MS));
         let discarded = reset_recorders_locked(handle).unwrap_or_else(|error| {
             panic!(
-                "the probe thread did not acknowledge a {window_name} reset ({error}); this is \
-                 a scheduling starvation failure, not evidence that reset_recorders is broken"
+                "the probe thread did not acknowledge a {window_name} reset ({error}); that is \
+                 EITHER the host never scheduling the probe thread in time to answer (a \
+                 starvation failure) OR reset_recorders failing to publish its own \
+                 acknowledgement (a real defect: a broken ack publish looks identical to \
+                 starvation from here, so treat this as inconclusive rather than confidently \
+                 starvation)"
             )
         });
+        first_round.get_or_insert(discarded);
+        last_round = discarded;
         total = total.saturating_add(discarded);
         if total >= RESET_TARGET_SAMPLES {
-            return total;
+            return AccumulatedResets {
+                total,
+                first_round: first_round.unwrap_or(discarded),
+                last_round,
+            };
         }
     }
     panic!(
         "{window_name} accumulated only {total} requests across {rounds} rounds of \
-         {RESET_ROUND_MS}ms each ({RESET_MAX_ROUNDS} rounds available); this is a scheduling \
-         starvation failure (the host never sustained enough throughput for this test's own \
-         precondition to be meaningful), not evidence that reset_recorders is broken"
+         {RESET_ROUND_MS}ms each ({RESET_MAX_ROUNDS} rounds available); that is EITHER the \
+         host never sustaining enough throughput for this test's own precondition to be \
+         meaningful (a starvation failure) OR reset_recorders not returning the count it \
+         discards (a real defect: a published count stuck at the floor looks identical to \
+         starvation from here, so treat this as inconclusive rather than confidently \
+         starvation)"
+    );
+}
+
+/// Asserts that `accumulate_resets`'s last round did not grow past
+/// `RESET_GROWTH_CEILING` times its first, the load-independent leak
+/// discriminator described where `RESET_GROWTH_CEILING` is declared. `first
+/// == 0` (the opening round acknowledged a reset before the probe had
+/// issued anything yet, plausible at the very start of window one) is
+/// excluded from the comparison rather than treated as an automatic
+/// failure: a zero baseline makes any nonzero growth read as infinite
+/// without saying anything about a leak.
+fn assert_reset_counts_do_not_grow(accumulated: &AccumulatedResets, window_name: &str) {
+    if accumulated.first_round == 0 {
+        return;
+    }
+    let growth_ceiling = accumulated.first_round.saturating_mul(RESET_GROWTH_CEILING);
+    assert!(
+        accumulated.last_round <= growth_ceiling,
+        "{window_name}'s last round discarded {} requests, more than {RESET_GROWTH_CEILING}x its \
+         own first round's {} over equal {RESET_ROUND_MS}ms sleeps; a per-round count that grows \
+         with the test's own age like this, independent of the host's achieved rate, is what a \
+         reset that returns a count WITHOUT discarding it looks like (each 'discard' reporting \
+         the full cumulative total since the test began rather than just that round's samples)",
+        accumulated.last_round,
+        accumulated.first_round
     );
 }
 
@@ -1351,6 +1438,10 @@ fn reset_recorders_discards_and_returns_count() {
     // Window one: accumulate real, acknowledged reset counts until they
     // clear the floor, rather than presume a fixed sleep buys them.
     let window_one = accumulate_resets(&handle, 0, "window one");
+    // Load-independent leak check: see RESET_GROWTH_CEILING's own doc
+    // comment for why the rate ceiling below cannot be trusted alone under
+    // contention.
+    assert_reset_counts_do_not_grow(&window_one, "window one");
 
     // The reset immediately following the one that closed window one. See
     // the doc comment above for why this, not the floor above, is what
@@ -1360,8 +1451,12 @@ fn reset_recorders_discards_and_returns_count() {
     std::thread::sleep(Duration::from_millis(RESET_ROUND_MS));
     let boundary = reset_recorders_locked(&handle).unwrap_or_else(|error| {
         panic!(
-            "the probe thread did not acknowledge the boundary reset ({error}); this is a \
-             scheduling starvation failure, not evidence that reset_recorders is broken"
+            "the probe thread did not acknowledge the boundary reset ({error}); that is \
+             EITHER the host never scheduling the probe thread in time to answer (a \
+             starvation failure) OR reset_recorders failing to publish its own \
+             acknowledgement (a real defect: a broken ack publish looks identical to \
+             starvation from here, so treat this as inconclusive rather than confidently \
+             starvation)"
         )
     });
     let boundary_elapsed = boundary_start.elapsed();
@@ -1376,14 +1471,16 @@ fn reset_recorders_discards_and_returns_count() {
          {boundary_elapsed:?} this test actually took to make that call ({boundary_rate:.1} \
          requests/sec against a {RESET_RATE_HZ} rps configured rate); a rate many times the \
          configured one means this reset returned a count WITHOUT discarding it, i.e. \
-         reset_recorders leaked window one's samples (total {window_one}) across the boundary \
-         instead of clearing them"
+         reset_recorders leaked window one's samples (total {}) across the boundary \
+         instead of clearing them",
+        window_one.total
     );
 
     // Window two: accumulate again, starting from the boundary reset's own
     // contribution, proving recording resumes normally after a reset rather
     // than getting stuck empty.
     let window_two = accumulate_resets(&handle, boundary, "window two");
+    assert_reset_counts_do_not_grow(&window_two, "window two");
 
     // The same rate-not-raw-count check as `boundary` above, exercised
     // through the `finish` path this file's other tests actually use to
@@ -1405,9 +1502,10 @@ fn reset_recorders_discards_and_returns_count() {
         "finish() reported {final_samples} samples over the {final_elapsed:?} this test \
          actually took to make that call ({final_rate:.1} requests/sec against a \
          {RESET_RATE_HZ} rps configured rate), immediately after window two's own last reset \
-         (which itself totalled {window_two}); a rate many times the configured one means that \
+         (which itself totalled {}); a rate many times the configured one means that \
          reset also failed to discard, carrying window two's samples into the final snapshot \
-         instead of clearing them"
+         instead of clearing them",
+        window_two.total
     );
 }
 
