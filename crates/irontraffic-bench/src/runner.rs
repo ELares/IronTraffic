@@ -83,6 +83,67 @@
 //! rather than a silently wrong single-process invocation. None of this
 //! issue's own 24 named tests drives `run_repetition` with `vegeta` as
 //! `generator`.
+//!
+//! # A disclosed gap: `direct_rps`
+//!
+//! [`RunResult::direct_rps`] documents itself, from `bench-runner-and-aggregation`'s
+//! own earlier issue #408, as "Client rps against the origin with the proxy
+//! bypassed": a run at the cell's OWN rate, not a saturate run. This issue's
+//! own Design step 2 says of the origin-ceiling measurement, in so many
+//! words, that conflating the two is wrong: "the null-proxy control in
+//! `{{bench-bottleneck-attribution}}` is a different run at the cell's own
+//! rate, and conflating the two is called out there." Design's own twelve
+//! numbered steps, the ones this function actually implements, never define
+//! or ask for that separate cell-rate, proxy-bypassed run at all; the
+//! measurement `direct_rps` is supposed to hold belongs entirely to
+//! `bench-bottleneck-attribution`, an issue that does not exist yet. Because
+//! `RunResult::direct_rps` is a non-`Option<f64>` field and every produced
+//! result must populate it, `run_repetition` sets `direct_rps` equal to
+//! `origin_ceiling_rps`: the same saturate number Design step 2 warns
+//! against treating as this one. This is exactly the conflation named above,
+//! done anyway because there is no other value to put here without
+//! inventing a whole new measurement run this issue's own Design section
+//! never asks for (rule 1: do exactly what the issue says, nothing more).
+//! `bench-bottleneck-attribution`, whenever it lands, must replace this
+//! alias with its own null-proxy run; until then, every `RunResult` this
+//! function produces carries the SAME number twice under two different
+//! names, and a reader of `direct_rps` gets a saturate figure, not a
+//! cell-rate one.
+//!
+//! # A disclosed gap: `run_cell`'s partial-cell context
+//!
+//! This issue's own Public API section says `run_cell`'s `# Errors` doc
+//! should read "Propagates the first repetition error; completed repetitions
+//! are returned in the error's context so a partial cell is still
+//! inspectable." [`BenchError`] (`crate::error`, not a file this issue's own
+//! Files table authorises touching) has no variant that carries a
+//! `Vec<RunResult>` or any other structured payload beyond a `&'static str`
+//! or a bounded, printable [`crate::error::Detail`] string: there is nowhere
+//! to put completed repetitions inside the error this function actually
+//! returns. `run_cell`'s own body reflects that: `attempt?` on the second,
+//! non-retried failure propagates `BenchError` alone, and every repetition
+//! collected before that point (in the local `runs` and `recorders`
+//! `Vec`s) is dropped along with the rest of this function's stack frame.
+//! A partial cell is therefore NOT inspectable from the returned `Err`
+//! today; this is disclosed here, in the same shape as the other gaps
+//! above, rather than silently omitted from this function's own doc
+//! comment.
+//!
+//! # A disclosed gap: no syscall-counting benchmark test
+//!
+//! This issue's own `## Benchmarks` section states: "Both bounds are
+//! asserted by a test that counts syscalls with `strace` where available and
+//! is skipped elsewhere, with the skip recorded so it is visible rather than
+//! silent." No such test exists in this crate. It is not one of the 27 named
+//! tests in this issue's own `## Tests` section (1 through 24 plus the
+//! property test), `strace` does not exist on this crate's own macOS
+//! development host at all (so any such test would run its "skipped
+//! elsewhere" branch here every time, verifying nothing on the one host this
+//! work was implemented and gated on), and building a portable,
+//! `strace`-wrapping child-process harness is a meaningfully sized new piece
+//! of test machinery on its own. Recorded here as an honest gap rather than
+//! left silently absent, matching this module's own established practice
+//! for the other disclosed gaps above.
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
@@ -251,10 +312,12 @@ impl Drop for ProbeGuard {
 ///
 /// # Errors
 /// `BenchError::Io` for a spawn, readiness or teardown failure,
-/// `BenchError::Parse` for unparsable tool output or a reconciliation
-/// mismatch beyond 0.1 percent, `BenchError::Cell` when `generator` is
-/// `"vegeta"` (see the module doc's disclosed gap) or when no adapter in
-/// `adapters` accepts the cell's saturate variant.
+/// `BenchError::Parse` for unparsable tool output, a reconciliation mismatch
+/// beyond 0.1 percent, or when no adapter in `adapters` accepts the cell's
+/// saturate variant (naming the cell and every refusal, which
+/// `BenchError::Cell`'s `&'static str` payload cannot carry: see
+/// `select_ceiling_adapter`'s own doc), and `BenchError::Cell` when
+/// `generator` is `"vegeta"` (see the module doc's disclosed gap).
 #[allow(
     clippy::too_many_lines,
     reason = "one cohesive, linearly ordered repetition sequence (the Design section's own \
@@ -338,6 +401,12 @@ pub fn run_repetition(
     } else {
         0.0
     };
+    // Disclosed gap: see the module doc's own "A disclosed gap: direct_rps"
+    // section. This is the exact conflation Design step 2 warns against
+    // (origin_ceiling_rps is a SATURATE run; direct_rps documents itself as
+    // a cell-rate, proxy-bypassed run), done anyway because this issue's own
+    // Design never defines the separate measurement direct_rps is supposed
+    // to hold and RunResult::direct_rps has no Option to leave unset.
     let direct_rps = origin_ceiling_rps;
 
     // Step 3: spawn the SUT, wait for readiness.
@@ -549,14 +618,12 @@ pub fn run_repetition(
     } else {
         0.0
     };
-    let cpu_seconds_per_request = match (sut_cpu_at_warmup_end, sut_cpu_at_end, cell.rate) {
-        (Some(start), Some(end), RateMode::Fixed(_)) if measured_requests > 0 => {
-            let delta = (end - start).max(0.0);
-            let value = delta / requests_as_f64(measured_requests);
-            if value.is_finite() { Some(value) } else { None }
-        }
-        _ => None,
-    };
+    let cpu_seconds_per_request = cpu_seconds_per_request(
+        sut_cpu_at_warmup_end,
+        sut_cpu_at_end,
+        cell.rate,
+        measured_requests,
+    );
 
     let latency_percentiles = raw.latency.percentiles();
     let latency_out_of_range = raw.out_of_range;
@@ -621,6 +688,13 @@ pub fn run_repetition(
 ///
 /// # Errors
 /// Propagates the first repetition error that does not clear on retry.
+/// Disclosed gap: this issue's own Public API section describes this
+/// doc as also saying completed repetitions are returned in the error's
+/// context so a partial cell is still inspectable; see the module doc's own
+/// "A disclosed gap: `run_cell`'s partial-cell context" section for why that
+/// is not actually true today (`BenchError` has no payload variant that
+/// could carry a `Vec<RunResult>`) and is stated honestly here rather than
+/// silently dropped from this comment.
 #[allow(
     clippy::too_many_arguments,
     reason = "mirrors run_repetition's own five parameters plus the repetition count, all of \
@@ -871,6 +945,44 @@ fn render_sut_yaml(cell: &BenchCell, bind: SocketAddr, upstream: SocketAddr) -> 
     )
 }
 
+/// Computes `RunResult::cpu_seconds_per_request` for one repetition.
+///
+/// `Some(finite)` only for a `RateMode::Fixed` cell with both CPU snapshots
+/// present and at least one measured request; `None` otherwise. This is a
+/// small, pure, directly testable seam extracted from `run_repetition`'s own
+/// body specifically so the "never compute this at saturation" rule (Design's
+/// own "Do NOT" list) is exercised by a unit test that does not need a whole
+/// live repetition (a `RateMode::Saturate` cell cannot reach `run_repetition`
+/// in this crate's own test suite at all, because every `LoadGenerator` this
+/// crate ships that accepts saturate is either untestable on this host
+/// (Nighthawk, no container runtime) or is `Oha`, which `Oha::supports`
+/// refuses for every saturate cell unconditionally).
+///
+/// - A saturate cell: `None`, always, per Design's own "CPU per request
+///   measured at saturation is definitionally 1 divided by throughput" rule.
+/// - Either CPU snapshot missing (`None`, off Linux or a read failure): the
+///   only source of a value.
+/// - `measured_requests == 0`: `None`, because the division would otherwise
+///   produce an infinity, which `serde_json` cannot round-trip.
+/// - Otherwise: `(end - start).max(0.0) / measured_requests`, `None` instead
+///   of `Some(f64::NAN)` on the rare chance that division is non-finite (a
+///   `NaN` sentinel would serialise as `null` and could never be read back).
+fn cpu_seconds_per_request(
+    sut_cpu_at_warmup_end: Option<f64>,
+    sut_cpu_at_end: Option<f64>,
+    rate: RateMode,
+    measured_requests: u64,
+) -> Option<f64> {
+    match (sut_cpu_at_warmup_end, sut_cpu_at_end, rate) {
+        (Some(start), Some(end), RateMode::Fixed(_)) if measured_requests > 0 => {
+            let delta = (end - start).max(0.0);
+            let value = delta / requests_as_f64(measured_requests);
+            if value.is_finite() { Some(value) } else { None }
+        }
+        _ => None,
+    }
+}
+
 /// A tool run's requests, widened to `f64` once, so callers never repeat the
 /// precision-loss annotation.
 #[expect(
@@ -954,6 +1066,19 @@ const SETTLE_MAX_ITERATIONS: u32 = 40;
 /// counter that is still rising. This is the ONE thing that makes a
 /// baseline-then-delta reconciliation trustworthy at all; see the two call
 /// sites' own comments.
+///
+/// # Errors
+/// `BenchError::Io` when a read itself fails (propagated from
+/// [`read_origin_stats`]), or when the counter has not settled (two
+/// consecutive equal reads) within [`SETTLE_MAX_ITERATIONS`] tries. The
+/// second case used to return the last unsettled read instead of an error:
+/// a still-rising counter fed straight into reconciliation as if it were
+/// final produces a mismatch that reads as a proxy defect when the real
+/// cause is that the origin's own counter never finished moving within this
+/// budget. Both call sites already propagate this function's `Result` with
+/// `?`, so returning `Err` here surfaces as `run_repetition`'s own failure
+/// (retried once by `run_cell`, per edge case 15) rather than silently
+/// publishing a number this function itself does not trust.
 fn read_origin_stats_settled(addr: SocketAddr, host: &str) -> Result<OriginStats, BenchError> {
     let mut previous = read_origin_stats(addr, host)?;
     for _ in 0..SETTLE_MAX_ITERATIONS {
@@ -964,7 +1089,16 @@ fn read_origin_stats_settled(addr: SocketAddr, host: &str) -> Result<OriginStats
         }
         previous = current;
     }
-    Ok(previous)
+    Err(BenchError::io(
+        &addr.to_string(),
+        std::io::Error::other(format!(
+            "the origin's /stats requests counter at {addr} never stopped moving across \
+             {SETTLE_MAX_ITERATIONS} reads spaced {SETTLE_POLL_INTERVAL:?} apart; a still-rising \
+             counter cannot be trusted as a reconciliation baseline or endpoint, and returning \
+             the last unsettled read here would silently blame a reconciliation mismatch on the \
+             proxy instead of on this"
+        )),
+    ))
 }
 
 /// Reads the origin's `/stats` endpoint over HTTP/1.1.
@@ -1099,7 +1233,18 @@ fn percore_utilisation_pct(prev: &[CoreTicks], cur: &[CoreTicks]) -> Option<f64>
 
 #[cfg(test)]
 mod tests {
-    use super::{percore_utilisation_pct, reconcile};
+    use super::{
+        SETTLE_MAX_ITERATIONS, cpu_seconds_per_request, percore_utilisation_pct,
+        read_origin_stats_settled, reconcile, select_ceiling_adapter,
+    };
+    use crate::cell::{
+        BenchCell, CacheMode, CellId, KeepaliveMode, PathCorpus, Protocol, RateMode, TlsMode,
+    };
+    use crate::error::BenchError;
+    use crate::loadgen::{
+        Invocation, LoadGenerator, ParseCtx, RawRun, RunParams, Target, Unsupported,
+    };
+    use crate::provenance::ToolStamp;
 
     #[test]
     fn reconcile_accepts_an_exact_match() {
@@ -1123,6 +1268,314 @@ mod tests {
         assert!(
             (0.0..=100.0).contains(&pct),
             "pct {pct} must stay in 0..=100 even for a backwards counter"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // select_ceiling_adapter: Design step 2's "choose the FIRST adapter in
+    // the adapters slice, in order, whose supports accepts the saturate
+    // variant; if none does, fail naming the cell and every refusal."
+    // Reviewed finding: the whole origin-ceiling step had no test that
+    // would fail if it were done wrong (M1 deleted it entirely and left
+    // origin_ceiling_rps at 0.0, exactly the trap Design forbids by name),
+    // and two narrower mutations on this specific function also survived
+    // (M2a: last-accepting instead of first; M2b: silent fallback to
+    // adapters[0] instead of failing and naming every refusal). These
+    // three tests exercise select_ceiling_adapter directly, with no live
+    // process and no dependency on oha being installed, specifically so
+    // they cannot be skipped the way the end-to-end tests below can be.
+    // -----------------------------------------------------------------
+
+    fn ceiling_test_cell() -> BenchCell {
+        BenchCell {
+            id: CellId::parse("select_ceiling_unit_test").unwrap_or_else(|_| {
+                panic!("select_ceiling_unit_test must be a valid cell id literal")
+            }),
+            protocol: Protocol::H1,
+            tls: TlsMode::Off,
+            payload_bytes: 0,
+            routes: 1,
+            path_corpus: PathCorpus::SingleHot,
+            connections: 4,
+            upstreams: 1,
+            filter_depth: 0,
+            cache: CacheMode::Bypass,
+            keepalive: KeepaliveMode::Both,
+            rate: RateMode::Fixed(1000),
+        }
+    }
+
+    /// A fake `LoadGenerator` whose `supports` always accepts. Every method
+    /// besides `name` and `supports` is unreachable from
+    /// `select_ceiling_adapter`'s own body, which never plans, parses or
+    /// version-probes the adapters it is choosing between.
+    struct AlwaysAccepts(&'static str);
+
+    impl LoadGenerator for AlwaysAccepts {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+
+        fn version_invocation(&self) -> Invocation {
+            unreachable!("select_ceiling_adapter never probes a version")
+        }
+
+        fn parse_version(&self, _stdout: &[u8]) -> Result<ToolStamp, BenchError> {
+            unreachable!("select_ceiling_adapter never probes a version")
+        }
+
+        fn supports(&self, _cell: &BenchCell) -> Result<(), Unsupported> {
+            Ok(())
+        }
+
+        fn plan(
+            &self,
+            _cell: &BenchCell,
+            _target: &Target,
+            _run: &RunParams,
+        ) -> Result<Invocation, BenchError> {
+            unreachable!("select_ceiling_adapter never plans an invocation")
+        }
+
+        fn parse(
+            &self,
+            _ctx: &ParseCtx<'_>,
+            _stdout: &[u8],
+            _stderr: &[u8],
+        ) -> Result<RawRun, BenchError> {
+            unreachable!("select_ceiling_adapter never parses output")
+        }
+    }
+
+    /// A fake `LoadGenerator` whose `supports` always refuses, naming
+    /// itself in the refusal so a test can assert the caller saw it.
+    struct AlwaysRefuses(&'static str);
+
+    impl LoadGenerator for AlwaysRefuses {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+
+        fn version_invocation(&self) -> Invocation {
+            unreachable!("select_ceiling_adapter never probes a version")
+        }
+
+        fn parse_version(&self, _stdout: &[u8]) -> Result<ToolStamp, BenchError> {
+            unreachable!("select_ceiling_adapter never probes a version")
+        }
+
+        fn supports(&self, _cell: &BenchCell) -> Result<(), Unsupported> {
+            Err(Unsupported::RateMode {
+                tool: self.0,
+                detail: "test fixture refuses every cell unconditionally",
+            })
+        }
+
+        fn plan(
+            &self,
+            _cell: &BenchCell,
+            _target: &Target,
+            _run: &RunParams,
+        ) -> Result<Invocation, BenchError> {
+            unreachable!("select_ceiling_adapter never plans an invocation")
+        }
+
+        fn parse(
+            &self,
+            _ctx: &ParseCtx<'_>,
+            _stdout: &[u8],
+            _stderr: &[u8],
+        ) -> Result<RawRun, BenchError> {
+            unreachable!("select_ceiling_adapter never parses output")
+        }
+    }
+
+    #[test]
+    fn select_ceiling_adapter_picks_the_first_accepting_adapter_in_order() {
+        let cell = ceiling_test_cell();
+        let first = AlwaysAccepts("first");
+        let second = AlwaysAccepts("second");
+        let adapters: Vec<&dyn LoadGenerator> = vec![&first, &second];
+        let (chosen, saturate_cell) = select_ceiling_adapter(&cell, &adapters)
+            .unwrap_or_else(|e| panic!("both adapters accept; must not error, got {e:?}"));
+        assert_eq!(
+            chosen.name(),
+            "first",
+            "when more than one adapter accepts, the FIRST in the slice must be chosen, not the \
+             last: a mutation that reverses this ordering is otherwise indistinguishable whenever \
+             the accepting set has exactly one member"
+        );
+        assert!(
+            matches!(saturate_cell.rate, RateMode::Saturate),
+            "the cell checked against (and returned for) the ceiling run must have its rate \
+             replaced with Saturate"
+        );
+    }
+
+    #[test]
+    fn select_ceiling_adapter_skips_refusals_before_the_first_acceptance() {
+        let cell = ceiling_test_cell();
+        let refuser = AlwaysRefuses("refuser");
+        let accepter = AlwaysAccepts("accepter");
+        let adapters: Vec<&dyn LoadGenerator> = vec![&refuser, &accepter];
+        let (chosen, _) = select_ceiling_adapter(&cell, &adapters)
+            .unwrap_or_else(|e| panic!("the second adapter accepts; must not error, got {e:?}"));
+        assert_eq!(
+            chosen.name(),
+            "accepter",
+            "a refusing adapter earlier in the slice must be skipped, not treated as a match"
+        );
+    }
+
+    #[test]
+    fn select_ceiling_adapter_fails_naming_every_refusal_when_none_accept() {
+        let cell = ceiling_test_cell();
+        let first = AlwaysRefuses("refuser_one");
+        let second = AlwaysRefuses("refuser_two");
+        let adapters: Vec<&dyn LoadGenerator> = vec![&first, &second];
+        let err = match select_ceiling_adapter(&cell, &adapters) {
+            Err(e) => e,
+            Ok((chosen, _)) => panic!(
+                "no adapter in the slice accepts; this must fail, never silently pick one, but \
+                 {} was chosen",
+                chosen.name()
+            ),
+        };
+        let text = err.to_string();
+        assert!(
+            text.contains("refuser_one"),
+            "the failure {text:?} must name refuser_one's own refusal"
+        );
+        assert!(
+            text.contains("refuser_two"),
+            "the failure {text:?} must name refuser_two's own refusal"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // cpu_seconds_per_request: extracted specifically so the "never at
+    // saturation" rule is directly testable. Reviewed finding: the
+    // integration test that names this rule (saturate_cell_has_no_cpu_per_request)
+    // only round-trips a hand-built RunResult through serde and never calls
+    // the runner at all, and RateMode::Saturate cannot reach run_repetition
+    // in this crate's own test suite (Oha::supports refuses it, and no
+    // saturate-capable adapter is exercised end-to-end here), so a mutation
+    // that computed and published a value at saturation survived. These
+    // tests call the real function the runner calls.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn cpu_seconds_per_request_is_none_for_saturate_even_with_valid_samples() {
+        let value = cpu_seconds_per_request(Some(1.0), Some(2.0), RateMode::Saturate, 100);
+        assert_eq!(
+            value, None,
+            "a saturate cell must never publish cpu_seconds_per_request, even when both CPU \
+             samples are present and requests were measured"
+        );
+    }
+
+    #[test]
+    fn cpu_seconds_per_request_is_some_finite_for_a_fixed_rate_cell() {
+        let value = cpu_seconds_per_request(Some(1.0), Some(1.5), RateMode::Fixed(1000), 100);
+        match value {
+            Some(v) => assert!(
+                (v - 0.005).abs() < f64::EPSILON,
+                "expected (1.5 - 1.0) / 100 = 0.005, got {v}"
+            ),
+            None => panic!("a fixed-rate cell with valid samples must publish Some(finite)"),
+        }
+    }
+
+    #[test]
+    fn cpu_seconds_per_request_is_none_when_no_requests_were_measured() {
+        let value = cpu_seconds_per_request(Some(1.0), Some(2.0), RateMode::Fixed(1000), 0);
+        assert_eq!(
+            value, None,
+            "zero measured requests must not be divided by, which would otherwise produce an \
+             infinity serde_json cannot round-trip"
+        );
+    }
+
+    #[test]
+    fn cpu_seconds_per_request_is_none_when_a_cpu_sample_is_missing() {
+        let value = cpu_seconds_per_request(None, Some(2.0), RateMode::Fixed(1000), 100);
+        assert_eq!(
+            value, None,
+            "a missing CPU sample (off Linux, or a read failure) must not be silently treated as \
+             zero"
+        );
+    }
+
+    // -----------------------------------------------------------------
+    // read_origin_stats_settled: Reviewed finding: giving up after
+    // SETTLE_MAX_ITERATIONS used to return the last unsettled read with no
+    // signal to the caller, and that value feeds reconciliation directly,
+    // so a still-moving counter became a reconciliation failure blamed on
+    // the proxy. This test drives a counter that increments on every
+    // single read, so it can never settle, and asserts the function now
+    // fails instead of returning a number it does not trust.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn read_origin_stats_settled_errors_when_the_counter_never_stops_moving() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let listener =
+            TcpListener::bind(("127.0.0.1", 0)).unwrap_or_else(|e| panic!("bind failed: {e}"));
+        let addr = listener
+            .local_addr()
+            .unwrap_or_else(|e| panic!("local_addr failed: {e}"));
+        let counter = AtomicU64::new(0);
+        // read_origin_stats_settled makes exactly one initial read plus
+        // SETTLE_MAX_ITERATIONS more when the counter never settles (this
+        // fake origin's own counter increments on every single read, so it
+        // never does): the accept loop below services EXACTLY that many
+        // connections and then returns on its own, which is what lets
+        // `thread::scope` below join it without blocking on a connection
+        // that will never arrive.
+        let accept_budget = usize::try_from(SETTLE_MAX_ITERATIONS)
+            .unwrap_or_else(|_| panic!("SETTLE_MAX_ITERATIONS must fit in usize"))
+            .saturating_add(1);
+
+        let result = std::thread::scope(|scope| {
+            scope.spawn(|| {
+                for _ in 0..accept_budget {
+                    let Ok((mut stream, _)) = listener.accept() else {
+                        break;
+                    };
+                    let mut buf = [0_u8; 512];
+                    let _ = stream.read(&mut buf);
+                    let n = counter.fetch_add(1, Ordering::SeqCst);
+                    let body =
+                        format!("{{\"requests\":{n},\"bytes\":0,\"rejects\":0,\"uptime_ms\":0}}");
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    let _ = stream.write_all(head.as_bytes());
+                    let _ = stream.write_all(body.as_bytes());
+                }
+            });
+
+            read_origin_stats_settled(addr, "bench.test")
+        });
+
+        assert!(
+            result.is_err(),
+            "a requests counter that increments on every single read must never be treated as \
+             settled; silently returning the last unsettled read would feed a still-moving \
+             counter straight into reconciliation and blame the proxy for what the origin never \
+             finished reporting"
+        );
+        // Sanity: this really did exhaust the full settle budget, not stop
+        // early for an uninteresting reason (like the accept loop dying).
+        assert!(
+            counter.load(Ordering::SeqCst) >= u64::from(SETTLE_MAX_ITERATIONS),
+            "the fake origin must have been read enough times to exercise the full settle budget, \
+             got {} reads",
+            counter.load(Ordering::SeqCst)
         );
     }
 }

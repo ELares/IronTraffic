@@ -279,6 +279,39 @@ fn iqr_within_tolerance_is_valid() {
     assert_eq!(aggregate.validity, Validity::Valid);
 }
 
+#[test]
+fn iqr_at_exactly_the_threshold_is_valid_not_unstable() {
+    // Reviewed finding: flipping `iqr_permille > MAX_IQR_PERMILLE` to `>=`
+    // survived every existing fixture, because none of them sits at exactly
+    // 100. p99 values [90, 95, 100, 105, 110]: median v[2] = 100,
+    // q1 v[1] = 95, q3 v[3] = 105, iqr_permille = (105 - 95) * 1000 / 100 =
+    // 100 EXACTLY. The spec's own wording is "exceeds 10 percent" (a strict
+    // `>`), so a cell sitting exactly at the threshold must still be Valid.
+    let runs = vec![
+        base_result("cell_threshold", 90, 1000.0, Validity::Valid),
+        base_result("cell_threshold", 95, 1000.0, Validity::Valid),
+        base_result("cell_threshold", 100, 1000.0, Validity::Valid),
+        base_result("cell_threshold", 105, 1000.0, Validity::Valid),
+        base_result("cell_threshold", 110, 1000.0, Validity::Valid),
+    ];
+    let recorders: Vec<LatencyRecorder> = runs
+        .iter()
+        .map(|r| recorder_with_samples(r.probe_latency.p99_ns, 10_000))
+        .collect();
+    #[allow(clippy::expect_used, reason = "test-support helper call")]
+    let cell_id = CellId::parse("cell_threshold").expect("valid cell id");
+    let aggregate =
+        CellAggregate::from_runs(cell_id, runs, &recorders).expect("from_runs must succeed");
+    assert_eq!(aggregate.iqr_permille, 100);
+    assert_eq!(
+        aggregate.validity,
+        Validity::Valid,
+        "a cell whose iqr_permille sits at EXACTLY the 100 permille threshold must still be \
+         Valid; the spec's own wording is \"exceeds 10 percent\", a strict >, and a mutation \
+         that flips it to >= would flag this cell Unstable instead"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // 7 / 8: a per-run Invalid or LoadgenSuspect dominates the spread.
 // ---------------------------------------------------------------------------

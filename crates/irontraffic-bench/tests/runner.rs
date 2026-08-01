@@ -37,14 +37,14 @@ use std::collections::BTreeMap;
 use std::net::{SocketAddr, TcpListener};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use irontraffic_bench::{
     BenchCell, BenchError, Bottleneck, CacheMode, CellAggregate, CellId, Child, CoreAssignment,
     CoreSet, DeepestPercentile, InvariantId, Invocation, KeepaliveMode, LatencyRecorder,
     LoadGenerator, ParseCtx, PathCorpus, Percentiles, Protocol, Provenance, RateMode, RawRun,
     RunParams, RunParamsFull, RunResult, TlsMode, ToolStamp, Unsupported, Validity,
-    parse_stat_cpu_ticks, reconcile, run_repetition,
+    parse_stat_cpu_ticks, reconcile, run_cell, run_repetition,
 };
 
 // ---------------------------------------------------------------------------
@@ -119,9 +119,29 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("run") => {
             // Mimics `irontraffic run --config <path> --bind <addr> --upstream <addr>`:
-            // a trivial pass-through TCP relay, ignoring --config entirely.
+            // a trivial pass-through TCP relay, ignoring the CONTENTS of
+            // --config entirely (but see the retry-once trigger below,
+            // which uses the --config PATH, not its contents).
             let bind = flag_value(&args, "--bind").expect("--bind required");
             let upstream = flag_value(&args, "--upstream").expect("--upstream required");
+            // Retry-once test support (run_cell's own tests): a sibling
+            // trigger file next to the rendered config, present only when a
+            // test deliberately created it before calling run_cell. Every
+            // OTHER test's config directory never has one (this checks
+            // metadata, not contents), so this is a no-op for them.
+            // run_repetition builds the SUT's argument list itself with no
+            // room for a purpose-built CLI flag, and params.work_dir (and
+            // therefore this rendered config path) is the ONE piece of
+            // per-call state a test already controls that reaches the SUT's
+            // own command line at all.
+            if let Some(config) = flag_value(&args, "--config") {
+                let trigger = std::path::Path::new(&config).with_file_name("force-first-sut-failure");
+                if std::fs::metadata(&trigger).is_ok() {
+                    let _ = std::fs::remove_file(&trigger);
+                    eprintln!("fixture: deliberate first-attempt SUT failure (retry-once trigger)");
+                    std::process::exit(7);
+                }
+            }
             let listener = TcpListener::bind(&bind).expect("bind failed");
             for stream in listener.incoming() {
                 if let Ok(client) = stream {
@@ -586,12 +606,54 @@ fn repetition_produces_a_result() {
     let (result, _recorder) =
         outcome.expect("run_repetition must succeed for a healthy fixture proxy");
     assert!(result.rps > 0.0, "rps must be nonzero, got {}", result.rps);
+    // Reviewed finding: the origin-ceiling step (Design step 2), the
+    // correction this issue was reopened for, had no test that would fail
+    // if it were skipped and origin_ceiling_rps left at 0.0, the exact trap
+    // Design forbids by name twice ("Never skip the ceiling measurement and
+    // leave origin_ceiling_rps at 0" / "Note the trap it declined to walk
+    // into... Do not take it"). This assertion is unconditional (not nested
+    // inside any one verdict arm below) because a healthy repetition must
+    // have measured a real ceiling regardless of which verdict it lands on.
+    assert!(
+        result.origin_ceiling_rps > 0.0,
+        "origin_ceiling_rps must be a real, positive measurement, never the skipped-step \
+         placeholder of 0.0, got {}",
+        result.origin_ceiling_rps
+    );
+    // Reviewed finding: sut_cores must be the SUT's OWN pinned core count
+    // (Design step 11: "RunResult::sut_cores is params.cores.sut.len() as
+    // u32 and nothing else"), never provenance.logical_cores (the whole
+    // machine's count, which test_provenance() fixes at 16 regardless of
+    // this host's real core count, giving this assertion real
+    // discriminating power against that specific substitution).
+    assert_eq!(
+        result.sut_cores,
+        u32::try_from(params.cores.sut.len()).unwrap_or(u32::MAX),
+        "sut_cores must equal the SUT's own pinned core count, never the whole machine's \
+         logical_cores"
+    );
     // "a Valid or explicitly-named verdict" (test 11's own wording): every
     // arm is named explicitly, exhaustively, rather than defaulted through a
-    // wildcard, and the two arms with their own payload assert something
-    // concrete about it.
+    // wildcard, and every arm asserts something concrete about it.
     match &result.validity {
-        Validity::Valid | Validity::LoadgenSuspect { .. } => {}
+        Validity::Valid => {}
+        // Reviewed finding: this arm used to be merged with Valid's and had
+        // an EMPTY body, silently accepting the exact mislabel a skipped
+        // ceiling measurement produces: guards.rs's own step_i2 reads a zero
+        // ceiling as LoadgenSuspect(OriginCeiling), so an empty arm here
+        // could not tell a genuine loadgen-suspect verdict apart from that
+        // mislabel. A healthy fixture run must never be OriginCeiling
+        // specifically (the origin_ceiling_rps assertion above already
+        // guards the underlying cause, but asserting on the verdict too
+        // means a future refactor that reintroduces the mislabel some other
+        // way still gets caught here).
+        Validity::LoadgenSuspect { reason } => {
+            assert!(
+                !matches!(reason, irontraffic_bench::SuspectReason::OriginCeiling),
+                "a healthy fixture run must not be mislabelled LoadgenSuspect(OriginCeiling); \
+                 that is exactly the mislabel a zero or skipped origin_ceiling_rps produces"
+            );
+        }
         Validity::Invalid { detail, .. } => {
             assert!(
                 detail.as_str().bytes().all(|b| (0x20..=0x7E).contains(&b)),
@@ -628,16 +690,42 @@ fn warmup_samples_are_discarded() {
         "warmup_samples_discarded must be positive after a nonzero warmup"
     );
     // The probe runs at 100 requests per second; a 3 second measurement
-    // therefore expects roughly 300 samples. This assertion is inherently
+    // therefore expects roughly 300 samples (measured directly on this host:
+    // 286-289 across repeated runs). This assertion is inherently
     // timing-sensitive (the probe is a real thread racing the harness's own
     // wait loop on a host whose load this test does not control), so a wide
     // band is used and a failure here is EITHER host starvation or a real
-    // defect in the probe's own pacing, not distinguishable from inside this
-    // test; treat it as inconclusive, not as confidently one or the other.
+    // defect, not distinguishable from inside this test; treat it as
+    // inconclusive, not as confidently one or the other.
+    //
+    // Reviewed finding: the issue's own test 12 requires "the probe's final
+    // sample count is close to measure_secs * 100", and the ORIGINAL
+    // assertion here only checked `> 0`, satisfiable by a single sample.
+    // That left the whole warmup-discard rule unverified: replacing the
+    // real `probe.reset_recorders()?` call with a hardcoded constant (so
+    // every warmup sample stays in the published histogram) measured
+    // final_samples=500 on this host (all of warmup_secs + measure_secs,
+    // 5s * 100/s), comfortably above the upper bound below; forcing
+    // has_internal_warmup true unconditionally (skipping the separate
+    // warmup invocation the Design mandates for every non-h2load tool)
+    // measured final_samples=125, comfortably below the lower bound. The
+    // correct code measured 286-289 across repeated runs, well inside
+    // [180, 420].
     let final_samples = recorder.len();
     assert!(
         final_samples > 0,
         "the probe's final sample count must be positive, got {final_samples}"
+    );
+    assert!(
+        (180..420).contains(&final_samples),
+        "the probe's final published sample count ({final_samples}) should be close to \
+         measure_secs * probe_rate_hz (3 * 100 = 300, measured at 286-289 on the development \
+         host), not close to the full warmup-plus-measure lifetime total (500, the signature of \
+         warmup samples never being discarded) or a fraction cut short by a skipped separate \
+         warmup invocation (125, the signature of has_internal_warmup wrongly forced true); a \
+         value outside [180, 420) is EITHER a real regression in the warmup-discard rule OR \
+         extreme host starvation distorting the probe's own pacing, not distinguishable from \
+         inside this test"
     );
 }
 
@@ -660,6 +748,17 @@ fn teardown_leaves_no_children() {
         outcome.is_err(),
         "pointing the SUT at a nonexistent binary must fail the repetition"
     );
+    // Reviewed finding: this test's only assertion is the one above, which
+    // says nothing about children (emptying Child's own Drop impl entirely
+    // left this test green while leaking a live it-origin process). This
+    // function cannot check that itself: run_repetition's own children are
+    // fully encapsulated inside it and it returns no pid on any path, Err
+    // included. `proc::tests::drop_without_an_explicit_stop_call_still_tears_down_the_child`
+    // (crates/irontraffic-bench/src/proc.rs) is where the "no child
+    // survives" invariant this test's own name promises is actually
+    // asserted, against a real pid, with no explicit stop() call anywhere
+    // in that test either: the same mechanism run_repetition's own Drop
+    // guards rely on here.
 }
 
 #[test]
@@ -692,9 +791,171 @@ fn reconciliation_mismatch_fails() {
                 text.contains("origin_requests"),
                 "reconciliation failure detail {text:?} must name origin_requests"
             );
+            // Reviewed finding: "origin_requests" is a literal in reconcile's
+            // own format string, so the assertion above is satisfied
+            // regardless of what the actual values were; recorder_count_mismatch_is_error's
+            // sibling test in tests/aggregate.rs asserts on the real numbers
+            // instead, and this test should follow it. The fixture's fake
+            // `/stats` handler returns the SAME hardcoded literal count on
+            // every read, so the baseline-to-end DELTA reconcile() actually
+            // computes is deterministically 0 (999999999 - 999999999), never
+            // the fixture's own irrelevant literal: assert on that real,
+            // computed number.
+            assert!(
+                text.contains("origin_requests 0"),
+                "reconciliation failure detail {text:?} must show the origin side of the \
+                 mismatch as the actual number reconcile() computed (0, the baseline-to-end \
+                 delta of the fixture's own constant /stats counter), not merely mention the \
+                 label"
+            );
         }
         other => panic!("expected BenchError::Parse naming both counts, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Reviewed finding: run_cell is exported from lib.rs but was never called
+// from any test in the workspace, leaving its own orchestration (the
+// repetition loop, the retry-once policy, the `retried` flag) completely
+// unexercised. These three tests drive run_cell itself, not just
+// run_repetition or CellAggregate::from_runs in isolation.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn run_cell_aggregates_the_requested_repetition_count() {
+    if !oha_available() {
+        return;
+    }
+    let cell = test_cell("runner_run_cell_ok");
+    let oha = irontraffic_bench::Oha;
+    let ceiling = CeilingProbe;
+    let adapters: Vec<&dyn LoadGenerator> = vec![&oha, &ceiling];
+    let params = test_params("run_cell_ok", 1, 1);
+    let provenance = test_provenance();
+
+    // Each repetition reconciles a real load client's own request count
+    // against the origin's, within a 0.1 percent tolerance: on a host under
+    // heavy concurrent load (many repetitions' worth of oha, it-origin and
+    // probe processes all competing for CPU at once), a repetition can fail
+    // that reconciliation for real, causing run_cell to retry once and
+    // (rarely) still fail if the retry lands under the same contention.
+    // Either failure below is EITHER host starvation or a genuine defect in
+    // run_cell's own orchestration, not distinguishable from inside this
+    // test.
+    let (aggregate, recorders) = run_cell(&cell, &oha, &adapters, &params, &provenance, 2)
+        .unwrap_or_else(|e| {
+            panic!(
+                "run_cell must succeed for a healthy fixture proxy, got {e:?} (EITHER a genuine \
+                 run_cell defect OR host contention causing a real reconciliation mismatch under \
+                 concurrent load, not distinguishable from inside this test)"
+            )
+        });
+    assert_eq!(
+        aggregate.runs.len(),
+        2,
+        "run_cell must run exactly the requested repetition count, not a fixed number"
+    );
+    assert_eq!(
+        recorders.len(),
+        2,
+        "run_cell must return one probe recorder per repetition"
+    );
+    assert!(
+        !aggregate.retried,
+        "an all-success run_cell call must report retried: false; if this repetition genuinely \
+         needed a retry under real host contention (not a run_cell defect), that is itself an \
+         honest signal this test cannot separate from a defect from inside itself"
+    );
+}
+
+#[test]
+fn run_cell_retries_once_then_propagates_a_persistent_failure() {
+    if !oha_available() {
+        return;
+    }
+    let cell = test_cell("runner_run_cell_retry_persist");
+    let oha = irontraffic_bench::Oha;
+    let ceiling = CeilingProbe;
+    let adapters: Vec<&dyn LoadGenerator> = vec![&oha, &ceiling];
+    let mut params = test_params("run_cell_retry_persist", 1, 1);
+    params.sut_binary = PathBuf::from("/nonexistent/binary/does-not-exist");
+    let provenance = test_provenance();
+
+    let start = Instant::now();
+    let outcome = run_cell(&cell, &oha, &adapters, &params, &provenance, 3);
+    let elapsed = start.elapsed();
+
+    assert!(
+        outcome.is_err(),
+        "a permanently broken SUT must fail run_cell even after the one retry edge case 15 \
+         allows"
+    );
+    // Each attempt pays the full origin-ceiling measurement's own budget
+    // (CEILING_RUN_SECONDS, 10s) before ever reaching the broken SUT spawn
+    // in step 3, so two attempts (the initial one plus the one retry) cost
+    // roughly twice one attempt's own time (measured directly on this host:
+    // a single attempt is ~10-11s, two are ~20-22s). A floor comfortably
+    // between those two, not a tight one: this is a real wall-clock signal
+    // that the retry actually ran a second full repetition rather than
+    // returning after the first failure, but on an EXTREMELY starved host a
+    // single attempt could also be inflated past this floor, in which case
+    // this assertion is inconclusive between host starvation and the
+    // retry-once policy silently regressing to zero retries, not a
+    // confident failure of the policy either way.
+    assert!(
+        elapsed >= Duration::from_secs(16),
+        "run_cell took {elapsed:?} against a permanently broken SUT; the retry-once policy \
+         (edge case 15) costs roughly two origin-ceiling runs (~20s measured on this host), and \
+         a duration this short is the signature of a retry that silently stopped happening \
+         (though on an extremely fast, unloaded host this could also be a false alarm from \
+         tighter-than-expected timing, not distinguishable from inside this test)"
+    );
+}
+
+#[test]
+fn run_cell_retries_once_and_records_retried_true() {
+    if !oha_available() {
+        return;
+    }
+    let cell = test_cell("runner_run_cell_retry_ok");
+    let oha = irontraffic_bench::Oha;
+    let ceiling = CeilingProbe;
+    let adapters: Vec<&dyn LoadGenerator> = vec![&oha, &ceiling];
+    let params = test_params("run_cell_retry_ok", 1, 1);
+    let provenance = test_provenance();
+
+    // Arrange exactly ONE deliberate SUT failure: the fixture's own "run"
+    // mode (see its own comment) checks for this exact trigger file, next
+    // to the rendered sut.yaml, and consumes it on the first sight. Every
+    // repetition and retry within one run_cell call shares the SAME
+    // params.work_dir (run_cell never varies it), so this is stable across
+    // exactly the calls this test needs it stable across, and unique to
+    // this one test's own work_dir otherwise.
+    std::fs::create_dir_all(&params.work_dir).expect("create work_dir for the trigger file");
+    let trigger = params.work_dir.join("force-first-sut-failure");
+    std::fs::write(&trigger, b"trigger").expect("write the retry-once trigger file");
+
+    // The retry (the second attempt) is a real repetition against the SAME
+    // real oha/it-origin/probe process tree as every other end-to-end test
+    // here, so on a host under heavy concurrent load it can ALSO fail for a
+    // genuine, unrelated reason (reconciliation timing), which run_cell has
+    // no third attempt left to recover from. A failure here is EITHER that
+    // host-contention case OR a real defect in the retry-once policy, not
+    // distinguishable from inside this test.
+    let (aggregate, recorders) = run_cell(&cell, &oha, &adapters, &params, &provenance, 1)
+        .unwrap_or_else(|e| {
+            panic!(
+                "run_cell must succeed once the one retry clears the deliberate first failure, \
+                 got {e:?} (EITHER the retry-once policy is broken OR the retry itself hit real \
+                 host contention, not distinguishable from inside this test)"
+            )
+        });
+    assert_eq!(aggregate.runs.len(), 1);
+    assert_eq!(recorders.len(), 1);
+    assert!(
+        aggregate.retried,
+        "a repetition that only passed on retry must set retried: true, not hide it"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -931,6 +1192,21 @@ fn teardown_kills_the_whole_process_group() {
     // correct reading of this test on a loaded host.
     std::thread::sleep(Duration::from_millis(500));
 
+    // Reviewed finding: without this check, this test could pass for the
+    // wrong reason on a starved host where the 500ms grace above was not
+    // enough for the grandchild to have bound yet (nothing to kill means
+    // the port-free assertion below trivially holds, proving nothing about
+    // teardown at all). This turns that silent ambiguity into an explicit,
+    // separately labelled signal: if THIS fails, the rest of the test is
+    // inconclusive about teardown specifically and should be read as host
+    // starvation, not a defect in Child::stop.
+    assert!(
+        TcpListener::bind(&bind_addr).is_err(),
+        "the grandchild must already be bound to {bind_addr} before teardown is exercised; if \
+         this fails, the 500ms grace period above was not enough on this host for the grandchild \
+         to bind (host starvation), not evidence that teardown itself is broken"
+    );
+
     child.stop();
 
     // Give the killed grandchild's socket a moment to actually release.
@@ -1057,6 +1333,52 @@ fn iqr_does_not_wrap_on_extreme_p99_values() {
         aggregate.iqr_permille > 0,
         "such widely spread p99 values must not report a wrapped, falsely small iqr_permille, got {}",
         aggregate.iqr_permille
+    );
+    // Reviewed finding: `> 0` alone does not pin the wrap this test is
+    // named for, because replacing the u128 computation with
+    // wrapping_mul(1000).wrapping_div(median) happened to ALSO produce a
+    // nonzero value for this exact array. `iqr_permille` is min()-capped at
+    // `u32::MAX` by construction (invariant 5b), and for THIS array the
+    // ratio genuinely exceeds that cap, so the correct answer is exactly
+    // u32::MAX; asserting that exact value, not just non-zero, is what a
+    // wrapping u64 computation cannot coincidentally satisfy.
+    assert_eq!(
+        aggregate.iqr_permille,
+        u32::MAX,
+        "this array's true ratio (q3 - q1) * 1000 / median vastly exceeds u32::MAX, so the \
+         correct, capped answer is exactly u32::MAX; anything else is evidence of a wrap"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 23 (reviewed finding, strengthened): the reviewer's own adversarial
+// construction, which they confirmed empirically distinguishes the u128
+// (capped) computation from a wrapping u64 one: p99 values
+// [100, 100, 100, X, X] with X = 100 + 18_446_744_073_709_552 give
+// iqr_permille = 4_294_967_295 (u32::MAX) under the correct, capped u128
+// computation and iqr_permille = 3 under a wrapping u64 one (confirmed by
+// landing that exact mutation against this exact input).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn iqr_caps_at_u32_max_on_the_reviewers_adversarial_input() {
+    #[allow(clippy::expect_used, reason = "test-support helper call")]
+    let cell_id = CellId::parse("runner_t23b").expect("valid cell id");
+    let x: u64 = 100 + 18_446_744_073_709_552;
+    let p99s = [100_u64, 100, 100, x, x];
+    let runs: Vec<RunResult> = p99s
+        .iter()
+        .map(|&p99| aggregate_result("runner_t23b", p99))
+        .collect();
+    let recorders: Vec<LatencyRecorder> = (0..5).map(|_| recorder_with(100, 2_000)).collect();
+    let aggregate =
+        CellAggregate::from_runs(cell_id, runs, &recorders).expect("from_runs must succeed");
+    assert_eq!(
+        aggregate.iqr_permille,
+        u32::MAX,
+        "median = 100, q1 = 100, q3 = X: (X - 100) * 1000 / 100 vastly exceeds u32::MAX, so the \
+         correct answer is exactly u32::MAX; a wrapping u64 computation on this exact input \
+         produces 3, not this value"
     );
 }
 

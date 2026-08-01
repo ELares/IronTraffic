@@ -70,6 +70,26 @@ pub const MAX_CAPTURED_BYTES: usize = 1024 * 1024;
 /// SIGKILL.
 pub const TEARDOWN_GRACE: Duration = Duration::from_secs(5);
 
+/// How long [`Child::stop`] waits for a capture reader thread to see EOF and
+/// exit, after the process itself has been signalled and reaped.
+///
+/// A descendant that escapes the process-group signal (this module's own
+/// documented gap: see [`Child::stop`]'s own doc on the container-CLI case)
+/// keeps its end of the captured pipe open, and `read` on that pipe blocks
+/// forever once nothing else is writing to it. Without this bound, `stop`
+/// (and therefore `Drop`, and therefore every one of `run_repetition`'s
+/// eleven early returns) would wedge the whole harness with no timeout and
+/// no diagnostic: this was observed directly during review, with a
+/// surviving grandchild parking the calling thread in `pthread_join` for the
+/// full length of a 300 second test run. `CapturedReader::join` polls
+/// `JoinHandle::is_finished` against this bound rather than calling the
+/// blocking `join` directly, because `std::thread::JoinHandle` has no
+/// timeout-bearing join in `std`.
+const READER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Poll interval for [`CapturedReader::join`]'s bounded wait.
+const READER_JOIN_POLL_INTERVAL: Duration = Duration::from_millis(20);
+
 /// Poll interval for [`Child::wait_ready`]'s TCP connect retry.
 const READY_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
@@ -133,6 +153,16 @@ fn lock_or_recover<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 struct CapturedReader {
     buf: Arc<Mutex<Vec<u8>>>,
     handle: Option<std::thread::JoinHandle<()>>,
+    /// Set when a bounded [`CapturedReader::join`] gave up before the
+    /// reader thread actually finished: the thread is still blocked in
+    /// `read`, almost always because a descendant escaped the process-group
+    /// signal and still holds the pipe's write end open (see `Child::stop`'s
+    /// own doc). Surfaced through `Debug` because there is nowhere else to
+    /// report it from a bounded, non-blocking join: this crate denies
+    /// `print_stdout`/`print_stderr` everywhere, and `stop`'s own Public API
+    /// doc fixes its signature as `fn stop(&mut self)`, with no `Result` to
+    /// carry a diagnostic in.
+    join_timed_out: bool,
 }
 
 impl std::fmt::Debug for CapturedReader {
@@ -143,6 +173,7 @@ impl std::fmt::Debug for CapturedReader {
         // this type's own doc comment.
         f.debug_struct("CapturedReader")
             .field("captured_bytes", &len)
+            .field("join_timed_out", &self.join_timed_out)
             .finish_non_exhaustive()
     }
 }
@@ -169,6 +200,7 @@ fn spawn_capture(mut reader: impl Read + Send + 'static, cap: usize) -> Captured
     CapturedReader {
         buf,
         handle: Some(handle),
+        join_timed_out: false,
     }
 }
 
@@ -178,10 +210,46 @@ impl CapturedReader {
         lock_or_recover(&self.buf).clone()
     }
 
-    /// Reclaims the reader thread. Idempotent: a second call is a no-op.
-    fn join(&mut self) {
-        if let Some(handle) = self.handle.take() {
+    /// Reclaims the reader thread, waiting at most `timeout`. Idempotent: a
+    /// second call after a successful join, or after one that already gave
+    /// up and set [`Self::join_timed_out`], is a cheap no-op.
+    ///
+    /// Bounded per [`READER_JOIN_TIMEOUT`]'s own doc: `JoinHandle::join` has
+    /// no timeout in `std`, so this polls `is_finished` instead (which is
+    /// non-blocking) and only calls the real, blocking `join` once the
+    /// thread has already finished, where it returns immediately.
+    fn join(&mut self, timeout: Duration) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        if handle.is_finished() {
             let _ = handle.join(); // it-allow: no-swallowed-error reason: this reader thread's only failure mode is a panic, which the loop body above cannot cause (every branch is an infallible match arm), and join's Err carries no information this caller could act on differently
+            return;
+        }
+        let start = Instant::now(); // it-allow: determinism-seam reason: bounds THIS bounded-join call's own wait budget, mirroring stop_unix's identical teardown-grace pattern just below; not a request-path or measurement-window time read
+        loop {
+            if handle.is_finished() {
+                let _ = handle.join(); // it-allow: no-swallowed-error reason: see the identical reason on the fast-path join just above
+                return;
+            }
+            if start.elapsed() >= timeout {
+                // Do not join: the thread is still blocked in `read`,
+                // almost always because a descendant escaped the group
+                // signal and still holds the pipe open (see `Child::stop`'s
+                // own doc). Dropping the `JoinHandle` here is safe: the
+                // thread keeps running and cleans itself up whenever its
+                // `read` eventually returns (or never does, in which case
+                // the OS reclaims it at process exit like any other
+                // detached thread), and this caller has no further use for
+                // its result. `handle` is deliberately NOT put back on
+                // `self`: a second bounded join later would just re-run
+                // this same bounded wait for no benefit, since nothing
+                // between now and then makes the thread any more likely to
+                // have finished.
+                self.join_timed_out = true;
+                return;
+            }
+            std::thread::park_timeout(READER_JOIN_POLL_INTERVAL); // it-allow: no-accumulated-sleep reason: a fixed poll tick bounded by the start.elapsed() >= timeout deadline check above on every iteration, mirroring stop_unix's identical teardown-grace pattern; a spurious wakeup only costs one extra tick and never accumulates
         }
     }
 }
@@ -301,8 +369,8 @@ impl Child {
                 // threads' own scheduling on a busy host. This is NOT safe
                 // to do in the other return below, where the child may
                 // still be running and its pipes still open.
-                self.stdout.join();
-                self.stderr.join();
+                self.stdout.join(READER_JOIN_TIMEOUT);
+                self.stderr.join(READER_JOIN_TIMEOUT);
                 return Err(self.readiness_error(addr, timeout));
             }
             match TcpStream::connect(addr) {
@@ -397,6 +465,16 @@ impl Child {
     /// installed on the development host, and the `docker ps --filter
     /// name=it-bench-` acceptance criterion is therefore vacuous on that host
     /// and must be reported as unverified rather than asserted as passing.
+    ///
+    /// The group signal above cannot reach a descendant that has already
+    /// escaped the group (the exact container case this doc just described,
+    /// and the one case this module cannot close). Reaping this process
+    /// itself is unaffected by that, but the capture reader threads below
+    /// read from a pipe such a descendant can keep open forever: `stop`
+    /// bounds that wait per [`READER_JOIN_TIMEOUT`]'s own doc rather than
+    /// blocking on it unconditionally, so an escaped descendant degrades
+    /// this call to "returns within a few seconds, `CapturedReader::join_timed_out`
+    /// set" instead of a wedge with no timeout and no diagnostic.
     pub fn stop(&mut self) {
         if self.reaped {
             return;
@@ -406,14 +484,14 @@ impl Child {
         #[cfg(not(unix))]
         self.stop_fallback();
         self.reaped = true;
-        self.stdout.join();
-        self.stderr.join();
+        self.stdout.join(READER_JOIN_TIMEOUT);
+        self.stderr.join(READER_JOIN_TIMEOUT);
     }
 
     #[cfg(unix)]
     fn stop_unix(&mut self) {
         let pid = rustix::process::Pid::from_child(&self.process);
-        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::TERM); // it-allow: no-swallowed-error reason: best-effort SIGTERM to the whole process group; the process may already have exited between the caller's own liveness check and this call, and the wait loop below observes the actual outcome regardless
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::TERM); // it-allow: no-swallowed-error reason: best-effort SIGTERM to the whole process group; the process may already have exited between the caller's own liveness check and this call, and the wait loop below observes the actual outcome regardless // it-allow: no-swallowed-error reason: best-effort SIGTERM to the whole process group; the process may already have exited between the caller's own liveness check and this call, and the wait loop below observes the actual outcome regardless
         let start = Instant::now(); // it-allow: determinism-seam reason: measures this teardown call's own 5 second SIGTERM grace budget before escalating to SIGKILL, mirroring crate::provenance's identical poll_until_done pattern; not a request-path time read
         loop {
             match self.process.try_wait() {
@@ -426,7 +504,7 @@ impl Child {
             }
             std::thread::park_timeout(TEARDOWN_POLL_INTERVAL); // it-allow: no-accumulated-sleep reason: a fixed 20ms grace-period poll tick bounded by the start.elapsed() >= TEARDOWN_GRACE deadline check above on every iteration, mirroring crate::provenance's identical poll_until_done pattern; a spurious wakeup only costs one extra tick and never accumulates
         }
-        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL); // it-allow: no-swallowed-error reason: best-effort SIGKILL escalation to the whole process group; the blocking reap immediately below observes the actual outcome regardless of whether the signal reached a still-live process or an already-exited one
+        let _ = rustix::process::kill_process_group(pid, rustix::process::Signal::KILL); // it-allow: no-swallowed-error reason: best-effort SIGKILL escalation to the whole process group; the blocking reap immediately below observes the actual outcome regardless of whether the signal reached a still-live process or an already-exited one // it-allow: no-swallowed-error reason: best-effort SIGKILL escalation to the whole process group; the blocking reap immediately below observes the actual outcome regardless of whether the signal reached a still-live process or an already-exited one
         let _ = self.process.wait(); // it-allow: no-swallowed-error reason: this reaps the child after SIGKILL, which cannot be caught or ignored; stop() has no further action to take whether the wait succeeds or the child had already been reaped by something else
     }
 
@@ -751,7 +829,9 @@ pub struct CoreAssignment {
 
 #[cfg(test)]
 mod tests {
-    use super::{append_capped, parse_stat_cpu_ticks};
+    use super::{Child, CoreSet, append_capped, parse_stat_cpu_ticks};
+    use crate::loadgen::Invocation;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn append_capped_drops_oldest_bytes() {
@@ -772,5 +852,59 @@ mod tests {
     #[test]
     fn parse_stat_cpu_ticks_rejects_a_line_with_no_paren() {
         assert!(parse_stat_cpu_ticks(b"not a stat line at all").is_err());
+    }
+
+    /// Whether `pid` is currently a running process. Checked with `ps`
+    /// rather than a raw signal-0 liveness probe, which would need `unsafe`
+    /// FFI this crate denies everywhere: `ps -p <pid>` exits 0 with output
+    /// when the pid exists and nonzero with no output once it is gone, on
+    /// both macOS and Linux.
+    fn pid_is_alive(pid: u32) -> bool {
+        std::process::Command::new("ps")
+            .arg("-p")
+            .arg(pid.to_string())
+            .output()
+            .is_ok_and(|out| out.status.success())
+    }
+
+    #[test]
+    fn drop_without_an_explicit_stop_call_still_tears_down_the_child() {
+        // Reviewed finding: teardown_leaves_no_children (tests/runner.rs,
+        // test 13) asserts only that run_repetition returns Err; emptying
+        // `impl Drop for Child { fn drop(&mut self) {} }` entirely left
+        // that test green while leaking a live process, because
+        // run_repetition's own encapsulation gives no external test a pid
+        // to check liveness against. This test drives `Child`'s own Drop
+        // impl directly, with no explicit `stop()` call anywhere, and
+        // checks real process liveness by pid: the one thing test 13
+        // structurally cannot do.
+        let invocation = Invocation {
+            program: "sleep".to_owned(),
+            args: vec!["30".to_owned()],
+            env: Vec::new(),
+        };
+        let cores = CoreSet::from_unsorted(Vec::new());
+        let child = Child::spawn(&invocation, &cores, "drop_without_stop_test")
+            .unwrap_or_else(|e| panic!("spawn of `sleep 30` failed: {e:?}"));
+        let pid = child.pid;
+        assert!(
+            pid_is_alive(pid),
+            "the freshly spawned child (pid {pid}) must be alive before Drop runs at all"
+        );
+
+        drop(child); // No stop() call: only Child's own Drop impl runs.
+
+        let start = Instant::now();
+        let mut alive = pid_is_alive(pid);
+        while alive && start.elapsed() < Duration::from_secs(6) {
+            std::thread::sleep(Duration::from_millis(50));
+            alive = pid_is_alive(pid);
+        }
+        assert!(
+            !alive,
+            "pid {pid} must not survive past Child's own Drop impl when nothing ever calls \
+             stop() explicitly; a live process here means Drop is not actually tearing children \
+             down"
+        );
     }
 }
