@@ -177,7 +177,7 @@ sha2 = "0.10"
 # AES-GCM nonce would, and this AEAD is sourced from this crate rather than from
 # a `rustls::crypto` provider, so the ticket format is byte-identical on
 # `crypto-aws-lc-rs` and `crypto-ring` builds.
-chacha20poly1305 = "0.10"
+chacha20poly1305 = "0.11"
 # Zeroizes the cluster ticket root, its HKDF pseudorandom key, and every derived
 # epoch key on drop (`cluster-derived-session-ticketer`, #120). The root is the
 # highest-value secret in the product; it must never linger in freed memory.
