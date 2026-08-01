@@ -1040,8 +1040,34 @@ fn zero_expected_requests_is_valid_and_empty() {
 // ---------------------------------------------------------------------------
 // 8. chunked_response_is_bad
 // ---------------------------------------------------------------------------
+/// Issue #811, round two: this test used to call `finish_probe` immediately
+/// after `spawn_probe`, with no wait at all. That races the probe thread's
+/// very first loop iteration against this thread's own `stop_requested`
+/// signal (see `run_for`'s own doc comment above: "every test that called
+/// finish immediately measured issued == 1 no matter what it configured", a
+/// statement about the UNCONTENDED case, never a guarantee). On a starved CI
+/// runner that race can be LOST outright: `issued` observed 0, which used to
+/// fail the `outcome.bad >= 1` assertion below and report the chunked-response
+/// guard as broken when nothing had exchanged at all (this issue's own filing:
+/// `test (ubuntu-latest)` failed on commit `31f0018`, a Cargo.toml-only
+/// metadata change with two immediately preceding green runs on identical
+/// test and probe code, `assert!(outcome.bad >= 1)` firing with zero
+/// exchanges completed).
+///
+/// The fix gives the probe thread a real window, several times its own
+/// configured schedule (5 requests at 20rps is 250ms), before cutting it off
+/// via `run_for`, which removes the race without changing what is tested: on
+/// a healthy host the probe still reaches `expected_requests` and stops on
+/// its own long before `SETTLE` elapses (`finish` then joins an
+/// already-finished thread, a documented no-op). The `issued >= 1` and
+/// `errors == 0` assertions below name starvation explicitly and distinctly
+/// from the classification assertions that follow them, so a starved run
+/// reports as starved rather than as a broken guard: the failure mode this
+/// whole family shares (see this file's own history, issue #811).
 #[test]
 fn chunked_response_is_bad() {
+    const SETTLE: Duration = Duration::from_millis(1_200);
+
     let addr = stub_chunked();
     let config = ProbeConfig {
         rate_hz: 20,
@@ -1049,8 +1075,24 @@ fn chunked_response_is_bad() {
         ..base_config(addr)
     };
     let handle = spawn_probe(config, real_time()).expect("spawns against the stub");
-    let outcome = finish_probe(handle).expect("probe thread does not panic");
+    let outcome = run_for(handle, SETTLE);
 
+    assert!(
+        outcome.issued >= 1,
+        "0 exchanges were issued in a {SETTLE:?} window (configured for 5 requests at 20rps); \
+         this is a scheduling starvation failure (the probe thread never got to run before this \
+         test cut it off), not evidence that the chunked-response guard is broken"
+    );
+    assert_eq!(
+        outcome.errors, 0,
+        "{} of {} issued exchanges hit an I/O error instead of being classified ok or bad; \
+         against an always-available stub with no injected delay, that is EITHER host \
+         contention pushing the round trip past its own deadline (a starvation failure) OR a \
+         broken guard leaving the probe reading for a body that never fully arrives (a real \
+         defect: `outcome.errors` alone cannot tell the two apart, unlike the issued == 0 case \
+         above, so treat this as inconclusive rather than confidently starvation)",
+        outcome.errors, outcome.issued
+    );
     assert_eq!(outcome.ok, 0, "a chunked response must never count as ok");
     assert!(outcome.bad >= 1, "a chunked response must count as bad");
     assert_eq!(
@@ -1184,30 +1226,188 @@ fn not_modified_with_a_late_body_forces_a_reconnect_not_a_leak() {
 // ---------------------------------------------------------------------------
 // 9. reset_recorders_discards_and_returns_count
 // ---------------------------------------------------------------------------
+/// Issue #811: this test used to sleep a fixed 3 seconds and assert
+/// `discarded` (and, in a second window, `final_samples`) landed within
+/// `240..=360`, presuming the host actually sustained close to the
+/// configured 100rps for the whole window. PR 819's own CI run measured this
+/// exact test failing that assertion on byte-identical code to an
+/// immediately preceding GREEN run, the starvation signature this issue
+/// documents: a contended runner can fall far short of 100rps, and a fixed
+/// window has no way to tell that apart from `reset_recorders` actually
+/// being broken.
+///
+/// The fix, mirroring `zero_allocations_in_steady_state`'s own precedent
+/// (PR 801): accumulate real, acknowledged reset counts across small rounds
+/// until they clear a floor, however many rounds that takes (bounded by
+/// `MAX_ROUNDS`), and fail with a message naming starvation, distinctly from
+/// the assertions that check `reset_recorders`'s own behaviour, when the
+/// floor is never reached.
+///
+/// The floor alone would not prove the DISCARD half of "discards and
+/// returns count" though: summing per-round deltas across a growing window
+/// reaches a floor either way, whether or not those deltas are genuine
+/// deltas or (if a future change broke the swap) a monotonically growing
+/// CUMULATIVE count. The `boundary` check below is what actually
+/// discriminates.
+///
+/// Round two of this same fix: `boundary` was first written to assume the
+/// gap between window one's LAST reset and this next one is near-instant
+/// ("no explicit sleep" reasoning), and to require its raw count stay under
+/// a small fixed ceiling. Watched to false-positive live, under `taskpolicy
+/// -c background` plus 30 background CPU hogs (the same reproduction bed
+/// this issue's fix was verified against): `reset_recorders_locked` itself
+/// polls for up to 2 seconds waiting for the probe thread's acknowledgement
+/// (see its own doc comment), so "no explicit `sleep` call" does not mean
+/// "no real elapsed time"; under load that poll alone can take long enough
+/// for a healthy, correctly-discarding reset to legitimately accumulate more
+/// than a small fixed ceiling allows, which is a false failure on
+/// UNMUTATED code, not evidence of anything. The fix is the same technique
+/// `probe_hits_target_rate` already uses for the identical reason: measure
+/// the ACTUAL elapsed wall-clock time this specific gap took (`Instant`,
+/// permitted in this test file though not in production code, see the
+/// determinism-seam invariant lint), and assert a RATE against a wide,
+/// one-sided ceiling rather than a raw count against an assumed-tiny window.
+/// A correctly discarding reset reports a count proportional to the
+/// configured rate over whatever real time this gap actually took, however
+/// long that was; a reset that returns a count WITHOUT discarding instead
+/// reports something close to the FULL cumulative total since the very
+/// start of the test, which implies a rate many times the configured one
+/// relative to this gap's own (measured, generally much shorter) duration.
+/// An explicit minimum-length sleep is folded into the measured gap so the
+/// rate is never computed over a near-zero denominator, which would be
+/// pure scheduling-noise quantization (0 or 1 request over a handful of
+/// microseconds reads as "0 rps" or "a million rps", neither of which means
+/// anything). The `final_samples` check below the `window_two` loop is the
+/// same technique, applied to the `finish()` path this file's other tests
+/// actually use to read a probe's outcome.
+const RESET_TARGET_SAMPLES: u64 = 60;
+const RESET_ROUND_MS: u64 = 150;
+const RESET_MAX_ROUNDS: u32 = 30;
+const RESET_RATE_HZ: u64 = 100;
+// Generous relative to probe_hits_target_rate's own repeated measurement
+// (34 observations spanning idle to 3x CPU oversubscription never saw
+// achieved rate exceed the configured one by more than a couple of
+// percent): this ceiling is many times looser than that, so a false
+// positive here would need a far larger anomaly than anything on that
+// record.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "RESET_RATE_HZ is a small compile-time constant (100), far below f64's 2^53 exact-integer range"
+)]
+const RESET_RATE_CEILING: f64 = RESET_RATE_HZ as f64 * 5.0;
+
+/// Accumulates real, acknowledged `reset_recorders` counts, starting from
+/// `start`, across small `RESET_ROUND_MS` rounds until the running total
+/// clears `RESET_TARGET_SAMPLES`, rather than presuming a fixed sleep or
+/// round count buys it. Panics with a message naming starvation, distinctly
+/// from an assertion that `reset_recorders` itself is broken, if the target
+/// is never reached within `RESET_MAX_ROUNDS`. `window_name` labels both
+/// panic messages.
+#[allow(
+    clippy::expect_used,
+    clippy::panic,
+    reason = "test-support setup, not itself a #[test] fn: reset_recorders_discards_and_returns_count is the only caller, and a panic here reports that test's own failure (starvation, distinctly from a reset_recorders defect) exactly as if the assertion were written inline"
+)]
+fn accumulate_resets(handle: &ProbeHandle, start: u64, window_name: &str) -> u64 {
+    let mut total = start;
+    let mut rounds = 0u32;
+    for _ in 0..RESET_MAX_ROUNDS {
+        rounds += 1;
+        std::thread::sleep(Duration::from_millis(RESET_ROUND_MS));
+        let discarded = reset_recorders_locked(handle).unwrap_or_else(|error| {
+            panic!(
+                "the probe thread did not acknowledge a {window_name} reset ({error}); this is \
+                 a scheduling starvation failure, not evidence that reset_recorders is broken"
+            )
+        });
+        total = total.saturating_add(discarded);
+        if total >= RESET_TARGET_SAMPLES {
+            return total;
+        }
+    }
+    panic!(
+        "{window_name} accumulated only {total} requests across {rounds} rounds of \
+         {RESET_ROUND_MS}ms each ({RESET_MAX_ROUNDS} rounds available); this is a scheduling \
+         starvation failure (the host never sustained enough throughput for this test's own \
+         precondition to be meaningful), not evidence that reset_recorders is broken"
+    );
+}
+
 #[test]
 fn reset_recorders_discards_and_returns_count() {
     let origin = spawn_it_origin(&[]);
     let config = ProbeConfig {
-        rate_hz: 100,
-        expected_requests: 700,
+        rate_hz: RESET_RATE_HZ,
+        // Deliberately far larger than either accumulate loop below could
+        // consume at any achievable host throughput within RESET_MAX_ROUNDS
+        // * RESET_ROUND_MS, so reaching it never tears the probe down (and
+        // reconstructs its recorders) mid-test: the same reasoning as
+        // zero_allocations_in_steady_state's own expected_requests.
+        expected_requests: 10_000_000,
         ..base_config(origin.addr)
     };
     let handle = spawn_probe(config, real_time()).expect("spawns");
 
-    std::thread::sleep(Duration::from_secs(3));
-    let discarded =
-        reset_recorders_locked(&handle).expect("the probe thread acknowledges the reset");
+    // Window one: accumulate real, acknowledged reset counts until they
+    // clear the floor, rather than presume a fixed sleep buys them.
+    let window_one = accumulate_resets(&handle, 0, "window one");
+
+    // The reset immediately following the one that closed window one. See
+    // the doc comment above for why this, not the floor above, is what
+    // actually proves the discard happened, and why it is timed rather than
+    // assumed instant.
+    let boundary_start = Instant::now();
+    std::thread::sleep(Duration::from_millis(RESET_ROUND_MS));
+    let boundary = reset_recorders_locked(&handle).unwrap_or_else(|error| {
+        panic!(
+            "the probe thread did not acknowledge the boundary reset ({error}); this is a \
+             scheduling starvation failure, not evidence that reset_recorders is broken"
+        )
+    });
+    let boundary_elapsed = boundary_start.elapsed();
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "boundary is at most a few hundred here, far below f64's 2^53 exact-integer range"
+    )]
+    let boundary_rate = boundary as f64 / boundary_elapsed.as_secs_f64();
     assert!(
-        (240..=360).contains(&discarded),
-        "discarded {discarded} must be close to the 300 requests issued in the first 3 seconds at 100 rps"
+        boundary_rate <= RESET_RATE_CEILING,
+        "the reset immediately after window one reported {boundary} requests over the \
+         {boundary_elapsed:?} this test actually took to make that call ({boundary_rate:.1} \
+         requests/sec against a {RESET_RATE_HZ} rps configured rate); a rate many times the \
+         configured one means this reset returned a count WITHOUT discarding it, i.e. \
+         reset_recorders leaked window one's samples (total {window_one}) across the boundary \
+         instead of clearing them"
     );
 
-    std::thread::sleep(Duration::from_secs(3));
+    // Window two: accumulate again, starting from the boundary reset's own
+    // contribution, proving recording resumes normally after a reset rather
+    // than getting stuck empty.
+    let window_two = accumulate_resets(&handle, boundary, "window two");
+
+    // The same rate-not-raw-count check as `boundary` above, exercised
+    // through the `finish` path this file's other tests actually use to
+    // read a probe's final outcome: `finish` reports whatever accumulated
+    // since window two's own last reset, over whatever real time this call
+    // (join included) actually took.
+    let final_start = Instant::now();
+    std::thread::sleep(Duration::from_millis(RESET_ROUND_MS));
     let outcome = finish_probe(handle).expect("probe thread does not panic");
+    let final_elapsed = final_start.elapsed();
     let final_samples = outcome.latency.len();
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "final_samples is at most a few hundred here, far below f64's 2^53 exact-integer range"
+    )]
+    let final_rate = final_samples as f64 / final_elapsed.as_secs_f64();
     assert!(
-        (240..=360).contains(&final_samples),
-        "final latency.samples {final_samples} must be close to the 300 requests issued in the SECOND 3 seconds, proving the first window's samples were discarded rather than merged"
+        final_rate <= RESET_RATE_CEILING,
+        "finish() reported {final_samples} samples over the {final_elapsed:?} this test \
+         actually took to make that call ({final_rate:.1} requests/sec against a \
+         {RESET_RATE_HZ} rps configured rate), immediately after window two's own last reset \
+         (which itself totalled {window_two}); a rate many times the configured one means that \
+         reset also failed to discard, carrying window two's samples into the final snapshot \
+         instead of clearing them"
     );
 }
 
@@ -1481,8 +1681,24 @@ fn dribbling_peer_is_cut_off_at_the_deadline() {
 // ---------------------------------------------------------------------------
 // 14. absurd_content_length_is_bad
 // ---------------------------------------------------------------------------
+/// Issue #811, round two: the identical unwaited-`finish_probe` race
+/// `chunked_response_is_bad` (above) is fixed against. See that test's own
+/// doc comment for the mechanism. This test's own record of it: it flaked
+/// once in 15 full-suite runs at 48 test threads (issue #810, during PR
+/// 801's round-five review), and PR 819 at head `8683570` failed `test
+/// (ubuntu-latest)` twice on the SAME commit, a different member of the
+/// family each time: `reset_recorders_discards_and_returns_count` on the
+/// first run, this test on the re-run, which is what escalated this issue
+/// from "record it" to "fix it" (re-running is not a workaround when the
+/// next run just picks a different victim). The fix is the same shape as
+/// `chunked_response_is_bad`'s: a real `SETTLE` window several times the
+/// configured schedule (3 requests at 20rps is 150ms), and a starvation
+/// check that names the failure distinctly from the Content-Length
+/// assertions it precedes.
 #[test]
 fn absurd_content_length_is_bad() {
+    const SETTLE: Duration = Duration::from_secs(1);
+
     for value in ["18446744073709551615", "999999999999999999999999999999"] {
         let addr = stub_absurd_length(value);
         let config = ProbeConfig {
@@ -1491,8 +1707,26 @@ fn absurd_content_length_is_bad() {
             ..base_config(addr)
         };
         let handle = spawn_probe(config, real_time()).expect("spawns against the stub");
-        let outcome = finish_probe(handle).expect("probe thread does not panic");
+        let outcome = run_for(handle, SETTLE);
 
+        assert!(
+            outcome.issued >= 1,
+            "value {value:?}: 0 exchanges were issued in a {SETTLE:?} window (configured for 3 \
+             requests at 20rps); this is a scheduling starvation failure (the probe thread \
+             never got to run before this test cut it off), not evidence that the \
+             Content-Length guard is broken"
+        );
+        assert_eq!(
+            outcome.errors, 0,
+            "value {value:?}: {} of {} issued exchanges hit an I/O error instead of being \
+             classified ok or bad; against an always-available stub with no injected delay, \
+             that is EITHER host contention pushing the round trip past its own deadline (a \
+             starvation failure) OR a broken guard leaving the probe reading for a body that \
+             never fully arrives (a real defect: outcome.errors alone cannot tell the two \
+             apart, unlike the issued == 0 case above, so treat this as inconclusive rather \
+             than confidently starvation)",
+            outcome.errors, outcome.issued
+        );
         assert_eq!(
             outcome.ok, 0,
             "value {value:?}: an absurd Content-Length must never be ok"
