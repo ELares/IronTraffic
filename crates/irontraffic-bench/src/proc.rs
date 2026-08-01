@@ -647,17 +647,20 @@ fn read_cpu_seconds(_pid: u32) -> Result<f64, BenchError> {
 /// exceed `f64`'s 52 bit mantissa, and the lint cannot see that this
 /// particular one is the constant 100. A cast plus an allow would silence the
 /// lint while leaving the same trap for whoever later makes the tick count
-/// dynamic, so the two are tied together instead: the debug assertion below
-/// fails the moment they diverge, which is the only way they can.
+/// dynamic, so the two are tied together instead: the const assertion below
+/// is evaluated at compile time, in const context, and fails the BUILD the
+/// moment either one moves. It names BOTH constants deliberately. An earlier
+/// version named only the `u64`, which is the inert one: after this rewrite
+/// `CLOCK_TICKS_PER_SEC` has no functional use left, while
+/// `CLOCK_TICKS_PER_SEC_F64` is the sole divisor in `read_cpu_seconds`, so a
+/// one-sided guard protected nothing an editor could plausibly break. A
+/// reviewer set the `f64` to 250.0 and the build stayed GREEN while every
+/// published `cpu_seconds` figure silently became 0.4x its true value.
 #[cfg(target_os = "linux")]
 const CLOCK_TICKS_PER_SEC_F64: f64 = 100.0;
 
 #[cfg(target_os = "linux")]
-#[allow(
-    clippy::assertions_on_constants,
-    reason = "the point IS that both sides are constants: this ties the f64 form to the u64               form so a future edit to one and not the other cannot silently scale every               cpu_seconds figure by a fixed factor"
-)]
-const _: () = assert!(CLOCK_TICKS_PER_SEC == 100);
+const _: () = assert!(CLOCK_TICKS_PER_SEC == 100 && CLOCK_TICKS_PER_SEC_F64 == 100.0);
 
 #[cfg(target_os = "linux")]
 fn read_memory(pid: u32) -> Result<(u64, u64), BenchError> {
@@ -912,15 +915,15 @@ mod tests {
         let start = Instant::now();
         let mut alive = pid_is_alive(pid);
         while alive && start.elapsed() < Duration::from_secs(6) {
-            // it-allow: no-accumulated-sleep reason: this is a bounded poll,
-            // not an unconditional wait. Each tick re-checks pid_is_alive and
-            // the loop exits the moment the pid is gone, against a 6 second
-            // deadline; that is the same shape every other park_timeout site
-            // in this crate uses. Justified by what it IS, deliberately not
-            // by which grep it does or does not match: a wait site that
-            // explains itself as staying out of a check is one a future
-            // reader cannot audit.
-            std::thread::park_timeout(Duration::from_millis(50));
+            // A bounded poll, not an unconditional wait: each tick re-checks
+            // pid_is_alive and the loop exits the moment the pid is gone,
+            // against a 6 second deadline, the same shape every other
+            // park_timeout site in this crate uses. The marker is on the CALL
+            // LINE, not here: invariant-lints' own drop_escaped() filters grep
+            // HIT lines, so a marker on a preceding comment line suppresses
+            // nothing. All 10 existing markers in the workspace are trailing
+            // same-line comments; this one now matches them.
+            std::thread::park_timeout(Duration::from_millis(50)); // it-allow: no-accumulated-sleep reason: bounded poll re-checking pid_is_alive each tick against a 6 second deadline
             alive = pid_is_alive(pid);
         }
         assert!(
