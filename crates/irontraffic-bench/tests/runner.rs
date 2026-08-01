@@ -860,8 +860,9 @@ fn reconciliation_mismatch_fails() {
 // still in flight when the client exits fails a perfectly healthy
 // repetition). measure_secs = 3 below (matching repetition_produces_a_result
 // and warmup_samples_are_discarded above) puts the tolerance back to a
-// handful of requests, comfortably above the largest plausible in-flight
-// discrepancy (at most test_cell's own 4 connections). This is the actual
+// handful of requests, comfortably above the measured discrepancy (see the
+// three-term accounting on run_cell_aggregates_the_requested_repetition_count
+// below: it is not simply test_cell's 4 connections). This is the actual
 // mechanism a reviewer measured failing gate-fast.sh on its first run
 // (~1 failure in 8 executions); it is fixed here at its source rather than
 // hedged as host contention, which was the wrong diagnosis: the tolerance
@@ -881,11 +882,24 @@ fn run_cell_aggregates_the_requested_repetition_count() {
     let provenance = test_provenance();
 
     // At measure_secs = 3 (see this section's own header comment) a healthy
-    // repetition's client-versus-origin discrepancy is bounded by at most
-    // test_cell's 4 in-flight connections, well inside the ~6 request
-    // tolerance this duration gives reconcile(); a failure here is therefore
-    // read as a genuine defect, not hedged as indistinguishable host
-    // contention.
+    // repetition's client-versus-origin discrepancy stays inside the 5 to 6
+    // request tolerance this duration gives reconcile(); a failure here is
+    // therefore read as a genuine defect, not hedged as indistinguishable
+    // host contention.
+    //
+    // Do NOT read that discrepancy as "at most test_cell's 4 connections".
+    // reconcile() does not see the raw origin counter: run_repetition passes
+    // it origin_delta - probe.issued - warmup_requests_sent, so the observed
+    // diff is the SUM of three independent skews, the measurement client's
+    // in-flight requests, the warmup invocation's sent-versus-counted skew,
+    // and the probe's own issued-versus-counted skew. A reviewer instrumented
+    // the call site over 40 healthy reconciliations at this duration and
+    // measured the three together at 0 fifteen times, 1 eighteen times and 2
+    // seven times, so the real margin is 2.5x, not the whole allowance. That
+    // is comfortably clear today and it is why 29 consecutive runs were
+    // green, but the bound is empirical: anyone changing probe_rate_hz,
+    // warmup_secs or the fixture rate must re-measure rather than trust this
+    // number.
     let (aggregate, recorders) = run_cell(&cell, &oha, &adapters, &params, &provenance, 2)
         .unwrap_or_else(|e| {
             panic!(

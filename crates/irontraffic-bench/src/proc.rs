@@ -897,9 +897,14 @@ mod tests {
         let start = Instant::now();
         let mut alive = pid_is_alive(pid);
         while alive && start.elapsed() < Duration::from_secs(6) {
-            // park_timeout, not a fixed sleep call: keeps this test out of
-            // the acceptance criterion's own grep for the two named
-            // production wait sites (this is neither one of them).
+            // it-allow: no-accumulated-sleep reason: this is a bounded poll,
+            // not an unconditional wait. Each tick re-checks pid_is_alive and
+            // the loop exits the moment the pid is gone, against a 6 second
+            // deadline; that is the same shape every other park_timeout site
+            // in this crate uses. Justified by what it IS, deliberately not
+            // by which grep it does or does not match: a wait site that
+            // explains itself as staying out of a check is one a future
+            // reader cannot audit.
             std::thread::park_timeout(Duration::from_millis(50));
             alive = pid_is_alive(pid);
         }
