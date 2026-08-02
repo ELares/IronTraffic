@@ -97,3 +97,37 @@ fn scratch_steady_state_allocates_nothing() {
          catching it"
     );
 }
+
+#[test]
+fn descend_allocates_nothing() {
+    // `path-descent-and-visit-budget` (#54) inherited the same original
+    // design intent as the two tests above: a process-wide counting
+    // `#[global_allocator]` proving `descend` and `prefix_boundary_ok`
+    // allocate nothing. That does not compile in this tree for the identical
+    // reason documented above `normalize_and_host_key_allocate_nothing`:
+    // `GlobalAlloc` is an `unsafe trait`, this crate's root is
+    // `#![forbid(unsafe_code)]` with no per-crate exception, and a
+    // process-wide allocator would be unsound here regardless, since it
+    // would count every OTHER test's allocations too, whichever happen to
+    // run in the same binary at the same time.
+    //
+    // `src/matching/path.rs` instead carries the same `//! HOT PATH` marker
+    // that already protects `normalize_authority` and `MatchScratch`, which
+    // puts `descend` and `prefix_boundary_ok` (both production, non-test
+    // code in that file) under `scripts/invariant-lints.sh`'s
+    // `hot-path-allocation` and `hot-path-lock` rules for every pull
+    // request. This test's only job is to guard against that marker line
+    // being deleted, which would silently drop the module out of that
+    // CI-enforced net; `assertions weakened` and `test removed` in
+    // `scripts/test-census.sh` both refuse a change that shrinks this
+    // test's body without a written justification.
+    let source = include_str!("../src/matching/path.rs");
+    assert!(
+        source.lines().any(|line| line == HOT_PATH_MARKER),
+        "crates/irontraffic-router/src/matching/path.rs must carry a line that \
+         is exactly `{HOT_PATH_MARKER}` so scripts/invariant-lints.sh's \
+         hot-path-allocation and hot-path-lock rules scan this module; without \
+         it, descend and prefix_boundary_ok could allocate or lock with \
+         nothing in this repository catching it"
+    );
+}

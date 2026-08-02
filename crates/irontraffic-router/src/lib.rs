@@ -8,6 +8,7 @@ pub mod build;
 pub mod ids;
 pub mod intern;
 pub mod limits;
+pub mod matching;
 pub mod normalize;
 pub mod precedence;
 pub mod request;
@@ -23,6 +24,7 @@ pub use ids::{
     ActionId, CertId, GroupId, ListenerId, MethodMask, NameId, NodeId, RouteId, SENTINEL,
 };
 pub use intern::{CompiledNameSet, MAX_NAMES, NameSetBuilder, NameSetError, is_tchar};
+pub use matching::path::{Descent, descend, prefix_boundary_ok};
 pub use normalize::{
     AuthorityError, HOST_KEY_BUF_BYTES, HostKind, host_key, normalize_authority,
     normalize_host_pattern,
