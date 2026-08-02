@@ -48,12 +48,25 @@
 #     population (lines 758-761), each shown to reopen a real bypass when
 #     unquoted, one at a time (round seven; cases 1, 2, 10, 19, 20, 48-54
 #     collectively close all 13, plus case 49 for the population site).
-#   - BOTH ALLOWLISTS' ANCHORS AND THEIR PER-ALTERNATIVE COMPONENT TOKENS:
-#     every one of BOT_ALLOWED's eight alternatives (cases 70-88, 94-99)
-#     and ALWAYS_ALLOWED's one (cases 69, 100) has its own leading/trailing
-#     anchor, its own directory and filename literals, and its own dot-
-#     escape pinned by a fixture that shares every OTHER token with a real
-#     allowlisted path and differs in only the one token being tested.
+#   - BOTH ALLOWLISTS' GLOBAL ANCHORS AND THEIR PER-ALTERNATIVE COMPONENT
+#     TOKENS: all four global anchor drops (BOT_ALLOWED's own `^` and `$`,
+#     ALWAYS_ALLOWED's own `^` and `$`) die, 4 of 4. Every one of
+#     BOT_ALLOWED's eight alternatives (cases 70-88, 94-99) and
+#     ALWAYS_ALLOWED's one (cases 69, 100) has its directory and filename
+#     literals and its dot-escape pinned by a fixture that shares every
+#     OTHER token with a real allowlisted path and differs in only the one
+#     token being tested: 18 of 18 component widens and 11 of 11 dot-escape
+#     strips die.
+#
+#     NOT the PER-ALTERNATIVE anchors, and an earlier version of this bullet
+#     said otherwise. Relaxing one alternative's own leading or trailing
+#     anchor (`Ai` to `.*Ai` or to `Ai.*`, leaving the global anchors alone)
+#     is 18 mutants, of which 6 die and 12 SURVIVE with the suite printing
+#     clean; five of the twelve were shown to be real EXEMPT bypasses rather
+#     than equivalent mutants. The six that die are ALWAYS_ALLOWED's two
+#     (its single alternative makes those the global anchors) plus a1-lead,
+#     a1-trail, a2-lead and a3-trail. This is an instance of the general
+#     limit below, not a separate gap to chase.
 #   - BOTH GREP CALL-SITE FLAGS: the two `grep -qE "$VAR"` call sites gating
 #     BOT_ALLOWED and ALWAYS_ALLOWED are each pinned against silently
 #     becoming case-insensitive (cases 101, 102).
