@@ -581,6 +581,36 @@ mod tests {
             u32::MAX,
             "requests_sent must saturate at u32::MAX rather than wrap to 0"
         );
+
+        // Review finding 4 on PR 843: this is the consequence of saturating at
+        // the ceiling, measured rather than changed. Once both counters have
+        // saturated at u32::MAX, response_complete's own saturating_add(1) on
+        // responses_received is *also* a no-op, so the mismatch comparison two
+        // lines later can never observe a surplus response again: the
+        // one-request-one-response accounting this module's own doc header
+        // calls "the structural defense against response queue poisoning" goes
+        // permanently vacuous on a connection that has served u32::MAX
+        // requests. `## Design` mandates saturating_add and `## Do NOT`
+        // forbids `+` on these counters, so the counters must not wrap
+        // either; this is not a defect this test is asking to be fixed.
+        assert_eq!(at_ceiling.response_complete(), Ok(()));
+        assert_eq!(at_ceiling.responses_received(), u32::MAX);
+        assert!(
+            at_ceiling.may_pool(),
+            "at the counter ceiling the exchange completes as Clean"
+        );
+
+        // A genuine surplus response -- one more response than was ever
+        // requested -- is exactly what saturating_add(1) can no longer
+        // distinguish from a real match: a second response_complete with
+        // nothing in flight also returns Ok and leaves the connection
+        // poolable.
+        assert_eq!(at_ceiling.response_complete(), Ok(()));
+        assert_eq!(at_ceiling.responses_received(), u32::MAX);
+        assert!(
+            at_ceiling.may_pool(),
+            "a surplus response at the counter ceiling still pools cleanly"
+        );
     }
 
     #[test]
@@ -626,6 +656,116 @@ mod tests {
             Purity::Poisoned(PoisonReason::ClosedInFlight)
         );
         assert!(!in_flight.may_pool());
+    }
+
+    // The three tests below (review finding 1 on PR 843) each drive a SECOND exchange
+    // on a ledger that has already completed a first one, which is the exact
+    // reuse-after-anomaly scenario this module exists to defend: every other test in
+    // this file starts from a virgin `ExchangeLedger::new()`, where `begin_request`'s
+    // resets of `request_body_complete`, `declared_body` and `received_body` (step 3
+    // of the state machine) are already sitting at their reset values, so dropping any
+    // one of those three resets left every prior test green. One test per reset, so a
+    // dropped reset points at exactly the field that regressed.
+
+    #[test]
+    fn second_exchange_resets_request_body_complete() {
+        // The concrete hole this pins: exchange 1 runs a clean GET and pools.
+        // Exchange 2 is checked out and its POST body is still being written when
+        // the origin emits its final response early (the 0.CL escape hatch). If
+        // begin_request's reset of `request_body_complete` were dropped, exchange
+        // 2's `response_head` would see it still `true` from exchange 1's finished
+        // request body, return `Ok`, and hand a desynced connection back to the
+        // pool.
+        let mut ledger = ExchangeLedger::new();
+
+        // Exchange 1 completes cleanly, leaving request_body_complete == true.
+        assert_eq!(ledger.begin_request(), Ok(()));
+        ledger.request_body_written();
+        assert_eq!(ledger.response_head(ResponseFraming::Empty), Ok(()));
+        assert_eq!(ledger.response_complete(), Ok(()));
+        assert!(ledger.may_pool());
+
+        // Exchange 2: begin_request must reset request_body_complete to false.
+        // request_body_written is deliberately never called for exchange 2, so
+        // this is exchange 2's request body still in flight when its response
+        // head arrives.
+        assert_eq!(ledger.begin_request(), Ok(()));
+        assert_eq!(
+            ledger.response_head(ResponseFraming::Empty),
+            Err(Purity::Poisoned(PoisonReason::EarlyFinalResponse)),
+            "a reused ledger must not inherit exchange 1's completed request body"
+        );
+        assert!(!ledger.may_pool());
+    }
+
+    #[test]
+    fn second_exchange_resets_declared_body() {
+        // Pins begin_request's reset of `declared_body` to `None`. `response_head`
+        // always overwrites `declared_body` before a normal `response_body_bytes`
+        // call sees it, so the only way to observe a dropped reset is to call
+        // `response_body_bytes` for exchange 2 before exchange 2's own
+        // `response_head`: the value it sees can then only be whatever
+        // begin_request left there.
+        let mut ledger = ExchangeLedger::new();
+
+        // Exchange 1 declares a body of Some(3) and completes cleanly.
+        assert_eq!(ledger.begin_request(), Ok(()));
+        ledger.request_body_written();
+        assert_eq!(
+            ledger.response_head(ResponseFraming::Exact { len: 3 }),
+            Ok(())
+        );
+        assert_eq!(ledger.response_body_bytes(3), Ok(()));
+        assert_eq!(ledger.response_complete(), Ok(()));
+        assert!(ledger.may_pool());
+
+        // Exchange 2: begin_request must reset declared_body to None. 4 octets,
+        // arriving before exchange 2's own response_head has declared a length,
+        // must be accepted: there is nothing to check them against yet. If the
+        // reset were dropped, declared_body would still be Some(3) from exchange
+        // 1, and 4 > 3 would poison a connection whose exchange 2 has not even
+        // received a response head.
+        assert_eq!(ledger.begin_request(), Ok(()));
+        assert_eq!(
+            ledger.response_body_bytes(4),
+            Ok(()),
+            "a reused ledger must not inherit exchange 1's declared body length"
+        );
+    }
+
+    #[test]
+    fn second_exchange_resets_received_body() {
+        // Pins begin_request's reset of `received_body` to 0. Both exchanges
+        // declare the same length, so a stale, un-reset count from exchange 1
+        // pushes exchange 2 over its own freshly declared length on exchange 2's
+        // very first body chunk.
+        let mut ledger = ExchangeLedger::new();
+
+        assert_eq!(ledger.begin_request(), Ok(()));
+        ledger.request_body_written();
+        assert_eq!(
+            ledger.response_head(ResponseFraming::Exact { len: 5 }),
+            Ok(())
+        );
+        assert_eq!(ledger.response_body_bytes(5), Ok(()));
+        assert_eq!(ledger.response_complete(), Ok(()));
+        assert!(ledger.may_pool());
+
+        assert_eq!(ledger.begin_request(), Ok(()));
+        ledger.request_body_written();
+        assert_eq!(
+            ledger.response_head(ResponseFraming::Exact { len: 5 }),
+            Ok(())
+        );
+        assert_eq!(
+            ledger.response_body_bytes(5),
+            Ok(()),
+            "a reused ledger must not inherit exchange 1's received body count"
+        );
+        assert_eq!(ledger.response_complete(), Ok(()));
+        assert!(ledger.may_pool());
+        assert_eq!(ledger.requests_sent(), 2);
+        assert_eq!(ledger.responses_received(), 2);
     }
 
     /// Drives a fresh ledger, through the public API only, to exactly `Poisoned(reason)`
@@ -682,12 +822,32 @@ mod tests {
     fn poison_is_terminal_and_first_reason_wins() {
         // Edge case 21 helper, declared first so it reads as a top-level fixture rather
         // than an item wedged between statements. A poison recorded through a &mut
-        // borrow is visible to the owner. `ExchangeLedger` is Clone but not Copy
-        // specifically so that a forwarding loop written to take it by value cannot
-        // compile; if that constraint were ever relaxed and `anomaly` started operating
-        // on a temporary copy instead of the caller's own ledger, the assertion at the
-        // end of this test is what would notice, and it is the difference between a
-        // poisoned connection being closed and it being handed to the next user.
+        // borrow is visible to the owner: mutating through `&mut ExchangeLedger`
+        // always mutates the caller's own value, regardless of whether the type is
+        // `Copy`, since `Copy` only governs what happens at a MOVE (whether the
+        // bits are duplicated or the original becomes unusable), and this helper
+        // never moves its argument at all.
+        //
+        // A previous version of this comment claimed that if `ExchangeLedger` ever
+        // became `Copy` and `anomaly` started operating on a temporary copy, "the
+        // assertion at the end of this test is what would notice". That was wrong,
+        // and review finding 2 on PR 843 caught it empirically: adding `Copy` to
+        // the derive above leaves this test, and every other test in this file,
+        // green, because `anomaly`'s signature is `&mut ExchangeLedger` either way
+        // and a reference cannot silently turn into a by-value copy without the
+        // call site changing. What `Copy` actually breaks is a forwarding loop
+        // that takes `ExchangeLedger` BY VALUE (`fn relay(mut ledger:
+        // ExchangeLedger, ..)`, see the type's own doc comment above): such code
+        // compiles today only because the value is moved out of the caller, so
+        // mutating the callee's copy is a compile-visible bug (the caller's ledger
+        // is gone, so it cannot be read again by mistake); the moment the type is
+        // `Copy`, the same code compiles AND silently mutates an implicit
+        // duplicate while the caller's original, still readable, stays untouched.
+        // No test that only ever takes `&mut ExchangeLedger` can observe that
+        // failure mode, because it depends on a call site the ledger's own tests
+        // do not contain. `exchange_ledger_is_not_copy`, below, is the actual
+        // regression test for the `Copy` prohibition: it probes the trait itself
+        // rather than trying to infer it from `&mut` behavior.
         fn anomaly(l: &mut ExchangeLedger) {
             assert_eq!(l.begin_request(), Ok(()));
             // request_body_written is never called: EarlyFinalResponse.
@@ -761,9 +921,160 @@ mod tests {
         );
     }
 
+    /// Whether `ExchangeLedger` implements `Copy`, checked at compile time via
+    /// method resolution rather than at run time.
+    ///
+    /// Review finding 2 on PR 843: acceptance criterion 2 and the first `## Do NOT`
+    /// entry both require that `ExchangeLedger` never derive `Copy`, but stable
+    /// Rust has no negative trait bound, so there is no `where ExchangeLedger:
+    /// !Copy` to write and no way to make `#[derive(Copy)]` on the struct itself
+    /// fail to compile from inside this crate without a proc-macro dependency.
+    ///
+    /// This is the closest available substitute: the same specialization-by-method-
+    /// priority idiom the `impls` crate uses internally (written out here rather
+    /// than taken as a dependency). `Wrapper<T>` gets an INHERENT `is_copy()` from
+    /// `impl<T: Copy> Wrapper<T>`, and a fallback trait-default `is_copy()` from
+    /// `ViaClone`, blanket-implemented for every `Wrapper<T>`. Inherent methods
+    /// always win over trait methods of the same name, unconditionally, so
+    /// `Wrapper::<ExchangeLedger>::is_copy()` resolves to the inherent one when
+    /// `ExchangeLedger: Copy` holds and falls back to the trait default otherwise.
+    ///
+    /// The type MUST be named directly at the call site, not threaded through an
+    /// unconstrained generic function. An earlier version of this probe did exactly
+    /// that (`fn is_copy<T>(value: T) -> bool`), and it was silently useless: Rust
+    /// type-checks a generic function body once, generically, before any concrete
+    /// type is known, so with no `T: Copy` bound in scope the compiler could never
+    /// select the `T: Copy` impl for ANY `T` and the probe always returned `false`,
+    /// Copy or not, with no error to reveal that it was checking nothing. Naming
+    /// `ExchangeLedger` explicitly here (`Wrapper::<ExchangeLedger>::is_copy()`)
+    /// forces resolution against the one, fully concrete type, which is what makes
+    /// the bound decidable at all. This distinction was verified empirically in an
+    /// isolated scratch crate before landing here, in both directions: the
+    /// generic-function form returns `false` unconditionally regardless of `Copy`;
+    /// this form returns `false` today and flips to `true` the moment `Copy` is
+    /// added to the derive above.
+    mod copy_probe {
+        use std::marker::PhantomData;
+
+        use super::ExchangeLedger;
+
+        pub(super) struct Wrapper<T>(PhantomData<T>);
+
+        pub(super) trait ViaClone {
+            fn is_copy() -> bool {
+                false
+            }
+        }
+        impl<T> ViaClone for Wrapper<T> {}
+
+        impl<T: Copy> Wrapper<T> {
+            // Dead by design in the current, correct state: `ExchangeLedger` is
+            // not `Copy`, so this inherent method is never the one selected and
+            // rustc's dead-code lint sees that. It exists to become LIVE, and
+            // this test to start failing, the moment `Copy` is added to the
+            // derive above.
+            #[allow(
+                dead_code,
+                reason = "dead only while ExchangeLedger correctly stays non-Copy; \
+                          becomes the selected method, and this probe's test starts \
+                          failing, the moment Copy is added to its derive"
+            )]
+            pub(super) fn is_copy() -> bool {
+                true
+            }
+        }
+
+        pub(super) type ExchangeLedgerWrapper = Wrapper<ExchangeLedger>;
+    }
+
+    #[test]
+    fn exchange_ledger_is_not_copy() {
+        // This is the actual regression test for acceptance criterion 2 and the
+        // first `## Do NOT` entry. It replaces the reasoning the (now corrected)
+        // comment on `anomaly` above used to rely on: a poison recorded through
+        // `&mut ExchangeLedger` mutates the caller's own value whether or not the
+        // type is `Copy`, so no test built only out of `&mut` calls can tell the
+        // difference. This test asks the type system the question directly instead.
+        //
+        // Proven to catch the regression it exists for: adding `Copy` to
+        // `ExchangeLedger`'s derive list flips this to `true`, failing the
+        // assertion below, while every other test in this file (including
+        // `poison_is_terminal_and_first_reason_wins`'s `anomaly` helper) stays
+        // green, exactly as both PR 843 reviewers measured.
+        use copy_probe::ViaClone as _;
+
+        assert!(
+            !copy_probe::ExchangeLedgerWrapper::is_copy(),
+            "ExchangeLedger must not be Copy: a poison recorded on an implicit \
+             copy leaves the connection's own ledger Clean, and may_pool() \
+             answers true for a connection that should be closed and is not"
+        );
+    }
+
     #[test]
     fn poison_reason_all_has_eight_unique_snake_case_labels() {
+        // Review finding 3 on PR 843: `assert_eq!(PoisonReason::ALL.len(), 8)` is a
+        // type-level tautology, since `ALL` is declared `[PoisonReason; 8]`, and it
+        // cannot enforce that `ALL` covers every variant. The non-emptiness,
+        // charset and uniqueness checks below are all invariant under permuting
+        // labels among variants, so swapping two labels (a real hazard: whoever is
+        // debugging a desyncing origin then chases the wrong condition) leaves them
+        // all passing.
+        //
+        // The two checks added here are the same device
+        // `proxyproto::mod::error_labels_are_unique` uses for `ProxyError`, which
+        // its own comment records caught a real `PathEncodedDot`/`PathEncodedSlash`
+        // label swap: an exhaustive match from variant to position, so `ALL`
+        // omitting or duplicating a variant is a compile error rather than a
+        // silent gap, and an independent oracle for the label itself, derived from
+        // the variant's own `Debug` name rather than comparing `metric_label` to
+        // itself.
+        fn position_of(reason: PoisonReason) -> usize {
+            match reason {
+                PoisonReason::ResponseFramingRefused => 0,
+                PoisonReason::EarlyFinalResponse => 1,
+                PoisonReason::BodyLengthMismatch => 2,
+                PoisonReason::ExchangeCountMismatch => 3,
+                PoisonReason::TrailingBytes => 4,
+                PoisonReason::ClosedInFlight => 5,
+                PoisonReason::CloseDelimitedResponse => 6,
+                PoisonReason::ProtocolAnomaly => 7,
+            }
+        }
+
+        fn snake_case_of_debug_name(name: &str) -> String {
+            let mut out = String::new();
+            for (i, c) in name.chars().enumerate() {
+                if c.is_ascii_uppercase() {
+                    if i != 0 {
+                        out.push('_');
+                    }
+                    out.push(c.to_ascii_lowercase());
+                } else {
+                    out.push(c);
+                }
+            }
+            out
+        }
+
         assert_eq!(PoisonReason::ALL.len(), 8);
+
+        let positions: Vec<usize> = PoisonReason::ALL.iter().copied().map(position_of).collect();
+        assert_eq!(
+            positions,
+            (0..8).collect::<Vec<usize>>(),
+            "PoisonReason::ALL must list every variant exactly once"
+        );
+
+        for reason in PoisonReason::ALL {
+            let want = snake_case_of_debug_name(&format!("{reason:?}"));
+            assert_eq!(
+                reason.metric_label(),
+                want,
+                "{reason:?}'s metric label diverges from its own Debug name"
+            );
+        }
+
         let mut labels: Vec<&'static str> =
             PoisonReason::ALL.iter().map(|r| r.metric_label()).collect();
         for label in &labels {
