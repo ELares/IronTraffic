@@ -720,7 +720,9 @@ pub(crate) fn expand_sha384(prk: &[u8; 48], info: &[u8]) -> [u8; 32] {
     if let Some(head) = t.get(..32) {
         out.copy_from_slice(head);
     }
-    t = [0u8; 48];
+    // (the bare `= [0u8; N]` reassignment that used to be banned here is gone:
+    // rustc rejects it under -D warnings as `value assigned is never read`, and
+    // the pattern that caught it also fired on an ordinary `let mut t = [0u8; 48];`)
     out
 }
 RS

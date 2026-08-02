@@ -2379,11 +2379,42 @@ integer arithmetic instead:
 #     file, not a proof that every wipe in this file is real: it does not
 #     understand Rust's types and cannot follow a call through a level of
 #     indirection (`let f = <[u8]>::fill; f(&mut full, 0);` would not match).
+#     The count check below is what closes the deletion case; the shapes that
+#     survive both halves (copy_from_slice, a helper fn, a renamed local) all
+#     still leave the two required call sites present, so they change HOW the
+#     buffer is wiped rather than WHETHER it is. A bare `= [0u8; N]`
+#     reassignment is deliberately NOT matched here: rustc already rejects it
+#     under the gate's own -D warnings as `value assigned is never read`, and
+#     the pattern that caught it also fired on an ordinary
+#     `let mut t = [0u8; 48];` binding, reporting a plain local as a failed
+#     secret wipe.
 #     It closes the specific regression this review demonstrated by running
 #     it, not every regression shaped like it.
 # ---------------------------------------------------------------------------
-hits="$(scan hkdf-zeroize-not-fill '\b(full|t)\.fill\s*\(|(^|[^[:alnum:]_])(full|t)\s*=\s*\[0u8' rust_files \
+hits="$(scan hkdf-zeroize-not-fill '\b(full|t)\.fill\s*\(' rust_files \
   | grep -E '^crates/irontraffic-tls/src/hkdf\.rs:' || true)"
+
+# THE POSITIVE HALF, and it is the half that matters. The block above is a
+# blacklist, so the cheapest regression of all evades it: DELETING the wipe
+# outright. A reviewer ran that and it compiles clean at -D warnings (rustc
+# even tells you to drop the now-unneeded `mut` and the `Zeroize` import) and
+# reproduces the pre-fix object code exactly, with this rule silent. Six more
+# shapes evade it too, including copy_from_slice, a helper fn in the same
+# file, and renaming the local. Enumerating them is a losing game; requiring
+# the wipe to BE THERE is not. Two call sites, counted.
+wipe_sites=0
+if [ -f crates/irontraffic-tls/src/hkdf.rs ]; then
+  wipe_sites="$(grep -cE '\b(full|t)\.zeroize\s*\(\s*\)' crates/irontraffic-tls/src/hkdf.rs || true)"
+fi
+if [ -f crates/irontraffic-tls/src/hkdf.rs ] && [ "$wipe_sites" -ne 2 ]; then
+  fail hkdf-zeroize-not-fill \
+"crates/irontraffic-tls/src/hkdf.rs must contain exactly two Zeroize wipe call
+sites, \`full.zeroize()\` in extract_sha384 and \`t.zeroize()\` in expand_sha384;
+found $wipe_sites. Forbidding \`.fill(0)\` is not enough on its own, because
+simply DELETING the wipe evades that check, compiles clean, and reproduces the
+unprotected object code. If these functions are legitimately restructured, keep
+a Zeroize call per HMAC output buffer and update this count deliberately." "count=$wipe_sites"
+fi
 [ -n "$hits" ] && fail hkdf-zeroize-not-fill \
 "crates/irontraffic-tls/src/hkdf.rs wipes the HMAC output buffer (locals
 \`full\` and \`t\`) with zeroize::Zeroize::zeroize(): a volatile write plus an
