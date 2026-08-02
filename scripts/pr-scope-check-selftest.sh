@@ -20,6 +20,81 @@
 # repositories with a stubbed `gh`, so it exercises the loop the way CI
 # actually does, the same discipline invariant-lints-selftest.sh and
 # test-census-selftest.sh already apply to their own scripts.
+#
+# ===========================================================================
+# COVERAGE LIMIT (round eleven). Read this before adding a case or trusting
+# a "clean" run. It replaces any earlier impression that this suite sweeps
+# every mutation of scripts/pr-scope-check.sh: it does not, and after round
+# eleven it stops trying to.
+#
+# WHAT IS PINNED BY CONSTRUCTION. Each of these is a specific, checkable
+# claim, not a round-count boast:
+#
+#   - THE NINE KNOWN EXPLOIT VECTORS this PR series exists to close: V1 glob
+#     (case 1), V2 whitespace (case 2), V3 build=Cargo.lock (case 13), V3's
+#     [[bin]] path variant (case 14), V3's build= pointed at the still-
+#     allowlisted crates/<n>/fuzz/Cargo.lock (case 15), V3C rename-hides-
+#     deletion (case 17), V4 [[example]] test=true (case 23), door 2 (case
+#     24) and door 3 (case 25).
+#   - EVERY EXIT SITE ASSERTS ITS OWN EXIT CODE, not merely its printed
+#     text. All 11 `exit 1` refusal sites in scripts/pr-scope-check.sh
+#     (lines 86, 90, 94, 149, 234, 258, 660, 681, 691, 751, 852) were each
+#     flipped to `exit 0` in turn and shown to turn this suite red (round
+#     six); `run_scope` has captured the real exit code, never discarded
+#     it, since.
+#   - ALL 14 ELEMENT-EXPANSION SITES over `changed`/`declared`: the 13
+#     `for x in "${arr[@]}"` loops at lines 251, 632, 640, 653, 764, 768,
+#     785, 790, 802, 817, 824, 876, 879, plus the DECLARED array's own
+#     population (lines 758-761), each shown to reopen a real bypass when
+#     unquoted, one at a time (round seven; cases 1, 2, 10, 19, 20, 48-54
+#     collectively close all 13, plus case 49 for the population site).
+#   - BOTH ALLOWLISTS' ANCHORS AND THEIR PER-ALTERNATIVE COMPONENT TOKENS:
+#     every one of BOT_ALLOWED's eight alternatives (cases 70-88, 94-99)
+#     and ALWAYS_ALLOWED's one (cases 69, 100) has its own leading/trailing
+#     anchor, its own directory and filename literals, and its own dot-
+#     escape pinned by a fixture that shares every OTHER token with a real
+#     allowlisted path and differs in only the one token being tested.
+#   - BOTH GREP CALL-SITE FLAGS: the two `grep -qE "$VAR"` call sites gating
+#     BOT_ALLOWED and ALWAYS_ALLOWED are each pinned against silently
+#     becoming case-insensitive (cases 101, 102).
+#   - BOTH DIRECTORY-DECLARATION ARMS (the `ok` arm at line 826 and its
+#     `cargo_lock_exempt` sibling at line 792): each is pinned against a
+#     total collapse (cases 103, 104) AND against relaxing its PREFIX test
+#     to a SUBSTRING test (cases 106, 107).
+#   - THE VACUITY GUARD (the `_finish` EXIT trap plus `CASES_FLOOR`, below)
+#     and the NOTE_COUNT/`NOTE_FLOOR` guard below it: both are measured
+#     directly against this exact committed file, not asserted -- see the
+#     line-by-line boundary search in the comment above `CASES_FLOOR` and
+#     the watched-to-fire note above `NOTE_FLOOR`.
+#
+# WHAT IS NOT, AND WHY NO FUTURE ROUND SHOULD TRY TO MAKE IT SO. This suite
+# does NOT claim that every one-token relaxation of BOT_ALLOWED or
+# ALWAYS_ALLOWED dies. Round ten mechanically enumerated four relaxation
+# operators (escape-strip, whole-component-widen, suffix-widen, anchor-
+# drop); round eleven's own independent review enumerated nine (those four
+# plus single-char-widen, char-optional, quantifier-widen, class-widen and
+# insert-optional), found 644 one-token relaxations of the two allowlists
+# and the two grep call sites, and 524 of them survived -- almost entirely
+# ones outside whichever operator list a round had actually swept. The one-
+# token relaxation space of a regex is not enumerable by construction the
+# way a fixed list of exploit vectors or loop sites is: a twelfth round
+# could define a tenth or fifteenth operator and enumerate a larger space
+# again. Chasing that space to zero survivors is therefore not a reachable
+# goal, and this suite stops treating it as one after round eleven's review
+# reproduced round nine's own "pinned the list, not the space" defect one
+# level up, on OPERATORS instead of mutants (see the ROUND ELEVEN comment
+# ahead of case 105 for the specific, semantic gaps that round closed
+# instead of chasing a tenth operator).
+#
+# WHAT TO DO INSTEAD. When BOT_ALLOWED, ALWAYS_ALLOWED, or either directory-
+# declaration arm changes, add a case for the SPECIFIC PROPERTY the change
+# is about -- the new alternative's own anchors and component tokens, or the
+# new arm's own prefix-vs-substring boundary -- the same way cases 70-108 do
+# for every alternative and arm that already exists. Do not launch another
+# operator sweep expecting to reach zero survivors: the two rounds that
+# tried each found a larger space than the round before it, and there is no
+# reason to expect a third attempt would end differently.
+# ===========================================================================
 
 # Vacuity guard (round seven, hardened round eight, RE-HARDENED round ten,
 # BLOCKING). Nothing previously counted how much of this file actually RAN:
@@ -83,7 +158,7 @@
 # also be the first character of the file. This is a claim about WHERE the
 # residual gap is, not an assertion that there is none, and it is measured
 # below, not merely asserted.
-CASES_FLOOR=111
+CASES_FLOOR=115
 DONE=0
 CASES_FILE=""
 WORK=""
@@ -219,7 +294,7 @@ note() { printf '  %s\n' "$1"; }
 # single `note` call) and this guard fires; CASES_FLOOR above does not, for
 # the reason this guard exists.
 NOTE_COUNT="$(git show HEAD:scripts/pr-scope-check-selftest.sh | grep -c '^[[:space:]]*note "' || true)"
-NOTE_FLOOR=135
+NOTE_FLOOR=142
 if [ "$NOTE_COUNT" -lt "$NOTE_FLOOR" ]; then
   echo "pr-scope-check-selftest: FAILED. Only $NOTE_COUNT note() call site(s) found in the" >&2
   echo "committed file (expected at least $NOTE_FLOOR). A case whose run_scope call survives" >&2
@@ -4392,7 +4467,10 @@ fi
 # (every `grep -qE "$VAR"` call site gating one of these two allowlists,
 # found by grepping the script, not guessed) and the directory-declaration
 # arm (every occurrence of the `*/) case "$f" in "$d"*) <var>=1;; esac ;;`
-# shape, likewise grepped, not hand-listed); cases 101-103 close those.
+# shape, likewise grepped, not hand-listed); cases 101-104 close those
+# (101-102 the two case-sensitivity call sites, 103-104 the two directory-
+# declaration arms; the previous version of this comment said "101-103" and
+# undercounted its own work by one case).
 # ---------------------------------------------------------------------------
 
 # ---------------------------------------------------------------------------
@@ -4988,6 +5066,355 @@ elif ! echo "$OUT104" | grep -qxF '    Cargo.lock'; then
   FAILED=1
 else
   note "root Cargo.lock stays undeclared when the only declared directory covers no manifest in this diff (pins the cargo_lock_exempt arm's own prefix test)"
+fi
+
+# ---------------------------------------------------------------------------
+# ROUND ELEVEN: three SEMANTIC gaps closed, not more mutation-counting
+# (round eleven's own independent review, BLOCKING x2 + SHOULD_FIX x1 folded
+# in). Round ten's own reviewer, one level up from round nine's, mechanically
+# enumerated NINE operators (round ten's own four, plus single-char-widen,
+# char-optional, quantifier-widen, class-widen and insert-optional) and found
+# 644 one-token relaxations of BOT_ALLOWED, ALWAYS_ALLOWED and the two grep
+# call sites, of which 524 survived. The survivors partitioned EXACTLY on
+# which of round ten's four operators could produce them: 0 of 33 for the
+# four it implemented, 421 of 454 for the five it never implemented. That is
+# round nine's own "a list, not a space" defect, reproduced one level up, on
+# OPERATORS instead of mutants -- and there is no principled ninth-operator
+# stopping point either: a twelfth round could define fifteen operators and
+# enumerate a larger space still. Chasing operator completeness is therefore
+# NOT what cases 105-108 below do; see this file's own header comment (above
+# `CASES_FLOOR`) for the coverage limit this suite states instead of another
+# operator sweep. What follows are the specific relaxations round eleven's
+# review proved are REAL, distinct properties nobody had pinned, not
+# artifacts of which operator list happened to produce them:
+#
+#   - CORRECTION TO THE ROUND TEN COMMIT RECORD (1afaa52). That commit's own
+#     message claimed its 49 BOT_ALLOWED + 6 ALWAYS_ALLOWED mutants were "a
+#     superset of round nine's 9" named survivors. That is false, and
+#     demonstrably so: round nine's own named mutant "a6b" relaxes
+#     `\.github/dependabot\.yml` to `\.github/dependabot\.ya?ml`, an
+#     INSERT-OPTIONAL mutation (a new optional atom appears where the
+#     literal previously had none). Round ten's generator implements exactly
+#     four operators -- escape-strip, whole-component-widen, sub-literal
+#     suffix-widen, anchor-drop -- every one of which only ever DELETES or
+#     WIDENS an atom already present; none of them can INSERT a new one, so
+#     "a6b" was never a candidate that generator could produce, let alone a
+#     member of a 49-mutant superset containing it. It survived, unnoticed,
+#     from round nine straight through round ten's own verification. Case
+#     105 below closes it. This paragraph is the correction; the commit that
+#     made the false claim is already on this branch and is not being
+#     rewritten, the same "correct forward, do not rewrite the record to
+#     look prescient" convention pr-scope-check.sh's own "ROUND TWO
+#     CORRECTIONS" comment already applies to itself.
+#
+#   - BOTH DIRECTORY-DECLARATION ARMS REMAIN UNPINNED AGAINST PREFIX-TO-
+#     SUBSTRING (cases 106 and 107). Round ten closed the TOTAL COLLAPSE of
+#     both `*/) case "$f" in "$d"*) <var>=1;; esac ;;` arms (cases 103 and
+#     104: `*/) ok=1 ;;` or `*/) cargo_lock_exempt=1 ;;` outright), which was
+#     the right fix for the mutant round nine actually named, and credit
+#     stands for finding the unnamed `cargo_lock_exempt` sibling by grepping
+#     the shape rather than the finding. But every fixture in cases 65-68,
+#     103 and 104 uses a path that either IS under the declared directory or
+#     shares NOTHING with it at all, so none of them can tell a PREFIX test
+#     apart from a SUBSTRING test: `case "$f" in "$d"*)` relaxed to
+#     `case "$f" in *"$d"*)`, one token, survives on both arms. An issue
+#     declaring `docs/` then wrongly covers `evil/docs/payload.rs` (case
+#     106, the `ok` arm) or lets `evil/docs/Cargo.toml` silently forgive the
+#     root `Cargo.lock` from needing its own declaration (case 107, the
+#     `cargo_lock_exempt` arm). Both are the identical rule-only-where-
+#     another-refuses shape round nine itself named.
+#
+#   - SHOULD_FIX, folded in now rather than deferred another round (case
+#     108): round nine's own NOTE said adding "package" to the Python
+#     engine's `DEP_TABLE_NAMES` tuple flips one `target.<cfg>.package`
+#     table from refused to exempt with nothing observing it. Round eleven's
+#     review measured the actual blast radius: the WHOLE `is_dep_table_path`
+#     membership predicate at line 497 was unobserved by any case, not just
+#     that one entry, including a collapse to unconditional True and a widen
+#     of `path[0] == "target"` to also admit "profile". Case 108 exercises
+#     `target.'cfg(unix)'.package`, `.workspace` and `.bin` (each pins
+#     `DEP_TABLE_NAMES` against gaining that name, and together pin the
+#     predicate against the unconditional-True collapse) plus
+#     `profile.dev.dependencies` (pins `path[0] == "target"` against
+#     widening). The `len(path) == 3` to `>= 3` mutant round nine already
+#     proved unreachable is left alone, as round nine and round eleven's
+#     review both concluded.
+#
+#   NOT fixed here, and why: round eleven's review also reported two further
+#   SURVIVED verdicts in the same battery as the directory-arm finding above
+#   -- the `cargo_lock_exempt` loop's own EXACT-match branch
+#   (`[ "$f" = "$d" ]`) relaxed to a prefix test, and the nested-lockfile
+#   sibling check (`[ "$d" = "$sibling" ]`) relaxed the same way. Both
+#   require a declared path that is a proper PREFIX of a real manifest path
+#   while not equalling it (e.g. an issue declaring the literal file
+#   `crates/pol/Cargo.tom`, one byte short of a real manifest name) to do
+#   anything at all; every constructed discriminator for either one needs an
+#   issue's Files table to already contain a malformed or truncated path,
+#   not an ordinary directory declaration like `docs/`. That is a materially
+#   different, weaker precondition than "declare a directory, get a
+#   substring match anywhere in the tree" (cases 106 and 107's actual,
+#   ordinary-looking trigger), and chasing it now would be exactly the
+#   unbounded one-token-operator pursuit this round's header change exists
+#   to stop rather than extend. Left open rather than asserted closed.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# 105. BOT_ALLOWED sweep, \.github/dependabot\.yml, INSERT-OPTIONAL token
+#      (round nine's own named mutant "a6b", closed by round eleven,
+#      BLOCKING). Round ten's four operators -- escape-strip, whole-
+#      component-widen, suffix-widen and anchor-drop -- can only ever DELETE
+#      or WIDEN an atom already present in the pattern; none of them can
+#      INSERT a brand new optional atom into a literal run, so relaxing
+#      `\.github/dependabot\.yml` to `\.github/dependabot\.ya?ml` was never
+#      in the swept set of 49 and survived undetected through round ten's
+#      own verification (see the ROUND ELEVEN correction above this case).
+#      `.github/dependabot.yaml` is a file GitHub's own dependabot service
+#      never reads (it only ever loads `.github/dependabot.yml`), so its
+#      content is completely unreviewed by anything upstream of this check;
+#      the CURRENT regex already refuses it correctly, so this case needed
+#      only WRITING, not a code change.
+# ---------------------------------------------------------------------------
+D105="$WORK/bot-allowed-a6-dependabot-yaml-insert-optional"
+new_repo "$D105"
+mkdir -p "$D105/.github"
+printf 'placeholder\n' > "$D105/README.md"
+commit_all "$D105" base
+git -C "$D105" checkout -qb pr
+printf 'attacker-controlled, GitHub never reads this filename\n' > "$D105/.github/dependabot.yaml"
+commit_all "$D105" attack
+fake_gh 'dependabot[bot]' ''
+echo "== BOT_ALLOWED sweep (.github/dependabot.yml, insert-optional 'a' before ml): dependabot.yaml must be refused =="
+OUT105="$(run_scope "$D105")" && RC105=0 || RC105=$?
+if [ "$RC105" -eq 0 ]; then
+  echo "FAIL: case 105 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT105" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT105" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: .github/dependabot.yaml was reported EXEMPT. Got:"
+  echo "$OUT105" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT105" | grep -qF '.github/dependabot.yaml'; then
+  echo "FAIL: refused, but .github/dependabot.yaml was not named among the offending paths. Got:"
+  echo "$OUT105" | sed 's/^/    /'
+  FAILED=1
+else
+  note "dependabot.yaml (a file GitHub's dependabot never reads) is refused (pins the literal extension against an inserted optional 'a', round nine's own a6b)"
+fi
+
+# ---------------------------------------------------------------------------
+# 106. The directory-declaration arm's own PREFIX test, not merely that it
+#      is non-empty (round eleven, BLOCKING). Case 103 closed the TOTAL
+#      COLLAPSE of line 826 (`*/) ok=1 ;;`) but its fixture,
+#      `evil/payload.rs`, contains the declared token "docs/" NOWHERE in its
+#      own path, so it cannot tell a PREFIX test (`case "$f" in "$d"*)`)
+#      apart from a SUBSTRING test (`case "$f" in *"$d"*)`): both correctly
+#      refuse a path that shares nothing with the declaration at all. This
+#      fixture's path contains "docs/" as a substring but not as a prefix,
+#      so the real prefix test refuses it while a substring relaxation of
+#      that identical line would wrongly accept it.
+# ---------------------------------------------------------------------------
+D106="$WORK/dir-declaration-arm-prefix-not-substring"
+new_repo "$D106"
+mkdir -p "$D106/docs" "$D106/evil/docs"
+printf 'orig\n' > "$D106/docs/x.md"
+commit_all "$D106" base
+git -C "$D106" checkout -qb pr
+printf 'changed\n' > "$D106/docs/x.md"
+printf 'attacker-controlled; contains "docs/" as a substring, not a prefix\n' > "$D106/evil/docs/payload.rs"
+commit_all "$D106" implement
+fake_gh 'coder-agent' 'Closes #5' '## Files
+
+| Path | Action | Purpose |
+| --- | --- | --- |
+| `docs/` | modify | a directory declaration; only files PREFIXED by it are covered |
+'
+echo "== directory-declaration arm: a path that merely CONTAINS the declared directory must still be refused =="
+OUT106="$(run_scope "$D106")" && RC106=0 || RC106=$?
+if [ "$RC106" -eq 0 ]; then
+  echo "FAIL: case 106 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT106" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT106" | grep -qF 'pr-scope-check: the diff matches issue'; then
+  echo "FAIL: evil/docs/payload.rs, which merely CONTAINS docs/ as a substring, rode the directory declaration. Got:" >&2
+  echo "$OUT106" | sed 's/^/    /' >&2
+  FAILED=1
+elif ! echo "$OUT106" | grep -qxF '    evil/docs/payload.rs'; then
+  echo "FAIL: refused, but evil/docs/payload.rs was not named among the undeclared paths. Got:"
+  echo "$OUT106" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a path that contains the declared directory as a substring, not a prefix, is refused (pins the arm as a PREFIX test, not a substring test)"
+fi
+
+# ---------------------------------------------------------------------------
+# 107. The SIBLING directory-declaration arm's own PREFIX test, in the
+#      cargo_lock_exempt loop at line 792 -- the same gap as case 106, one
+#      line away (round eleven, BLOCKING). Case 104 closed this arm's TOTAL
+#      COLLAPSE but declared a directory that shares no substring at all
+#      with the manifest path it changed, so it cannot tell a prefix test
+#      apart from a substring one either. Here the issue declares `docs/`
+#      and the PR changes `evil/docs/Cargo.toml` -- undeclared either way,
+#      by the untouched arm at line 826 -- alongside the root `Cargo.lock`.
+#      The real prefix test leaves `cargo_lock_exempt` at 0 (the manifest is
+#      NOT under `docs/`), so `Cargo.lock` is ALSO listed as undeclared. A
+#      substring relaxation of line 792 alone would wrongly set
+#      `cargo_lock_exempt=1` (the manifest's path merely CONTAINS "docs/"),
+#      making `Cargo.lock` silently vanish from that list even though the
+#      overall exit code stays nonzero for the unrelated reason that the
+#      manifest itself is still refused by the untouched arm -- exactly the
+#      "still red, but for a narrower reason than it looks" shape this whole
+#      round exists to catch.
+# ---------------------------------------------------------------------------
+D107="$WORK/cargo-lock-exempt-arm-prefix-not-substring"
+new_repo "$D107"
+mkdir -p "$D107/docs" "$D107/evil/docs"
+printf 'orig\n' > "$D107/docs/x.md"
+printf 'placeholder\n' > "$D107/Cargo.lock"
+commit_all "$D107" base
+git -C "$D107" checkout -qb pr
+printf 'changed\n' > "$D107/docs/x.md"
+printf 'attacker-controlled; not under docs/, merely contains it\n' > "$D107/evil/docs/Cargo.toml"
+printf 'bumped\n' > "$D107/Cargo.lock"
+commit_all "$D107" implement
+fake_gh 'coder-agent' 'Closes #5' '## Files
+
+| Path | Action | Purpose |
+| --- | --- | --- |
+| `docs/` | modify | a directory declaration that shares a substring with, but does not cover, evil/docs/ |
+'
+echo "== cargo_lock_exempt arm: a manifest that merely CONTAINS the declared directory must not forgive Cargo.lock =="
+OUT107="$(run_scope "$D107")" && RC107=0 || RC107=$?
+if [ "$RC107" -eq 0 ]; then
+  echo "FAIL: case 107 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT107" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT107" | grep -qF 'pr-scope-check: the diff matches issue'; then
+  echo "FAIL: root Cargo.lock, alongside a manifest that merely contains docs/, rode the declaration. Got:" >&2
+  echo "$OUT107" | sed 's/^/    /' >&2
+  FAILED=1
+elif ! echo "$OUT107" | grep -qxF '    Cargo.lock'; then
+  echo "FAIL: refused, but root Cargo.lock was not named among the undeclared paths, meaning cargo_lock_exempt was wrongly set. Got:"
+  echo "$OUT107" | sed 's/^/    /'
+  FAILED=1
+else
+  note "root Cargo.lock stays undeclared when the only manifest change merely CONTAINS the declared directory as a substring (pins the cargo_lock_exempt arm as a PREFIX test, not a substring test)"
+fi
+
+# ---------------------------------------------------------------------------
+# 108. SHOULD_FIX, folded in: the `target.<cfg>.<name>` dependency-table
+#      membership test in the Python engine (round eleven; round nine's own
+#      NOTE understated this as one entry, "package", when the whole
+#      predicate at `is_dep_table_path`, line 497, was unobserved). This
+#      fixture packs four independent probes into one manifest:
+#      `target.'cfg(unix)'.package`, `.workspace` and `.bin` (each pins
+#      `DEP_TABLE_NAMES` against gaining that entry; together they also pin
+#      the predicate against collapsing to unconditional True, since a
+#      collapsed predicate would wrongly admit all three probes at once) and
+#      `profile.dev.dependencies` (pins `path[0] == "target"` against
+#      widening to also admit "profile"). Each table's only change from base
+#      to head is one already-present key's value -- the identical shape a
+#      REAL dependency-table entry is allowed to change -- so the point
+#      being pinned is specifically that these four tables are NOT
+#      recognised as dependency tables, and that narrow a change must still
+#      be refused there.
+# ---------------------------------------------------------------------------
+D108="$WORK/manifest-target-cfg-membership"
+new_repo "$D108"
+cat > "$D108/Cargo.toml" <<'BASETOML108'
+[package]
+name = "pol"
+version = "0.1.0"
+
+[dependencies]
+serde = "1.0"
+
+[target.'cfg(unix)'.package]
+extra = "1.0"
+
+[target.'cfg(unix)'.workspace]
+extra = "1.0"
+
+[target.'cfg(unix)'.bin]
+extra = "1.0"
+
+[profile.dev.dependencies]
+extra = "1.0"
+BASETOML108
+printf 'placeholder\n' > "$D108/README.md"
+commit_all "$D108" base
+git -C "$D108" checkout -qb pr
+cat > "$D108/Cargo.toml" <<'HEADTOML108'
+[package]
+name = "pol"
+version = "0.1.0"
+
+[dependencies]
+serde = "1.0"
+
+[target.'cfg(unix)'.package]
+extra = "2.0"
+
+[target.'cfg(unix)'.workspace]
+extra = "2.0"
+
+[target.'cfg(unix)'.bin]
+extra = "2.0"
+
+[profile.dev.dependencies]
+extra = "2.0"
+HEADTOML108
+commit_all "$D108" attack
+fake_gh 'dependabot[bot]' ''
+echo "== manifest engine: target.<cfg>.<name> and profile.<cfg>.dependencies membership must be refused =="
+OUT108="$(run_scope "$D108")" && RC108=0 || RC108=$?
+if [ "$RC108" -eq 0 ]; then
+  echo "FAIL: case 108 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT108" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT108" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: a target.<cfg>.<name>/profile.<cfg>.dependencies mutant let the whole PR through as EXEMPT. Got:" >&2
+  echo "$OUT108" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if ! echo "$OUT108" | grep -qF 'target.cfg(unix).package.extra'; then
+  echo "FAIL: refused, but target.'cfg(unix)'.package's change was not named among the offenses. Got:"
+  echo "$OUT108" | sed 's/^/    /'
+  FAILED=1
+else
+  note "target.'cfg(unix)'.package is refused (pins DEP_TABLE_NAMES against gaining 'package')"
+fi
+if ! echo "$OUT108" | grep -qF 'target.cfg(unix).workspace.extra'; then
+  echo "FAIL: refused, but target.'cfg(unix)'.workspace's change was not named among the offenses. Got:"
+  echo "$OUT108" | sed 's/^/    /'
+  FAILED=1
+else
+  note "target.'cfg(unix)'.workspace is refused (pins DEP_TABLE_NAMES against gaining 'workspace')"
+fi
+if ! echo "$OUT108" | grep -qF 'target.cfg(unix).bin.extra'; then
+  echo "FAIL: refused, but target.'cfg(unix)'.bin's change was not named among the offenses. Got:"
+  echo "$OUT108" | sed 's/^/    /'
+  FAILED=1
+else
+  note "target.'cfg(unix)'.bin is refused (pins DEP_TABLE_NAMES against gaining 'bin'; together with the two probes above, pins the membership predicate against collapsing to unconditional True)"
+fi
+if ! echo "$OUT108" | grep -qF 'profile.dev.dependencies.extra'; then
+  echo "FAIL: refused, but profile.dev.dependencies's change was not named among the offenses. Got:"
+  echo "$OUT108" | sed 's/^/    /'
+  FAILED=1
+else
+  note "profile.dev.dependencies is refused (pins path[0] == target against widening to admit profile as well)"
 fi
 
 # 47. Each of the three required environment variables must fail this script
