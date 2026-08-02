@@ -18,6 +18,7 @@ pub mod grpc;
 pub mod grpc_mode;
 pub mod http;
 pub mod schedule;
+pub mod scheduler;
 pub mod tcp;
 pub mod wheel;
 
@@ -34,6 +35,7 @@ pub use schedule::{
     CheckOutcome, EndpointSchedule, FailKind, HealthCheckConfig, IntervalState, Transition,
     phase_ms,
 };
+pub use scheduler::{CheckOrder, CheckReport, HealthScheduler, PollStats, SchedulerStats};
 pub use tcp::{CompiledTcpCheck, TcpCheckCodec, TcpCheckSpec};
 pub use wheel::TimerWheel;
 
