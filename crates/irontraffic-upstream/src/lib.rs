@@ -25,19 +25,24 @@
 //! (including 169.254.169.254), and private ranges are otherwise reachable through us.
 
 mod connector;
+pub mod ewma;
 pub mod health;
 pub mod identity;
 pub mod registry;
 pub mod stats;
+pub mod sync;
 
 pub use connector::{ConnectError, SingleUpstream};
+pub use ewma::{
+    EwmaCfg, MAX_RTT_MS, MIN_RTT_MS, decay_factor, exp_neg, pack, peak_ewma_step, unpack,
+};
 pub use health::EndpointHealth;
 pub use identity::{EndpointAddr, EndpointIdentity, MAX_IDENTITY_BYTES};
 pub use registry::{
     DEFAULT_CAPACITY, EndpointId, EndpointRegistry, EndpointRegistryWriter, MAX_CAPACITY,
     RECYCLE_BATCH, RECYCLE_GRACE_GENERATIONS, RECYCLE_GRACE_MS, RegistryError,
 };
-pub use stats::EndpointStats;
+pub use stats::{ConnGuard, CostCtx, EndpointStats, InflightGuard, order_key};
 
 /// Milliseconds since process start, as produced by `irontraffic_time`'s
 /// `CoarseMono`.
