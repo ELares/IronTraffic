@@ -2349,8 +2349,10 @@ integer arithmetic instead:
 
 # ---------------------------------------------------------------------------
 # 28. hkdf-zeroize-not-fill: the HKDF key-schedule wipe in hkdf.rs must be a
-#     real Zeroize call, not a plain `.fill(0)` or a bare `= [0u8; N]`
-#     reassignment that a compiler is free to treat as dead-store elimination.
+#     real Zeroize call, not a plain `.fill(0)`, and it must actually BE
+#     THERE: deleting it, hiding it in a #[cfg(test)] block, spelling it out
+#     only in a comment or a string literal, or moving the file it lives in
+#     must all still fail this rule.
 #
 #     WHY THIS EXISTS (review of PR 839, review-zeroize.json finding 2). The
 #     guarantee that `extract_sha384` and `expand_sha384` wipe the HMAC output
@@ -2365,6 +2367,42 @@ integer arithmetic instead:
 #     code emitted zero key-schedule wipe instructions for either function. A
 #     green gate that cannot see this regression is exactly how it got here.
 #
+#     HARDENED AGAIN (review-delta2.json, three BLOCKING findings against the
+#     first version of the positive check below, all reproduced directly
+#     against this repository before being fixed, not taken on faith):
+#       1. The count was `grep -cE` on the real, checked-out file: line-based
+#          and blind to comments, string literals, and #[cfg(test)]. Prefixing
+#          both real `.zeroize()` calls with `// ` (and then dropping the now-
+#          unneeded `mut` and `Zeroize` import, exactly as rustc's own warning
+#          suggests) left the unprotected object code this rule exists to
+#          catch, at `invariant-lints: clean`, clippy `-D warnings` exit 0, and
+#          the KAT passing. So did moving both real calls into a
+#          `#[cfg(test)] mod tests` block on throwaway locals, and so did
+#          replacing each call with a string literal spelling it out.
+#       2. Both halves were guarded by `[ -f crates/.../hkdf.rs ]`, so moving
+#          the file (for example to hkdf/mod.rs, a plausible, entirely
+#          innocent restructuring) made the guard false and this whole rule
+#          report nothing at all. A blacklist failing open on a rename only
+#          loses one shape of detection; a POSITIVE requirement failing open
+#          on a rename loses the entire guarantee, silently.
+#       3. The comment claiming a bare `= [0u8; N]` reassignment is skipped
+#          because rustc already rejects it as `value assigned is never read`
+#          named the wrong diagnostic: `full`/`t` are
+#          `hybrid_array::Array<u8, U48>`, not `[u8; N]`, so a bare array
+#          literal reassignment is `error[E0308]: mismatched types`, a hard
+#          type error at any warning level. The `unused_assignments` diagnostic
+#          named in the old comment is real, but belongs to the `.into()` form
+#          (`= [0u8; 48].into();`), which does compile. Both were reproduced
+#          directly against this crate (`cargo clippy -p irontraffic-tls --lib
+#          --no-default-features --features crypto-ring -- -D warnings`)
+#          before writing this comment: the bare form gives two `E0308`s and
+#          zero `unused_assignments` diagnostics; the `.into()` form gives the
+#          reverse. The conclusion the old comment drew (dropping the
+#          alternative loses no coverage) was correct; only the mechanism was
+#          wrong. Neither shape needs a rule of its own either way: the bare
+#          form never reaches a build, and the `.into()` form is already a
+#          hard error under this gate's own `-D warnings`.
+#
 #     SCOPE. This targets only the two local names this file's own two wipe
 #     sites use today (`full` in extract_sha384, `t` in expand_sha384), and
 #     only in this one file: a workspace-wide ban on `.fill(` would forbid
@@ -2375,21 +2413,27 @@ integer arithmetic instead:
 #     h2load-no-float above already use for a property that only matters in
 #     one specific place.
 #
-#     KNOWN LIMIT, STATED HONESTLY. This is a plain grep restricted to one
-#     file, not a proof that every wipe in this file is real: it does not
-#     understand Rust's types and cannot follow a call through a level of
-#     indirection (`let f = <[u8]>::fill; f(&mut full, 0);` would not match).
-#     The count check below is what closes the deletion case; the shapes that
-#     survive both halves (copy_from_slice, a helper fn, a renamed local) all
-#     still leave the two required call sites present, so they change HOW the
-#     buffer is wiped rather than WHETHER it is. A bare `= [0u8; N]`
-#     reassignment is deliberately NOT matched here: rustc already rejects it
-#     under the gate's own -D warnings as `value assigned is never read`, and
-#     the pattern that caught it also fired on an ordinary
-#     `let mut t = [0u8; 48];` binding, reporting a plain local as a failed
-#     secret wipe.
-#     It closes the specific regression this review demonstrated by running
-#     it, not every regression shaped like it.
+#     NO ESCAPE HATCH FOR THE POSITIVE HALF. The `// it-allow:` marker below
+#     suppresses only the `.fill(` blacklist match on the line that carries
+#     it. It does nothing for the exactly-one-call-site requirement further
+#     down, on purpose: that check is a count, not a per-line match, so there
+#     is no single line to attach a justification to, and a wipe that can be
+#     commented away with a "reason" is not a wipe. Verified directly:
+#     reverting both real calls to `.fill(0)` with a justified `it-allow` on
+#     each line suppresses the blacklist hits and still fails the gate,
+#     because the count sees zero `.zeroize()` sites either way.
+#
+#     KNOWN LIMIT, STATED HONESTLY. Neither half understands Rust's types and
+#     neither can follow a call through a level of indirection (`let f =
+#     <[u8]>::fill; f(&mut full, 0);` would not match the blacklist;
+#     `zeroize::Zeroize::zeroize(&mut full)` -- fully qualified syntax --
+#     would not match the count's method-call shape). The shapes that survive
+#     both halves (copy_from_slice, a helper fn, a renamed local, either of
+#     the two indirections above) all still leave the required call sites
+#     present in some form, so they change HOW the buffer is wiped rather than
+#     WHETHER it is. This closes the specific regressions the two reviews
+#     above demonstrated by running them, not every regression shaped like
+#     them.
 # ---------------------------------------------------------------------------
 hits="$(scan hkdf-zeroize-not-fill '\b(full|t)\.fill\s*\(' rust_files \
   | grep -E '^crates/irontraffic-tls/src/hkdf\.rs:' || true)"
@@ -2401,29 +2445,96 @@ hits="$(scan hkdf-zeroize-not-fill '\b(full|t)\.fill\s*\(' rust_files \
 # reproduces the pre-fix object code exactly, with this rule silent. Six more
 # shapes evade it too, including copy_from_slice, a helper fn in the same
 # file, and renaming the local. Enumerating them is a losing game; requiring
-# the wipe to BE THERE is not. Two call sites, counted.
-wipe_sites=0
-if [ -f crates/irontraffic-tls/src/hkdf.rs ]; then
-  wipe_sites="$(grep -cE '\b(full|t)\.zeroize\s*\(\s*\)' crates/irontraffic-tls/src/hkdf.rs || true)"
-fi
-if [ -f crates/irontraffic-tls/src/hkdf.rs ] && [ "$wipe_sites" -ne 2 ]; then
+# the wipe to BE THERE is not.
+#
+# Counted with rslex.finditer_real (not a plain grep), over the SAME
+# #[cfg(test)]-stripped shadow tree scan_prod uses, for two independent
+# reasons proven above: (1) finditer_real makes a comment, a doc comment, and
+# a string literal opaque, so text that merely SPELLS the call cannot satisfy
+# a count that is supposed to prove the call is real code; (2) reading from
+# the shadow tree rather than the checked-out file means a `#[cfg(test)]`
+# block's own `.zeroize()` calls are already blanked before the count ever
+# sees them, so moving the two real wipes into a test module cannot satisfy
+# it either. The pattern tolerates the rustfmt-adjacent spellings a developer
+# actually produces (a call split across lines after the dot, stray spaces
+# around the dot or inside the parens): `\s` already matches a newline with no
+# extra flag, so `full\n    .zeroize()` and `full . zeroize ( )` both count.
+cat > "$WORK/count_wipe_sites.py" <<'PY'
+import os
+import re
+import sys
+
+sys.path.insert(0, os.environ["WORK"])
+import rslex
+
+FULL = re.compile(r"\bfull\s*\.\s*zeroize\s*\(\s*\)")
+T = re.compile(r"\bt\s*\.\s*zeroize\s*\(\s*\)")
+
+path = sys.argv[1]
+try:
+    text = open(path, encoding="utf-8").read()
+except (OSError, UnicodeDecodeError):
+    print("0 0")
+    sys.exit(0)
+
+full_n = sum(1 for _ in rslex.finditer_real(FULL, text))
+t_n = sum(1 for _ in rslex.finditer_real(T, text))
+print(f"{full_n} {t_n}")
+PY
+build_prod_tree
+hkdf_scoped_rel="crates/irontraffic-tls/src/hkdf.rs"
+if [ ! -f "$PROD_TREE/$hkdf_scoped_rel" ]; then
+  # RENAME/DELETION SAFETY. A positive requirement that silently skips when
+  # its target is missing deletes the entire guarantee, not just one shape of
+  # detection (a blacklist merely fails open on the one thing it was banning;
+  # a "this must be present" check that goes quiet on a missing file reports
+  # clean on a tree with no wipe at all). Verified directly: copying hkdf.rs to
+  # hkdf/mod.rs with both real `.zeroize()` calls deleted, and removing the
+  # original, used to leave `invariant-lints: clean`. Failing here instead
+  # means a genuine, innocent rename of this file requires updating the path
+  # above (owned by this script, not by an implementer) rather than silently
+  # losing the guarantee.
   fail hkdf-zeroize-not-fill \
-"crates/irontraffic-tls/src/hkdf.rs must contain exactly two Zeroize wipe call
-sites, \`full.zeroize()\` in extract_sha384 and \`t.zeroize()\` in expand_sha384;
-found $wipe_sites. Forbidding \`.fill(0)\` is not enough on its own, because
-simply DELETING the wipe evades that check, compiles clean, and reproduces the
-unprotected object code. If these functions are legitimately restructured, keep
-a Zeroize call per HMAC output buffer and update this count deliberately." "count=$wipe_sites"
+"$hkdf_scoped_rel does not exist at the path this rule is scoped to, either
+because it was renamed/moved or because it was deleted. This rule enforces a
+POSITIVE requirement (the wipe must be there), and skipping silently when the
+scoped file is missing would make that requirement evaporate on a rename
+instead of merely failing open on one shape of blacklist evasion. If the code
+genuinely moved, update \`hkdf_scoped_rel\` above to wherever extract_sha384
+and expand_sha384 now live; if it was deleted, the HKDF wipe guarantee needs
+to be re-established somewhere. There is no it-allow escape for this: a
+comment cannot stand in for a file that is not there." "missing: $hkdf_scoped_rel"
+else
+  read -r wipe_full wipe_t <<<"$(python3 "$WORK/count_wipe_sites.py" "$PROD_TREE/$hkdf_scoped_rel" 2>/dev/null)"
+  wipe_full="${wipe_full:-0}"
+  wipe_t="${wipe_t:-0}"
+  if [ "$wipe_full" -ne 1 ] || [ "$wipe_t" -ne 1 ]; then
+    fail hkdf-zeroize-not-fill \
+"$hkdf_scoped_rel must contain exactly one real \`full.zeroize()\` call in
+extract_sha384 and exactly one \`t.zeroize()\` call in expand_sha384; found
+full=$wipe_full t=$wipe_t. Counted with the same comment- and literal-aware
+scanner (rslex.finditer_real) every other rule in this file already uses, over
+the #[cfg(test)]-stripped shadow tree, so neither a call living only in a test
+module nor the call text spelled out in a doc comment or a string literal can
+satisfy this. Forbidding \`.fill(0)\` is not enough on its own, because simply
+DELETING the wipe evades that check, compiles clean, and reproduces the
+unprotected object code. There is no it-allow escape for this count: a wipe
+that can be commented away is not a wipe. If these functions are legitimately
+restructured, keep one Zeroize call per HMAC output buffer and update this
+rule to match." "full=$wipe_full t=$wipe_t"
+  fi
 fi
 [ -n "$hits" ] && fail hkdf-zeroize-not-fill \
 "crates/irontraffic-tls/src/hkdf.rs wipes the HMAC output buffer (locals
 \`full\` and \`t\`) with zeroize::Zeroize::zeroize(): a volatile write plus an
-optimization barrier, specifically because \`.fill(0)\` and a bare
-\`= [0u8; N]\` reassignment are plain, non-volatile stores into a value that
-is dead immediately afterwards, exactly the kind of store a compiler is
-entitled to remove. This was measured, not assumed: reverting to .fill(0)
-compiles, passes every test, and emits NO wipe instructions in the release
-object code. If a real exception exists, say why on the same line:
+optimization barrier, specifically because \`.fill(0)\` is a plain,
+non-volatile store into a value that is dead immediately afterwards, exactly
+the kind of store a compiler is entitled to remove. This was measured, not
+assumed: reverting to .fill(0) compiles, passes every test, and emits NO wipe
+instructions in the release object code. If a real exception exists for using
+\`.fill(0)\` on this specific line instead of \`Zeroize\`, say why on the same
+line; this suppresses only THIS blacklist match, not the exactly-one-call-site
+requirement above, which has no escape:
   // it-allow: hkdf-zeroize-not-fill reason: <why this is not a secret wipe>" "$hits"
 
 # ---------------------------------------------------------------------------
