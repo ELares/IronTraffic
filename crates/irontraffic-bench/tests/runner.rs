@@ -906,23 +906,49 @@ fn unpinned_probe_is_marked_unpublishable() {
     //
     // The replacement keeps the one property this test actually needs (an
     // index invalid on every real host, so `pin_to_core` returns `false`)
-    // while staying nowhere near `CPU_SETSIZE`: one past
-    // `available_parallelism()` is, by definition, one past the highest
-    // index `core_affinity::get_core_ids` (`sched_getaffinity` under the
-    // hood) can ever report as permitted to this process on THIS host, yet
-    // it is still orders of magnitude below 1024 on any real or virtualised
-    // machine, so `CPU_SET`'s indexing never panics and `sched_setaffinity`
-    // itself cleanly rejects the nonexistent core with `EINVAL`
-    // (`set_for_current` returning plain `false`). The `debug_assert!`
-    // below turns "nowhere near" into a checked invariant instead of an
-    // assumption: if it ever fired, this test would be about to
-    // reintroduce the exact out-of-bounds index it exists to rule out.
+    // by deriving it from the exact call the pin itself goes through:
+    // `core_affinity::get_core_ids` reports every core index permitted to
+    // this process (`sched_getaffinity` under the hood, the same set both
+    // `taskset` and the cgroup CPU quota narrow), so one past the HIGHEST
+    // id it reports is, by definition, an index no `sched_setaffinity` call
+    // against this process can ever succeed for.
+    //
+    // Reviewed finding (BLOCKING, round 5): the prior form of this fix used
+    // `available_parallelism() + 1` instead, reasoning that it was "one
+    // past the highest index `core_affinity::get_core_ids` can ever report
+    // as permitted to this process on any real or virtualised host". That
+    // is false: `available_parallelism` returns a COUNT, and it folds in
+    // both `sched_getaffinity` and the cgroup CPU quota, exactly like
+    // `get_core_ids` does, but count + 1 is only "one past the highest
+    // permitted index" when the permitted set is the contiguous run
+    // `0..count`. When it is not, count + 1 lands on a real permitted CPU.
+    // Measured on Ubuntu 6.8 x86_64, 12 cores: unrestricted, this test
+    // passes as intended, but under `taskset -c 0,1` the permitted count is
+    // 2, so the old computation forced core 3, and `sched_setaffinity(cpu=3)`
+    // SUCCEEDS on that 12-core box. The pin this test needs to fail instead
+    // quietly works, `pinned` comes back `true`, and
+    // `unpinned_probe_is_marked_unpublishable` fails at its own
+    // discriminating assertion below for a reason that has nothing to do
+    // with the code under test; `taskset -c 8,9` reproduces the same
+    // failure. `get_core_ids`'s own highest reported id has no such gap: it
+    // is a member of the permitted set by construction, so one past it is
+    // provably outside that set regardless of how sparse or offset the set
+    // is. Still nowhere near `CPU_SETSIZE`: the `debug_assert!` below turns
+    // that into a checked invariant instead of an assumption; if it ever
+    // fired, this test would be about to reintroduce the exact
+    // out-of-bounds index it exists to rule out.
     if !oha_available() {
         return;
     }
-    let out_of_range_core = std::thread::available_parallelism()
-        .map_or(8, std::num::NonZero::get)
-        .saturating_add(1);
+    let highest_permitted_core = core_affinity::get_core_ids()
+        .and_then(|ids| ids.into_iter().map(|id| id.id).max())
+        .expect(
+            "core_affinity::get_core_ids must return Some with at least one entry on both this \
+             crate's deploy target (Linux) and its development host (macOS); see \
+             cores_available_to_pin_rejects_an_index_this_host_does_not_have's own comment in \
+             proc.rs for the same guarantee relied on elsewhere in this crate",
+        );
+    let out_of_range_core = highest_permitted_core + 1;
     debug_assert!(
         out_of_range_core < 1024,
         "the probe's forced-invalid core index ({out_of_range_core}) must stay well inside \
@@ -1611,8 +1637,9 @@ fn teardown_kills_the_whole_process_group() {
         // Binding does not merely observe the port, it briefly TAKES it (the
         // temporary listener is dropped, and so releases it again,
         // immediately after this statement), and the fixture's grandchild
-        // (runner.rs:190) does a single `TcpListener::bind(&bind).expect(...)`
-        // with no retry of its own, so a poll tick that lands inside the
+        // (`FIXTURE_SOURCE`'s own `"listen-forever"` arm, above in this
+        // file) does a single `TcpListener::bind(&bind).expect(...)` with no
+        // retry of its own, so a poll tick that lands inside the
         // grandchild's own bind attempt can win the race and kill it
         // outright: the port then never gets bound at all, this loop burns
         // its whole 10s deadline, and the panic below would misreport a
