@@ -675,6 +675,65 @@ pub async fn bad_pace(interval: Duration) {
 }
 RS
 
+# ---------------------------------------------------------------------------
+# hkdf-zeroize-not-fill (review of PR 839; hardened again by review-delta2.json
+# finding 4): two INDEPENDENT violation shapes in one file, each catchable by
+# a different half of the rule, so a regression in either half is visible on
+# its own rather than only through the other. extract_sha384 reverts its real
+# wipe to a plain `.fill(0)`, the shape the BLACKLIST half
+# (`\b(full|t)\.fill\s*\(`) exists to catch. expand_sha384 goes further: the
+# wipe is not weakened, it is DELETED OUTRIGHT, with no `.fill(` and no
+# `.zeroize()` anywhere, which the blacklist half cannot see at all (there is
+# nothing there for it to match) and only the COUNT half (exactly one real
+# `full.zeroize()`, exactly one real `t.zeroize()`) catches. Both are the same
+# regression a disassembly-level review reconstructed from the pre-fix tree:
+# each compiles, passes every test, and emits no wipe instructions at all in
+# the release object code. See the RAW_A check further down (review-delta2.json
+# finding 4) for why this file demonstrates the count half specifically rather
+# than relying on the rule-name check above to prove it still works.
+# ---------------------------------------------------------------------------
+mkdir -p "$A/crates/irontraffic-tls/src"
+cat > "$A/crates/irontraffic-tls/src/hkdf.rs" <<'RS'
+//! Deliberately violates hkdf-zeroize-not-fill two different ways: one
+//! function reverts its wipe to a plain, non-volatile `.fill(0)` (caught by
+//! the BLACKLIST half); the other deletes its wipe outright, with no
+//! `.fill(` and no `.zeroize()` at all (caught only by the COUNT half).
+use hmac::{Hmac, KeyInit, Mac};
+use sha2::Sha384;
+
+/// The `.fill(0)` shape: exactly the regression a real review caught by
+/// disassembly, which emitted zero wipe instructions in release object code.
+pub(crate) fn extract_sha384(salt: &[u8], ikm: &[u8]) -> [u8; 48] {
+    let Ok(mut mac) = Hmac::<Sha384>::new_from_slice(salt) else {
+        return [0u8; 48];
+    };
+    mac.update(ikm);
+    let mut full = mac.finalize().into_bytes();
+    let mut prk = [0u8; 48];
+    if let Some(head) = full.get(..48) {
+        prk.copy_from_slice(head);
+    }
+    full.fill(0);
+    prk
+}
+
+/// The deleted-wipe shape: no `.fill(` and no `.zeroize()` call at all, which
+/// is invisible to the blacklist above and caught only by the count
+/// requiring exactly one real `t.zeroize()` call site.
+pub(crate) fn expand_sha384(prk: &[u8; 48], info: &[u8]) -> [u8; 32] {
+    let Ok(mut mac) = Hmac::<Sha384>::new_from_slice(prk) else {
+        return [0u8; 32];
+    };
+    mac.update(info);
+    let mut t = mac.finalize().into_bytes();
+    let mut out = [0u8; 32];
+    if let Some(head) = t.get(..32) {
+        out.copy_from_slice(head);
+    }
+    out
+}
+RS
+
 printf '[workspace.dependencies]\nserde = "1"\n' > "$A/Cargo.toml"
 
 EXPECTED='allow-needs-reason
@@ -686,6 +745,7 @@ crate-inherits-workspace
 determinism-seam
 dependency-justification
 framing-fields-confined
+hkdf-zeroize-not-fill
 hot-path-allocation
 hot-path-lock
 interior-mutability
@@ -813,6 +873,76 @@ if [ -n "$MISSING_BENCH_LINES" ]; then
   FAILED=1
 else
   note "all three bench-registration violations (dropped fn, stale fn, ungoverned group) are individually visible"
+fi
+
+# ---------------------------------------------------------------------------
+# review-delta2.json finding 4 (independent review of the hkdf-zeroize-not-fill
+# rewrite): the SET-OF-RULE-NAMES check above cannot tell the COUNT half of
+# hkdf-zeroize-not-fill apart from the BLACKLIST half, because corpus A's
+# extract_sha384 fixture above already fires the rule through `full.fill(0)`
+# on its own; `hkdf-zeroize-not-fill` lands in ACTUAL either way. Deleting the
+# count block entirely from invariant-lints.sh (the `wipe_sites`/`hkdf_scoped_rel`
+# logic) left this whole selftest reporting clean while the real tree, with
+# both real `.zeroize()` calls deleted, went back to `invariant-lints: clean`
+# too: a regression that disables only the count is invisible to the rule-name
+# check, because the surviving blacklist hit on `full.fill(0)` is enough on its
+# own to keep the name in ACTUAL.
+#
+# Grep the RAW per-line output for the count's OWN evidence text instead:
+# "full=0 t=0" is the literal third argument the count's `fail` call passes
+# (see invariant-lints.sh's hkdf-zeroize-not-fill block), produced by no other
+# check in this file, and only reachable because expand_sha384 above has no
+# `.zeroize()` call anywhere (the outright-deletion shape the blacklist half
+# cannot see at all). Verified by running the corpus directly, and by removing
+# the count block and confirming this specific check (not just the rule-name
+# check) is what goes red.
+# ---------------------------------------------------------------------------
+echo "== corpus A: the hkdf-zeroize-not-fill COUNT half must be individually visible =="
+if printf '%s\n' "$RAW_A" | grep -qF "full=0 t=0"; then
+  note "the count half's own evidence (full=0 t=0) is visible, independent of the blacklist hit"
+else
+  echo "FAIL: corpus A's raw output is missing the count half's own evidence line"
+  echo "      (full=0 t=0). The set-of-rule-names check above cannot tell a"
+  echo "      regression that silently disables ONLY the count half (the half"
+  echo "      that catches an outright-deleted wipe) apart from the blacklist"
+  echo "      hit already firing on this same file's .fill(0) shape."
+  FAILED=1
+fi
+
+# ---------------------------------------------------------------------------
+# review-lint-r2.json finding 2 (round three of hkdf-zeroize-not-fill): the
+# mirror image of the check just above. That check proves a regression that
+# silently disables ONLY the count half is visible; this one proves the same
+# for the BLACKLIST half, because the identical blind spot exists in the
+# other direction and nothing above tested for it. Deleting the blacklist
+# entirely from invariant-lints.sh (the `scan hkdf-zeroize-not-fill` call and
+# its `fail` block) left this whole selftest reporting clean: the rule NAME
+# still lands in ACTUAL, and the count check just above still sees "full=0
+# t=0", both for the same reason (neither of corpus A's two functions has a
+# real `.zeroize()` call anywhere, so the count half alone already catches
+# this fixture), so neither existing assertion notices the blacklist is gone.
+#
+# Grep the RAW per-line output for the blacklist's OWN evidence instead: the
+# grep hit line beginning "crates/irontraffic-tls/src/hkdf.rs:20:" is the
+# exact `$hits` text the blacklist's own `fail` call passes as its third
+# argument (see invariant-lints.sh's hkdf-zeroize-not-fill block), produced
+# by no other check in this file, and reachable only because extract_sha384
+# above reverts its wipe to `full.fill(0)`, the specific shape the blacklist
+# exists to name (as opposed to a wipe missing outright, which the count half
+# already covers on its own). Verified by running the corpus directly, and by
+# deleting the blacklist block and confirming this specific check, not the
+# rule-name check and not the count-half check above, is what goes red.
+# ---------------------------------------------------------------------------
+echo "== corpus A: the hkdf-zeroize-not-fill BLACKLIST half must be individually visible =="
+if printf '%s\n' "$RAW_A" | grep -qF "crates/irontraffic-tls/src/hkdf.rs:20:"; then
+  note "the blacklist half's own evidence (hkdf.rs:20: full.fill(0)) is visible, independent of the count half's full=0 t=0"
+else
+  echo "FAIL: corpus A's raw output is missing the blacklist half's own evidence line"
+  echo "      (hkdf.rs:20, the full.fill(0) hit). The count-half check above cannot"
+  echo "      tell a regression that silently disables ONLY the blacklist half apart"
+  echo "      from the count's own full=0 t=0 evidence, which fires on this same"
+  echo "      file regardless of whether the blacklist runs at all."
+  FAILED=1
 fi
 
 # ---------------------------------------------------------------------------
@@ -1644,6 +1774,54 @@ pub fn is_transfer_encoding(k: KnownHeader) -> bool {
 }
 RS
 
+# The genuine hkdf-zeroize-not-fill shape: a real zeroize::Zeroize call on
+# both locals, plus a `let`-initialized zero buffer with a DIFFERENT name
+# (`prk`), proving the rule does not flag ordinary zero-initialization: only a
+# `.fill(` call on `full`/`t` themselves trips the blacklist half, and the
+# count half requires exactly one real `.zeroize()` call per local, which
+# this fixture supplies for both.
+mkdir -p "$B/crates/irontraffic-tls/src"
+cat > "$B/crates/irontraffic-tls/src/hkdf.rs" <<'RS'
+//! The correct hkdf-zeroize-not-fill shape: a real zeroize::Zeroize call on
+//! both HMAC output locals, must not trip the rule.
+use hmac::{Hmac, KeyInit, Mac};
+use sha2::Sha384;
+use zeroize::Zeroize;
+
+/// Wipes the HMAC output buffer for real.
+pub(crate) fn extract_sha384(salt: &[u8], ikm: &[u8]) -> [u8; 48] {
+    let Ok(mut mac) = Hmac::<Sha384>::new_from_slice(salt) else {
+        return [0u8; 48];
+    };
+    mac.update(ikm);
+    let mut full = mac.finalize().into_bytes();
+    // An ordinary `let`-initialized zero buffer under a DIFFERENT name: not
+    // a `.fill(`/`.zeroize()` call on `full` or `t` themselves, and must not
+    // trip the rule either.
+    let mut prk = [0u8; 48];
+    if let Some(head) = full.get(..48) {
+        prk.copy_from_slice(head);
+    }
+    full.zeroize();
+    prk
+}
+
+/// Wipes the second HMAC output buffer for real.
+pub(crate) fn expand_sha384(prk: &[u8; 48], info: &[u8]) -> [u8; 32] {
+    let Ok(mut mac) = Hmac::<Sha384>::new_from_slice(prk) else {
+        return [0u8; 32];
+    };
+    mac.update(info);
+    let mut t = mac.finalize().into_bytes();
+    let mut out = [0u8; 32];
+    if let Some(head) = t.get(..32) {
+        out.copy_from_slice(head);
+    }
+    t.zeroize();
+    out
+}
+RS
+
 # Legitimate, NON-allocating hot-path code that a naive widening of the
 # hot-path-allocation token list would have rejected.
 #
@@ -1880,8 +2058,17 @@ fi
 # Corpus C: the escape hatch. A reason suppresses; a bare marker does not.
 # ---------------------------------------------------------------------------
 C="$WORK/escape"
-mkdir -p "$C/crates/irontraffic-router/src"
+mkdir -p "$C/crates/irontraffic-router/src" "$C/crates/irontraffic-tls/src"
 cp "$B/Cargo.toml" "$C/Cargo.toml"
+# hkdf-zeroize-not-fill's positive half (review-delta2.json finding 2) now
+# FAILS, rather than silently skipping, when
+# crates/irontraffic-tls/src/hkdf.rs is missing, precisely so a rename in the
+# real repository cannot make the guarantee evaporate silently. This corpus
+# asserts "no rule fires at all" below, so it needs the same genuine, clean
+# hkdf.rs corpus B already proves is rule-silent, copied in rather than
+# reinvented, or that positive requirement would fire here for a reason that
+# has nothing to do with what this corpus tests.
+cp "$B/crates/irontraffic-tls/src/hkdf.rs" "$C/crates/irontraffic-tls/src/hkdf.rs"
 cat > "$C/crates/irontraffic-router/src/lib.rs" <<'RS'
 //! Uses the escape hatch correctly.
 /// Parses a value that the caller guarantees is a decimal.

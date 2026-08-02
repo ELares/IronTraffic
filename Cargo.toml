@@ -166,18 +166,65 @@ arc-swap = "1.9.2"
 # HMAC-SHA384, the primitive `irontraffic-tls`'s hand-rolled RFC 5869
 # HKDF-Extract/Expand (`hkdf.rs`) runs over for the cluster-derived TLS session
 # ticket key schedule (`cluster-derived-session-ticketer`, #120). Only
-# `irontraffic-tls` names it.
-hmac = "0.12"
+# `irontraffic-tls` names it. 0.13 is built on `digest` 0.11, which is why
+# `sha2` below must stay on a `digest` 0.11 release too: `Hmac::<Sha384>` needs
+# both crates to agree on which `digest` major they name.
+#
+# The `zeroize` feature forwards to `digest/zeroize`, which does two things for the key
+# schedule in `hkdf.rs`, neither of which is the `hybrid_array::Array` impl the name might
+# suggest: nothing in this workspace's resolved graph turns on hybrid-array's own `zeroize`
+# feature (`cargo tree -e features` still reports `hybrid-array feature "default"` only with
+# this enabled; see `hkdf.rs` for how the explicit wipe there gets a real `Zeroize` anyway).
+# What this feature genuinely buys: `digest/zeroize` forwards on to `block-buffer/zeroize`,
+# so `Sha384`'s internal block buffer is wiped on drop; and it makes `digest::CtOutput` (the
+# type `Hmac::finalize()` returns before `.into_bytes()` clones out of it) zeroize itself on
+# drop instead of leaking that transient copy unwiped.
+#
+# This does NOT also cover `sha2`'s own zeroize-gated code, and an earlier version of this
+# comment said it did; that was false and is corrected in `sha2`'s own comment below. Feature
+# unification gives `sha2` the same zeroize-enabled `digest` rlib, but unification is per
+# resolved crate version, not per feature: it does not set `cfg(feature = "zeroize")` inside
+# the `sha2` crate itself, and `sha2` 0.11 has its own code gated on exactly that cfg (its
+# `Drop for Sha512VarCore`, which wipes the running SHA-512 compression state, i.e. the
+# ipad/opad-keyed key schedule state for `Hmac::<Sha384>`; see the `sha2` line below for how
+# this was checked and measured, not assumed).
+hmac = { version = "0.13", features = ["zeroize"] }
 # SHA-384, the hash the HKDF above is built on (`cluster-derived-session-ticketer`,
-# #120).
-sha2 = "0.10"
+# #120). Kept in lockstep with `hmac`'s `digest` major; see the comment there.
+#
+# `zeroize` is enabled here too, separately from `hmac`'s own `zeroize` feature above, because
+# the two features gate different code. `hmac`'s feature (via `digest/zeroize`) never sets
+# `cfg(feature = "zeroize")` inside the `sha2` crate itself; only naming the feature on `sha2`
+# directly does that, and `sha2` 0.11 has real code behind it: `block_api.rs`'s `impl Drop for
+# Sha512VarCore` wipes `self.state` and `self.block_len` under that cfg, and `Sha384` is
+# `CtOutWrapper<Sha512VarCore, U48>`, so for `Hmac::<Sha384>` that state is the running
+# compression state of the key schedule this HKDF is built to protect.
+#
+# CHECKED, NOT ASSUMED, twice over. First, the claim that this line was redundant did not
+# reproduce: with only `hmac`'s `zeroize` feature on, `cargo tree -p irontraffic-tls -e
+# features` differs from the state with this line added too, in all four invocation shapes
+# tried (bare, `-i sha2`, `-i digest@0.11.3`, `-i hybrid-array`). Second, the wipe itself was
+# confirmed in the compiled object code, not just in the feature graph: building
+# `irontraffic-tls` in release with this feature off, `extract_sha384` calls
+# `Sha512VarCore::drop` zero times; built with it on, twice, once per `Sha384` instance the
+# `Hmac` holds. `Cargo.lock` is unchanged apart from this one package's own feature list; no
+# new crate enters the tree.
+sha2 = { version = "0.11", features = ["zeroize"] }
 # XChaCha20-Poly1305 for TLS session ticket encryption (`cluster-derived-session-ticketer`,
 # #120), a deliberate deviation from the design note's AES-256-GCM: a 192-bit
 # random nonce needs no per-key nonce-collision analysis the way a 96-bit
 # AES-GCM nonce would, and this AEAD is sourced from this crate rather than from
 # a `rustls::crypto` provider, so the ticket format is byte-identical on
 # `crypto-aws-lc-rs` and `crypto-ring` builds.
-chacha20poly1305 = "0.10"
+#
+# `zeroize` is an opt-in feature as of 0.11 (it was a mandatory dependency in
+# 0.10), and it is NOT in this crate's own default feature set. Without it,
+# `ChaChaPoly1305`'s `Drop` is an empty function and the 32-byte epoch key
+# copy the cipher holds internally is left, unwiped, in freed memory on every
+# encrypt and decrypt (see the comment on `zeroize` below: the root and every
+# derived epoch key must never linger in freed memory). The feature must be
+# named explicitly here for that guarantee to hold.
+chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
 # Zeroizes the cluster ticket root, its HKDF pseudorandom key, and every derived
 # epoch key on drop (`cluster-derived-session-ticketer`, #120). The root is the
 # highest-value secret in the product; it must never linger in freed memory.
