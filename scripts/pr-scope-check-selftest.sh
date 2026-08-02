@@ -114,17 +114,38 @@ FAKEGH
 # run_scope <dir> [base_sha] [head_sha] -- runs the real script against
 # <dir>, whose fake_gh was already configured. Defaults BASE_SHA/HEAD_SHA to
 # main/HEAD; a case that needs a specific pair (an unrelated commit, an
-# orphan branch) passes them explicitly. Never lets a non-zero exit escape
-# and trip this self-test's own `set -e`; every case below reads the OUTPUT
-# text, the same convention test-census-selftest.sh uses for the identical
-# reason.
+# orphan branch) passes them explicitly.
+#
+# ROUND SIX CORRECTION. This used to end in `bash "$SCOPE" 2>&1 || true`,
+# which threw away the real script's exit code and left every case in this
+# file reading only the OUTPUT TEXT, the same convention test-census-selftest.sh
+# uses. That convention is safe for test-census.sh, which never prints a
+# refusal-shaped message on a path that also exits 0. It is NOT safe here,
+# because this script's own header says so in as many words: "GitHub reports
+# a skipped job to branch protection as SUCCESS", and a check whose FAIL text
+# still prints while its exit code is 0 is exactly that failure mode reached
+# one layer up, in the judge rather than the defendant. Proven directly:
+# flipping any of eight of this script's eleven `exit 1` refusals to `exit 0`
+# left every case in this file, before this fix, fully green, including the
+# case covering the bot-path refusal this whole PR series exists to harden.
+#
+# `|| true` is gone. The function's own exit status is now whatever
+# `bash "$SCOPE"` returned, and every call site below captures it with the
+# `OUT="$(run_scope ...)" && RC=0 || RC=$?` idiom (verified directly: under
+# `set -e`, this form propagates a subshell's real exit status into `RC`
+# without the failing status itself tripping this self-test's own `set -e`,
+# the same shape case 47 already uses for the three required-variable
+# guards, generalised to every case rather than three of them). A case
+# expecting a refusal now asserts `RC` is non-zero; a case expecting EXEMPT
+# or an ordinary match asserts `RC` is zero. Text is still checked too, so a
+# refusal for the WRONG reason (right rc, wrong message) still fails.
 run_scope() {
   local dir="$1" base="${2:-}" head="${3:-}"
   ( cd "$dir"
     [ -z "$base" ] && base="$(git rev-parse main)"
     [ -z "$head" ] && head="$(git rev-parse HEAD)"
     PATH="$FAKEBIN:$PATH" GITHUB_REPOSITORY=test-org/test-repo PR_NUMBER=1 \
-      BASE_SHA="$base" HEAD_SHA="$head" bash "$SCOPE" 2>&1 || true
+      BASE_SHA="$base" HEAD_SHA="$head" bash "$SCOPE" 2>&1
   )
 }
 
@@ -148,7 +169,14 @@ printf 'fn main(){ /* arbitrary code on the CI runner */ }\n' > "$D1/crates/pol/
 commit_all "$D1" attack
 fake_gh 'dependabot[bot]' ''
 echo "== exploit vector 1: glob-expandable payload name must be refused, by its real name =="
-OUT1="$(run_scope "$D1")"
+OUT1="$(run_scope "$D1")" && RC1=0 || RC1=$?
+if [ "$RC1" -eq 0 ]; then
+  echo "FAIL: case 1 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT1" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT1" | grep -qF 'pr-scope-check: EXEMPT'; then
   echo "FAIL: the glob-expandable payload was reported EXEMPT. Got:"
   echo "$OUT1" | sed 's/^/    /'
@@ -180,7 +208,14 @@ printf 'fn main(){ /* arbitrary code */ }\n' > "$D2/crates/pol/Cargo.toml Cargo.
 commit_all "$D2" attack
 fake_gh 'dependabot[bot]' ''
 echo "== exploit vector 2: space-splitting payload name must be refused, by its real name =="
-OUT2="$(run_scope "$D2")"
+OUT2="$(run_scope "$D2")" && RC2=0 || RC2=$?
+if [ "$RC2" -eq 0 ]; then
+  echo "FAIL: case 2 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT2" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT2" | grep -qF 'pr-scope-check: EXEMPT'; then
   echo "FAIL: the space-splitting payload was reported EXEMPT. Got:"
   echo "$OUT2" | sed 's/^/    /'
@@ -210,7 +245,14 @@ printf 'pub fn x(){ 1 }\n' > "$D3/crates/pol/src/lib.rs"
 commit_all "$D3" attack
 fake_gh 'dependabot[bot]' ''
 echo "== a bot PR touching crates/<name>/src/ must be refused =="
-OUT3="$(run_scope "$D3")"
+OUT3="$(run_scope "$D3")" && RC3=0 || RC3=$?
+if [ "$RC3" -eq 0 ]; then
+  echo "FAIL: case 3 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT3" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT3" | grep -qF 'pr-scope-check: EXEMPT'; then
   echo "FAIL: a bot PR touching source was reported EXEMPT. Got:"
   echo "$OUT3" | sed 's/^/    /'
@@ -234,7 +276,14 @@ printf '[package]\nname="b"\nversion="0.2.0"\n' > "$D4/crates/a/b/Cargo.toml"
 commit_all "$D4" attack
 fake_gh 'dependabot[bot]' ''
 echo "== crates/a/b/Cargo.toml (nested) must be refused =="
-OUT4="$(run_scope "$D4")"
+OUT4="$(run_scope "$D4")" && RC4=0 || RC4=$?
+if [ "$RC4" -eq 0 ]; then
+  echo "FAIL: case 4 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT4" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT4" | grep -qF 'pr-scope-check: EXEMPT'; then
   echo "FAIL: a nested crate manifest was reported EXEMPT. Got:"
   echo "$OUT4" | sed 's/^/    /'
@@ -256,7 +305,14 @@ printf 'stale copy\n' > "$D5/Cargo.toml.bak"
 commit_all "$D5" attack
 fake_gh 'dependabot[bot]' ''
 echo "== Cargo.toml.bak must be refused =="
-OUT5="$(run_scope "$D5")"
+OUT5="$(run_scope "$D5")" && RC5=0 || RC5=$?
+if [ "$RC5" -eq 0 ]; then
+  echo "FAIL: case 5 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT5" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT5" | grep -qF 'pr-scope-check: EXEMPT'; then
   echo "FAIL: Cargo.toml.bak was reported EXEMPT. Got:"
   echo "$OUT5" | sed 's/^/    /'
@@ -282,7 +338,12 @@ printf '[package]\nname="irontraffic-policy"\nversion="0.1.0"\n\n[dependencies]\
 commit_all "$D6" bump
 fake_gh 'dependabot[bot]' ''
 echo "== a legitimate per-crate manifest bump must be EXEMPT (issue #836's own motivation) =="
-OUT6="$(run_scope "$D6")"
+OUT6="$(run_scope "$D6")" && RC6=0 || RC6=$?
+if [ "$RC6" -ne 0 ]; then
+  echo "FAIL: case 6 was expected to pass (rc=0) but exited non-zero (rc=$RC6)." >&2
+  echo "$OUT6" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT6" | grep -qF 'pr-scope-check: EXEMPT'; then
   note "the per-crate bump is EXEMPT"
 else
@@ -305,7 +366,14 @@ printf '[package]\nname="irontraffic-policy"\nversion="0.1.1"\n' > "$D7/crates/i
 commit_all "$D7" bump
 fake_gh 'mallory' 'no closing keyword here'
 echo "== a non-bot author with no closing keyword must be refused =="
-OUT7="$(run_scope "$D7")"
+OUT7="$(run_scope "$D7")" && RC7=0 || RC7=$?
+if [ "$RC7" -eq 0 ]; then
+  echo "FAIL: case 7 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT7" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT7" | grep -qF 'does not close an issue'; then
   note "a non-bot PR with no Closes line is refused for that reason"
 else
@@ -338,7 +406,14 @@ commit_all "$D8" base
 fake_gh 'dependabot[bot]' ''
 echo "== an empty diff must not be reported EXEMPT =="
 SHA8="$(git -C "$D8" rev-parse main)"
-OUT8="$(run_scope "$D8" "$SHA8" "$SHA8")"
+OUT8="$(run_scope "$D8" "$SHA8" "$SHA8")" && RC8=0 || RC8=$?
+if [ "$RC8" -eq 0 ]; then
+  echo "FAIL: case 8 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT8" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT8" | grep -qF 'pr-scope-check: EXEMPT'; then
   echo "FAIL: an empty diff was reported EXEMPT. Got:"
   echo "$OUT8" | sed 's/^/    /'
@@ -371,7 +446,14 @@ commit_all "$D9" orphan-commit
 HEAD9="$(git -C "$D9" rev-parse HEAD)"
 fake_gh 'dependabot[bot]' ''
 echo "== a bot PR whose merge base cannot be computed must fail closed =="
-OUT9="$(run_scope "$D9" "$BASE9" "$HEAD9")"
+OUT9="$(run_scope "$D9" "$BASE9" "$HEAD9")" && RC9=0 || RC9=$?
+if [ "$RC9" -eq 0 ]; then
+  echo "FAIL: case 9 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT9" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT9" | grep -qF 'pr-scope-check: EXEMPT'; then
   echo "FAIL: a failed merge base on the bot path was reported EXEMPT. Got:"
   echo "$OUT9" | sed 's/^/    /'
@@ -402,7 +484,14 @@ printf 'payload\n' > "$newline_path"
 commit_all "$D10" attack
 fake_gh 'dependabot[bot]' ''
 echo "== a path with an embedded newline must be refused outright =="
-OUT10="$(run_scope "$D10")"
+OUT10="$(run_scope "$D10")" && RC10=0 || RC10=$?
+if [ "$RC10" -eq 0 ]; then
+  echo "FAIL: case 10 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT10" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT10" | grep -qF 'pr-scope-check: EXEMPT'; then
   echo "FAIL: a path with an embedded newline was reported EXEMPT. Got:"
   echo "$OUT10" | sed 's/^/    /'
@@ -436,7 +525,12 @@ fake_gh 'coder-agent' 'Closes #42' '## Files
 | `crates/irontraffic-policy/src/lib.rs` | modify | bump the returned value |
 '
 echo "== the ordinary non-bot happy path still matches after the array rewrite =="
-OUT11="$(run_scope "$D11")"
+OUT11="$(run_scope "$D11")" && RC11=0 || RC11=$?
+if [ "$RC11" -ne 0 ]; then
+  echo "FAIL: case 11 was expected to pass (rc=0) but exited non-zero (rc=$RC11)." >&2
+  echo "$OUT11" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT11" | grep -qF 'pr-scope-check: the diff matches issue #42'; then
   note "a declared, fully-matching non-bot PR still matches"
 else
@@ -465,7 +559,14 @@ fake_gh 'coder-agent' 'Closes #42' '## Files
 | `crates/irontraffic-policy/src/lib.rs` | modify | bump the returned value |
 '
 echo "== an undeclared file in a non-bot PR is still refused and named =="
-OUT12="$(run_scope "$D12")"
+OUT12="$(run_scope "$D12")" && RC12=0 || RC12=$?
+if [ "$RC12" -eq 0 ]; then
+  echo "FAIL: case 12 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT12" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT12" | grep -qF 'does not declare' && echo "$OUT12" | grep -qF 'extra.rs'; then
   note "the undeclared file is refused and named"
 else
@@ -497,7 +598,14 @@ printf 'fn main(){ /* arbitrary code on the CI runner */ }\n' > "$D13/crates/pol
 commit_all "$D13" "chore(deps): bump serde from 1.0.1 to 1.0.2"
 fake_gh 'dependabot[bot]' ''
 echo "== exploit vector 3: crates/<n>/Cargo.toml declaring build=Cargo.lock, both allowlisted-shaped, must be refused =="
-OUT13="$(run_scope "$D13")"
+OUT13="$(run_scope "$D13")" && RC13=0 || RC13=$?
+if [ "$RC13" -eq 0 ]; then
+  echo "FAIL: case 13 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT13" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT13" | grep -qF 'pr-scope-check: EXEMPT'; then
   echo "FAIL: the crate manifest + crate lockfile payload was reported EXEMPT. Got:"
   echo "$OUT13" | sed 's/^/    /'
@@ -529,7 +637,14 @@ printf 'fn main(){ /* arbitrary code */ }\n' > "$D14/crates/pol/Cargo.lock"
 commit_all "$D14" "chore(deps): bump"
 fake_gh 'dependabot[bot]' ''
 echo "== exploit vector 3 variant: [[bin]] path=Cargo.lock must be refused too =="
-OUT14="$(run_scope "$D14")"
+OUT14="$(run_scope "$D14")" && RC14=0 || RC14=$?
+if [ "$RC14" -eq 0 ]; then
+  echo "FAIL: case 14 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT14" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT14" | grep -qF 'pr-scope-check: EXEMPT'; then
   echo "FAIL: the [[bin]] path=Cargo.lock payload was reported EXEMPT. Got:"
   echo "$OUT14" | sed 's/^/    /'
@@ -561,7 +676,14 @@ printf 'fn main(){ /* arbitrary code */ }\n' > "$D15/crates/pol/fuzz/Cargo.lock"
 commit_all "$D15" "chore(deps): bump libfuzzer-sys"
 fake_gh 'dependabot[bot]' ''
 echo "== build= pointed at a lockfile path that STAYS allowlisted (crates/<n>/fuzz/Cargo.lock) must still be refused =="
-OUT15="$(run_scope "$D15")"
+OUT15="$(run_scope "$D15")" && RC15=0 || RC15=$?
+if [ "$RC15" -eq 0 ]; then
+  echo "FAIL: case 15 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT15" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT15" | grep -qF 'pr-scope-check: EXEMPT'; then
   echo "FAIL: build= into an allowlisted fuzz lockfile was reported EXEMPT. Got:"
   echo "$OUT15" | sed 's/^/    /'
@@ -586,7 +708,12 @@ printf '[package]\nname="pol-fuzz"\nversion="0.0.0"\npublish=false\nedition="202
 commit_all "$D16" "chore(deps): bump libfuzzer-sys"
 fake_gh 'dependabot[bot]' ''
 echo "== a legitimate fuzz-crate bump with an UNCHANGED [[bin]] path must stay EXEMPT (no false positive) =="
-OUT16="$(run_scope "$D16")"
+OUT16="$(run_scope "$D16")" && RC16=0 || RC16=$?
+if [ "$RC16" -ne 0 ]; then
+  echo "FAIL: case 16 was expected to pass (rc=0) but exited non-zero (rc=$RC16)." >&2
+  echo "$OUT16" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT16" | grep -qF 'pr-scope-check: EXEMPT'; then
   note "unchanged [[bin]] path across a real bump is not a false positive"
 else
@@ -627,7 +754,14 @@ else
 fi
 fake_gh 'dependabot[bot]' ''
 echo "== the V3C combined case (rename hides deletion + capability change) must be refused =="
-OUT17="$(run_scope "$D17")"
+OUT17="$(run_scope "$D17")" && RC17=0 || RC17=$?
+if [ "$RC17" -eq 0 ]; then
+  echo "FAIL: case 17 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT17" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT17" | grep -qF 'pr-scope-check: EXEMPT'; then
   echo "FAIL: the rename-plus-capability payload was reported EXEMPT. Got:"
   echo "$OUT17" | sed 's/^/    /'
@@ -665,7 +799,14 @@ fake_gh 'coder-agent' 'Closes #42' '## Files
 NORENAME18="$(git -C "$D18" diff --no-renames --name-only main HEAD | tr '\n' '|')"
 note "with --no-renames: $NORENAME18"
 echo "== a rename onto a DECLARED path must not hide the deletion of an undeclared source file =="
-OUT18="$(run_scope "$D18")"
+OUT18="$(run_scope "$D18")" && RC18=0 || RC18=$?
+if [ "$RC18" -eq 0 ]; then
+  echo "FAIL: case 18 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT18" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT18" | grep -qF 'pr-scope-check: the diff matches issue'; then
   echo "FAIL: a rename that hid an undeclared source-file deletion was reported as matching. Got:"
   echo "$OUT18" | sed 's/^/    /'
@@ -710,7 +851,14 @@ fake_gh 'coder-agent' 'Closes #42' '## Files
 | `b.rs` | modify | second declared file |
 '
 echo "== the undeclared loop must not be fooled by a changed path that word-splits into two declared paths =="
-OUT19="$(run_scope "$D19")"
+OUT19="$(run_scope "$D19")" && RC19=0 || RC19=$?
+if [ "$RC19" -eq 0 ]; then
+  echo "FAIL: case 19 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT19" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT19" | grep -qF 'pr-scope-check: the diff matches issue'; then
   echo "FAIL: a single undeclared file whose name splits into two declared paths was reported as matching. Got:"
   echo "$OUT19" | sed 's/^/    /'
@@ -760,7 +908,14 @@ fake_gh 'coder-agent' 'Closes #42' '## Files
 | `crates/pol/Cargo.toml` | modify | the declared manifest |
 '
 echo "== the cargo_lock_exempt loop must not be fooled into forgiving root Cargo.lock =="
-OUT20="$(run_scope "$D20")"
+OUT20="$(run_scope "$D20")" && RC20=0 || RC20=$?
+if [ "$RC20" -eq 0 ]; then
+  echo "FAIL: case 20 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT20" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT20" | grep -qF 'pr-scope-check: the diff matches issue'; then
   echo "FAIL: a bare root Cargo.lock bump alongside an unrelated undeclared file was reported as matching. Got:"
   echo "$OUT20" | sed 's/^/    /'
@@ -801,7 +956,14 @@ printf 'fn main(){ /* arbitrary code; build= was already there before this PR */
 commit_all "$D21" "chore(deps): bump serde from 1.0.1 to 1.0.2"
 fake_gh 'dependabot[bot]' ''
 echo "== a lockfile swap under a PRE-EXISTING, unchanged build= key must still be refused (fix a, independent of fix b) =="
-OUT21="$(run_scope "$D21")"
+OUT21="$(run_scope "$D21")" && RC21=0 || RC21=$?
+if [ "$RC21" -eq 0 ]; then
+  echo "FAIL: case 21 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT21" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT21" | grep -qF 'pr-scope-check: EXEMPT'; then
   echo "FAIL: a Cargo.lock content swap under an unchanged, pre-existing build= key was reported EXEMPT. Got:"
   echo "$OUT21" | sed 's/^/    /'
@@ -865,7 +1027,14 @@ fake_gh 'coder-agent' 'Closes #42' '## Files
 | `crates/pol/src/declared_new.rs` | create | the new module |
 '
 echo "== R080 rename, --no-renames is the SOLE cause of the refusal (no Cargo.toml in this diff) =="
-OUT22="$(run_scope "$D22")"
+OUT22="$(run_scope "$D22")" && RC22=0 || RC22=$?
+if [ "$RC22" -eq 0 ]; then
+  echo "FAIL: case 22 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT22" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT22" | grep -qF 'pr-scope-check: the diff matches issue'; then
   echo "FAIL: a rename that hides an undeclared source-file deletion, with no manifest in the diff at all, was reported as matching. Got:"
   echo "$OUT22" | sed 's/^/    /'
@@ -900,7 +1069,14 @@ printf 'fn main(){}\n#[test]\nfn compat(){ /* arbitrary code under cargo test */
 commit_all "$D23" "chore(deps): bump libfuzzer-sys from 0.4.7 to 0.4.8"
 fake_gh 'dependabot[bot]' ''
 echo "== VECTOR 4: [[example]] test=true pointed at the fuzz lockfile must be refused =="
-OUT23="$(run_scope "$D23")"
+OUT23="$(run_scope "$D23")" && RC23=0 || RC23=$?
+if [ "$RC23" -eq 0 ]; then
+  echo "FAIL: case 23 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT23" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT23" | grep -qF 'pr-scope-check: EXEMPT'; then
   echo "FAIL: vector 4 ([[example]] test=true) was reported EXEMPT. Got:"
   echo "$OUT23" | sed 's/^/    /'
@@ -940,7 +1116,14 @@ printf 'fn main(){}\n#[test]\nfn compat(){ /* arbitrary code */ }\n' > "$D24/cra
 commit_all "$D24" "chore(deps): bump"
 fake_gh 'dependabot[bot]' ''
 echo "== DOOR 2: fuzz-manifest [[example]] plus root [workspace] members widening must be refused =="
-OUT24="$(run_scope "$D24")"
+OUT24="$(run_scope "$D24")" && RC24=0 || RC24=$?
+if [ "$RC24" -eq 0 ]; then
+  echo "FAIL: case 24 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT24" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT24" | grep -qF 'pr-scope-check: EXEMPT'; then
   echo "FAIL: door 2 was reported EXEMPT. Got:"
   echo "$OUT24" | sed 's/^/    /'
@@ -971,7 +1154,14 @@ printf '[workspace]\nresolver="2"\nmembers=["crates/pol"]\nexclude=["crates/pol/
 commit_all "$D25" "chore(deps): bump"
 fake_gh 'dependabot[bot]' ''
 echo "== DOOR 3: root [patch.crates-io] path must be refused =="
-OUT25="$(run_scope "$D25")"
+OUT25="$(run_scope "$D25")" && RC25=0 || RC25=$?
+if [ "$RC25" -eq 0 ]; then
+  echo "FAIL: case 25 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT25" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT25" | grep -qF 'pr-scope-check: EXEMPT'; then
   echo "FAIL: door 3 (root [patch.crates-io]) was reported EXEMPT. Got:"
   echo "$OUT25" | sed 's/^/    /'
@@ -998,7 +1188,14 @@ printf '[package]\nname="pol"\nversion="0.1.0"\n\n[dependencies]\nserde = "1.0"\
 commit_all "$D26" "chore(deps): bump"
 fake_gh 'dependabot[bot]' ''
 echo "== a brand-new dependency key, with the existing one untouched, must be refused =="
-OUT26="$(run_scope "$D26")"
+OUT26="$(run_scope "$D26")" && RC26=0 || RC26=$?
+if [ "$RC26" -eq 0 ]; then
+  echo "FAIL: case 26 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT26" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT26" | grep -qF 'pr-scope-check: EXEMPT'; then
   echo "FAIL: introducing a brand-new dependency was reported EXEMPT. Got:"
   echo "$OUT26" | sed 's/^/    /'
@@ -1026,7 +1223,14 @@ printf '[package]\nname="pol"\nversion="0.1.0"\n\n[dependencies]\nserde = "1.0"\
 commit_all "$D27" "chore(deps): bump"
 fake_gh 'dependabot[bot]' ''
 echo "== a removed dependency entry must be refused =="
-OUT27="$(run_scope "$D27")"
+OUT27="$(run_scope "$D27")" && RC27=0 || RC27=$?
+if [ "$RC27" -eq 0 ]; then
+  echo "FAIL: case 27 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT27" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT27" | grep -qF 'pr-scope-check: EXEMPT'; then
   echo "FAIL: removing a dependency entry was reported EXEMPT. Got:"
   echo "$OUT27" | sed 's/^/    /'
@@ -1058,7 +1262,14 @@ printf '[package]\nname="pol"\nversion="0.1.0"\n' > "$D28/crates/pol/Cargo.toml"
 commit_all "$D28" "chore(deps): bump"
 fake_gh 'dependabot[bot]' ''
 echo "== package.build REMOVED at head must be refused, not silently ignored =="
-OUT28="$(run_scope "$D28")"
+OUT28="$(run_scope "$D28")" && RC28=0 || RC28=$?
+if [ "$RC28" -eq 0 ]; then
+  echo "FAIL: case 28 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT28" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT28" | grep -qF 'pr-scope-check: EXEMPT'; then
   echo "FAIL: removing package.build was reported EXEMPT. Got:"
   echo "$OUT28" | sed 's/^/    /'
@@ -1086,7 +1297,14 @@ printf '[package]\nname="pol"\nversion="0.1.0"\n\n[dependencies]\nserde = { vers
 commit_all "$D29" "chore(deps): bump serde and quietly add a feature"
 fake_gh 'dependabot[bot]' ''
 echo "== a dependency's non-version sub-key (features) changing alongside its version must be refused =="
-OUT29="$(run_scope "$D29")"
+OUT29="$(run_scope "$D29")" && RC29=0 || RC29=$?
+if [ "$RC29" -eq 0 ]; then
+  echo "FAIL: case 29 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT29" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT29" | grep -qF 'pr-scope-check: EXEMPT'; then
   echo "FAIL: a features change riding along with a version bump was reported EXEMPT. Got:"
   echo "$OUT29" | sed 's/^/    /'
@@ -1117,7 +1335,12 @@ printf '[package]\nname="pol"\nversion="0.1.0"\n\n[dependencies]\nserde = { vers
 commit_all "$D30" "chore(deps): bump serde"
 fake_gh 'dependabot[bot]' ''
 echo "== a detailed-table dependency whose ONLY sub-key change is version must stay EXEMPT =="
-OUT30="$(run_scope "$D30")"
+OUT30="$(run_scope "$D30")" && RC30=0 || RC30=$?
+if [ "$RC30" -ne 0 ]; then
+  echo "FAIL: case 30 was expected to pass (rc=0) but exited non-zero (rc=$RC30)." >&2
+  echo "$OUT30" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT30" | grep -qF 'pr-scope-check: EXEMPT'; then
   note "a version-only change inside a detailed dependency table stays EXEMPT"
 else
@@ -1142,7 +1365,12 @@ printf '[workspace]\nresolver="2"\nmembers=["crates/pol"]\n\n[workspace.dependen
 commit_all "$D31" "chore(deps): bump serde"
 fake_gh 'dependabot[bot]' ''
 echo "== workspace.dependencies string bump on the root manifest must stay EXEMPT (real PRs #831/#833/#834 shape) =="
-OUT31="$(run_scope "$D31")"
+OUT31="$(run_scope "$D31")" && RC31=0 || RC31=$?
+if [ "$RC31" -ne 0 ]; then
+  echo "FAIL: case 31 was expected to pass (rc=0) but exited non-zero (rc=$RC31)." >&2
+  echo "$OUT31" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT31" | grep -qF 'pr-scope-check: EXEMPT'; then
   note "a workspace.dependencies string bump stays EXEMPT"
 else
@@ -1166,7 +1394,12 @@ printf '[package]\nname="pol"\nversion="0.1.0"\n\n[target.\x27cfg(unix)\x27.depe
 commit_all "$D32" "chore(deps): bump libc"
 fake_gh 'dependabot[bot]' ''
 echo "== a target.'cfg(unix)'.dependencies string bump must stay EXEMPT =="
-OUT32="$(run_scope "$D32")"
+OUT32="$(run_scope "$D32")" && RC32=0 || RC32=$?
+if [ "$RC32" -ne 0 ]; then
+  echo "FAIL: case 32 was expected to pass (rc=0) but exited non-zero (rc=$RC32)." >&2
+  echo "$OUT32" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT32" | grep -qF 'pr-scope-check: EXEMPT'; then
   note "a target-specific dependencies string bump stays EXEMPT"
 else
@@ -1190,7 +1423,14 @@ printf '[package\nname="pol"\nversion="0.1.0"\n' > "$D33/crates/pol/Cargo.toml"
 commit_all "$D33" "chore(deps): bump"
 fake_gh 'dependabot[bot]' ''
 echo "== a HEAD manifest that fails to parse as TOML must be refused =="
-OUT33="$(run_scope "$D33")"
+OUT33="$(run_scope "$D33")" && RC33=0 || RC33=$?
+if [ "$RC33" -eq 0 ]; then
+  echo "FAIL: case 33 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT33" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT33" | grep -qF 'pr-scope-check: EXEMPT'; then
   echo "FAIL: an unparsable HEAD manifest was reported EXEMPT. Got:"
   echo "$OUT33" | sed 's/^/    /'
@@ -1219,7 +1459,14 @@ printf '[package]\nname="pol"\nversion="0.1.0"\n\n[dependencies]\nserde = "1.0"\
 commit_all "$D34" "chore(deps): bump"
 fake_gh 'dependabot[bot]' ''
 echo "== a BASE manifest that does not parse as TOML must be refused, even if HEAD looks like a clean bump =="
-OUT34="$(run_scope "$D34")"
+OUT34="$(run_scope "$D34")" && RC34=0 || RC34=$?
+if [ "$RC34" -eq 0 ]; then
+  echo "FAIL: case 34 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT34" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT34" | grep -qF 'pr-scope-check: EXEMPT'; then
   echo "FAIL: an unparsable BASE manifest was reported EXEMPT. Got:"
   echo "$OUT34" | sed 's/^/    /'
@@ -1264,7 +1511,14 @@ exec "$REAL_GIT" "\$@"
 GITWRAP
 chmod +x "$FAKEBIN/git"
 echo "== a base blob that exists but cannot be read must be refused, naming the failure, not treated as safe =="
-OUT35="$(run_scope "$D35")"
+OUT35="$(run_scope "$D35")" && RC35=0 || RC35=$?
+if [ "$RC35" -eq 0 ]; then
+  echo "FAIL: case 35 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT35" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 rm -f "$FAKEBIN/git"
 if echo "$OUT35" | grep -qF 'pr-scope-check: EXEMPT'; then
   echo "FAIL: an unreadable base blob was reported EXEMPT. Got:"
@@ -1296,7 +1550,12 @@ printf '[package]\nname="pol"\nversion="0.1.0"\n\n[dev-dependencies]\ncriterion 
 commit_all "$D36" "chore(deps): bump criterion and cc"
 fake_gh 'dependabot[bot]' ''
 echo "== dev-dependencies AND build-dependencies string bumps together must stay EXEMPT =="
-OUT36="$(run_scope "$D36")"
+OUT36="$(run_scope "$D36")" && RC36=0 || RC36=$?
+if [ "$RC36" -ne 0 ]; then
+  echo "FAIL: case 36 was expected to pass (rc=0) but exited non-zero (rc=$RC36)." >&2
+  echo "$OUT36" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT36" | grep -qF 'pr-scope-check: EXEMPT'; then
   note "dev-dependencies and build-dependencies string bumps stay EXEMPT"
 else
@@ -1326,7 +1585,12 @@ printf '[package]\nname="pol"\nversion="0.1.0"\n\n[target.\x27cfg(unix)\x27.dev-
 commit_all "$D36b" "chore(deps): bump assert_cmd"
 fake_gh 'dependabot[bot]' ''
 echo "== a target.'cfg(unix)'.dev-dependencies string bump must stay EXEMPT =="
-OUT36b="$(run_scope "$D36b")"
+OUT36b="$(run_scope "$D36b")" && RC36b=0 || RC36b=$?
+if [ "$RC36b" -ne 0 ]; then
+  echo "FAIL: case 36b was expected to pass (rc=0) but exited non-zero (rc=$RC36b)." >&2
+  echo "$OUT36b" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT36b" | grep -qF 'pr-scope-check: EXEMPT'; then
   note "a target-specific dev-dependencies string bump stays EXEMPT"
 else
@@ -1353,7 +1617,14 @@ printf '[package]\nname="pol"\nversion="0.1.0"\n\n[dependencies]\nirontraffic-ti
 commit_all "$D37" "chore(deps): bump"
 fake_gh 'dependabot[bot]' ''
 echo "== a dependency's path sub-key changing, with version untouched, must be refused and named =="
-OUT37="$(run_scope "$D37")"
+OUT37="$(run_scope "$D37")" && RC37=0 || RC37=$?
+if [ "$RC37" -eq 0 ]; then
+  echo "FAIL: case 37 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT37" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT37" | grep -qF 'pr-scope-check: EXEMPT'; then
   echo "FAIL: a dependency path retarget with version untouched was reported EXEMPT. Got:"
   echo "$OUT37" | sed 's/^/    /'
@@ -1386,7 +1657,14 @@ printf '[package]\nname="pol"\nversion="0.1.0"\nedition="2021"\n\n[[bin]]\nname=
 commit_all "$D38" "chore(deps): bump"
 fake_gh 'dependabot[bot]' ''
 echo "== an already-declared [[bin]]'s path edited in place (same array length) must be refused =="
-OUT38="$(run_scope "$D38")"
+OUT38="$(run_scope "$D38")" && RC38=0 || RC38=$?
+if [ "$RC38" -eq 0 ]; then
+  echo "FAIL: case 38 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT38" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT38" | grep -qF 'pr-scope-check: EXEMPT'; then
   echo "FAIL: an in-place [[bin]] path edit was reported EXEMPT. Got:"
   echo "$OUT38" | sed 's/^/    /'
@@ -1417,7 +1695,14 @@ printf '[package]\nname="newcrate"\nversion="0.1.0"\n\n[dependencies]\nserde = "
 commit_all "$D39" "chore(deps): bump"
 fake_gh 'dependabot[bot]' ''
 echo "== a brand-new manifest must be refused, named as introduced, not as a base parse failure =="
-OUT39="$(run_scope "$D39")"
+OUT39="$(run_scope "$D39")" && RC39=0 || RC39=$?
+if [ "$RC39" -eq 0 ]; then
+  echo "FAIL: case 39 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT39" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT39" | grep -qF 'pr-scope-check: EXEMPT'; then
   echo "FAIL: a brand-new manifest was reported EXEMPT. Got:"
   echo "$OUT39" | sed 's/^/    /'
@@ -1455,7 +1740,14 @@ printf '[package]\nname="pol"\nversion="0.1.0"\n\n[lib]\npath="src/lib.rs"\n\n[l
 commit_all "$D40" "chore(deps): bump"
 fake_gh 'dependabot[bot]' ''
 echo "== a lookalike two-level '...dependencies' table (not one of the five real shapes) must still be refused =="
-OUT40="$(run_scope "$D40")"
+OUT40="$(run_scope "$D40")" && RC40=0 || RC40=$?
+if [ "$RC40" -eq 0 ]; then
+  echo "FAIL: case 40 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT40" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT40" | grep -qF 'pr-scope-check: EXEMPT'; then
   echo "FAIL: a change under a lookalike [lib.dependencies] table was reported EXEMPT. Got:"
   echo "$OUT40" | sed 's/^/    /'
@@ -1485,7 +1777,14 @@ printf '[package]\nname="pol"\nversion="0.1.1"\n' > "$D41/crates/pol/Cargo.toml"
 commit_all "$D41" implement
 fake_gh 'coder-agent' 'Closes #42 and fixes #43'
 echo "== a PR body naming two distinct issues must be refused, not merely accepted as at-least-one =="
-OUT41="$(run_scope "$D41")"
+OUT41="$(run_scope "$D41")" && RC41=0 || RC41=$?
+if [ "$RC41" -eq 0 ]; then
+  echo "FAIL: case 41 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT41" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT41" | grep -qF 'pr-scope-check: the diff matches issue'; then
   echo "FAIL: a PR closing two distinct issues was accepted. Got:"
   echo "$OUT41" | sed 's/^/    /'
@@ -1528,7 +1827,14 @@ fake_gh 'coder-agent' 'Closes #42' '## Files
 | `crates/pol/src/lib.rs` | modify | unrelated change in the same PR |
 '
 echo "== a nested fuzz lockfile whose sibling manifest is NOT declared must be refused on the non-bot path =="
-OUT42="$(run_scope "$D42")"
+OUT42="$(run_scope "$D42")" && RC42=0 || RC42=$?
+if [ "$RC42" -eq 0 ]; then
+  echo "FAIL: case 42 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT42" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT42" | grep -qF 'pr-scope-check: the diff matches issue'; then
   echo "FAIL: a nested lockfile with an undeclared sibling manifest was accepted as matching. Got:"
   echo "$OUT42" | sed 's/^/    /'
@@ -1572,7 +1878,14 @@ printf '[package]\nname="pol"\nversion="0.1.0"\n\n[dependencies]\nlogos = { git 
 commit_all "$D43" "chore(deps): bump logos"
 fake_gh 'dependabot[bot]' ''
 echo "== M19: a dependency value changing from a bare string to a detailed table (git source) must be refused =="
-OUT43="$(run_scope "$D43")"
+OUT43="$(run_scope "$D43")" && RC43=0 || RC43=$?
+if [ "$RC43" -eq 0 ]; then
+  echo "FAIL: case 43 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT43" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT43" | grep -qF 'pr-scope-check: EXEMPT'; then
   echo "FAIL: a dependency shape change (string to detailed table) was reported EXEMPT. Got:"
   echo "$OUT43" | sed 's/^/    /'
@@ -1608,7 +1921,14 @@ printf '[package]\nname="pol"\nversion="0.1.0"\nbuild="fuzz/Cargo.lock"\n' > "$D
 commit_all "$D44" "chore(deps): bump"
 fake_gh 'dependabot[bot]' ''
 echo "== M29: package.build retargeted from one string to another must be refused (package is not a dependency table) =="
-OUT44="$(run_scope "$D44")"
+OUT44="$(run_scope "$D44")" && RC44=0 || RC44=$?
+if [ "$RC44" -eq 0 ]; then
+  echo "FAIL: case 44 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT44" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT44" | grep -qF 'pr-scope-check: EXEMPT'; then
   echo "FAIL: package.build retargeted string-to-string was reported EXEMPT. Got:"
   echo "$OUT44" | sed 's/^/    /'
@@ -1640,7 +1960,14 @@ printf '[package]\nname="pol"\nversion="0.1.1"\n' > "$D45/crates/pol/Cargo.toml"
 commit_all "$D45" bump
 fake_gh 'sneaky-app[bot]' 'no closing keyword here'
 echo "== an unrecognised bot-suffixed author must NOT take the bot-exempt path =="
-OUT45="$(run_scope "$D45")"
+OUT45="$(run_scope "$D45")" && RC45=0 || RC45=$?
+if [ "$RC45" -eq 0 ]; then
+  echo "FAIL: case 45 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT45" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT45" | grep -qF 'pr-scope-check: EXEMPT'; then
   echo "FAIL: an author outside the three named bot logins was exempted as a bot. Got:"
   echo "$OUT45" | sed 's/^/    /'
@@ -1685,7 +2012,14 @@ fake_gh 'coder-agent' 'Closes #42' '## Files
 | `crates/other/Cargo.toml` | modify | a completely unrelated crate, declared but not touched by this diff |
 '
 echo "== a nested fuzz lockfile must be tied to its OWN sibling manifest, not to some OTHER declared manifest =="
-OUT46="$(run_scope "$D46")"
+OUT46="$(run_scope "$D46")" && RC46=0 || RC46=$?
+if [ "$RC46" -eq 0 ]; then
+  echo "FAIL: case 46 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT46" | sed 's/^/    /' >&2
+  FAILED=1
+fi
 if echo "$OUT46" | grep -qF 'pr-scope-check: the diff matches issue'; then
   echo "FAIL: a nested lockfile was forgiven because an UNRELATED manifest was declared, not its own sibling. Got:"
   echo "$OUT46" | sed 's/^/    /'
@@ -1696,6 +2030,205 @@ elif ! echo "$OUT46" | grep -qF 'crates/pol/fuzz/Cargo.lock'; then
   FAILED=1
 else
   note "the nested lockfile is refused and named; an unrelated declared manifest does not forgive it"
+fi
+
+# ===========================================================================
+# ROUND SIX. The round-five review found that the rc plumbing fixed above
+# (run_scope no longer eats the real exit code with `|| true`) was applied to
+# three of the script's eleven exit sites only (case 47's guards); every case
+# that goes through run_scope asserted text alone, so eight of the eleven
+# `exit 1` refusals could each become `exit 0` with this whole suite still
+# green, including the bot-path refusal (line 660) this entire PR series
+# exists to harden. That is now fixed for every case above (cases 1 to 46b),
+# not case by case here. Cases 46b to 46e close the three remaining named
+# gaps: the list branch's unpinned append arm, and the two round-five cases
+# (44 and 45) that only pinned the exact mutant named and not the
+# neighbouring one-token relaxation of the same rule.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# 46b. The engine's list branch has three arms: appended entries
+#      (`i >= len(base)`), removed entries, and edited entries. Case 38 above
+#      edits an EXISTING [[bin]] entry in place, at an unchanged array
+#      length, and pins the edited-entry arm. No case pins the appended-entry
+#      arm: every `[[bin]]`/`[[test]]`/`[[bench]]`/`[[example]]` case in this
+#      file, including case 38, either edits an existing single-entry array
+#      or introduces the WHOLE array from nothing (caught by the generic
+#      dict branch's "introduces bin = [...]" before the list comparison is
+#      ever reached), so a mutation that silently drops the `i >= len(base)`
+#      branch (turning it into a no-op) is invisible to every case above.
+#
+#      Not hypothetical: `git ls-files` on this repository shows 26 tracked
+#      Cargo.toml files carrying 74 `[[bin]]`/`[[bench]]` entries between
+#      them, and every `crates/*/fuzz/Cargo.toml` already has one `[[bin]]`
+#      sitting on BOT_ALLOWED next to its own `fuzz/Cargo.lock`. Appending a
+#      SECOND `[[bin]]` whose `path` is that sibling lockfile lands vector
+#      4's capability (a Cargo target compiling and running the lockfile's
+#      content) through the one branch nothing above exercises.
+# ---------------------------------------------------------------------------
+D46b="$WORK/list-branch-append-arm-pinned"
+new_repo "$D46b"
+mkdir -p "$D46b/crates/pol/fuzz/fuzz_targets"
+printf '[package]\nname="pol-fuzz"\nversion="0.0.0"\npublish=false\nedition="2021"\n\n[workspace]\n\n[dependencies]\nlibfuzzer-sys="0.4"\n\n[[bin]]\nname="t"\npath="fuzz_targets/t.rs"\n' > "$D46b/crates/pol/fuzz/Cargo.toml"
+printf '#![no_main]\n' > "$D46b/crates/pol/fuzz/fuzz_targets/t.rs"
+printf '# placeholder fuzz lockfile\n' > "$D46b/crates/pol/fuzz/Cargo.lock"
+commit_all "$D46b" base
+git -C "$D46b" checkout -qb pr
+printf '[package]\nname="pol-fuzz"\nversion="0.0.0"\npublish=false\nedition="2021"\n\n[workspace]\n\n[dependencies]\nlibfuzzer-sys="0.4"\n\n[[bin]]\nname="t"\npath="fuzz_targets/t.rs"\n\n[[bin]]\nname="evil"\npath="Cargo.lock"\n' > "$D46b/crates/pol/fuzz/Cargo.toml"
+printf 'fn main(){ /* arbitrary code, smuggled via an APPENDED [[bin]] entry the array-introduction branch never sees */ }\n' > "$D46b/crates/pol/fuzz/Cargo.lock"
+commit_all "$D46b" "chore(deps): bump libfuzzer-sys"
+fake_gh 'dependabot[bot]' ''
+echo "== the list branch's APPEND arm must be pinned: a second [[bin]] appended to an existing array, path=Cargo.lock, must be refused =="
+OUT46b="$(run_scope "$D46b")" && RC46b=0 || RC46b=$?
+if [ "$RC46b" -eq 0 ]; then
+  echo "FAIL: case 46b was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT46b" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT46b" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: an appended [[bin]] entry pointed at the sibling lockfile was reported EXEMPT. Got:"
+  echo "$OUT46b" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT46b" | grep -qF 'bin[1]'; then
+  echo "FAIL: refused, but the appended entry was not named as bin[1]. Got:"
+  echo "$OUT46b" | sed 's/^/    /'
+  FAILED=1
+else
+  note "an appended [[bin]] entry is refused and named, pinning the list branch's append arm"
+fi
+
+# ---------------------------------------------------------------------------
+# 46c. Round five's case 45 (M11) closed widening the author match to any
+#      `*\[bot\]`-suffixed login, using `sneaky-app[bot]`, which does not
+#      start with "dependabot". It did not close the OTHER obvious one-token
+#      relaxation of the same case arm: `dependabot*` (a bare prefix match,
+#      dropping the `\[bot\]` and the exact `[bot]` login entirely). That
+#      widening matches a real historical login family this repository could
+#      plausibly see, `dependabot-preview[bot]`, as well as any account whose
+#      name merely starts with "dependabot". This author must still take the
+#      ORDINARY non-bot path and be refused for having no closing keyword,
+#      the same shape case 45 already checks, so that a widened match (which
+#      would route it into the bot arm instead, changing the refusal reason
+#      to a manifest-capability offense rather than "does not close an
+#      issue") is caught by the missing text rather than merely by rc, the
+#      same defence-in-depth case 45 already relies on.
+# ---------------------------------------------------------------------------
+D46c="$WORK/dependabot-prefix-widening"
+new_repo "$D46c"
+mkdir -p "$D46c/crates/pol"
+printf '[package]\nname="pol"\nversion="0.1.0"\n' > "$D46c/crates/pol/Cargo.toml"
+commit_all "$D46c" base
+git -C "$D46c" checkout -qb pr
+printf '[package]\nname="pol"\nversion="0.1.1"\n' > "$D46c/crates/pol/Cargo.toml"
+commit_all "$D46c" bump
+fake_gh 'dependabot-preview[bot]' 'no closing keyword here'
+echo "== an author merely starting with dependabot (not the exact dependabot[bot] login) must NOT take the bot-exempt path =="
+OUT46c="$(run_scope "$D46c")" && RC46c=0 || RC46c=$?
+if [ "$RC46c" -eq 0 ]; then
+  echo "FAIL: case 46c was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT46c" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT46c" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: an author only starting with dependabot, not the exact login, was exempted as a bot. Got:"
+  echo "$OUT46c" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT46c" | grep -qF 'does not close an issue'; then
+  echo "FAIL: refused, but not for the ordinary non-bot reason, so it may have taken the bot branch anyway. Got:"
+  echo "$OUT46c" | sed 's/^/    /'
+  FAILED=1
+else
+  note "an author merely starting with dependabot is treated as an ordinary non-bot author"
+fi
+
+# ---------------------------------------------------------------------------
+# 46d. Round five's case 44 (M29) closed `is_dep_table_path` also accepting
+#      `("package",)`. It did not close the sibling shape door 3 is about:
+#      `("patch", "crates-io")`. Door 3 (case 25) cannot pin this on its own
+#      because it INTRODUCES `[patch]` from nothing, which the top level
+#      dict branch reports as `introduces patch = {...}` and refuses without
+#      ever recursing far enough to ask `is_dep_table_path` about
+#      `("patch", "crates-io")` at all. The delta only shows on an EXISTING
+#      patch entry whose bare string value moves: base already has
+#      `[patch.crates-io]` with an entry, head only changes that entry's
+#      string. The shipped engine refuses this correctly today (a plain
+#      recursive diff on a non-dependency-table path); a mutation widening
+#      `is_dep_table_path` to also treat `[patch.crates-io]` as a table whose
+#      entries may move version-only would let a bare-string-to-bare-string
+#      change through silently, the same branch case 43 pins for
+#      `[dependencies]`.
+# ---------------------------------------------------------------------------
+D46d="$WORK/existing-patch-entry-bare-string-retargeted"
+new_repo "$D46d"
+mkdir -p "$D46d/crates/pol/src"
+printf '[workspace]\nresolver="2"\nmembers=["crates/pol"]\n\n[patch.crates-io]\nlibc = "0.2.0"\n' > "$D46d/Cargo.toml"
+printf 'pub fn x(){}\n' > "$D46d/crates/pol/src/lib.rs"
+printf '[package]\nname="pol"\nversion="0.1.0"\n' > "$D46d/crates/pol/Cargo.toml"
+commit_all "$D46d" base
+git -C "$D46d" checkout -qb pr
+printf '[workspace]\nresolver="2"\nmembers=["crates/pol"]\n\n[patch.crates-io]\nlibc = "https://evil.example/libc"\n' > "$D46d/Cargo.toml"
+commit_all "$D46d" "chore(deps): bump"
+fake_gh 'dependabot[bot]' ''
+echo "== an EXISTING [patch.crates-io] entry whose bare string value is retargeted must be refused, not treated as a dependency-table version move =="
+OUT46d="$(run_scope "$D46d")" && RC46d=0 || RC46d=$?
+if [ "$RC46d" -eq 0 ]; then
+  echo "FAIL: case 46d was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT46d" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT46d" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: an existing [patch.crates-io] entry retargeted was reported EXEMPT. Got:"
+  echo "$OUT46d" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT46d" | grep -qF 'patch.crates-io'; then
+  echo "FAIL: refused, but the patch.crates-io entry was not named. Got:"
+  echo "$OUT46d" | sed 's/^/    /'
+  FAILED=1
+else
+  note "an existing [patch.crates-io] entry retargeted is refused and named"
+fi
+
+# ---------------------------------------------------------------------------
+# 46e. No case in this file exercises the missing-'## Files'-table refusal
+#      (line 751) at all, so nothing pins it: a coder-agent PR closing a real
+#      issue whose body has no `## Files` heading anywhere must be refused
+#      for exactly that reason, checked by rc as well as by text, the same as
+#      every other exit site in this round.
+# ---------------------------------------------------------------------------
+D46e="$WORK/no-files-table"
+new_repo "$D46e"
+mkdir -p "$D46e/crates/pol"
+printf '[package]\nname="pol"\nversion="0.1.0"\n' > "$D46e/crates/pol/Cargo.toml"
+commit_all "$D46e" base
+git -C "$D46e" checkout -qb pr
+printf '[package]\nname="pol"\nversion="0.1.1"\n' > "$D46e/crates/pol/Cargo.toml"
+commit_all "$D46e" implement
+fake_gh 'coder-agent' 'Closes #42' 'Just a description of the change. No Files heading anywhere in this body.'
+echo "== an issue with no '## Files' table anywhere must be refused =="
+OUT46e="$(run_scope "$D46e")" && RC46e=0 || RC46e=$?
+if [ "$RC46e" -eq 0 ]; then
+  echo "FAIL: case 46e was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT46e" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT46e" | grep -qF 'pr-scope-check: the diff matches issue'; then
+  echo "FAIL: a PR whose issue has no Files table at all was reported as matching. Got:"
+  echo "$OUT46e" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT46e" | grep -qF "has no '## Files' table"; then
+  echo "FAIL: refused, but not for the missing-Files-table reason. Got:"
+  echo "$OUT46e" | sed 's/^/    /'
+  FAILED=1
+else
+  note "an issue with no '## Files' table is refused for that reason"
 fi
 
 echo
