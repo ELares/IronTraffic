@@ -85,7 +85,7 @@ WORK="$(mktemp -d)"
 # genuine, already-explained failure and simply relays the status.
 CASES_FILE="$WORK/.cases-ran"
 : > "$CASES_FILE"
-CASES_FLOOR=100
+CASES_FLOOR=102
 DONE=0
 _finish() {
   local rc=$? n
@@ -178,7 +178,7 @@ note() { printf '  %s\n' "$1"; }
 # single `note` call) and this guard fires; CASES_FLOOR above does not, for
 # the reason this guard exists.
 NOTE_COUNT="$(git show HEAD:scripts/pr-scope-check-selftest.sh | grep -c '^[[:space:]]*note "' || true)"
-NOTE_FLOOR=106
+NOTE_FLOOR=108
 if [ "$NOTE_COUNT" -lt "$NOTE_FLOOR" ]; then
   echo "pr-scope-check-selftest: FAILED. Only $NOTE_COUNT note() call site(s) found in the" >&2
   echo "committed file (expected at least $NOTE_FLOOR). A case whose run_scope call survives" >&2
@@ -4242,6 +4242,93 @@ elif ! echo "$OUT93" | grep -qF 'crates/b/fuzz/Cargo.lock'; then
   FAILED=1
 else
   note "an unrelated crate's nested lockfile does not ride a different crate's declared manifest bump"
+fi
+
+# ---------------------------------------------------------------------------
+# 94. BOT_ALLOWED sweep, crates/[^/]+/fuzz/Cargo\.lock, filename token
+#     (round nine: a measured survivor of round nine's OWN re-run sweep,
+#     not hypothesised). Cases 78-80 pin the "fuzz" directory token, the
+#     leading "crates" directory token, and dropping the extension entirely,
+#     but none of them pins the middle ground: widening the literal
+#     "Cargo\.lock" filename to "[^/]+\.lock" still requires a *.lock
+#     extension, so it slips past case 80's non-.lock fixture while still
+#     admitting any lockfile NAME, not only the real one, inside a real
+#     fuzz/ directory. Its content is never checked by anything in this
+#     script (manifest_disallowed_diff only ever runs over a path ending in
+#     Cargo.toml), so this is a full content bypass, not merely scope.
+# ---------------------------------------------------------------------------
+D94="$WORK/bot-allowed-a5-filename-token-lock-name"
+new_repo "$D94"
+mkdir -p "$D94/crates/pol/fuzz"
+printf 'placeholder\n' > "$D94/README.md"
+commit_all "$D94" base
+git -C "$D94" checkout -qb pr
+printf 'attacker-controlled content, never named Cargo.lock, no sibling manifest reviews it\n' > "$D94/crates/pol/fuzz/other.lock"
+commit_all "$D94" attack
+fake_gh 'dependabot[bot]' ''
+echo "== BOT_ALLOWED sweep (fuzz/Cargo\\.lock, filename token): crates/pol/fuzz/other.lock must be refused =="
+OUT94="$(run_scope "$D94")" && RC94=0 || RC94=$?
+if [ "$RC94" -eq 0 ]; then
+  echo "FAIL: case 94 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT94" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT94" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: crates/pol/fuzz/other.lock was reported EXEMPT. Got:"
+  echo "$OUT94" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT94" | grep -qF 'crates/pol/fuzz/other.lock'; then
+  echo "FAIL: refused, but crates/pol/fuzz/other.lock was not named among the offending paths. Got:"
+  echo "$OUT94" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a *.lock file inside a real fuzz dir that is not literally Cargo.lock is refused (pins the filename token; a mutant here bypasses the content check entirely, not merely scope)"
+fi
+
+# ---------------------------------------------------------------------------
+# 95. BOT_ALLOWED sweep, \.github/workflows/[^/]+\.ya?ml, "workflows"
+#     directory token (round nine: a measured survivor of round nine's OWN
+#     re-run sweep, not hypothesised). Case 83 pins this shape too, but its
+#     fixture (.github/actions/setup/action.yml) is nested THREE components
+#     below .github/, one deeper than the widened-by-one-token mutant
+#     (`\.github/[^/]+/[^/]+\.ya?ml`, which still requires exactly TWO
+#     components) actually admits, so case 83 never reaches this mutant at
+#     all: it is refused by both the real regex and the mutant, for
+#     unrelated reasons (depth), and proves nothing about the dir token.
+#     This fixture is exactly two components deep, the shape the mutant was
+#     built to admit.
+# ---------------------------------------------------------------------------
+D95="$WORK/bot-allowed-a6-dir-token-shallow"
+new_repo "$D95"
+mkdir -p "$D95/.github"
+printf 'placeholder\n' > "$D95/README.md"
+commit_all "$D95" base
+git -C "$D95" checkout -qb pr
+mkdir -p "$D95/.github/actions"
+printf 'name: deploy\non: push\njobs: {}\n' > "$D95/.github/actions/deploy.yml"
+commit_all "$D95" attack
+fake_gh 'dependabot[bot]' ''
+echo "== BOT_ALLOWED sweep (.github/workflows, dir token, shallow): .github/actions/deploy.yml must be refused =="
+OUT95="$(run_scope "$D95")" && RC95=0 || RC95=$?
+if [ "$RC95" -eq 0 ]; then
+  echo "FAIL: case 95 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT95" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT95" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: .github/actions/deploy.yml was reported EXEMPT. Got:"
+  echo "$OUT95" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT95" | grep -qF '.github/actions/deploy.yml'; then
+  echo "FAIL: refused, but .github/actions/deploy.yml was not named among the offending paths. Got:"
+  echo "$OUT95" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a YAML file exactly two components under .github, in a dir literally named anything but workflows, is refused (pins the workflows-dir token at the depth the one-token relaxation actually admits)"
 fi
 
 # 47. Each of the three required environment variables must fail this script
