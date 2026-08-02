@@ -48,7 +48,23 @@ author="$(printf '%s' "$pr_json" | jq -r '.user.login // ""')"
 # exempt, which is the case that would actually matter if a token were misused.
 # This is a positive check in the script rather than a skipped job, because
 # GitHub reports a skipped job to branch protection as SUCCESS.
-BOT_ALLOWED='^(Cargo\.toml|Cargo\.lock|\.github/workflows/[^/]+\.ya?ml|\.github/dependabot\.yml|packages/[^/]+/package(-lock)?\.json)$'
+#
+# The crate-level manifests are here for a reason found the hard way: the first
+# version anchored only the ROOT Cargo.toml and Cargo.lock, so a bump to a
+# dependency declared in a single crate, which is most of them, produced
+# "dependabot[bot] is a bot but this PR touches files outside the dependency
+# allowlist: crates/irontraffic-policy/Cargo.toml". The gate refused exactly the
+# class of PR this exemption exists to permit, and it said so in the wording of
+# a security refusal, which reads as the bot having done something suspicious
+# rather than as a hole in this list. PR 832 (logos) hit it.
+#
+# Widening to crate manifests does NOT widen the threat model. The comment above
+# is still the rule that matters: a bot PR touching SOURCE is not exempt. A
+# crate manifest can add a dependency, but so can the root manifest that was
+# always allowed, so this admits nothing the previous list did not. Note the
+# [^/]+ segments are deliberate: crates/<name>/Cargo.toml matches,
+# crates/<name>/src/anything does not.
+BOT_ALLOWED='^(Cargo\.toml|Cargo\.lock|crates/[^/]+/Cargo\.toml|crates/[^/]+/Cargo\.lock|crates/[^/]+/fuzz/Cargo\.toml|crates/[^/]+/fuzz/Cargo\.lock|\.github/workflows/[^/]+\.ya?ml|\.github/dependabot\.yml|packages/[^/]+/package(-lock)?\.json)$'
 case "$author" in
   dependabot\[bot\]|renovate\[bot\]|github-actions\[bot\])
     changed_now="$(git diff --name-only "$(git merge-base "$BASE_SHA" "$HEAD_SHA" || echo "$BASE_SHA")" "$HEAD_SHA")"
