@@ -59,24 +59,35 @@
 //!   stderr string, which is not guaranteed stable across `taskset`
 //!   versions or locales.
 //!
-//! [`Child::pinned`] records which of the two happened: `true` only when
-//! pinning was both requested (`cores` non-empty) and actually applied.
+//! [`Child::pinned`] records which of the two happened, but read its own doc
+//! before treating `true` as proof of anything past the spawn itself: it is
+//! set from the decision made BEFORE the spawn (`cores` non-empty and
+//! [`cores_available_to_pin`] agreeing), not from an observation taken
+//! after. A `taskset` that starts, passes both checks, and still loses the
+//! core between the check and the exec (an `EPERM`, an offlined CPU, or a
+//! cpuset narrowed concurrently) is a real gap `pinned()` cannot see, and
+//! its own doc says so.
 //!
-//! ## A known gap this fix does not close
+//! ## The gap a prior version of this doc left open is now closed
 //!
 //! `Child::pinned` is the crate-local half of "a benchmark result can never
 //! silently claim pinned numbers it did not get" (this crate's own
-//! dominant-defect concern). The other half, threading that fact into
-//! [`crate::provenance::Provenance`]'s publishability, is deliberately NOT
-//! done here: `Provenance::recompute_publishable` (`provenance.rs`, issue
-//! #407) derives `unpublishable_reasons` from a fixed six-condition table
-//! "per [its own] Design" and clears the vector before every re-derivation,
-//! so a reason pushed from outside would not survive the result writer's own
-//! later call to it; and `RunResult` (`result.rs`, also from an earlier
-//! issue) documents its own field list as closed ("One later issue adds
-//! fields to this struct and no other does"). Both files sit outside this
-//! issue's own `## Files` table. Filed as
-//! <https://github.com/ELares/IronTraffic/issues/838> rather than fixed here.
+//! dominant-defect concern). The other half is threading that fact into
+//! [`crate::provenance::Provenance`]'s publishability. An earlier revision
+//! of this fix left that undone, reasoning that `provenance.rs` (issue #407)
+//! and `result.rs` sat outside this issue's own `## Files` table, and filed
+//! <https://github.com/ELares/IronTraffic/issues/838> instead. A review of
+//! this same pull request found the gap was not merely theoretical: the
+//! EINVAL fallback above is what FIRST makes "unpinned, yet fully
+//! publishable" reachable, and reachable specifically ON LINUX, where the
+//! off-Linux `ip_local_port_range` condition that used to cover an unpinned
+//! run does not apply. Both files were extended into this issue's `## Files`
+//! table for that reason. [`crate::runner::run_repetition`] now sets
+//! [`crate::provenance::Provenance::pinning_incomplete`] from the observed
+//! [`Child::pinned`] of every child that requested pinning, and
+//! `Provenance::recompute_publishable` folds that into
+//! `unpublishable_reasons`, so a contended run can no longer serialise as
+//! isolated. See that field's own doc for the mechanism.
 //!
 //! # CPU accounting is Linux-only
 //!
@@ -395,18 +406,29 @@ impl Child {
         })
     }
 
-    /// Whether pinning was both requested and actually applied: `true` only
-    /// when `cores` was non-empty AND the `taskset` invocation it produced
-    /// actually ran `invocation.program` (as opposed to `taskset` itself
-    /// failing, whether because it is not installed or because a requested
-    /// cpu index is not one this host has; see this module's own "#
-    /// Pinning" doc for both cases).
+    /// Whether pinning was requested and this module did not skip attempting
+    /// it: `true` only when `cores` was non-empty AND the `taskset`
+    /// invocation it produced actually ran `invocation.program` (as opposed
+    /// to `taskset` itself failing, whether because it is not installed or
+    /// because a requested cpu index is not one this host has; see this
+    /// module's own "# Pinning" doc for both cases).
+    ///
+    /// Reviewed finding: this is a RECORDED DECISION, not a verified
+    /// outcome. It is assigned from `attempt_pin`, computed BEFORE the
+    /// spawn, so it cannot see a `sched_setaffinity` that fails AFTER
+    /// `taskset` starts (an `EPERM`, a CPU offlined, or a cpuset narrowed
+    /// between the check above and the exec). `Command::spawn` returning
+    /// `Ok` only proves a process was created, never that it became the
+    /// pinned target; that narrower gap is not observable from this process
+    /// without re-reading the child's own affinity mask after the fact,
+    /// which this method does not do.
     ///
     /// `false` never fails a spawn on its own: a caller that requires real
     /// core isolation for a published measurement must check this and treat
     /// `false` as unpublishable itself, matching edge case 11's existing
     /// "provenance is already unpublishable" convention for a non-pinned
-    /// run.
+    /// run. [`crate::runner::run_repetition`] is that caller today; see
+    /// [`crate::provenance::Provenance::pinning_incomplete`].
     #[must_use]
     pub fn pinned(&self) -> bool {
         self.pinned
@@ -913,6 +935,26 @@ impl CoreSet {
             client: Self::from_unsorted(client),
             probe: Self::from_unsorted(probe),
         })
+    }
+
+    /// Builds a `CoreSet` directly from `cores`, sorted and deduplicated,
+    /// with no minimum count and no partitioning into disjoint roles.
+    ///
+    /// Reviewed finding: unlike [`Self::partition`], this never refuses a
+    /// small core count, because it does not try to carve four disjoint
+    /// roles out of one machine at all. It exists for a caller, a test
+    /// fixture above all, that already knows its own indices and needs a
+    /// `CoreSet` naming exactly them: on a host with fewer than 8 logical
+    /// cores, where `partition` correctly refuses rather than silently
+    /// handing back an assignment that is disjoint in name only, a fixture
+    /// that still needs to spawn something pinned-ish has nowhere else to
+    /// get a `CoreSet` from. It is also how a test forces `Child::spawn`'s
+    /// fallback path deliberately, by naming an index no real host has (the
+    /// unit tests below already relied on this shape before this
+    /// constructor existed to name it).
+    #[must_use]
+    pub fn from_indices(cores: impl IntoIterator<Item = usize>) -> Self {
+        Self::from_unsorted(cores.into_iter().collect())
     }
 
     /// Rendered for `taskset -c`.

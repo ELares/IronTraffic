@@ -49,6 +49,7 @@ fn base_provenance() -> Provenance {
         thermal_throttle_count: Some(0),
         ulimit_nofile: 1_048_576,
         ip_local_port_range: Some((32_768, 60_999)),
+        pinning_incomplete: false,
         sut: clean_stamp(),
         origin: clean_stamp(),
         loadgen: ToolStamp {

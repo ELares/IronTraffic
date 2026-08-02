@@ -633,10 +633,34 @@ pub fn run_repetition(
     let probe_latency = probe_outcome.latency.percentiles();
     let sut_cores = u32::try_from(params.cores.sut.len()).unwrap_or(u32::MAX);
 
+    // Reviewed finding (BLOCKING, PR 828): `Child::spawn`'s EINVAL fallback
+    // (`crate::proc`'s own "# Pinning" doc) can silently run any of these
+    // three children unpinned when a requested core index is not one the
+    // host has. Before that fallback existed, such a host failed the
+    // repetition outright, so a contended run could never reach here
+    // labelled isolated. Fold the OBSERVED outcome, never the mere request,
+    // into THIS repetition's own provenance: a clone, not the shared
+    // `provenance` argument itself, which is captured once per matrix run
+    // before anything is spawned and must stay that way for every other
+    // repetition of the same cell. `recompute_publishable` derives
+    // `unpublishable_reasons` from `Provenance`'s own fields, so the fact
+    // has to live in a field (`pinning_incomplete`) rather than be pushed
+    // into the vector directly, which a later call would just clear.
+    let pinning_incomplete = [
+        (&params.cores.origin, origin_child.pinned()),
+        (&params.cores.sut, sut_child.pinned()),
+        (&params.cores.client, client_child.pinned()),
+    ]
+    .into_iter()
+    .any(|(cores, pinned)| !cores.is_empty() && !pinned);
+    let mut repetition_provenance = provenance.clone();
+    repetition_provenance.pinning_incomplete = pinning_incomplete;
+    repetition_provenance.recompute_publishable();
+
     let result = RunResult {
         cell: cell.id.clone(),
         cell_def: cell.clone(),
-        provenance: provenance.clone(),
+        provenance: repetition_provenance,
         rps,
         latency: latency_percentiles,
         probe_latency,

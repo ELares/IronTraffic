@@ -550,6 +550,7 @@ fn test_provenance() -> Provenance {
         thermal_throttle_count: Some(0),
         ulimit_nofile: 1_048_576,
         ip_local_port_range: Some((32_768, 60_999)),
+        pinning_incomplete: false,
         sut: BuildStamp {
             name: "sut".to_owned(),
             version: "0.1.0".to_owned(),
@@ -583,6 +584,42 @@ fn test_provenance() -> Provenance {
     p
 }
 
+/// Builds a `CoreAssignment` for a host with exactly `logical_u32` logical
+/// cores: `CoreSet::partition` when there are at least 8, or else every role
+/// sharing the SAME real `CoreSet::from_indices(0..logical_u32)`.
+///
+/// Reviewed finding: the previous version of this helper computed
+/// `available_parallelism().max(8)` and handed that inflated count straight
+/// to `partition`, so on any host with fewer than 8 logical cores (a 4-core
+/// `ubuntu-latest` runner, PR 828's own CI failure) the client and probe
+/// sets named cores 4..=7, indices that host does not have. `Child::spawn`'s
+/// EINVAL fallback now keeps that from crashing the repetition, but the
+/// fixture would still silently lose pinning for every role on such a host,
+/// which is finding 1's own blast radius realised on the very host CI uses.
+/// Sharing one non-disjoint `CoreSet` across every role below 8 cores is
+/// honest instead: this is a correctness fixture, not an isolation
+/// measurement, so overlap here costs nothing a test in this file checks,
+/// and every core index it names is one the host actually has.
+///
+/// Takes the count as a parameter, rather than reading
+/// `available_parallelism()` itself, so `core_assignment_never_lies_about_a_small_hosts_cores`
+/// below can drive the below-8 branch on ANY host, this development host's
+/// own (>= 8) core count included.
+fn core_assignment_for(logical_u32: u32) -> CoreAssignment {
+    match CoreSet::partition(logical_u32) {
+        Ok(assignment) => assignment,
+        Err(_fewer_than_eight_logical_cores) => {
+            let all = CoreSet::from_indices(0..logical_u32 as usize);
+            CoreAssignment {
+                origin: all.clone(),
+                sut: all.clone(),
+                client: all.clone(),
+                probe: all,
+            }
+        }
+    }
+}
+
 fn core_assignment() -> CoreAssignment {
     let logical = std::thread::available_parallelism().map_or(8, std::num::NonZero::get);
     #[allow(
@@ -590,11 +627,35 @@ fn core_assignment() -> CoreAssignment {
         reason = "available_parallelism on any real development or CI host is far below u32::MAX"
     )]
     let logical_u32 = logical as u32;
-    #[allow(
-        clippy::expect_used,
-        reason = "test setup helper, not itself a #[test] fn"
-    )]
-    CoreSet::partition(logical_u32.max(8)).expect("at least 8 logical cores on the test host")
+    core_assignment_for(logical_u32)
+}
+
+#[test]
+fn core_assignment_never_lies_about_a_small_hosts_cores() {
+    // Reviewed finding: this drives `core_assignment_for` directly with an
+    // explicit 4, never reading this development host's own (>= 8) real
+    // core count, so it reproduces the shape of PR 828's own CI failure (a
+    // 4-core `ubuntu-latest` runner) on ANY host. Before the fix above, this
+    // function computed `4_u32.max(8) == 8` and partitioned as if the host
+    // had 8 cores, so the client and probe sets would have named 4, 5, 6 and
+    // 7: indices a real 4-core host does not have. Every core index in
+    // every role below must be strictly less than the 4 cores actually
+    // given.
+    let assignment = core_assignment_for(4);
+    for (role_name, role) in [
+        ("origin", &assignment.origin),
+        ("sut", &assignment.sut),
+        ("client", &assignment.client),
+        ("probe", &assignment.probe),
+    ] {
+        for &core in role.iter() {
+            assert!(
+                core < 4,
+                "{role_name}'s core {core} must be < 4 on a 4 logical-core host, not an index \
+                 only an 8-or-more-core host would actually have"
+            );
+        }
+    }
 }
 
 fn test_params(label: &str, warmup_secs: u32, measure_secs: u32) -> RunParamsFull {
@@ -700,6 +761,66 @@ fn repetition_produces_a_result() {
             );
         }
     }
+}
+
+#[test]
+fn unpinned_repetition_is_marked_unpublishable() {
+    // Reviewed finding (BLOCKING, PR 828). Before this fix, `Child::spawn`'s
+    // EINVAL fallback (`crate::proc`'s own "# Pinning" doc) let a
+    // repetition run any child unpinned with NOTHING anywhere recording it:
+    // `Child::pinned()` had exactly one caller in the whole workspace (a
+    // unit test in `proc.rs`), `Provenance::recompute_publishable`'s table
+    // did not consider pinning at all, and this crate denies logging, so a
+    // contended run could serialise as `sut_cores`-isolated and fully
+    // `publishable`. This forces the SAME fallback PR 828's own CI failure
+    // needed (an out-of-range core index; see
+    // `cores_available_to_pin_rejects_an_index_this_host_does_not_have` in
+    // `proc.rs`'s own unit tests for the identical argument that no real
+    // host has core 999_999) onto the SUT specifically, so the SUT falls
+    // back to unpinned without needing an actual small-core machine to
+    // prove it, and asserts the repetition's own provenance now NAMES that,
+    // rather than silently trusting the fallback happened.
+    if !oha_available() {
+        return;
+    }
+    let cell = test_cell("runner_unpinned");
+    let oha = irontraffic_bench::Oha;
+    let ceiling = CeilingProbe;
+    let adapters: Vec<&dyn LoadGenerator> = vec![&oha, &ceiling];
+    let mut params = test_params("unpinned", 2, 3);
+    params.cores.sut = CoreSet::from_indices([999_999]);
+    let provenance = test_provenance();
+
+    let outcome = run_repetition(&cell, &oha, &adapters, &params, &provenance);
+    let (result, _recorder) = outcome.expect(
+        "a child that falls back to unpinned must still complete the repetition, never fail it \
+         outright",
+    );
+    assert!(
+        !result.provenance.publishable,
+        "a repetition where the SUT could not be pinned to its requested cores must never be \
+         publishable; unpublishable_reasons was {:?}",
+        result.provenance.unpublishable_reasons
+    );
+    // This development host is ALSO unpublishable for reasons unrelated to
+    // pinning (off Linux, `test_provenance`'s own build stamps are
+    // `StampSource::Fallback`), so asserting `!publishable` alone would pass
+    // even without this fix. Naming the specific reason is what actually
+    // discriminates: this is the assertion that FAILS if the wiring this
+    // finding added to `run_repetition` (folding the observed
+    // `Child::pinned` into a `pinning_incomplete` clone of `provenance`
+    // before `recompute_publishable`) is reverted, verified by hand while
+    // implementing this fix.
+    assert!(
+        result
+            .provenance
+            .unpublishable_reasons
+            .iter()
+            .any(|r| r.contains("pinned")),
+        "unpublishable_reasons {:?} must name the pinning failure specifically, not merely \
+         happen to be unpublishable for some unrelated reason",
+        result.provenance.unpublishable_reasons
+    );
 }
 
 #[test]
@@ -1090,8 +1211,7 @@ fn readiness_timeout_includes_stderr() {
         ],
         env: Vec::new(),
     };
-    let cores = CoreSet::partition(core_assignment_logical_cores())
-        .map_or_else(|_| default_probe_core_set(), |assignment| assignment.probe);
+    let cores = default_probe_core_set();
     let mut child = Child::spawn(&invocation, &cores, "readiness_timeout_test")
         .expect("spawning the fixture must succeed");
     // A port nothing listens on: the fixture never binds anything.
@@ -1113,23 +1233,29 @@ fn readiness_timeout_includes_stderr() {
         .wait_ready(never_listens, Duration::from_secs(3))
         .expect_err("a child that never listens must time out");
     let text = err.to_string();
-    // The ENOENT ("`taskset` not installed") fallback happens entirely inside
-    // `Child::spawn`, before this test ever sees a capture, so it can never
-    // appear in `text`. Only the EINVAL text can, and only if
-    // `cores_available_to_pin` ever has a gap: check for it explicitly
-    // rather than silently blaming an unrelated cause the way PR 828's own
-    // CI failure did.
-    let taskset_refused = text.contains("taskset: failed to set");
-    let diagnosis = if taskset_refused {
-        "the excerpt above already names a real, identifiable cause (`taskset` refused the \
-         requested core, so the fixture never ran at all): a genuine defect in \
-         `cores_available_to_pin` or this test's own core assignment, NOT host starvation"
+    // Reviewed finding: the previous version of this test selected its
+    // diagnosis purely by `text.contains("taskset: failed to set")`, and
+    // `crate::proc`'s own module doc argues for `core_affinity` over parsing
+    // captured stderr precisely because that text "is not guaranteed stable
+    // across `taskset` versions or locales": under a different locale or
+    // util-linux version, a child that provably never ran would silently
+    // get the starvation hedge below instead, one string match away from
+    // the original defect. `wait_ready` joins BOTH capture reader threads
+    // before building this error whenever it observes the child has already
+    // exited (see its own doc), so "the reader thread lost the race against
+    // a starved host" is IMPOSSIBLE once the child is confirmed dead:
+    // `is_alive()` settles the question directly, the same way the sibling
+    // test `teardown_kills_the_whole_process_group` (below) already does.
+    let diagnosis = if child.is_alive() {
+        "the fixture is still running (it loops forever after writing its stderr text), which \
+         is consistent with, though not proof of, host starvation before the 3 second deadline: \
+         a live process really can be merely slow"
     } else {
-        "with that specific cause ruled out, the remaining explanation is genuinely ambiguous \
-         from inside this test: either the capture reader thread lost the race against a \
-         starved host before the 3 second deadline, or a real defect in the capture path \
-         itself. The two are distinguished only from OUTSIDE this test, by whether the failure \
-         reproduces on an otherwise idle host: starvation would not, a capture defect would"
+        "the fixture has ALREADY EXITED, which rules out host starvation outright: a process \
+         that is not running cannot be merely slow. `hang-stderr` never exits on its own, so \
+         this points to a genuine defect in spawning it (for example a `taskset` pinning \
+         failure that kept it from ever running at all, PR 828's own diagnosed root cause) or \
+         in the capture path, not to a starved host"
     };
     assert!(
         text.contains("distinctive-marker-9f3e"),
@@ -1170,16 +1296,6 @@ fn readiness_error_is_sanitised() {
 
 fn default_probe_core_set() -> CoreSet {
     core_assignment().probe
-}
-
-fn core_assignment_logical_cores() -> u32 {
-    let logical = std::thread::available_parallelism().map_or(8, std::num::NonZero::get);
-    #[allow(
-        clippy::cast_possible_truncation,
-        reason = "available_parallelism on any real development or CI host is far below u32::MAX"
-    )]
-    let logical_u32 = logical as u32;
-    logical_u32.max(8)
 }
 
 // ---------------------------------------------------------------------------
