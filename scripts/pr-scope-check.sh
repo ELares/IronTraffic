@@ -368,7 +368,7 @@ done
 # `scripts/pr-scope-check-selftest.sh` for the executable form of both claims.
 #
 # `crates/[^/]+/fuzz/Cargo\.lock` STAYS on BOT_ALLOWED below, after
-# consideration: it is a real, cargo-fuzz-required lockfile (11 of them are
+# consideration: it is a real, cargo-fuzz-required lockfile (10 of them are
 # tracked) and a real fuzz-dependency bump touches its content the same way a
 # root bump touches the root `Cargo.lock`. Round three's finding was never that
 # this file's content is safe to read as a lockfile; it is that nothing stops
