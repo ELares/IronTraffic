@@ -11,7 +11,7 @@
 
 use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha384;
-use zeroize::Zeroizing;
+use zeroize::{Zeroize, Zeroizing};
 
 /// RFC 5869 section 2.2: `PRK = HMAC-Hash(salt, IKM)`. Returns the 48-byte pseudorandom key.
 pub(crate) fn extract_sha384(salt: &[u8], ikm: &[u8]) -> Zeroizing<[u8; 48]> {
@@ -30,20 +30,34 @@ pub(crate) fn extract_sha384(salt: &[u8], ikm: &[u8]) -> Zeroizing<[u8; 48]> {
     if let Some(head) = full.get(..48) {
         prk.copy_from_slice(head);
     }
-    // Zeroize the HMAC's own output buffer in place: `hybrid_array::Array` derefs to `[u8]`,
-    // so `fill` reaches every byte without needing `zeroize::Zeroize` implemented for it.
-    // `prk` itself is returned wrapped in `Zeroizing`, so both copies are covered.
+    // Zeroize the HMAC's own output buffer in place, not just `prk`. `full` is
+    // `hybrid_array::Array<u8, U48>` (`crypto_common::Output<Hmac<Sha384>>`); nothing in this
+    // workspace's resolved dependency graph turns on hybrid-array's own `zeroize` feature
+    // (`cargo tree -e features` reports `hybrid-array feature "default"` only, checked with the
+    // workspace `Cargo.toml`'s `hmac` `zeroize` feature enabled), so `Array` itself has no
+    // `Zeroize` impl here. The call below still resolves, through a different route: `Array`
+    // derefs to `[u8]`, and the `zeroize` crate has its own blanket
+    // `impl<Z: DefaultIsZeroes> Zeroize for [Z]`, which covers `u8` unconditionally and needs no
+    // feature flag of its own. That slice impl is what actually runs.
     //
-    // This comment used to say `GenericArray` and cite a `generic-array` dependency feature
-    // this crate was not authorized to add. The hmac 0.13 / sha2 0.11 bump moved
-    // `finalize().into_bytes()` to `crypto_common::Output<T>`, which is a
-    // `hybrid_array::Array`, and hybrid-array declares only `alloc` and `extra-sizes`, so
-    // the feature the old text pointed at does not exist to add. The MECHANISM is unchanged
-    // and still correct, which is exactly why nothing failed when the type moved: a reader
-    // chasing the reasoning would have gone looking for a crate the bump removed from the
-    // graph. This is the key schedule for the product's highest value secret and this is the
-    // only in-tree explanation of why the wipe is done by hand.
-    full.fill(0);
+    // This is a real change from `<[u8]>::fill(0)`, which it replaces, and the reason is not
+    // cosmetic. `fill` is a plain, non-volatile store into a local that is dead immediately
+    // afterwards, exactly the kind of store a compiler is entitled to remove as dead.
+    // `Zeroize::zeroize` for a byte slice performs a volatile write followed by an explicit
+    // optimization barrier, specifically so the write survives that elimination. This is the
+    // key schedule for the product's highest value secret, so that property is worth the one
+    // line it costs. (The workspace `Cargo.toml` comment on `hmac`'s `zeroize` feature records
+    // the two other things enabling it buys: a wipe of `sha2`'s internal block buffer on drop,
+    // and a wipe of the transient `CtOutput` that `mac.finalize()` produces before
+    // `.into_bytes()` clones out of it.)
+    //
+    // This comment has been wrong twice before, in opposite directions: once claiming the
+    // `Zeroize` route needed a dependency feature (`generic-array`) this crate was not
+    // authorized to add, and once claiming, of the successor type `hybrid-array`, that the
+    // feature it would need does not exist. Neither claim is repeated here; this text states
+    // only what was checked against the graph above, not what would be convenient to believe.
+    // `prk` itself is returned wrapped in `Zeroizing`, so both copies are covered.
+    full.zeroize();
     Zeroizing::new(prk)
 }
 
@@ -76,8 +90,9 @@ pub(crate) fn expand_sha384(prk: &[u8; 48], info: &[u8], out: &mut [u8]) -> bool
     } else {
         false
     };
-    // Zeroize `t`, in place, for the same reason and by the same mechanism as `extract_sha384`.
-    t.fill(0);
+    // Zeroize `t`, in place, for the same reason and by the same mechanism as `extract_sha384`:
+    // see the comment there for what is actually true about the route this takes.
+    t.zeroize();
     ok
 }
 

@@ -169,7 +169,20 @@ arc-swap = "1.9.2"
 # `irontraffic-tls` names it. 0.13 is built on `digest` 0.11, which is why
 # `sha2` below must stay on a `digest` 0.11 release too: `Hmac::<Sha384>` needs
 # both crates to agree on which `digest` major they name.
-hmac = "0.13"
+#
+# The `zeroize` feature forwards to `digest/zeroize`, which does two things for the key
+# schedule in `hkdf.rs`, neither of which is the `hybrid_array::Array` impl the name might
+# suggest: nothing in this workspace's resolved graph turns on hybrid-array's own `zeroize`
+# feature (`cargo tree -e features` still reports `hybrid-array feature "default"` only with
+# this enabled; see `hkdf.rs` for how the explicit wipe there gets a real `Zeroize` anyway).
+# What this feature genuinely buys: `digest/zeroize` forwards on to `block-buffer/zeroize`,
+# so `Sha384`'s internal block buffer is wiped on drop; and it makes `digest::CtOutput` (the
+# type `Hmac::finalize()` returns before `.into_bytes()` clones out of it) zeroize itself on
+# drop instead of leaking that transient copy unwiped. Feature unification is per resolved
+# crate version, not per dependency edge, so enabling this only here also covers `sha2`'s own
+# internal use of `digest`; `sha2` does not need the same feature named a second time below
+# (checked: adding it to `sha2` here too changes nothing in `cargo tree -e features`).
+hmac = { version = "0.13", features = ["zeroize"] }
 # SHA-384, the hash the HKDF above is built on (`cluster-derived-session-ticketer`,
 # #120). Kept in lockstep with `hmac`'s `digest` major; see the comment there.
 sha2 = "0.11"
