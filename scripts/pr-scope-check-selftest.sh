@@ -20,16 +20,13 @@
 # repositories with a stubbed `gh`, so it exercises the loop the way CI
 # actually does, the same discipline invariant-lints-selftest.sh and
 # test-census-selftest.sh already apply to their own scripts.
-set -euo pipefail
-cd "$(git rev-parse --show-toplevel)"
-WORK="$(mktemp -d)"
 
-# Vacuity guard (round seven, hardened round eight, BLOCKING). Nothing
-# previously counted how much of this file actually RAN: an `exit 0`
-# inserted before case 1, or most of the cases below simply deleted, both
-# left this file printing "clean" with rc=0, because `FAILED` only ever
-# records a case that ran and found something wrong, never the absence of
-# cases to run in the first place.
+# Vacuity guard (round seven, hardened round eight, RE-HARDENED round ten,
+# BLOCKING). Nothing previously counted how much of this file actually RAN:
+# an `exit 0` inserted before case 1, or most of the cases below simply
+# deleted, both left this file printing "clean" with rc=0, because `FAILED`
+# only ever records a case that ran and found something wrong, never the
+# absence of cases to run in the first place.
 #
 # A plain shell variable cannot do the counting: almost every case invokes
 # `run_scope` as `OUT="$(run_scope ...)"`, and `$( )` command substitution
@@ -54,44 +51,49 @@ WORK="$(mktemp -d)"
 # anything, exactly the branch-protection-reports-SUCCESS failure mode this
 # whole suite exists to catch, reached one layer up, in the judge of the
 # judge. Round seven's own comment asserted this "structurally cannot be
-# caught by anything placed later in this same linear script" and that
-# closing it needed a change to ci.yml. That conclusion was false: a check
-# does not have to be placed LATER to run on every exit; an EXIT trap is
-# placed EARLIER (installed once, here) and fires on every exit this script
-# takes, including an `exit 0` reached on line 2 and including falling off
-# the end normally. `DONE` is set to 1 only once, at the single point near
-# the bottom of this file where the case-running body has finished
-# accounting for `$FAILED` and is about to report its verdict (see there);
-# every other exit path, deliberate or not, leaves `DONE` at its default of
-# 0, and the trap treats that, OR a case count under the floor, as failure.
+# caught by anything placed later in this same linear script" and drew the
+# right conclusion (move the CHECK earlier, not the exit later): an EXIT
+# trap fires on every exit this script takes, not only the ones that fall
+# through to the bottom.
 #
-# WATCHED TO FIRE, both ways, directly against this file (not merely
-# reasoned about; see the round-eight review's own experiments (a)/(b)/(c)/
-# (c2)/(d), reproduced here): an `exit 0` inserted before case 1 -> rc=1,
-# "exited early or with too few cases (0 case(s) ran ... DONE=0)"; deleting
-# every case from case 2 through the end -> rc=1, "1 case(s) ran"; deleting
-# case 46b entirely -> rc=1, "... case(s) ran" one short of the floor; an
-# unmutated run -> rc=0, "pr-scope-check-selftest: clean". The trap's own
-# `exit` statements are explicit, not an implicit fatal-expansion abort, so
-# they propagate their status correctly regardless of where in the script
-# the trap fired from (the same distinction pr-scope-check.sh's own header
-# comment makes about `${VAR:?}` versus an explicit `exit`); and on the
-# CLEAN path the trap re-emits the script's own already-decided exit status
-# (`exit "$rc"`, captured from `$?` as the trap's very first statement)
-# rather than substituting its own, so it does not itself turn a legitimate
-# `exit 1` (a real case failure, `$FAILED` non-zero) into a different,
-# misleadingly "vacuous" message: `DONE` is set to 1 on that path too,
-# before the script's own explicit `exit 1`, so the trap recognises it as a
-# genuine, already-explained failure and simply relays the status.
-CASES_FILE="$WORK/.cases-ran"
-: > "$CASES_FILE"
-CASES_FLOOR=102
+# ROUND EIGHT installed that trap a few statements into the script, after
+# `set -euo pipefail`, `cd`, and `WORK="$(mktemp -d)"`, and asserted it
+# therefore covered "an `exit 0` reached on line 2". ROUND TEN'S OWN REVIEW
+# measured that claim directly rather than trusting it, by binary-searching
+# with a real `exit 0` inserted at successive lines of the committed file:
+# every insertion point from the shebang down through the trap's own
+# `_finish`/`trap` statements produced a SILENT rc=0 vacuous pass, and only
+# an `exit 0` placed AFTER the trap installation was caught. The prose was
+# correct about WHY an EXIT trap works and wrong about WHERE this one
+# reached: "installed once, here" was not early enough, because "here" was
+# still several statements past the top of the file. A trap that is not
+# installed YET cannot fire, no matter how early "installed once" sounds.
+#
+# The fix is to make the trap installation as close to the literal first
+# thing this script's interpreter executes as a trap CAN be: ahead of
+# `set -euo pipefail` and `cd` and `WORK`, not merely early relative to the
+# case bodies. `CASES_FILE` and `WORK` are given safe empty defaults so
+# `_finish` degrades to "0 cases ran" rather than an unbound-variable error
+# if it fires before either is assigned for real a few lines below. The only
+# statements left ahead of the `trap` command itself are the four trivial,
+# infallible variable assignments immediately below (`CASES_FLOOR`, `DONE`,
+# `CASES_FILE`, `WORK`) and the `_finish` function DEFINITION (registering
+# the function does not run its body), none of which can itself abort or
+# exit; the trap command has to be a real, separate statement, so it cannot
+# also be the first character of the file. This is a claim about WHERE the
+# residual gap is, not an assertion that there is none, and it is measured
+# below, not merely asserted.
+CASES_FLOOR=111
 DONE=0
+CASES_FILE=""
+WORK=""
 _finish() {
-  local rc=$? n
-  n="$(wc -c < "$CASES_FILE" 2>/dev/null | tr -d ' ')"
-  [ -n "$n" ] || n=0
-  rm -rf "$WORK"
+  local rc=$? n=0
+  if [ -n "$CASES_FILE" ] && [ -f "$CASES_FILE" ]; then
+    n="$(wc -c < "$CASES_FILE" 2>/dev/null | tr -d ' ')"
+    [ -n "$n" ] || n=0
+  fi
+  [ -n "$WORK" ] && rm -rf "$WORK"
   if [ "$DONE" -ne 1 ] || [ "$n" -lt "$CASES_FLOOR" ]; then
     echo "pr-scope-check-selftest: FAILED. exited early or with too few cases ($n case(s) ran," >&2
     echo "DONE=$DONE, expected at least $CASES_FLOOR and DONE=1). A self-test that runs" >&2
@@ -102,6 +104,45 @@ _finish() {
   exit "$rc"
 }
 trap _finish EXIT
+#
+# WATCHED TO FIRE, both ways, directly against this file (not merely
+# reasoned about; round eight's own experiments (a)/(b)/(c)/(c2)/(d), and
+# round ten's own line-by-line boundary search, both reproduced here, INCLUDING
+# the false positive the first version of this search produced: an `exit 0`
+# spliced in immediately before the `_finish` function's closing `}` lands
+# INSIDE that function's body, after its own `exit` statements, so it is
+# genuinely dead code and proves nothing about the trap either way). With
+# that corrected, the measured boundary is: an `exit 0` inserted anywhere
+# from the shebang through the `trap _finish EXIT` statement's OWN line
+# (the four assignments above, the `_finish` definition, or in place of the
+# `trap` line itself) is still a silent, uncaught rc=0 vacuous pass, exactly
+# as round eight's version of this file was for a much larger span (its
+# trap sat several real statements later, at what was then line 104); an
+# `exit 0` inserted anywhere AFTER that line -- including immediately after
+# it -- is caught, rc=1, "0 case(s) ran ... DONE=0". A trap cannot fire
+# before the statement that installs it has run; that is the one part of
+# the old blind spot no reordering can remove, and it is now the ONLY part
+# left. An `exit 0` inserted before case 1 -> rc=1, "0 case(s) ran ...
+# DONE=0"; deleting every case from case 2 through the end -> rc=1, "1
+# case(s) ran"; deleting case 46b entirely -> rc=1, "... case(s) ran" one
+# short of the floor; an unmutated run -> rc=0, "pr-scope-check-selftest:
+# clean". The trap's own `exit` statements are
+# explicit, not an implicit fatal-expansion abort, so they propagate their
+# status correctly regardless of where in the script the trap fired from
+# (the same distinction pr-scope-check.sh's own header comment makes about
+# `${VAR:?}` versus an explicit `exit`); and on the CLEAN path the trap
+# re-emits the script's own already-decided exit status (`exit "$rc"`,
+# captured from `$?` as the trap's very first statement) rather than
+# substituting its own, so it does not itself turn a legitimate `exit 1` (a
+# real case failure, `$FAILED` non-zero) into a different, misleadingly
+# "vacuous" message: `DONE` is set to 1 on that path too, before the
+# script's own explicit `exit 1`, so the trap recognises it as a genuine,
+# already-explained failure and simply relays the status.
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+WORK="$(mktemp -d)"
+CASES_FILE="$WORK/.cases-ran"
+: > "$CASES_FILE"
 FAKEBIN="$WORK/fakebin"
 # Captured before any case puts a stub `git` on FAKEBIN (round four, case 35
 # below), so that stub has a real git to delegate everything except the one
@@ -178,7 +219,7 @@ note() { printf '  %s\n' "$1"; }
 # single `note` call) and this guard fires; CASES_FLOOR above does not, for
 # the reason this guard exists.
 NOTE_COUNT="$(git show HEAD:scripts/pr-scope-check-selftest.sh | grep -c '^[[:space:]]*note "' || true)"
-NOTE_FLOOR=108
+NOTE_FLOOR=135
 if [ "$NOTE_COUNT" -lt "$NOTE_FLOOR" ]; then
   echo "pr-scope-check-selftest: FAILED. Only $NOTE_COUNT note() call site(s) found in the" >&2
   echo "committed file (expected at least $NOTE_FLOOR). A case whose run_scope call survives" >&2
@@ -4329,6 +4370,624 @@ elif ! echo "$OUT95" | grep -qF '.github/actions/deploy.yml'; then
   FAILED=1
 else
   note "a YAML file exactly two components under .github, in a dir literally named anything but workflows, is refused (pins the workflows-dir token at the depth the one-token relaxation actually admits)"
+fi
+
+# ===========================================================================
+# ROUND TEN: BLOCKING findings from round nine's independent review, closed
+# by mechanically enumerating the relaxation SPACE from the regex text
+# itself (scratchpad/r10/enumerate.py: tokenizes each alternative, then
+# applies escape-strip, whole-component-widen, sub-literal suffix-widen and
+# anchor-drop operators to every atom it finds), not by hand-listing the
+# handful of relaxations a reviewer happened to name. That generator
+# produced 49 candidate BOT_ALLOWED mutants and 6 candidate ALWAYS_ALLOWED
+# mutants; every one of them was actually run against the committed suite
+# (scratchpad/r10/sweep.sh, an index/line-scoped mutator plus a driver whose
+# CAUGHT verdict requires rc EXACTLY 1 AND a real FAIL line in the log --
+# built in from the start, because round nine's own reviewer's first sweep
+# scored 38/38 CAUGHT at rc=127 on a host with no `timeout` binary, before
+# it added that same guard). 29 of the 55 regex mutants survived; cases
+# 96-100 below close every one of them, several fixtures at a time where a
+# single discriminating path refutes more than one mutant. The remaining
+# two BLOCKING findings are not regex mutations at all: case sensitivity
+# (every `grep -qE "$VAR"` call site gating one of these two allowlists,
+# found by grepping the script, not guessed) and the directory-declaration
+# arm (every occurrence of the `*/) case "$f" in "$d"*) <var>=1;; esac ;;`
+# shape, likewise grepped, not hand-listed); cases 101-103 close those.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# 96. BOT_ALLOWED sweep, dot-escape unpinned on every manifest filename
+#     literal, all five manifest alternatives at once (round ten: mechanically
+#     enumerated from the regex itself, not spot-checked one alternative at a
+#     time -- see scratchpad/r10/enumerate.py). Dropping ONE backslash from
+#     any of Cargo\.toml, Cargo\.lock, crates/[^/]+/Cargo\.toml,
+#     crates/[^/]+/fuzz/Cargo\.toml or crates/[^/]+/fuzz/Cargo\.lock turns
+#     that literal dot into an ERE "any character", admitting a same-length
+#     path with an arbitrary byte where the dot belongs (real grep -E
+#     applies no filesystem special-casing to `.`, so even a literal `/`
+#     would match). A SIXTH fixture pins both fuzz-dir manifests' trailing
+#     extension in one shot: widening `Cargo\.toml` or `Cargo\.lock` to
+#     `Cargo\.[^/]+` inside `crates/<n>/fuzz/` admits ANY extension, and
+#     because the two alternatives differ only in which one is mutated, not
+#     in what the mutant then admits, the identical fixture (`Cargo.evil`)
+#     refutes either one.
+# ---------------------------------------------------------------------------
+D96="$WORK/bot-allowed-manifest-dot-escape-sweep"
+new_repo "$D96"
+mkdir -p "$D96/crates/pol/fuzz"
+printf 'placeholder\n' > "$D96/README.md"
+commit_all "$D96" base
+git -C "$D96" checkout -qb pr
+printf 'attacker-controlled, not a real manifest\n' > "$D96/CargoXtoml"
+printf 'attacker-controlled, not a real lockfile\n' > "$D96/CargoXlock"
+printf 'attacker-controlled\n' > "$D96/crates/pol/CargoXtoml"
+printf 'attacker-controlled\n' > "$D96/crates/pol/fuzz/CargoXtoml"
+printf 'attacker-controlled\n' > "$D96/crates/pol/fuzz/CargoXlock"
+printf 'attacker-controlled, no sibling manifest reviews it, extension is not toml or lock\n' > "$D96/crates/pol/fuzz/Cargo.evil"
+commit_all "$D96" attack
+fake_gh 'dependabot[bot]' ''
+echo "== BOT_ALLOWED sweep (dot-escape, all 5 manifest alts + fuzz-dir extension): all 6 fixtures must be refused =="
+OUT96="$(run_scope "$D96")" && RC96=0 || RC96=$?
+if [ "$RC96" -eq 0 ]; then
+  echo "FAIL: case 96 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT96" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT96" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: a dot-escape or extension-widen mutant let the whole PR through as EXEMPT. Got:" >&2
+  echo "$OUT96" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if ! echo "$OUT96" | grep -qxF '    CargoXtoml'; then
+  echo "FAIL: refused, but the top-level CargoXtoml probe (alt 0's dot-escape) was not named among the offending paths. Got:"
+  echo "$OUT96" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a same-length top-level CargoXtoml (any-char instead of the literal dot) is refused (pins alt 0's dot-escape)"
+fi
+if ! echo "$OUT96" | grep -qxF '    CargoXlock'; then
+  echo "FAIL: refused, but the top-level CargoXlock probe (alt 1's dot-escape) was not named among the offending paths. Got:"
+  echo "$OUT96" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a same-length top-level CargoXlock (any-char instead of the literal dot) is refused (pins alt 1's dot-escape)"
+fi
+if ! echo "$OUT96" | grep -qxF '    crates/pol/CargoXtoml'; then
+  echo "FAIL: refused, but crates/pol/CargoXtoml (alt 2's dot-escape) was not named among the offending paths. Got:"
+  echo "$OUT96" | sed 's/^/    /'
+  FAILED=1
+else
+  note "crates/pol/CargoXtoml is refused (pins alt 2's dot-escape)"
+fi
+if ! echo "$OUT96" | grep -qxF '    crates/pol/fuzz/CargoXtoml'; then
+  echo "FAIL: refused, but crates/pol/fuzz/CargoXtoml (alt 3's dot-escape) was not named among the offending paths. Got:"
+  echo "$OUT96" | sed 's/^/    /'
+  FAILED=1
+else
+  note "crates/pol/fuzz/CargoXtoml is refused (pins alt 3's dot-escape)"
+fi
+if ! echo "$OUT96" | grep -qxF '    crates/pol/fuzz/CargoXlock'; then
+  echo "FAIL: refused, but crates/pol/fuzz/CargoXlock (alt 4's dot-escape) was not named among the offending paths. Got:"
+  echo "$OUT96" | sed 's/^/    /'
+  FAILED=1
+else
+  note "crates/pol/fuzz/CargoXlock is refused (pins alt 4's dot-escape)"
+fi
+if ! echo "$OUT96" | grep -qxF '    crates/pol/fuzz/Cargo.evil'; then
+  echo "FAIL: refused, but crates/pol/fuzz/Cargo.evil (alts 3 and 4's extension boundary) was not named among the offending paths. Got:"
+  echo "$OUT96" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a fuzz-dir Cargo.evil (wrong extension) is refused (pins both alt 3's and alt 4's trailing-extension boundary, whichever one a mutant widens)"
+fi
+
+# ---------------------------------------------------------------------------
+# 97. BOT_ALLOWED sweep, \.github/workflows/[^/]+\.ya?ml, every remaining
+#     one-token relaxation of this alternative (round ten: mechanically
+#     enumerated). Cases 81-84 already pin the extension, the single-
+#     component depth, the "workflows" directory name and the ".github"
+#     directory name against a NESTED .github/actions/... probe; they do not
+#     reach the shallower mutants below, each caught by its own
+#     generator-derived fixture:
+#       - widening the LEADING ".github" component to a bare wildcard, or
+#         stripping its escape so only ONE arbitrary character need precede
+#         literal "github", both admit a top-level dir that merely ENDS in
+#         "github" -- one fixture pins both at once.
+#       - stripping the escape on the leading dot while widening "github"
+#         itself to any word admits ANY dot-directory, not only .github.
+#       - stripping the escape on the extension's dot lets any single
+#         character stand in for it.
+#       - widening the extension's "y" (before the optional "a") to a
+#         wildcard, or widening its "ml" (after the optional "a") to a
+#         wildcard, each admit a file that merely ends, or merely starts,
+#         with the right piece of "ya?ml" -- two more fixtures, both
+#         distinct from the plain-extension case already covered.
+# ---------------------------------------------------------------------------
+D97="$WORK/bot-allowed-a6-workflows-sweep"
+new_repo "$D97"
+mkdir -p "$D97/Xgithub/workflows" "$D97/.github/workflows" "$D97/.hub/workflows"
+printf 'placeholder\n' > "$D97/README.md"
+commit_all "$D97" base
+git -C "$D97" checkout -qb pr
+printf 'name: deploy\non: push\njobs: {}\n' > "$D97/Xgithub/workflows/evil.yml"
+printf 'name: deploy\non: push\njobs: {}\n' > "$D97/.hub/workflows/evil.yml"
+printf 'name: deploy\non: push\njobs: {}\n' > "$D97/.github/workflows/evil-yml"
+printf 'name: deploy\non: push\njobs: {}\n' > "$D97/.github/workflows/evil.xml"
+printf 'name: deploy\non: push\njobs: {}\n' > "$D97/.github/workflows/evil.yxyz"
+commit_all "$D97" attack
+fake_gh 'dependabot[bot]' ''
+echo "== BOT_ALLOWED sweep (.github/workflows, remaining one-token relaxations): all 5 fixtures must be refused =="
+OUT97="$(run_scope "$D97")" && RC97=0 || RC97=$?
+if [ "$RC97" -eq 0 ]; then
+  echo "FAIL: case 97 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT97" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT97" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: a workflows-alternative mutant let the whole PR through as EXEMPT. Got:" >&2
+  echo "$OUT97" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if ! echo "$OUT97" | grep -qxF '    Xgithub/workflows/evil.yml'; then
+  echo "FAIL: refused, but Xgithub/workflows/evil.yml was not named among the offending paths. Got:"
+  echo "$OUT97" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a top-level dir that merely ends in 'github' (no leading dot) is refused (pins the .github component both as a bare-wildcard widen and as an escape-strip)"
+fi
+if ! echo "$OUT97" | grep -qxF '    .hub/workflows/evil.yml'; then
+  echo "FAIL: refused, but .hub/workflows/evil.yml was not named among the offending paths. Got:"
+  echo "$OUT97" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a dot-directory that is not literally .github is refused (pins the leading dot staying escaped while 'github' itself is widened)"
+fi
+if ! echo "$OUT97" | grep -qxF '    .github/workflows/evil-yml'; then
+  echo "FAIL: refused, but .github/workflows/evil-yml was not named among the offending paths. Got:"
+  echo "$OUT97" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a workflows file with no dot before its extension is refused (pins the extension dot's escape)"
+fi
+if ! echo "$OUT97" | grep -qxF '    .github/workflows/evil.xml'; then
+  echo "FAIL: refused, but .github/workflows/evil.xml was not named among the offending paths. Got:"
+  echo "$OUT97" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a workflows file ending in .xml (not .yml or .yaml) is refused (pins the 'y' half of ya?ml)"
+fi
+if ! echo "$OUT97" | grep -qxF '    .github/workflows/evil.yxyz'; then
+  echo "FAIL: refused, but .github/workflows/evil.yxyz was not named among the offending paths. Got:"
+  echo "$OUT97" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a workflows file starting with y but not ending in ml (not .yml or .yaml) is refused (pins the 'ml' half of ya?ml)"
+fi
+
+# ---------------------------------------------------------------------------
+# 98. BOT_ALLOWED sweep, \.github/dependabot\.yml, every remaining one-token
+#     relaxation of this alternative (round ten: mechanically enumerated).
+#     Cases 84 and 85 already pin the "dependabot" name and the extension
+#     against siblings that still live directly under a real .github/; they
+#     do not reach the leading-directory-token mutants below:
+#       - widening ".github" to a bare wildcard, or stripping its escape so
+#         one arbitrary character stands in for the dot, both admit a
+#         top-level dir that merely ends in "github" -- one fixture pins
+#         both.
+#       - stripping the escape on the extension's dot lets any single
+#         character stand in for it (round nine's own review's "a6e").
+#       - stripping the escape on the leading dot while widening "github"
+#         itself to any word admits any dot-directory.
+# ---------------------------------------------------------------------------
+D98="$WORK/bot-allowed-a7-dependabot-sweep"
+new_repo "$D98"
+mkdir -p "$D98/Xgithub" "$D98/.github" "$D98/.hub"
+printf 'placeholder\n' > "$D98/README.md"
+commit_all "$D98" base
+git -C "$D98" checkout -qb pr
+printf 'name: dependabot\n' > "$D98/Xgithub/dependabot.yml"
+printf 'name: dependabot\n' > "$D98/.github/dependabotXyml"
+printf 'name: dependabot\n' > "$D98/.hub/dependabot.yml"
+commit_all "$D98" attack
+fake_gh 'dependabot[bot]' ''
+echo "== BOT_ALLOWED sweep (.github/dependabot.yml, remaining one-token relaxations): all 3 fixtures must be refused =="
+OUT98="$(run_scope "$D98")" && RC98=0 || RC98=$?
+if [ "$RC98" -eq 0 ]; then
+  echo "FAIL: case 98 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT98" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT98" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: a dependabot.yml-alternative mutant let the whole PR through as EXEMPT. Got:" >&2
+  echo "$OUT98" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if ! echo "$OUT98" | grep -qxF '    Xgithub/dependabot.yml'; then
+  echo "FAIL: refused, but Xgithub/dependabot.yml was not named among the offending paths. Got:"
+  echo "$OUT98" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a top-level dir that merely ends in 'github' (no leading dot) is refused (pins the .github component both as a bare-wildcard widen and as an escape-strip)"
+fi
+if ! echo "$OUT98" | grep -qxF '    .github/dependabotXyml'; then
+  echo "FAIL: refused, but .github/dependabotXyml was not named among the offending paths. Got:"
+  echo "$OUT98" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a dependabot file with no dot before its extension is refused (pins the extension dot's escape)"
+fi
+if ! echo "$OUT98" | grep -qxF '    .hub/dependabot.yml'; then
+  echo "FAIL: refused, but .hub/dependabot.yml was not named among the offending paths. Got:"
+  echo "$OUT98" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a dot-directory that is not literally .github is refused (pins the leading dot staying escaped while 'github' itself is widened)"
+fi
+
+# ---------------------------------------------------------------------------
+# 99. BOT_ALLOWED sweep, packages/[^/]+/package(-lock)?\.json, every
+#     remaining one-token relaxation of this alternative (round ten:
+#     mechanically enumerated). Cases 86-88 already pin the filename, the
+#     leading directory and the depth; they do not reach the extension's
+#     escape, the extension's wildcard-widen, or either shape of widening
+#     the optional "(-lock)?" group's own content:
+#       - stripping the escape on the extension's dot.
+#       - widening the extension itself to a wildcard (round nine's own
+#         review's "a7e").
+#       - widening the ENTIRE optional-group content to a wildcard, so
+#         package<anything>.json is admitted even with no separator.
+#       - widening only the content AFTER the group's literal dash (round
+#         nine's own review's "a7d"), so package-<anything>.json is
+#         admitted.
+# ---------------------------------------------------------------------------
+D99="$WORK/bot-allowed-a8-packages-sweep"
+new_repo "$D99"
+mkdir -p "$D99/packages/dash"
+printf 'placeholder\n' > "$D99/README.md"
+commit_all "$D99" base
+git -C "$D99" checkout -qb pr
+printf '{"not":"json-shaped, no dot at all"}\n' > "$D99/packages/dash/packageXjson"
+printf 'console.log("not a manifest at all");\n' > "$D99/packages/dash/package.js"
+printf '{"not":"package or package-lock"}\n' > "$D99/packages/dash/packageXYZ.json"
+printf '{"not":"package-lock either"}\n' > "$D99/packages/dash/package-evil.json"
+commit_all "$D99" attack
+fake_gh 'dependabot[bot]' ''
+echo "== BOT_ALLOWED sweep (packages/.../package(-lock)?.json, remaining one-token relaxations): all 4 fixtures must be refused =="
+OUT99="$(run_scope "$D99")" && RC99=0 || RC99=$?
+if [ "$RC99" -eq 0 ]; then
+  echo "FAIL: case 99 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT99" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT99" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: a package(-lock)?.json-alternative mutant let the whole PR through as EXEMPT. Got:" >&2
+  echo "$OUT99" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if ! echo "$OUT99" | grep -qxF '    packages/dash/packageXjson'; then
+  echo "FAIL: refused, but packages/dash/packageXjson was not named among the offending paths. Got:"
+  echo "$OUT99" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a package file with no dot before its extension is refused (pins the extension dot's escape)"
+fi
+if ! echo "$OUT99" | grep -qxF '    packages/dash/package.js'; then
+  echo "FAIL: refused, but packages/dash/package.js was not named among the offending paths. Got:"
+  echo "$OUT99" | sed 's/^/    /'
+  FAILED=1
+else
+  note "package.js (not .json) is refused (pins the extension's own wildcard-widen boundary)"
+fi
+if ! echo "$OUT99" | grep -qxF '    packages/dash/packageXYZ.json'; then
+  echo "FAIL: refused, but packages/dash/packageXYZ.json was not named among the offending paths. Got:"
+  echo "$OUT99" | sed 's/^/    /'
+  FAILED=1
+else
+  note "package immediately followed by an unrecognised suffix before .json is refused (pins the optional group's content as a whole)"
+fi
+if ! echo "$OUT99" | grep -qxF '    packages/dash/package-evil.json'; then
+  echo "FAIL: refused, but packages/dash/package-evil.json was not named among the offending paths. Got:"
+  echo "$OUT99" | sed 's/^/    /'
+  FAILED=1
+else
+  note "package-evil.json (dash present but not -lock) is refused (pins the optional group's content after its own literal dash)"
+fi
+
+# ---------------------------------------------------------------------------
+# 100. ALWAYS_ALLOWED sweep, ^(CHANGELOG\.md)$, every one-token relaxation
+#      of the ONE rule that gates every ordinary, human-authored PR (round
+#      ten, BLOCKING: this allowlist had never been swept at all before this
+#      round -- mechanically enumerated the same way as BOT_ALLOWED). Case
+#      69 is a positive control (CHANGELOG.md itself must be exempt); none
+#      of the five fixtures below is CHANGELOG.md, and every one of them
+#      must stay undeclared-and-refused:
+#        - stripping the dot's escape admits a same-length CHANGELOGXmd.
+#        - widening "CHANGELOG" to a wildcard admits ANY root .md file
+#          (README.md here), letting an unrelated doc ride along undeclared.
+#        - widening the "md" extension to a wildcard admits CHANGELOG.txt.
+#        - dropping the leading anchor turns the match into "ends with
+#          CHANGELOG.md", admitting a NESTED docs/CHANGELOG.md.
+#        - dropping the trailing anchor turns it into "starts with
+#          CHANGELOG.md", admitting CHANGELOG.md.bak (the ALWAYS_ALLOWED
+#          twin of case 5's BOT_ALLOWED Cargo.toml.bak).
+# ---------------------------------------------------------------------------
+D100="$WORK/always-allowed-sweep"
+new_repo "$D100"
+mkdir -p "$D100/src" "$D100/docs"
+printf 'orig\n' > "$D100/src/a.rs"
+commit_all "$D100" base
+git -C "$D100" checkout -qb pr
+printf 'changed\n' > "$D100/src/a.rs"
+printf 'attacker-controlled, same length as CHANGELOG.md\n' > "$D100/CHANGELOGXmd"
+printf '# not the changelog\n' > "$D100/README.md"
+printf 'attacker-controlled, right name wrong extension\n' > "$D100/CHANGELOG.txt"
+printf 'attacker-controlled, nested\n' > "$D100/docs/CHANGELOG.md"
+printf 'stale copy\n' > "$D100/CHANGELOG.md.bak"
+commit_all "$D100" implement
+fake_gh 'coder-agent' 'Closes #5' '## Files
+
+| Path | Action | Purpose |
+| --- | --- | --- |
+| `src/a.rs` | modify | the only file this issue declares |
+'
+echo "== ALWAYS_ALLOWED sweep: 5 undeclared, non-CHANGELOG.md fixtures must all stay refused =="
+OUT100="$(run_scope "$D100")" && RC100=0 || RC100=$?
+if [ "$RC100" -eq 0 ]; then
+  echo "FAIL: case 100 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT100" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT100" | grep -qF 'pr-scope-check: the diff matches issue'; then
+  echo "FAIL: an ALWAYS_ALLOWED mutant let the whole PR through as matching issue #5. Got:" >&2
+  echo "$OUT100" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if ! echo "$OUT100" | grep -qxF '    CHANGELOGXmd'; then
+  echo "FAIL: refused, but CHANGELOGXmd was not named among the undeclared paths. Got:"
+  echo "$OUT100" | sed 's/^/    /'
+  FAILED=1
+else
+  note "CHANGELOGXmd (any char instead of the literal dot) is refused (pins ALWAYS_ALLOWED's dot-escape)"
+fi
+if ! echo "$OUT100" | grep -qxF '    README.md'; then
+  echo "FAIL: refused, but README.md was not named among the undeclared paths. Got:"
+  echo "$OUT100" | sed 's/^/    /'
+  FAILED=1
+else
+  note "an unrelated root README.md is refused (pins ALWAYS_ALLOWED's CHANGELOG name, not just any .md file)"
+fi
+if ! echo "$OUT100" | grep -qxF '    CHANGELOG.txt'; then
+  echo "FAIL: refused, but CHANGELOG.txt was not named among the undeclared paths. Got:"
+  echo "$OUT100" | sed 's/^/    /'
+  FAILED=1
+else
+  note "CHANGELOG.txt (right name, wrong extension) is refused (pins ALWAYS_ALLOWED's .md extension)"
+fi
+if ! echo "$OUT100" | grep -qxF '    docs/CHANGELOG.md'; then
+  echo "FAIL: refused, but docs/CHANGELOG.md was not named among the undeclared paths. Got:"
+  echo "$OUT100" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a nested docs/CHANGELOG.md is refused (pins ALWAYS_ALLOWED's leading anchor)"
+fi
+if ! echo "$OUT100" | grep -qxF '    CHANGELOG.md.bak'; then
+  echo "FAIL: refused, but CHANGELOG.md.bak was not named among the undeclared paths. Got:"
+  echo "$OUT100" | sed 's/^/    /'
+  FAILED=1
+else
+  note "CHANGELOG.md.bak is refused (pins ALWAYS_ALLOWED's trailing anchor)"
+fi
+
+# ---------------------------------------------------------------------------
+# 101. BOT_ALLOWED sweep, case sensitivity (round ten, BLOCKING). Line 633's
+#      match is `grep -qE`, not `grep -qEi`; adding that one `i` would make
+#      the entire bot allowlist case-insensitive on a filesystem (and a CI
+#      runner) that is itself case-sensitive, admitting `cargo.toml` where
+#      only `Cargo.toml` is reviewed content. None of cases 70-99 differ
+#      from an allowlisted path only in case, so none of them can observe
+#      this flag.
+# ---------------------------------------------------------------------------
+D101="$WORK/bot-allowed-case-sensitivity"
+new_repo "$D101"
+printf 'placeholder\n' > "$D101/README.md"
+commit_all "$D101" base
+git -C "$D101" checkout -qb pr
+# Deliberately does NOT also create a real `Cargo.toml` in this fixture: on a
+# case-preserving-but-case-INSENSITIVE filesystem (the default on macOS,
+# where this suite is also run locally) writing `cargo.toml` right after
+# `Cargo.toml` overwrites the SAME directory entry instead of creating a
+# second one, so `changed` would contain only `Cargo.toml` (unchanged case)
+# with mutated content, not the lowercase probe this case exists to test
+# (caught directly: the first version of this fixture did exactly that, and
+# the file that showed up in the manifest-parse failure was spelled with a
+# capital C). A single brand-new `cargo.toml`, with nothing of the real name
+# to collide with, exercises the same case-sensitivity question without
+# depending on the host filesystem's own case-folding behaviour.
+printf 'attacker-controlled, differs from the real manifest only in case\n' > "$D101/cargo.toml"
+commit_all "$D101" attack
+fake_gh 'dependabot[bot]' ''
+echo "== BOT_ALLOWED sweep (case sensitivity): cargo.toml (lowercase) must be refused =="
+OUT101="$(run_scope "$D101")" && RC101=0 || RC101=$?
+if [ "$RC101" -eq 0 ]; then
+  echo "FAIL: case 101 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT101" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT101" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: cargo.toml (lowercase) was reported EXEMPT. Got:"
+  echo "$OUT101" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT101" | grep -qxF '    cargo.toml'; then
+  echo "FAIL: refused, but cargo.toml was not named among the offending paths. Got:"
+  echo "$OUT101" | sed 's/^/    /'
+  FAILED=1
+else
+  note "cargo.toml (lowercase) is refused (pins BOT_ALLOWED's case sensitivity)"
+fi
+
+# ---------------------------------------------------------------------------
+# 102. ALWAYS_ALLOWED sweep, case sensitivity (round ten, BLOCKING). Line
+#      803's match is also `grep -qE`, not `grep -qEi`; the identical `i`
+#      flag here would exempt `changelog.md` from needing its own Files row
+#      on the case-sensitive path every ordinary PR takes.
+# ---------------------------------------------------------------------------
+D102="$WORK/always-allowed-case-sensitivity"
+new_repo "$D102"
+mkdir -p "$D102/src"
+printf 'orig\n' > "$D102/src/a.rs"
+commit_all "$D102" base
+git -C "$D102" checkout -qb pr
+printf 'changed\n' > "$D102/src/a.rs"
+printf 'attacker-controlled, differs from CHANGELOG.md only in case\n' > "$D102/changelog.md"
+commit_all "$D102" implement
+fake_gh 'coder-agent' 'Closes #5' '## Files
+
+| Path | Action | Purpose |
+| --- | --- | --- |
+| `src/a.rs` | modify | the only file this issue declares |
+'
+echo "== ALWAYS_ALLOWED sweep (case sensitivity): changelog.md (lowercase) must stay undeclared =="
+OUT102="$(run_scope "$D102")" && RC102=0 || RC102=$?
+if [ "$RC102" -eq 0 ]; then
+  echo "FAIL: case 102 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT102" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT102" | grep -qF 'pr-scope-check: the diff matches issue'; then
+  echo "FAIL: changelog.md (lowercase) rode ALWAYS_ALLOWED's exemption. Got:" >&2
+  echo "$OUT102" | sed 's/^/    /' >&2
+  FAILED=1
+elif ! echo "$OUT102" | grep -qxF '    changelog.md'; then
+  echo "FAIL: refused, but changelog.md was not named among the undeclared paths. Got:"
+  echo "$OUT102" | sed 's/^/    /'
+  FAILED=1
+else
+  note "changelog.md (lowercase) is refused (pins ALWAYS_ALLOWED's case sensitivity)"
+fi
+
+# ---------------------------------------------------------------------------
+# 103. The directory-declaration arm's own prefix test (round ten,
+#      BLOCKING). Line 826 is `*/) case "$f" in "$d"*) ok=1;; esac ;;`;
+#      collapsing it to `*/) ok=1 ;;` means that as soon as the issue
+#      declares ANY directory (a Files row ending in a slash), every changed
+#      file in the PR is accepted, whatever its path -- a total collapse of
+#      scope enforcement. Cases 65-68 (and the sibling cargo_lock_exempt arm
+#      a few lines above this one) only ever exercise this shape on a file
+#      that IS under the declared directory, so none of them can tell "the
+#      prefix was checked and matched" apart from "the prefix was never
+#      checked at all". This case declares only `docs/` and adds an
+#      unrelated `evil/payload.rs` alongside a legitimately-covered
+#      `docs/x.md`, so it fails only if the prefix test itself is gone.
+# ---------------------------------------------------------------------------
+D103="$WORK/dir-declaration-arm-refuses-outside-prefix"
+new_repo "$D103"
+mkdir -p "$D103/docs"
+printf 'orig\n' > "$D103/docs/x.md"
+commit_all "$D103" base
+git -C "$D103" checkout -qb pr
+printf 'changed\n' > "$D103/docs/x.md"
+mkdir -p "$D103/evil"
+printf 'attacker-controlled, not under the declared directory\n' > "$D103/evil/payload.rs"
+commit_all "$D103" implement
+fake_gh 'coder-agent' 'Closes #5' '## Files
+
+| Path | Action | Purpose |
+| --- | --- | --- |
+| `docs/` | modify | a directory declaration; only files under it are covered |
+'
+echo "== directory-declaration arm: a file outside the declared directory must still be refused =="
+OUT103="$(run_scope "$D103")" && RC103=0 || RC103=$?
+if [ "$RC103" -eq 0 ]; then
+  echo "FAIL: case 103 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT103" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT103" | grep -qF 'pr-scope-check: the diff matches issue'; then
+  echo "FAIL: evil/payload.rs, outside the declared docs/ directory, rode the directory declaration. Got:" >&2
+  echo "$OUT103" | sed 's/^/    /' >&2
+  FAILED=1
+elif ! echo "$OUT103" | grep -qxF '    evil/payload.rs'; then
+  echo "FAIL: refused, but evil/payload.rs was not named among the undeclared paths. Got:"
+  echo "$OUT103" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a file outside a declared directory is refused even though the issue declares that directory (pins the arm's own prefix test, not merely that a directory declaration exists)"
+fi
+
+# ---------------------------------------------------------------------------
+# 104. The SIBLING directory-declaration arm's own prefix test, in the
+#      cargo_lock_exempt loop (round ten: found by the SAME mechanical grep
+#      for the `*/) case "$f" in "$d"*) <var>=1;; esac ;;` shape that found
+#      case 103's target, not hand-picked; caught here after discovering
+#      that an EARLIER, coincidental pass in an unrelated case (22's rename
+#      fixture, whose own git-similarity assertion is independently flaky)
+#      had been silently absorbing this exact mutant in this suite's own
+#      verification sweeps, exactly the "CAUGHT for the wrong reason" trap
+#      this whole round exists to close one layer up). Line 792 is
+#      `*/) case "$f" in "$d"*) cargo_lock_exempt=1;; esac ;;`; collapsing
+#      it to `*/) cargo_lock_exempt=1 ;;` means that as soon as the issue
+#      declares ANY directory, ANY Cargo.toml changed anywhere in the PR
+#      -- covered by that directory or not -- forgives the ROOT Cargo.lock
+#      from needing its own declaration. This declares `docs/` (which
+#      covers nothing manifest-shaped) and changes `crates/pol/Cargo.toml`
+#      (uncovered) alongside the root `Cargo.lock`; both must be refused,
+#      and specifically Cargo.lock's OWN presence in the undeclared list
+#      is what a mutant here removes, the same isolation case 20 above
+#      already established for a different bypass of this identical flag.
+# ---------------------------------------------------------------------------
+D104="$WORK/cargo-lock-exempt-arm-refuses-outside-prefix"
+new_repo "$D104"
+mkdir -p "$D104/docs" "$D104/crates/pol"
+printf 'orig\n' > "$D104/docs/x.md"
+printf '[package]\nname="pol"\nversion="0.1.0"\n' > "$D104/crates/pol/Cargo.toml"
+printf 'placeholder\n' > "$D104/Cargo.lock"
+commit_all "$D104" base
+git -C "$D104" checkout -qb pr
+printf 'changed\n' > "$D104/docs/x.md"
+printf '[package]\nname="pol"\nversion="0.1.0"\n\n[dependencies]\nserde = "1.0"\n' > "$D104/crates/pol/Cargo.toml"
+printf 'bumped\n' > "$D104/Cargo.lock"
+commit_all "$D104" implement
+fake_gh 'coder-agent' 'Closes #5' '## Files
+
+| Path | Action | Purpose |
+| --- | --- | --- |
+| `docs/` | modify | a directory declaration that covers no manifest at all |
+'
+echo "== cargo_lock_exempt arm: an unrelated directory declaration must not forgive the root Cargo.lock =="
+OUT104="$(run_scope "$D104")" && RC104=0 || RC104=$?
+if [ "$RC104" -eq 0 ]; then
+  echo "FAIL: case 104 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT104" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT104" | grep -qF 'pr-scope-check: the diff matches issue'; then
+  echo "FAIL: root Cargo.lock, alongside an uncovered crate manifest, rode an unrelated directory declaration. Got:" >&2
+  echo "$OUT104" | sed 's/^/    /' >&2
+  FAILED=1
+elif ! echo "$OUT104" | grep -qxF '    Cargo.lock'; then
+  echo "FAIL: refused, but root Cargo.lock was not named among the undeclared paths, meaning cargo_lock_exempt was wrongly set. Got:"
+  echo "$OUT104" | sed 's/^/    /'
+  FAILED=1
+else
+  note "root Cargo.lock stays undeclared when the only declared directory covers no manifest in this diff (pins the cargo_lock_exempt arm's own prefix test)"
 fi
 
 # 47. Each of the three required environment variables must fail this script
