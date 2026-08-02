@@ -2370,12 +2370,12 @@ integer arithmetic instead:
 #     under test. A disassembly-level review proved this by reconstructing
 #     the pre-fix tree: reverting `.zeroize()` back to `.fill(0)` on `full`
 #     and `t` compiled, passed all 397 lib tests, passed the pinned
-#     known-answer vector, and passed review twice, while contributing no
-#     wipe instructions of its own to the release object code. Stated that
+#     known-answer vector, and passed review twice, while the `.fill(0)` store itself
+#     contributed no wipe instructions of its own to the release object code. Stated that
 #     way deliberately: an earlier version of this sentence said the object
 #     code emitted ZERO wipe instructions for either function, which is false
-#     for `extract_sha384` and is corrected with measured counts in the
-#     `.fill(0)` paragraph below. The point that survives is the one that
+#     for `extract_sha384` and is corrected with measured counts in
+#     THE POSITIVE HALF paragraph below. The point that survives is the one that
 #     matters here: `.fill(0)` buys nothing. A green gate that cannot see
 #     this regression is exactly how it got here.
 #
@@ -2529,7 +2529,7 @@ hits="$(scan hkdf-zeroize-not-fill '\b(full|t)\.fill\s*\(' rust_files \
 # every round drew that boundary wrong, including the "SAME predicate"
 # sentence this paragraph replaces. Stop drawing it: a Python regex cannot
 # close a spelling class Rust's own lexer defines, because Rust's
-# whitespace and comment rules are not Python's, in both directions.
+# whitespace and comment rules are not Python's, in both directions.)
 #
 # This count is a TEXT-LEVEL heuristic over a text-level shadow tree. It
 # catches the spellings listed below, each of which was run directly
