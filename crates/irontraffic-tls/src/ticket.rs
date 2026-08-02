@@ -513,9 +513,18 @@ impl ClusterTicketer {
         out.extend_from_slice(&ek.name);
         out.extend_from_slice(&nonce);
 
-        let aead = XChaCha20Poly1305::new(Key::from_slice(ek.key.as_slice()));
+        // `Array::from_slice` is deprecated in favour of `TryFrom` (hybrid-array 0.4). Both
+        // conversions here are over fixed-size arrays (`ek.key: Zeroizing<[u8; 32]>`, `nonce:
+        // [u8; 24]`), so the infallible reference form of `From` is correct: it reinterprets the
+        // existing memory rather than copying it, the same zero-copy shape `Key::from_slice`
+        // itself had, so no additional unprotected copy of the epoch key is created outside the
+        // cipher's own (now-zeroized, see the `zeroize` feature on `chacha20poly1305` in the
+        // workspace `Cargo.toml`) internal copy.
+        let key: &Key = (&*ek.key).into();
+        let nonce_ref: &XNonce = (&nonce).into();
+        let aead = XChaCha20Poly1305::new(key);
         let Ok(ct) = aead.encrypt(
-            XNonce::from_slice(&nonce),
+            nonce_ref,
             Payload {
                 msg: plain,
                 aad: &ek.name,
@@ -581,9 +590,21 @@ impl ClusterTicketer {
         }
         let (ek, root) = matched?;
 
-        let aead = XChaCha20Poly1305::new(Key::from_slice(ek.key.as_slice()));
-        let Ok(plain) = aead.decrypt(XNonce::from_slice(nonce), Payload { msg: ct, aad: name })
-        else {
+        // `ek.key` is a fixed-size `Zeroizing<[u8; 32]>`, so the infallible reference form of
+        // `From` is correct and copy-free, same as the encrypt site above. `nonce`, in contrast,
+        // is a slice into `cipher`, which is fully attacker controlled (see this function's own
+        // doc comment: must not panic for any input), so it must go through the fallible
+        // `TryFrom` rather than the deprecated, panicking `Array::from_slice`. In practice this
+        // slice is always exactly 24 bytes (`cipher.get(16..40)?` above), but that is an
+        // invariant of this function's own control flow, not something the type system states,
+        // and `Array::from_slice`'s replacement should not depend on a reader re-deriving that.
+        let key: &Key = (&*ek.key).into();
+        let Ok(nonce) = XNonce::try_from(nonce) else {
+            self.stats.decrypt_malformed.fetch_add(1, Ordering::Relaxed);
+            return None;
+        };
+        let aead = XChaCha20Poly1305::new(key);
+        let Ok(plain) = aead.decrypt(&nonce, Payload { msg: ct, aad: name }) else {
             self.stats.decrypt_aead_fail.fetch_add(1, Ordering::Relaxed);
             return None;
         };

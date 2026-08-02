@@ -9,7 +9,7 @@
 //! unexercised machinery carrying its own correctness burden for zero benefit here. The
 //! restriction is enforced in code (a length check up front) and documented, not merely assumed.
 
-use hmac::{Hmac, Mac};
+use hmac::{Hmac, KeyInit, Mac};
 use sha2::Sha384;
 use zeroize::Zeroizing;
 

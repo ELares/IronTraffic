@@ -166,18 +166,28 @@ arc-swap = "1.9.2"
 # HMAC-SHA384, the primitive `irontraffic-tls`'s hand-rolled RFC 5869
 # HKDF-Extract/Expand (`hkdf.rs`) runs over for the cluster-derived TLS session
 # ticket key schedule (`cluster-derived-session-ticketer`, #120). Only
-# `irontraffic-tls` names it.
-hmac = "0.12"
+# `irontraffic-tls` names it. 0.13 is built on `digest` 0.11, which is why
+# `sha2` below must stay on a `digest` 0.11 release too: `Hmac::<Sha384>` needs
+# both crates to agree on which `digest` major they name.
+hmac = "0.13"
 # SHA-384, the hash the HKDF above is built on (`cluster-derived-session-ticketer`,
-# #120).
-sha2 = "0.10"
+# #120). Kept in lockstep with `hmac`'s `digest` major; see the comment there.
+sha2 = "0.11"
 # XChaCha20-Poly1305 for TLS session ticket encryption (`cluster-derived-session-ticketer`,
 # #120), a deliberate deviation from the design note's AES-256-GCM: a 192-bit
 # random nonce needs no per-key nonce-collision analysis the way a 96-bit
 # AES-GCM nonce would, and this AEAD is sourced from this crate rather than from
 # a `rustls::crypto` provider, so the ticket format is byte-identical on
 # `crypto-aws-lc-rs` and `crypto-ring` builds.
-chacha20poly1305 = "0.11"
+#
+# `zeroize` is an opt-in feature as of 0.11 (it was a mandatory dependency in
+# 0.10), and it is NOT in this crate's own default feature set. Without it,
+# `ChaChaPoly1305`'s `Drop` is an empty function and the 32-byte epoch key
+# copy the cipher holds internally is left, unwiped, in freed memory on every
+# encrypt and decrypt (see the comment on `zeroize` below: the root and every
+# derived epoch key must never linger in freed memory). The feature must be
+# named explicitly here for that guarantee to hold.
+chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
 # Zeroizes the cluster ticket root, its HKDF pseudorandom key, and every derived
 # epoch key on drop (`cluster-derived-session-ticketer`, #120). The root is the
 # highest-value secret in the product; it must never linger in freed memory.

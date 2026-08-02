@@ -82,7 +82,7 @@ rand = "0.10"
 # full rationale and the exact provenance of the `0.19.0` pin.
 rand_regex = { workspace = true }
 # Hashes the resolved command line for each entry in `bench/cells.snapshot`
-# (test 7, invariant I12): `sha2 = "0.10"` is already pinned in the workspace
+# (test 7, invariant I12): `sha2 = "0.11"` is already pinned in the workspace
 # `Cargo.toml` by `cluster-derived-session-ticketer` (#120), so this takes it
 # via `workspace = true` rather than restating the version.
 sha2 = { workspace = true }
