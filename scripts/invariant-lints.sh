@@ -17,9 +17,12 @@
 #
 #   // it-allow: <rule-name> reason: <why this specific line is correct>
 #
-# Rules whose name ends in `-prod` run against copies of the sources with every
-# `#[cfg(test)]` module body blanked out, so unit tests living beside the code
-# they test do not trip production-only rules. Line numbers are preserved.
+# Some rules run against a shadow copy of the sources with every
+# `#[cfg(test)]` module body blanked out, so unit tests living beside the
+# code they test do not trip production-only rules; look for a call to
+# scan_prod, hot_scan, hotpath_crate_scan, or build_prod_tree directly inside
+# that rule's own code, not a `-prod` suffix on the rule's own name (no rule
+# in this file is actually named that way). Line numbers are preserved.
 set -uo pipefail
 cd "$(git rev-parse --show-toplevel)"
 
@@ -332,8 +335,8 @@ rust_non_test_files() {
 # itself while diagnosing this issue:
 #
 #  1. TRIVIA-BLIND MATCHING. The attribute used to be found with a plain
-#     `CFG.finditer(text)`, not the rslex.finditer_real every OTHER rule in
-#     this file routes through specifically to stay out of comments and
+#     `CFG.finditer(text)`, not the rslex.finditer_real a minority of rules
+#     in this file route through specifically to stay out of comments and
 #     string literals (see allow_reason.py, vacuous_assert.py, no_assert.py,
 #     and the rest, all just above). A doc comment or a `reason = "..."`
 #     string that merely MENTIONS `#[cfg(test)]` in prose therefore matched
@@ -344,7 +347,7 @@ rust_non_test_files() {
 #     prose mentions in `irontraffic-router/src/intern.rs`, all inside a doc
 #     comment explaining this exact hazard, each blanked an always-compiled
 #     helper function's entire body. Fixed by scanning with
-#     rslex.finditer_real, exactly like every other rule here.
+#     rslex.finditer_real, the same route those rules already use.
 #
 #  2. MOD-SHAPED ASSUMPTION. After finding the attribute, the old code
 #     searched forward for the next real `{` and blanked to its matching
@@ -2406,12 +2409,16 @@ integer arithmetic instead:
 #     SCOPE. This targets only the two local names this file's own two wipe
 #     sites use today (`full` in extract_sha384, `t` in expand_sha384), and
 #     only in this one file: a workspace-wide ban on `.fill(` would forbid
-#     the many legitimate, non-secret uses of `<[T]>::fill` elsewhere in the
-#     tree (initializing a buffer to a known value is ordinary code; wiping a
-#     secret immediately before it is dropped is not). This is the same
-#     narrow, named-file, named-local shape framing-fields-confined and
-#     h2load-no-float above already use for a property that only matters in
-#     one specific place.
+#     legitimate, non-secret uses of `<[T]>::fill` elsewhere in the tree (six
+#     call sites in three files today, none named `full`/`t`; initializing a
+#     buffer to a known value is ordinary code, wiping a secret immediately
+#     before it is dropped is not). Named-file scoping by itself is not new
+#     here -- framing-fields-confined above already restricts
+#     KnownHeader::(ContentLength|TransferEncoding) to six named files, and
+#     h2load-no-float above restricts `parse::<f64>|as f64` to one -- but
+#     neither of those keys on a LOCAL NAME the way this rule does; that part
+#     is unique to this rule, for a property that only matters on these two
+#     specific locals.
 #
 #     NO ESCAPE HATCH FOR THE POSITIVE HALF. The `// it-allow:` marker below
 #     suppresses only the `.fill(` blacklist match on the line that carries
@@ -2430,19 +2437,23 @@ integer arithmetic instead:
 #     of indirection: `let f = <[u8]>::fill; f(&mut full[..], 0);` contains no
 #     `full.fill(`/`t.fill(` text, so it does not match, and that gap is
 #     accepted because the count below is the check that actually matters.
-#     The count matches exactly ONE spelling: `full.zeroize()` and
+#     The count matches exactly ONE call shape: `full.zeroize()` and
 #     `t.zeroize()` as method calls on those two local names, in this one
-#     file. Every other spelling of a genuine wipe FAILS the count, and each
-#     of the following was run directly against this script, not assumed: a
+#     file. Every other shape of a genuine wipe FAILS the count, and each of
+#     the following was run directly against this script, not assumed: a
 #     helper function (`fn wipe(buf: &mut [u8]) { buf.zeroize(); }`, called as
 #     `wipe(&mut full)` / `wipe(&mut t)`) gives full=0 t=0; unifying both
 #     locals to the single name `full`, keeping two real `.zeroize()` calls,
-#     gives full=2 t=0; fully qualified syntax
-#     (`zeroize::Zeroize::zeroize(&mut full[..])`) gives full=0 t=1; and
-#     `copy_from_slice` in place of either call gives the same kind of miss.
-#     All four compile clean at `-D warnings`. This is deliberate, not an
-#     oversight: a rule narrow enough to be checked is worth more than one
-#     broad enough to be wrong. If extract_sha384 or expand_sha384 are
+#     gives full=2 t=0; and fully qualified syntax
+#     (`zeroize::Zeroize::zeroize(&mut full[..])`) gives full=0 t=1. All
+#     three compile clean at `-D warnings` and are the accepted trade: a rule
+#     narrow enough to be checked is worth more than one broad enough to be
+#     wrong. `copy_from_slice` is a different case, worth naming only because
+#     it evades the `.fill(` blacklist above the same way those three evade
+#     the count: `full.copy_from_slice(&[0u8; 48])` also gives full=0 t=1 and
+#     also compiles clean, but it is not a genuine wipe -- it is the same
+#     plain, non-volatile store `.fill(0)` is -- so the count rejecting it is
+#     correct behavior, not a gap. If extract_sha384 or expand_sha384 are
 #     legitimately restructured so the wipe no longer takes this exact shape,
 #     update this rule in the SAME commit as the restructuring; do not let the
 #     two drift apart again.
@@ -2454,7 +2465,7 @@ hits="$(scan hkdf-zeroize-not-fill '\b(full|t)\.fill\s*\(' rust_files \
 # blacklist, so the cheapest regression of all evades it: DELETING the wipe
 # outright. A reviewer ran that and it compiles clean at -D warnings (rustc
 # even tells you to drop the now-unneeded `mut` and the `Zeroize` import) and
-# reproduces the pre-fix object code exactly, with this rule silent. Other
+# reproduces the pre-fix object code, with this rule silent. Other
 # shapes evade it too, verified directly: copy_from_slice, a helper fn in the
 # same file, and renaming a local all leave no `full.fill(`/`t.fill(` text
 # anywhere for this blacklist to find. Enumerating every such shape is a
@@ -2465,11 +2476,15 @@ hits="$(scan hkdf-zeroize-not-fill '\b(full|t)\.fill\s*\(' rust_files \
 # reasons proven above: (1) finditer_real makes a comment, a doc comment, and
 # a string literal opaque, so text that merely SPELLS the call cannot satisfy
 # a count that is supposed to prove the call is real code; (2) reading from
-# the shadow tree rather than the checked-out file means a block carrying the
-# EXACT spelling `#[cfg(test)]` (the only spelling build_prod_tree.py's own
-# `CFG = re.compile(...)` recognizes, defined above) has its `.zeroize()`
-# calls blanked before the count ever sees them, so moving the two real wipes
-# into a plain `#[cfg(test)] mod ...` cannot satisfy it either.
+# the shadow tree rather than the checked-out file means a block carrying
+# `#[cfg(test)]`, with any amount of whitespace inside the parens
+# (build_prod_tree.py's own `CFG = re.compile(r"#\[cfg\(\s*test\s*\)\]")`,
+# defined above, matches `#[cfg( test )]` and a multi-line spelling too, not
+# only the exact zero-whitespace form), has its `.zeroize()` calls blanked
+# before the count ever sees them, so moving the two real wipes into any of
+# those `#[cfg(test)]` spellings cannot satisfy it either. What the regex
+# does NOT match is a different cfg predicate, not a whitespace variant: see
+# the next paragraph for the one that gets through.
 #
 # review-lint-r2.json finding 4: that second claim used to say NO test module
 # can satisfy this count, and that is false. A DIFFERENTLY spelled test-only
@@ -2478,10 +2493,12 @@ hits="$(scan hkdf-zeroize-not-fill '\b(full|t)\.fill\s*\(' rust_files \
 # throwaway locals is not stripped by the CFG regex above, satisfies this
 # count, and compiles clean at `-D warnings` while the real functions ship no
 # wipe at all. Verified directly, and confirmed the exact `#[cfg(test)]`
-# spelling still fails the same tree. Widening the CFG regex would close
-# this, but scan_prod and every other `-prod` rule in this file share it, so
-# that is a change with its own blast radius, left for a dedicated fix rather
-# than folded in here.
+# spelling (and its whitespace variants above) still fails the same tree.
+# Widening the CFG regex would close this, but every rule that reads the
+# shadow tree (scan_prod, hot_scan, hotpath_crate_scan, and the handful of
+# rules that call build_prod_tree directly -- 16 others besides this one)
+# shares it, so that is a change with its own blast radius, left for a
+# dedicated fix rather than folded in here.
 #
 # The pattern tolerates the rustfmt-adjacent spellings a developer actually
 # produces (a call split across lines after the dot, stray spaces around the
@@ -2538,19 +2555,22 @@ else
   wipe_t="${wipe_t:-0}"
   if [ "$wipe_full" -ne 1 ] || [ "$wipe_t" -ne 1 ]; then
     fail hkdf-zeroize-not-fill \
-"$hkdf_scoped_rel must contain exactly one real \`full.zeroize()\` call in
-extract_sha384 and exactly one \`t.zeroize()\` call in expand_sha384; found
-full=$wipe_full t=$wipe_t. Counted with rslex.finditer_real, a comment- and
-literal-aware scanner most rules in this file do NOT use (they scan with a
-plain grep instead, this rule's own \`.fill(\` blacklist above included), over
-the #[cfg(test)]-stripped shadow tree, so neither a call living only in a
-test module nor the call text spelled out in a doc comment or a string
-literal can satisfy this. Forbidding \`.fill(0)\` is not enough on its own,
-because simply DELETING the wipe evades that check, compiles clean, and reproduces the
-unprotected object code. There is no it-allow escape for this count: a wipe
-that can be commented away is not a wipe. If these functions are legitimately
-restructured, keep one Zeroize call per HMAC output buffer and update this
-rule to match." "full=$wipe_full t=$wipe_t"
+"$hkdf_scoped_rel must contain, somewhere in the file, exactly one real
+\`full.zeroize()\` call (the one extract_sha384 is supposed to make) and
+exactly one \`t.zeroize()\` call (the one expand_sha384 is supposed to make);
+found full=$wipe_full t=$wipe_t. Counted with rslex.finditer_real, a
+comment- and literal-aware scanner most rules in this file do NOT use (they
+scan with a plain grep instead, this rule's own \`.fill(\` blacklist above
+included), over the #[cfg(test)]-stripped shadow tree, so a call living only
+in a plain #[cfg(test)] block does not satisfy this, nor does the call text
+spelled out in a doc comment or a string literal; a differently spelled
+test-only cfg predicate the stripper does not recognise is a known gap,
+documented above. Forbidding \`.fill(0)\` is not enough on its own, because
+simply DELETING the wipe evades that check, compiles clean, and reproduces
+the unprotected object code. There is no it-allow escape for this count: a
+wipe that can be commented away is not a wipe. If these functions are
+legitimately restructured, keep one Zeroize call per HMAC output buffer and
+update this rule to match." "full=$wipe_full t=$wipe_t"
   fi
 fi
 [ -n "$hits" ] && fail hkdf-zeroize-not-fill \
