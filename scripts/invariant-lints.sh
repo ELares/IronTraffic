@@ -358,8 +358,8 @@ rust_non_test_files() {
 #     itself immediately followed by its own `{`, that search runs straight
 #     past the real, small extent of the attributed item and lands on
 #     whatever unrelated brace pair happens to come next -- blanking
-#     everything in between out of every `-prod` and `hotpath_crate_scan`
-#     rule's view, with no error. Measured on `main`: the one genuine
+#     everything in between out of view for every rule that reads the shadow
+#     tree, with no error. Measured on `main`: the one genuine
 #     instance of this shape found there, `#[cfg(test)] pub mod testutil;`
 #     in `irontraffic-router/src/lib.rs`, blanked the crate's unrelated `pub
 #     mod trace;` declaration and part of the following `pub use` alongside
@@ -418,12 +418,12 @@ rust_non_test_files() {
 #
 #     REFUSE, DO NOT GUESS: if item_extent() reaches end of file with an
 #     unresolved bracket depth, build_prod_tree.py prints the offending file
-#     and attribute line to stderr and exits nonzero. Every `-prod` and
-#     `hotpath_crate_scan` rule depends on this shadow tree being right, so
-#     a case this cannot resolve must stop the whole gate rather than
-#     continue on data that might already be wrong -- the same "fail closed,
-#     never guess" contract scripts/rebase-issue.sh applies to a Rust merge
-#     conflict it cannot resolve safely. build_prod_tree runs inside a
+#     and attribute line to stderr and exits nonzero. Every rule that reads
+#     this shadow tree depends on it being right, so a case this cannot
+#     resolve must stop the whole gate rather than continue on data that
+#     might already be wrong -- the same "fail closed, never guess" contract
+#     scripts/rebase-issue.sh applies to a Rust merge conflict it cannot
+#     resolve safely. build_prod_tree runs inside a
 #     command-substitution subshell from almost every call site
 #     (`hits="$(scan_prod ...)"` and the like: PROD_TREE itself is therefore
 #     rebuilt once per subshell rather than truly once per run, since a
@@ -442,7 +442,7 @@ sys.path.insert(0, os.environ["WORK"])
 import rslex
 
 OUT = sys.argv[1]
-CFG = re.compile(r"#\[cfg\(\s*test\s*\)\]")
+CFG = re.compile(r"#\s*\[\s*cfg\s*\(\s*test\s*,?\s*\)\s*\]")
 
 # issue #643: an item's own HEADER can contain a depth-0 comma that is not
 # the end of the item at all, most commonly a generic parameter list
@@ -604,8 +604,8 @@ build_prod_tree() {
     printf '%s\n' "$err" | sed 's/^/  /' >&2
     printf '  build_prod_tree refuses to guess at this #[cfg(test)] attribute'"'"'s\n' >&2
     printf '  extent rather than blank an arbitrary, possibly unrelated, later brace\n' >&2
-    printf '  pair: every -prod and hotpath_crate_scan rule depends on this shadow tree\n' >&2
-    printf '  being right. Restructure the attributed item so its extent is unambiguous\n' >&2
+    printf '  pair: every rule that reads this shadow tree depends on it being right.\n' >&2
+    printf '  Restructure the attributed item so its extent is unambiguous\n' >&2
     printf '  (give it its own brace body, or end it with a plain `;` or `,`), then\n' >&2
     printf '  re-run.\n' >&2
     # See the header comment above: a plain `exit 1` here would only kill the
@@ -2409,16 +2409,19 @@ integer arithmetic instead:
 #     SCOPE. This targets only the two local names this file's own two wipe
 #     sites use today (`full` in extract_sha384, `t` in expand_sha384), and
 #     only in this one file: a workspace-wide ban on `.fill(` would forbid
-#     legitimate, non-secret uses of `<[T]>::fill` elsewhere in the tree (six
-#     call sites in three files today, none named `full`/`t`; initializing a
-#     buffer to a known value is ordinary code, wiping a secret immediately
-#     before it is dropped is not). Named-file scoping by itself is not new
-#     here -- framing-fields-confined above already restricts
-#     KnownHeader::(ContentLength|TransferEncoding) to six named files, and
-#     h2load-no-float above restricts `parse::<f64>|as f64` to one -- but
-#     neither of those keys on a LOCAL NAME the way this rule does; that part
-#     is unique to this rule, for a property that only matters on these two
-#     specific locals.
+#     the one legitimate, non-secret `<[T]>::fill` call site elsewhere in the
+#     tree today (`crates/irontraffic-io/src/buffer.rs:114`, filling a
+#     recycled buffer with a poison byte; none of it named `full`/`t`;
+#     initializing a buffer to a known value is ordinary code, wiping a
+#     secret immediately before it is dropped is not -- a plain `.fill(`
+#     grep also turns up that same call from a doc comment, and four calls
+#     to unrelated `fill(&mut buf)` methods on this crate's own
+#     `NonceSource`/aws-lc-rs's `Okm`, neither of them `<[T]>::fill`).
+#     Named-file scoping by itself is not new here -- framing-fields-confined
+#     above already restricts KnownHeader::(ContentLength|TransferEncoding)
+#     to six named files, and h2load-no-float above bans `parse::<f64>|as
+#     f64` inside one named file -- but neither of those keys on a LOCAL
+#     NAME the way this rule does.
 #
 #     NO ESCAPE HATCH FOR THE POSITIVE HALF. The `// it-allow:` marker below
 #     suppresses only the `.fill(` blacklist match on the line that carries
@@ -2464,46 +2467,46 @@ hits="$(scan hkdf-zeroize-not-fill '\b(full|t)\.fill\s*\(' rust_files \
 # THE POSITIVE HALF, and it is the half that matters. The block above is a
 # blacklist, so the cheapest regression of all evades it: DELETING the wipe
 # outright. A reviewer ran that and it compiles clean at -D warnings (rustc
-# even tells you to drop the now-unneeded `mut` and the `Zeroize` import) and
-# reproduces the pre-fix object code, with this rule silent. Other
-# shapes evade it too, verified directly: copy_from_slice, a helper fn in the
-# same file, and renaming a local all leave no `full.fill(`/`t.fill(` text
-# anywhere for this blacklist to find. Enumerating every such shape is a
-# losing game; requiring the wipe to BE THERE is not.
+# even tells you to drop the now-unneeded `mut` and the `Zeroize` import),
+# with this rule silent; run directly, release object code, aarch64/rustc
+# 1.97.0: expand_sha384 comes out instruction-identical to the pre-fix
+# `.fill(0)` build, extract_sha384 differs only in stack staging (175 vs 171
+# instructions) -- neither shape emits a wipe. Other shapes evade the
+# blacklist too, verified directly: copy_from_slice, a helper fn in the same
+# file, and renaming a local all leave no `full.fill(`/`t.fill(` text
+# anywhere for it to find. Enumerating every such shape is a losing game;
+# requiring the wipe to BE THERE is not.
 #
 # Counted with rslex.finditer_real (not a plain grep), over the SAME
 # #[cfg(test)]-stripped shadow tree scan_prod uses, for two independent
-# reasons proven above: (1) finditer_real makes a comment, a doc comment, and
-# a string literal opaque, so text that merely SPELLS the call cannot satisfy
-# a count that is supposed to prove the call is real code; (2) reading from
-# the shadow tree rather than the checked-out file means a block carrying
-# `#[cfg(test)]`, with any amount of whitespace inside the parens
-# (build_prod_tree.py's own `CFG = re.compile(r"#\[cfg\(\s*test\s*\)\]")`,
-# defined above, matches `#[cfg( test )]` and a multi-line spelling too, not
-# only the exact zero-whitespace form), has its `.zeroize()` calls blanked
-# before the count ever sees them, so moving the two real wipes into any of
-# those `#[cfg(test)]` spellings cannot satisfy it either. What the regex
-# does NOT match is a different cfg predicate, not a whitespace variant: see
-# the next paragraph for the one that gets through.
+# reasons: (1) finditer_real makes a comment, a doc comment, and a string
+# literal opaque, so text that merely SPELLS the call cannot satisfy a count
+# that is supposed to prove the call is real code; (2) reading from the
+# shadow tree means a `.zeroize()` call moved into a real `#[cfg(test)]`
+# block never reaches the count either -- run directly: moving both real
+# calls into a `#[cfg(test)] mod` on throwaway locals gives full=0 t=0.
 #
-# review-lint-r2.json finding 4: that second claim used to say NO test module
-# can satisfy this count, and that is false. A DIFFERENTLY spelled test-only
-# attribute is not caught by this route: `#[cfg(any(test, doctest))]` around
-# a decoy module carrying real `full.zeroize()`/`t.zeroize()` calls on
-# throwaway locals is not stripped by the CFG regex above, satisfies this
-# count, and compiles clean at `-D warnings` while the real functions ship no
-# wipe at all. Verified directly, and confirmed the exact `#[cfg(test)]`
-# spelling (and its whitespace variants above) still fails the same tree.
-# Widening the CFG regex would close this, but every rule that reads the
-# shadow tree (scan_prod, hot_scan, hotpath_crate_scan, and the handful of
-# rules that call build_prod_tree directly -- 16 others besides this one)
-# shares it, so that is a change with its own blast radius, left for a
-# dedicated fix rather than folded in here.
+# review-lint-r4.json finding 1: build_prod_tree.py's CFG regex used to
+# recognize only whitespace inside the parens, so `#[cfg (test)]`,
+# `#[ cfg(test) ]`, `# [cfg(test)]`, and `#[cfg(test,)]` were NOT stripped;
+# a decoy module spelled one of those four, carrying the real wipes on
+# throwaway locals, satisfied this count while the shipped functions had
+# none, and still compiled clean at `-D warnings`. Fixed by widening CFG to
+# `#\s*\[\s*cfg\s*\(\s*test\s*,?\s*\)\s*\]`; run directly against the real
+# script, all four spellings are now stripped and fail this count, and the
+# plain `#[cfg(test)]` spelling still fails it too. That widening closes
+# only spellings of the SAME predicate: `#[cfg(any(test, doctest))]` is a
+# different predicate, is not matched either before or after, and still
+# evades this count -- run directly, both ways. It cannot regress any other
+# rule that reads this shadow tree: every `#[cfg(test)]`-shaped attribute in
+# the tracked tree today (249, grep-counted) already used the exact spelling
+# the old regex matched, so the shadow tree this produces on the real,
+# unmutated tree is unchanged, and the full gate re-run against that tree is
+# still `invariant-lints: clean`.
 #
-# The pattern tolerates the rustfmt-adjacent spellings a developer actually
-# produces (a call split across lines after the dot, stray spaces around the
-# dot or inside the parens): `\s` already matches a newline with no extra
-# flag, so `full\n    .zeroize()` and `full . zeroize ( )` both count.
+# The count's own patterns tolerate the rustfmt-adjacent spellings a
+# developer actually produces: run directly, `full\n    .zeroize()` and
+# `full . zeroize ( )` both count.
 cat > "$WORK/count_wipe_sites.py" <<'PY'
 import os
 import re
@@ -2563,9 +2566,10 @@ comment- and literal-aware scanner most rules in this file do NOT use (they
 scan with a plain grep instead, this rule's own \`.fill(\` blacklist above
 included), over the #[cfg(test)]-stripped shadow tree, so a call living only
 in a plain #[cfg(test)] block does not satisfy this, nor does the call text
-spelled out in a doc comment or a string literal; a differently spelled
-test-only cfg predicate the stripper does not recognise is a known gap,
-documented above. Forbidding \`.fill(0)\` is not enough on its own, because
+spelled out in a doc comment or a string literal; a genuinely different
+test-only cfg PREDICATE (#[cfg(any(test, doctest))], not a whitespace or
+comma variant of #[cfg(test)] itself) is a known gap, documented above.
+Forbidding \`.fill(0)\` is not enough on its own, because
 simply DELETING the wipe evades that check, compiles clean, and reproduces
 the unprotected object code. There is no it-allow escape for this count: a
 wipe that can be commented away is not a wipe. If these functions are
