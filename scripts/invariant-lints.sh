@@ -2348,6 +2348,54 @@ integer arithmetic instead:
   // it-allow: h2load-no-float reason: <why a float conversion is safe here>" "$hits"
 
 # ---------------------------------------------------------------------------
+# 28. hkdf-zeroize-not-fill: the HKDF key-schedule wipe in hkdf.rs must be a
+#     real Zeroize call, not a plain `.fill(0)` or a bare `= [0u8; N]`
+#     reassignment that a compiler is free to treat as dead-store elimination.
+#
+#     WHY THIS EXISTS (review of PR 839, review-zeroize.json finding 2). The
+#     guarantee that `extract_sha384` and `expand_sha384` wipe the HMAC output
+#     buffer in memory rests entirely on two `.zeroize()` call sites (`full`
+#     and `t`), and nothing in the test suite can observe the difference
+#     between a real wipe and none at all: any test that reads the buffer
+#     afterwards keeps the store alive, which defeats exactly the property
+#     under test. A disassembly-level review proved this by reconstructing
+#     the pre-fix tree: reverting `.zeroize()` back to `.fill(0)` on `full`
+#     and `t` compiled, passed all 397 lib tests, passed the pinned
+#     known-answer vector, and passed review twice, while the release object
+#     code emitted zero key-schedule wipe instructions for either function. A
+#     green gate that cannot see this regression is exactly how it got here.
+#
+#     SCOPE. This targets only the two local names this file's own two wipe
+#     sites use today (`full` in extract_sha384, `t` in expand_sha384), and
+#     only in this one file: a workspace-wide ban on `.fill(` would forbid
+#     the many legitimate, non-secret uses of `<[T]>::fill` elsewhere in the
+#     tree (initializing a buffer to a known value is ordinary code; wiping a
+#     secret immediately before it is dropped is not). This is the same
+#     narrow, named-file, named-local shape framing-fields-confined and
+#     h2load-no-float above already use for a property that only matters in
+#     one specific place.
+#
+#     KNOWN LIMIT, STATED HONESTLY. This is a plain grep restricted to one
+#     file, not a proof that every wipe in this file is real: it does not
+#     understand Rust's types and cannot follow a call through a level of
+#     indirection (`let f = <[u8]>::fill; f(&mut full, 0);` would not match).
+#     It closes the specific regression this review demonstrated by running
+#     it, not every regression shaped like it.
+# ---------------------------------------------------------------------------
+hits="$(scan hkdf-zeroize-not-fill '\b(full|t)\.fill\s*\(|(^|[^[:alnum:]_])(full|t)\s*=\s*\[0u8' rust_files \
+  | grep -E '^crates/irontraffic-tls/src/hkdf\.rs:' || true)"
+[ -n "$hits" ] && fail hkdf-zeroize-not-fill \
+"crates/irontraffic-tls/src/hkdf.rs wipes the HMAC output buffer (locals
+\`full\` and \`t\`) with zeroize::Zeroize::zeroize(): a volatile write plus an
+optimization barrier, specifically because \`.fill(0)\` and a bare
+\`= [0u8; N]\` reassignment are plain, non-volatile stores into a value that
+is dead immediately afterwards, exactly the kind of store a compiler is
+entitled to remove. This was measured, not assumed: reverting to .fill(0)
+compiles, passes every test, and emits NO wipe instructions in the release
+object code. If a real exception exists, say why on the same line:
+  // it-allow: hkdf-zeroize-not-fill reason: <why this is not a secret wipe>" "$hits"
+
+# ---------------------------------------------------------------------------
 if [ "$FAILED" -ne 0 ]; then
   printf '\ninvariant-lints: FAILED. Each block above names the rule, explains why it\n'
   printf 'exists, and lists the offending lines. Fix the code; do not silence a lint\n'

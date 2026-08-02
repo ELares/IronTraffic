@@ -675,6 +675,56 @@ pub async fn bad_pace(interval: Duration) {
 }
 RS
 
+# ---------------------------------------------------------------------------
+# hkdf-zeroize-not-fill (review of PR 839): the two banned shapes, a plain
+# .fill(0) call and a bare `= [0u8; N]` reassignment, on the two local names
+# (`full`, `t`) the real crates/irontraffic-tls/src/hkdf.rs wipes with a real
+# zeroize::Zeroize call. This is the exact regression a disassembly-level
+# review reconstructed from the pre-fix tree: it compiled, passed every test,
+# and emitted no wipe instructions at all.
+# ---------------------------------------------------------------------------
+mkdir -p "$A/crates/irontraffic-tls/src"
+cat > "$A/crates/irontraffic-tls/src/hkdf.rs" <<'RS'
+//! Deliberately violates hkdf-zeroize-not-fill: reverts both HMAC output
+//! wipes to a plain, non-volatile store the compiler is free to remove
+//! instead of a real zeroize::Zeroize call.
+use hmac::{Hmac, KeyInit, Mac};
+use sha2::Sha384;
+
+/// The `.fill(0)` shape: exactly the regression a real review caught by
+/// disassembly, which emitted zero wipe instructions in release object code.
+pub(crate) fn extract_sha384(salt: &[u8], ikm: &[u8]) -> [u8; 48] {
+    let Ok(mut mac) = Hmac::<Sha384>::new_from_slice(salt) else {
+        return [0u8; 48];
+    };
+    mac.update(ikm);
+    let mut full = mac.finalize().into_bytes();
+    let mut prk = [0u8; 48];
+    if let Some(head) = full.get(..48) {
+        prk.copy_from_slice(head);
+    }
+    full.fill(0);
+    prk
+}
+
+/// The other banned shape: reassigning the buffer to a fresh zero array
+/// instead of calling fill or zeroize. Just as non-volatile, and just as
+/// dead the moment the compiler can see nothing reads `t` again.
+pub(crate) fn expand_sha384(prk: &[u8; 48], info: &[u8]) -> [u8; 32] {
+    let Ok(mut mac) = Hmac::<Sha384>::new_from_slice(prk) else {
+        return [0u8; 32];
+    };
+    mac.update(info);
+    let mut t = mac.finalize().into_bytes();
+    let mut out = [0u8; 32];
+    if let Some(head) = t.get(..32) {
+        out.copy_from_slice(head);
+    }
+    t = [0u8; 48];
+    out
+}
+RS
+
 printf '[workspace.dependencies]\nserde = "1"\n' > "$A/Cargo.toml"
 
 EXPECTED='allow-needs-reason
@@ -686,6 +736,7 @@ crate-inherits-workspace
 determinism-seam
 dependency-justification
 framing-fields-confined
+hkdf-zeroize-not-fill
 hot-path-allocation
 hot-path-lock
 interior-mutability
@@ -1641,6 +1692,51 @@ use crate::known::KnownHeader;
 /// Confined to the allowlist; must not trip framing-fields-confined.
 pub fn is_transfer_encoding(k: KnownHeader) -> bool {
     k == KnownHeader::TransferEncoding
+}
+RS
+
+# The genuine hkdf-zeroize-not-fill shape: a real zeroize::Zeroize call on
+# both locals, plus a `let`-initialized zero buffer with a DIFFERENT name
+# (`prk`), proving the rule does not flag ordinary zero-initialization, only
+# a reassignment or .fill( on the two wipe-site locals themselves.
+mkdir -p "$B/crates/irontraffic-tls/src"
+cat > "$B/crates/irontraffic-tls/src/hkdf.rs" <<'RS'
+//! The correct hkdf-zeroize-not-fill shape: a real zeroize::Zeroize call on
+//! both HMAC output locals, must not trip the rule.
+use hmac::{Hmac, KeyInit, Mac};
+use sha2::Sha384;
+use zeroize::Zeroize;
+
+/// Wipes the HMAC output buffer for real.
+pub(crate) fn extract_sha384(salt: &[u8], ikm: &[u8]) -> [u8; 48] {
+    let Ok(mut mac) = Hmac::<Sha384>::new_from_slice(salt) else {
+        return [0u8; 48];
+    };
+    mac.update(ikm);
+    let mut full = mac.finalize().into_bytes();
+    // An ordinary `let`-initialized zero buffer under a DIFFERENT name: not
+    // a reassignment of `full` or `t`, and must not trip the rule either.
+    let mut prk = [0u8; 48];
+    if let Some(head) = full.get(..48) {
+        prk.copy_from_slice(head);
+    }
+    full.zeroize();
+    prk
+}
+
+/// Wipes the second HMAC output buffer for real.
+pub(crate) fn expand_sha384(prk: &[u8; 48], info: &[u8]) -> [u8; 32] {
+    let Ok(mut mac) = Hmac::<Sha384>::new_from_slice(prk) else {
+        return [0u8; 32];
+    };
+    mac.update(info);
+    let mut t = mac.finalize().into_bytes();
+    let mut out = [0u8; 32];
+    if let Some(head) = t.get(..32) {
+        out.copy_from_slice(head);
+    }
+    t.zeroize();
+    out
 }
 RS
 

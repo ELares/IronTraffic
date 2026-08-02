@@ -46,10 +46,14 @@ pub(crate) fn extract_sha384(salt: &[u8], ikm: &[u8]) -> Zeroizing<[u8; 48]> {
     // `Zeroize::zeroize` for a byte slice performs a volatile write followed by an explicit
     // optimization barrier, specifically so the write survives that elimination. This is the
     // key schedule for the product's highest value secret, so that property is worth the one
-    // line it costs. (The workspace `Cargo.toml` comment on `hmac`'s `zeroize` feature records
-    // the two other things enabling it buys: a wipe of `sha2`'s internal block buffer on drop,
-    // and a wipe of the transient `CtOutput` that `mac.finalize()` produces before
-    // `.into_bytes()` clones out of it.)
+    // line it costs. (The workspace `Cargo.toml` comments on `hmac`'s and `sha2`'s own `zeroize`
+    // features record what enabling them buys beyond this line: a wipe of `sha2`'s streaming
+    // block buffer on drop, a wipe of the transient `CtOutput` that `mac.finalize()` produces
+    // before `.into_bytes()` clones out of it, and, separately, `sha2`'s own `Sha512VarCore`
+    // wiping the running SHA-512 compression state on drop, which for `Hmac::<Sha384>` is the
+    // ipad/opad-keyed key-schedule state this whole file exists to protect. That last one needs
+    // `sha2`'s own `zeroize` feature named directly, not only `hmac`'s; see the `sha2` line in
+    // the workspace `Cargo.toml` for how that was measured rather than assumed.)
     //
     // This comment has been wrong twice before, in opposite directions: once claiming the
     // `Zeroize` route needed a dependency feature (`generic-array`) this crate was not
