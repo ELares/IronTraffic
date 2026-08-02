@@ -2423,17 +2423,29 @@ integer arithmetic instead:
 #     each line suppresses the blacklist hits and still fails the gate,
 #     because the count sees zero `.zeroize()` sites either way.
 #
-#     KNOWN LIMIT, STATED HONESTLY. Neither half understands Rust's types and
-#     neither can follow a call through a level of indirection (`let f =
-#     <[u8]>::fill; f(&mut full, 0);` would not match the blacklist;
-#     `zeroize::Zeroize::zeroize(&mut full)` -- fully qualified syntax --
-#     would not match the count's method-call shape). The shapes that survive
-#     both halves (copy_from_slice, a helper fn, a renamed local, either of
-#     the two indirections above) all still leave the required call sites
-#     present in some form, so they change HOW the buffer is wiped rather than
-#     WHETHER it is. This closes the specific regressions the two reviews
-#     above demonstrated by running them, not every regression shaped like
-#     them.
+#     KNOWN LIMIT, STATED HONESTLY (review-lint-r2.json finding 1: the
+#     previous version of this paragraph named four shapes as surviving both
+#     halves and every one of them fails; that list is gone, replaced with
+#     only what was run). The blacklist above can be evaded through a level
+#     of indirection: `let f = <[u8]>::fill; f(&mut full[..], 0);` contains no
+#     `full.fill(`/`t.fill(` text, so it does not match, and that gap is
+#     accepted because the count below is the check that actually matters.
+#     The count matches exactly ONE spelling: `full.zeroize()` and
+#     `t.zeroize()` as method calls on those two local names, in this one
+#     file. Every other spelling of a genuine wipe FAILS the count, and each
+#     of the following was run directly against this script, not assumed: a
+#     helper function (`fn wipe(buf: &mut [u8]) { buf.zeroize(); }`, called as
+#     `wipe(&mut full)` / `wipe(&mut t)`) gives full=0 t=0; unifying both
+#     locals to the single name `full`, keeping two real `.zeroize()` calls,
+#     gives full=2 t=0; fully qualified syntax
+#     (`zeroize::Zeroize::zeroize(&mut full[..])`) gives full=0 t=1; and
+#     `copy_from_slice` in place of either call gives the same kind of miss.
+#     All four compile clean at `-D warnings`. This is deliberate, not an
+#     oversight: a rule narrow enough to be checked is worth more than one
+#     broad enough to be wrong. If extract_sha384 or expand_sha384 are
+#     legitimately restructured so the wipe no longer takes this exact shape,
+#     update this rule in the SAME commit as the restructuring; do not let the
+#     two drift apart again.
 # ---------------------------------------------------------------------------
 hits="$(scan hkdf-zeroize-not-fill '\b(full|t)\.fill\s*\(' rust_files \
   | grep -E '^crates/irontraffic-tls/src/hkdf\.rs:' || true)"
@@ -2442,23 +2454,39 @@ hits="$(scan hkdf-zeroize-not-fill '\b(full|t)\.fill\s*\(' rust_files \
 # blacklist, so the cheapest regression of all evades it: DELETING the wipe
 # outright. A reviewer ran that and it compiles clean at -D warnings (rustc
 # even tells you to drop the now-unneeded `mut` and the `Zeroize` import) and
-# reproduces the pre-fix object code exactly, with this rule silent. Six more
-# shapes evade it too, including copy_from_slice, a helper fn in the same
-# file, and renaming the local. Enumerating them is a losing game; requiring
-# the wipe to BE THERE is not.
+# reproduces the pre-fix object code exactly, with this rule silent. Other
+# shapes evade it too, verified directly: copy_from_slice, a helper fn in the
+# same file, and renaming a local all leave no `full.fill(`/`t.fill(` text
+# anywhere for this blacklist to find. Enumerating every such shape is a
+# losing game; requiring the wipe to BE THERE is not.
 #
 # Counted with rslex.finditer_real (not a plain grep), over the SAME
 # #[cfg(test)]-stripped shadow tree scan_prod uses, for two independent
 # reasons proven above: (1) finditer_real makes a comment, a doc comment, and
 # a string literal opaque, so text that merely SPELLS the call cannot satisfy
 # a count that is supposed to prove the call is real code; (2) reading from
-# the shadow tree rather than the checked-out file means a `#[cfg(test)]`
-# block's own `.zeroize()` calls are already blanked before the count ever
-# sees them, so moving the two real wipes into a test module cannot satisfy
-# it either. The pattern tolerates the rustfmt-adjacent spellings a developer
-# actually produces (a call split across lines after the dot, stray spaces
-# around the dot or inside the parens): `\s` already matches a newline with no
-# extra flag, so `full\n    .zeroize()` and `full . zeroize ( )` both count.
+# the shadow tree rather than the checked-out file means a block carrying the
+# EXACT spelling `#[cfg(test)]` (the only spelling build_prod_tree.py's own
+# `CFG = re.compile(...)` recognizes, defined above) has its `.zeroize()`
+# calls blanked before the count ever sees them, so moving the two real wipes
+# into a plain `#[cfg(test)] mod ...` cannot satisfy it either.
+#
+# review-lint-r2.json finding 4: that second claim used to say NO test module
+# can satisfy this count, and that is false. A DIFFERENTLY spelled test-only
+# attribute is not caught by this route: `#[cfg(any(test, doctest))]` around
+# a decoy module carrying real `full.zeroize()`/`t.zeroize()` calls on
+# throwaway locals is not stripped by the CFG regex above, satisfies this
+# count, and compiles clean at `-D warnings` while the real functions ship no
+# wipe at all. Verified directly, and confirmed the exact `#[cfg(test)]`
+# spelling still fails the same tree. Widening the CFG regex would close
+# this, but scan_prod and every other `-prod` rule in this file share it, so
+# that is a change with its own blast radius, left for a dedicated fix rather
+# than folded in here.
+#
+# The pattern tolerates the rustfmt-adjacent spellings a developer actually
+# produces (a call split across lines after the dot, stray spaces around the
+# dot or inside the parens): `\s` already matches a newline with no extra
+# flag, so `full\n    .zeroize()` and `full . zeroize ( )` both count.
 cat > "$WORK/count_wipe_sites.py" <<'PY'
 import os
 import re
@@ -2512,12 +2540,13 @@ else
     fail hkdf-zeroize-not-fill \
 "$hkdf_scoped_rel must contain exactly one real \`full.zeroize()\` call in
 extract_sha384 and exactly one \`t.zeroize()\` call in expand_sha384; found
-full=$wipe_full t=$wipe_t. Counted with the same comment- and literal-aware
-scanner (rslex.finditer_real) every other rule in this file already uses, over
-the #[cfg(test)]-stripped shadow tree, so neither a call living only in a test
-module nor the call text spelled out in a doc comment or a string literal can
-satisfy this. Forbidding \`.fill(0)\` is not enough on its own, because simply
-DELETING the wipe evades that check, compiles clean, and reproduces the
+full=$wipe_full t=$wipe_t. Counted with rslex.finditer_real, a comment- and
+literal-aware scanner most rules in this file do NOT use (they scan with a
+plain grep instead, this rule's own \`.fill(\` blacklist above included), over
+the #[cfg(test)]-stripped shadow tree, so neither a call living only in a
+test module nor the call text spelled out in a doc comment or a string
+literal can satisfy this. Forbidding \`.fill(0)\` is not enough on its own,
+because simply DELETING the wipe evades that check, compiles clean, and reproduces the
 unprotected object code. There is no it-allow escape for this count: a wipe
 that can be commented away is not a wipe. If these functions are legitimately
 restructured, keep one Zeroize call per HMAC output buffer and update this

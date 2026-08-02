@@ -910,6 +910,42 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+# review-lint-r2.json finding 2 (round three of hkdf-zeroize-not-fill): the
+# mirror image of the check just above. That check proves a regression that
+# silently disables ONLY the count half is visible; this one proves the same
+# for the BLACKLIST half, because the identical blind spot exists in the
+# other direction and nothing above tested for it. Deleting the blacklist
+# entirely from invariant-lints.sh (the `scan hkdf-zeroize-not-fill` call and
+# its `fail` block) left this whole selftest reporting clean: the rule NAME
+# still lands in ACTUAL, and the count check just above still sees "full=0
+# t=0", both for the same reason (neither of corpus A's two functions has a
+# real `.zeroize()` call anywhere, so the count half alone already catches
+# this fixture), so neither existing assertion notices the blacklist is gone.
+#
+# Grep the RAW per-line output for the blacklist's OWN evidence instead: the
+# grep hit line beginning "crates/irontraffic-tls/src/hkdf.rs:20:" is the
+# exact `$hits` text the blacklist's own `fail` call passes as its third
+# argument (see invariant-lints.sh's hkdf-zeroize-not-fill block), produced
+# by no other check in this file, and reachable only because extract_sha384
+# above reverts its wipe to `full.fill(0)`, the specific shape the blacklist
+# exists to name (as opposed to a wipe missing outright, which the count half
+# already covers on its own). Verified by running the corpus directly, and by
+# deleting the blacklist block and confirming this specific check, not the
+# rule-name check and not the count-half check above, is what goes red.
+# ---------------------------------------------------------------------------
+echo "== corpus A: the hkdf-zeroize-not-fill BLACKLIST half must be individually visible =="
+if printf '%s\n' "$RAW_A" | grep -qF "crates/irontraffic-tls/src/hkdf.rs:20:"; then
+  note "the blacklist half's own evidence (hkdf.rs:20: full.fill(0)) is visible, independent of the count half's full=0 t=0"
+else
+  echo "FAIL: corpus A's raw output is missing the blacklist half's own evidence line"
+  echo "      (hkdf.rs:20, the full.fill(0) hit). The count-half check above cannot"
+  echo "      tell a regression that silently disables ONLY the blacklist half apart"
+  echo "      from the count's own full=0 t=0 evidence, which fires on this same"
+  echo "      file regardless of whether the blacklist runs at all."
+  FAILED=1
+fi
+
+# ---------------------------------------------------------------------------
 # Corpus A, per call spelling: hot-path-allocation must name EVERY covered
 # call, by line.
 #
