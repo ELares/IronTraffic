@@ -2353,9 +2353,12 @@ integer arithmetic instead:
 # ---------------------------------------------------------------------------
 # 28. hkdf-zeroize-not-fill: the HKDF key-schedule wipe in hkdf.rs must be a
 #     real Zeroize call, not a plain `.fill(0)`, and it must actually BE
-#     THERE: deleting it, hiding it in a #[cfg(test)] block, spelling it out
-#     only in a comment or a string literal, or moving the file it lives in
-#     must all still fail this rule.
+#     THERE: deleting it, commenting it out, spelling it out only in a
+#     comment or a string literal, hiding it behind one of the #[cfg(test)]
+#     spellings this rule's shadow-tree stripper recognizes (see the
+#     CFG-SPELLING LIMIT paragraph below for exactly which, and for what
+#     still evades), or moving the file it lives in must all still fail
+#     this rule.
 #
 #     WHY THIS EXISTS (review of PR 839, review-zeroize.json finding 2). The
 #     guarantee that `extract_sha384` and `expand_sha384` wipe the HMAC output
@@ -2468,14 +2471,24 @@ hits="$(scan hkdf-zeroize-not-fill '\b(full|t)\.fill\s*\(' rust_files \
 # blacklist, so the cheapest regression of all evades it: DELETING the wipe
 # outright. A reviewer ran that and it compiles clean at -D warnings (rustc
 # even tells you to drop the now-unneeded `mut` and the `Zeroize` import),
-# with this rule silent; run directly, release object code, aarch64/rustc
-# 1.97.0: expand_sha384 comes out instruction-identical to the pre-fix
-# `.fill(0)` build, extract_sha384 differs only in stack staging (175 vs 171
-# instructions) -- neither shape emits a wipe. Other shapes evade the
-# blacklist too, verified directly: copy_from_slice, a helper fn in the same
-# file, and renaming a local all leave no `full.fill(`/`t.fill(` text
-# anywhere for it to find. Enumerating every such shape is a losing game;
-# requiring the wipe to BE THERE is not.
+# with the blacklist above silent (there is no `full.fill(`/`t.fill(` text
+# left for it to match); the count below is what catches it. Release object
+# code, aarch64/rustc 1.97.0, rebuilt and diffed directly (review-lint-r5.json
+# finding 2): the `.fill(0)` store itself contributes zero wipe instructions
+# of its own -- expand_sha384's `.fill(0)` build is instruction-identical to
+# deleting the call outright (zero zeroing stores either way), and
+# extract_sha384's `.fill(0)` build differs from its deleted build only in
+# stack staging. Both of extract_sha384's builds DO still contain a 48-byte
+# zeroing store, but it comes from hmac/sha2's own zeroize-on-drop on the
+# transient `CtOutput` (see the comment on `full.zeroize()` above, and the
+# workspace Cargo.toml's `hmac`/`sha2` `zeroize` features), not from
+# `.fill(0)` or from the deletion; `.zeroize()` in the current code adds 48
+# more byte-stores per function on top of whatever that dependency feature
+# already contributes. Other shapes evade the blacklist too, verified
+# directly: copy_from_slice, a helper fn in the same file, and renaming a
+# local all leave no `full.fill(`/`t.fill(` text anywhere for it to find.
+# Enumerating every such shape is a losing game; requiring the wipe to BE
+# THERE is not.
 #
 # Counted with rslex.finditer_real (not a plain grep), over the SAME
 # #[cfg(test)]-stripped shadow tree scan_prod uses, for two independent
@@ -2494,15 +2507,38 @@ hits="$(scan hkdf-zeroize-not-fill '\b(full|t)\.fill\s*\(' rust_files \
 # none, and still compiled clean at `-D warnings`. Fixed by widening CFG to
 # `#\s*\[\s*cfg\s*\(\s*test\s*,?\s*\)\s*\]`; run directly against the real
 # script, all four spellings are now stripped and fail this count, and the
-# plain `#[cfg(test)]` spelling still fails it too. That widening closes
-# only spellings of the SAME predicate: `#[cfg(any(test, doctest))]` is a
-# different predicate, is not matched either before or after, and still
-# evades this count -- run directly, both ways. It cannot regress any other
-# rule that reads this shadow tree: every `#[cfg(test)]`-shaped attribute in
-# the tracked tree today (249, grep-counted) already used the exact spelling
-# the old regex matched, so the shadow tree this produces on the real,
-# unmutated tree is unchanged, and the full gate re-run against that tree is
-# still `invariant-lints: clean`.
+# plain `#[cfg(test)]` spelling still fails it too (see the CFG-SPELLING
+# LIMIT paragraph immediately below for what is actually verified caught --
+# this widening is not a closed boundary, and this comment has stopped
+# trying to draw one). It cannot regress any other rule that reads this
+# shadow tree: every `#[cfg(test)]`-shaped attribute in the tracked tree
+# today (249, grep-counted) already used the exact spelling the old regex
+# matched, so the shadow tree this produces on the real, unmutated tree is
+# unchanged, and the full gate re-run against that tree is still
+# `invariant-lints: clean`.
+#
+# CFG-SPELLING LIMIT, STATED HONESTLY (review-lint-r5.json finding 1: seven
+# straight rounds of this comment tried to draw a precise boundary around
+# which cfg spellings this count's shadow-tree stripper recognizes, and
+# every round drew that boundary wrong, including the "SAME predicate"
+# sentence this paragraph replaces. Stop drawing it: a Python regex cannot
+# close a spelling class Rust's own lexer defines, because Rust's
+# whitespace and comment rules are not Python's, in both directions.
+#
+# This count is a TEXT-LEVEL heuristic over a text-level shadow tree. It
+# catches the spellings listed below, each of which was run directly
+# against this exact script -- both real wipes deleted from hkdf.rs, a
+# decoy module carrying them on throwaway locals under the spelling shown,
+# gate re-run -- and each gave exit 1, full=0 t=0 (CAUGHT):
+#   #[cfg(test)]     #[cfg (test)]     #[ cfg(test) ]
+#   # [cfg(test)]    #[cfg(test,)]
+# Any cfg spelling this stripper does not recognize evades this count, and
+# that class cannot be closed by widening the regex again -- see above.
+# This rule's value is that the CHEAP regressions die loudly, re-verified
+# directly against this exact script: deleting the wipe outright,
+# commenting it out, and reverting to `.fill(0)` are all still caught. A
+# determined author can still route around this count; nothing here closes
+# that, and nothing here claims to.
 #
 # The count's own patterns tolerate the rustfmt-adjacent spellings a
 # developer actually produces: run directly, `full\n    .zeroize()` and
@@ -2566,15 +2602,18 @@ comment- and literal-aware scanner most rules in this file do NOT use (they
 scan with a plain grep instead, this rule's own \`.fill(\` blacklist above
 included), over the #[cfg(test)]-stripped shadow tree, so a call living only
 in a plain #[cfg(test)] block does not satisfy this, nor does the call text
-spelled out in a doc comment or a string literal; a genuinely different
-test-only cfg PREDICATE (#[cfg(any(test, doctest))], not a whitespace or
-comma variant of #[cfg(test)] itself) is a known gap, documented above.
-Forbidding \`.fill(0)\` is not enough on its own, because
-simply DELETING the wipe evades that check, compiles clean, and reproduces
-the unprotected object code. There is no it-allow escape for this count: a
-wipe that can be commented away is not a wipe. If these functions are
-legitimately restructured, keep one Zeroize call per HMAC output buffer and
-update this rule to match." "full=$wipe_full t=$wipe_t"
+spelled out in a doc comment or a string literal. This count is a
+TEXT-LEVEL heuristic over a text-level shadow tree: it catches the cfg
+spellings verified caught in the CFG-SPELLING LIMIT paragraph above, and
+any cfg spelling the stripper does not recognize evades it. That class is
+not enumerated here, because every past attempt to enumerate it was wrong;
+it cannot be closed by widening the regex further, only narrowed.
+Forbidding \`.fill(0)\` is not enough on its own: simply DELETING the wipe
+leaves that blacklist match silent (there is no \`.fill(\` text left for it
+to find), and this count is what catches it. There is no it-allow escape
+for this count: a wipe that can be commented away is not a wipe. If these
+functions are legitimately restructured, keep one Zeroize call per HMAC
+output buffer and update this rule to match." "full=$wipe_full t=$wipe_t"
   fi
 fi
 [ -n "$hits" ] && fail hkdf-zeroize-not-fill \
@@ -2583,11 +2622,15 @@ fi
 optimization barrier, specifically because \`.fill(0)\` is a plain,
 non-volatile store into a value that is dead immediately afterwards, exactly
 the kind of store a compiler is entitled to remove. This was measured, not
-assumed: reverting to .fill(0) compiles, passes every test, and emits NO wipe
-instructions in the release object code. If a real exception exists for using
-\`.fill(0)\` on this specific line instead of \`Zeroize\`, say why on the same
-line; this suppresses only THIS blacklist match, not the exactly-one-call-site
-requirement above, which has no escape:
+assumed: reverting to .fill(0) compiles, passes every test, and the
+\`.fill(0)\` store itself contributes zero wipe instructions of its own to
+the release object code (expand_sha384's \`.fill(0)\` build is
+instruction-identical to deleting the call outright; extract_sha384's
+differs from its deleted build only in stack staging) -- \`.zeroize()\` adds
+48 zeroing byte-stores per function on top of that. If a real exception
+exists for using \`.fill(0)\` on this specific line instead of \`Zeroize\`,
+say why on the same line; this suppresses only THIS blacklist match, not
+the exactly-one-call-site requirement above, which has no escape:
   // it-allow: hkdf-zeroize-not-fill reason: <why this is not a secret wipe>" "$hits"
 
 # ---------------------------------------------------------------------------
