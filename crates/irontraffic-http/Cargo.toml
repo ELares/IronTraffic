@@ -91,6 +91,10 @@ name = "http_known"
 harness = false
 
 [[bench]]
+name = "http_mplex"
+harness = false
+
+[[bench]]
 name = "http_section"
 harness = false
 

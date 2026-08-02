@@ -85,3 +85,10 @@ path = "fuzz_targets/fuzz_h1_roundtrip.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "fuzz_mplex_head"
+path = "fuzz_targets/fuzz_mplex_head.rs"
+test = false
+doc = false
+bench = false

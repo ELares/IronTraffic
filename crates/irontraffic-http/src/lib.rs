@@ -54,6 +54,7 @@ pub mod h1;
 pub mod hlist;
 pub mod known;
 pub mod limits;
+pub mod mplex;
 pub mod path;
 pub mod peer;
 pub mod priority;
