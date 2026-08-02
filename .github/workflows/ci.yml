@@ -400,7 +400,8 @@ jobs:
           set -euo pipefail
           git fetch --depth=1 origin "${{ github.base_ref || github.ref_name }}"
           for f in scripts/invariant-lints.sh scripts/invariant-lints-selftest.sh \
-                   scripts/dash-scan.sh scripts/pr-scope-check.sh scripts/test-census.sh \
+                   scripts/dash-scan.sh scripts/pr-scope-check.sh scripts/pr-scope-check-selftest.sh \
+                   scripts/test-census.sh \
                    scripts/test-census-selftest.sh \
                    scripts/gate-fast.sh scripts/gate.sh scripts/feature-matrix.sh opencode.json \
                    clippy.toml deny.toml rustfmt.toml; do
@@ -448,6 +449,17 @@ jobs:
         # file's assertion count dropping all the way to zero. Both are
         # regression-tested here against the shipped script.
         run: scripts/test-census-selftest.sh
+      - name: PR scope check self-test
+        # pr-scope-check.sh is the one gate script in this lane that
+        # adjudicates author identity and an allowlist, and until PR 837's
+        # review it had no self-test at all: a nine-row markdown table of
+        # asserted regex results in a PR body stood in for one, and the
+        # regex was fine in isolation while the shell loop consuming it was
+        # not. Runs the real script against throwaway git repos with a
+        # stubbed gh, the same discipline as its two siblings above,
+        # including both of that review's exploit vectors and the
+        # motivation this list exists for at all (issue #836).
+        run: scripts/pr-scope-check-selftest.sh
       - name: governance files present
         # These files are trust infrastructure. This lint ensures they cannot
         # be silently removed, renamed, or emptied.

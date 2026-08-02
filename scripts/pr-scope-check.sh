@@ -18,6 +18,12 @@
 #
 # Environment: GH_TOKEN, PR_NUMBER, BASE_SHA, HEAD_SHA.
 set -euo pipefail
+# Belt and suspenders alongside the NUL-delimited reads below: this script
+# never intentionally relies on pathname expansion, so turn it off entirely.
+# `case` patterns are unaffected by this (they are not filename globbing), so
+# nothing below changes behaviour; it only removes a footgun for the next
+# edit.
+set -f
 cd "$(git rev-parse --show-toplevel)"
 
 : "${PR_NUMBER:?PR_NUMBER is required}"
@@ -42,6 +48,122 @@ pr_json="$(gh api "repos/$REPO/pulls/$PR_NUMBER")"
 body="$(printf '%s' "$pr_json" | jq -r '.body // ""')"
 author="$(printf '%s' "$pr_json" | jq -r '.user.login // ""')"
 
+# THREE dots, not two. `git diff A B` is a two-dot diff and shows everything
+# that differs between the tips, so once other pull requests merge into main the
+# base sha advances and THEIR files appear in THIS diff, producing a false scope
+# violation the author cannot act on. The three-dot form diffs against the merge
+# base, which is what "the files this branch changed" actually means.
+#
+# A FAILED merge-base is a FAILURE, not a two-dot diff wearing a fallback
+# (issue #535). This used to be `|| MERGE_BASE="$BASE_SHA"` on the issue path,
+# and separately `|| echo "$BASE_SHA"` inline on the bot path below it, an
+# inconsistency PR 837's review caught: two spellings of the identical wrong
+# idea, one fixed and one not. If `git merge-base` cannot find a shared
+# ancestor, that almost always means this checkout never actually fetched the
+# commit `BASE_SHA` names (its own fetch step raced a later commit landing on
+# the base branch), not that no common ancestor exists. Substituting `BASE_SHA`
+# then diffs against a commit this branch may never have descended from at
+# all, and reports every file whatever else landed on the base branch in that
+# window as an undeclared change in THIS pull request, exactly what happened
+# to PR #512 (blamed for issue #113's already merged SNI normalization files).
+# `scripts/test-census.sh` already gets this right for its own merge base:
+# fail loudly and let the run be investigated or re-tried, never guess. There
+# is exactly one merge base and exactly one "files this PR changed" for the
+# whole script, computed once here and used by both the bot path and the
+# issue path below, rather than twice with two chances to disagree.
+if ! MERGE_BASE="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"; then
+  cat >&2 <<EOF
+FAIL: could not compute a merge base between BASE_SHA ($BASE_SHA) and HEAD_SHA
+($HEAD_SHA). This almost always means the checkout does not actually have the
+commit BASE_SHA names, not that the two commits share no history. Falling back
+to a two-dot diff against BASE_SHA would compare against a commit this branch
+may not descend from at all once other pull requests have merged into the base
+branch since this branch's last rebase, and would misreport every file those
+merges touched as an undeclared change in THIS pull request. Re-run this check
+rather than trust a result computed without a real merge base.
+EOF
+  exit 1
+fi
+
+# Read the diff NUL delimited and compare each path LITERALLY. This script
+# used to compute this list with `git diff --name-only` (newline separated)
+# and then consume it as `for f in $changed`, an UNQUOTED expansion. Bash
+# word-splits AND pathname-expands an unquoted expansion, so what actually got
+# tested was never the path that changed; it was that expansion. PR 837's
+# review proved two independent ways to abuse this, both against the real
+# script with real cargo:
+#
+#   1. GLOB. A file literally named `crates/pol/Cargo.tom[l]` is a valid
+#      glob pattern. Expanded against the checkout, `Cargo.tom[l]` matches
+#      `Cargo.toml` whenever that file also exists alongside it, which an
+#      attacker controls by simply committing both. The loop then tests
+#      `crates/pol/Cargo.toml`, not the path that changed, and a payload
+#      planted at `crates/pol/Cargo.tom[l]` is never tested at all. Paired
+#      with a sibling `crates/pol/Cargo.toml` carrying `build =
+#      "Cargo.tom[l]"`, this made the bot path print EXEMPT while cargo
+#      compiled and ran the payload during `cargo build`.
+#   2. WHITESPACE. `git diff --name-only` does not quote a space, so a path
+#      containing one is a single diff line that word-splits into TWO
+#      allowlisted fragments with no existing file required:
+#      `crates/pol/Cargo.toml Cargo.toml` becomes `crates/pol/Cargo.toml` and
+#      `Cargo.toml`, and the real, space-containing path is again never
+#      tested.
+#
+# `git diff --name-only -z` NUL-terminates every entry instead of newline
+# separating them, and `read -r -d ''` reads exactly one NUL-terminated
+# record into `f` with no word-splitting and no globbing, whatever bytes the
+# path contains. That is the only correct way to consume this output, and it
+# is why this is fixed in the loop, not in the allowlist regex: the regex was
+# never wrong, it was simply never shown the path that changed.
+changed=()
+while IFS= read -r -d '' f; do
+  changed+=("$f")
+done < <(git diff --name-only -z "$MERGE_BASE" "$HEAD_SHA")
+
+# A path containing a literal embedded newline is rejected outright, rather
+# than trusted to any particular grep flavour's handling of one. Every match
+# below is done with `grep -qE` against a single value, which is safe for an
+# ordinary one-line path; but a value that itself contains a newline reads to
+# a line-oriented tool as MULTIPLE lines, and `grep -q` succeeds if ANY line
+# matches, so a two-line value with one allowlisted line and one payload line
+# could otherwise pass. It also defeats the directory-prefix `case "$f" in
+# "$d"*)` matches further down in the same way, since a glob-style prefix
+# match does not stop at an embedded newline either. NUL-delimited reading
+# cannot itself produce this (a NUL cannot appear in a POSIX path), but a
+# real newline can, and this is the one remaining metacharacter worth
+# checking for by hand rather than by trusting `grep -z` semantics, which
+# this repository's own local tooling was observed to implement differently
+# from GNU grep.
+for f in "${changed[@]}"; do
+  case "$f" in
+    *$'\n'*)
+      echo "FAIL: a changed path contains an embedded newline, which this" >&2
+      echo "check will not compare against a line-oriented allowlist. The" >&2
+      echo "raw bytes, one apparent line per embedded fragment:" >&2
+      printf '%s\n' "$f" | sed 's/^/    /' >&2
+      exit 1
+      ;;
+  esac
+done
+
+# An empty diff must never read as "nothing to enforce, so EXEMPT" or
+# "nothing to enforce, so it matches". Every other lane in this workflow
+# fails closed when its inputs are missing rather than reporting success for
+# having found nothing; this script was the one exception, on the bot path
+# only, where an empty diff printed EXEMPT with a blank file list and exited
+# 0. A `pull_request` event always has at least one changed file in practice;
+# if this ever fires, something upstream (a bad BASE_SHA/HEAD_SHA pair, most
+# likely) is broken and deserves investigation, not a silent pass.
+if [ "${#changed[@]}" -eq 0 ]; then
+  cat >&2 <<EOF
+FAIL: no files changed between the merge base and HEAD_SHA ($HEAD_SHA). A pull
+request with no diff has nothing for this check to enforce, and reporting a
+pass here would be exactly the vacuous pass this workflow refuses everywhere
+else. Investigate rather than trust it.
+EOF
+  exit 1
+fi
+
 # Automated dependency and workflow bumps have no issue and never will. They are
 # exempt ONLY when the author is a known bot AND every file they touch is a
 # dependency manifest or a workflow. A bot PR that touches source code is NOT
@@ -58,24 +180,37 @@ author="$(printf '%s' "$pr_json" | jq -r '.user.login // ""')"
 # a security refusal, which reads as the bot having done something suspicious
 # rather than as a hole in this list. PR 832 (logos) hit it.
 #
-# Widening to crate manifests does NOT widen the threat model. The comment above
-# is still the rule that matters: a bot PR touching SOURCE is not exempt. A
-# crate manifest can add a dependency, but so can the root manifest that was
-# always allowed, so this admits nothing the previous list did not. Note the
-# [^/]+ segments are deliberate: crates/<name>/Cargo.toml matches,
+# CORRECTED CLAIM (PR 837's review caught this one). This comment and issue
+# #836 both used to say the widening below "admits nothing the previous list
+# did not", on the theory that a crate manifest can add a dependency but so
+# can the root manifest that was already allowed. That equivalence does NOT
+# hold in this repository: the root `Cargo.toml` is a VIRTUAL workspace
+# manifest (`[workspace]`, no `[package]`), so Cargo refuses `build =`,
+# `[[bin]] path =`, `[lib] path =` and `[[test]] path =` there entirely. A
+# crate manifest accepts all of them. So a crate manifest carries a
+# capability the root manifest never had: it can retarget what Cargo COMPILES
+# AND RUNS at an arbitrary path already in the tree. That is a real widening
+# of the threat model, not a null one, and the reason it is safe to ship is
+# the fix above, not this paragraph: once every path in the diff is compared
+# literally, an allowlisted crate manifest can only point Cargo at a file
+# that is ALSO part of this same reviewed diff, never at a payload smuggled
+# under a different name via a glob or a space. Widening this allowlist and
+# reading paths literally are one change, not two. Note the [^/]+ segments
+# are still deliberate: crates/<name>/Cargo.toml matches,
 # crates/<name>/src/anything does not.
 BOT_ALLOWED='^(Cargo\.toml|Cargo\.lock|crates/[^/]+/Cargo\.toml|crates/[^/]+/Cargo\.lock|crates/[^/]+/fuzz/Cargo\.toml|crates/[^/]+/fuzz/Cargo\.lock|\.github/workflows/[^/]+\.ya?ml|\.github/dependabot\.yml|packages/[^/]+/package(-lock)?\.json)$'
 case "$author" in
   dependabot\[bot\]|renovate\[bot\]|github-actions\[bot\])
-    changed_now="$(git diff --name-only "$(git merge-base "$BASE_SHA" "$HEAD_SHA" || echo "$BASE_SHA")" "$HEAD_SHA")"
     offending=""
-    for f in $changed_now; do
+    for f in "${changed[@]}"; do
       printf '%s' "$f" | grep -qE "$BOT_ALLOWED" || offending="$offending$f
 "
     done
     if [ -z "$offending" ]; then
       echo "pr-scope-check: EXEMPT. Automated dependency bump by $author touching only manifests and workflows:"
-      printf '%s\n' $changed_now | sed 's/^/    /'
+      for f in "${changed[@]}"; do
+        printf '    %s\n' "$f"
+      done
       exit 0
     fi
     echo "FAIL: $author is a bot but this PR touches files outside the dependency allowlist:" >&2
@@ -107,7 +242,9 @@ fi
 count="$(printf '%s\n' "$issues" | wc -l | tr -d ' ')"
 if [ "$count" -ne 1 ]; then
   echo "FAIL: this PR closes $count issues:" >&2
-  printf '  #%s\n' $issues >&2
+  while IFS= read -r n; do
+    printf '  #%s\n' "$n" >&2
+  done <<< "$issues"
   echo "One issue per PR. Split it." >&2
   exit 1
 fi
@@ -119,7 +256,7 @@ issue_body="$(gh api "repos/$REPO/issues/$issue" --jq '.body // ""')"
 
 # Extract the first column of the markdown table under `## Files`. Rows look
 # like:  | `crates/irontraffic-router/src/matcher.rs` | create | ... |
-declared="$(printf '%s' "$issue_body" | python3 -c '
+declared_raw="$(printf '%s' "$issue_body" | python3 -c '
 import re, sys
 
 text = sys.stdin.read()
@@ -155,7 +292,7 @@ for line in lines:
 print("\n".join(out))
 ')"
 
-if [ -z "$declared" ]; then
+if [ -z "$declared_raw" ]; then
   cat >&2 <<EOF
 FAIL: issue #$issue has no '## Files' table, so this PR's scope is undefined.
 
@@ -172,42 +309,23 @@ EOF
   exit 1
 fi
 
-# THREE dots, not two. `git diff A B` is a two-dot diff and shows everything
-# that differs between the tips, so once other pull requests merge into main the
-# base sha advances and THEIR files appear in THIS diff, producing a false scope
-# violation the author cannot act on. The three-dot form diffs against the merge
-# base, which is what "the files this branch changed" actually means.
-#
-# A FAILED merge-base is a FAILURE, not a two-dot diff wearing a fallback
-# (issue #535). This used to be `|| MERGE_BASE="$BASE_SHA"`, which silently
-# turned exactly the failure the paragraph above describes into the very
-# comparison it exists to avoid: if `git merge-base` cannot find a shared
-# ancestor, that almost always means this checkout never actually fetched the
-# commit `BASE_SHA` names (its own fetch step raced a later commit landing on
-# the base branch), not that no common ancestor exists. Substituting `BASE_SHA`
-# then diffs against a commit this branch may never have descended from at
-# all, and reports every file whatever else landed on the base branch in that
-# window as an undeclared change in THIS pull request, exactly what happened
-# to PR #512 (blamed for issue #113's already merged SNI normalization files).
-# `scripts/test-census.sh` already gets this right for its own merge base:
-# fail loudly and let the run be investigated or re-tried, never guess.
-if ! MERGE_BASE="$(git merge-base "$BASE_SHA" "$HEAD_SHA")"; then
-  cat >&2 <<EOF
-FAIL: could not compute a merge base between BASE_SHA ($BASE_SHA) and HEAD_SHA
-($HEAD_SHA). This almost always means the checkout does not actually have the
-commit BASE_SHA names, not that the two commits share no history. Falling back
-to a two-dot diff against BASE_SHA would compare against a commit this branch
-may not descend from at all once other pull requests have merged into the base
-branch since this branch's last rebase, and would misreport every file those
-merges touched as an undeclared change in THIS pull request. Re-run this check
-rather than trust a result computed without a real merge base.
-EOF
-  exit 1
-fi
-changed="$(git diff --name-only "$MERGE_BASE" "$HEAD_SHA")"
+# Read line by line rather than `for d in $declared_raw`, the same unquoted
+# shape fixed above for the diff: a declared path is author-controlled prose
+# (the issue's own Files table) and deserves the identical literal treatment,
+# not a second, differently-shaped trust boundary.
+declared=()
+while IFS= read -r d; do
+  [ -n "$d" ] && declared+=("$d")
+done <<< "$declared_raw"
 
-echo "declared in issue #$issue:"; printf '  %s\n' $declared
-echo "changed by this PR:"; printf '  %s\n' $changed
+echo "declared in issue #$issue:"
+for d in "${declared[@]}"; do
+  printf '  %s\n' "$d"
+done
+echo "changed by this PR:"
+for f in "${changed[@]}"; do
+  printf '  %s\n' "$f"
+done
 
 # Cargo.lock exemption: allowed WITHOUT its own Files row, but only when this
 # same diff also touches a Cargo.toml that the issue DID declare. That ties
@@ -222,12 +340,12 @@ echo "changed by this PR:"; printf '  %s\n' $changed
 # this is a narrowing of the false-positive, not a claim that Cargo.lock
 # content is fully verified here.
 cargo_lock_exempt=0
-for f in $changed; do
+for f in "${changed[@]}"; do
   case "$f" in
     Cargo.toml|*/Cargo.toml) : ;;
     *) continue ;;
   esac
-  for d in $declared; do
+  for d in "${declared[@]}"; do
     case "$d" in
       */) case "$f" in "$d"*) cargo_lock_exempt=1;; esac ;;
       *)  [ "$f" = "$d" ] && cargo_lock_exempt=1 ;;
@@ -239,7 +357,7 @@ done
 
 # A declared entry may name a directory (trailing slash) to cover a tree.
 undeclared=""
-for f in $changed; do
+for f in "${changed[@]}"; do
   if printf '%s' "$f" | grep -qE "$ALWAYS_ALLOWED"; then continue; fi
   if [ "$f" = "Cargo.lock" ] && [ "$cargo_lock_exempt" -eq 1 ]; then continue; fi
   # A NESTED lockfile, crates/<name>/fuzz/Cargo.lock, is generated by cargo-fuzz
@@ -254,14 +372,14 @@ for f in $changed; do
     */Cargo.lock)
       sibling="${f%/Cargo.lock}/Cargo.toml"
       sib_declared=0
-      for d in $declared; do
+      for d in "${declared[@]}"; do
         [ "$d" = "$sibling" ] && sib_declared=1 && break
       done
       [ "$sib_declared" -eq 1 ] && continue
       ;;
   esac
   ok=0
-  for d in $declared; do
+  for d in "${declared[@]}"; do
     case "$d" in
       */) case "$f" in "$d"*) ok=1;; esac ;;
       *)  [ "$f" = "$d" ] && ok=1 ;;
@@ -295,9 +413,13 @@ fi
 # A declared file that was never touched is a signal, not a failure: the issue
 # may have over-declared, or the implementer may have missed a required edit.
 untouched=""
-for d in $declared; do
+for d in "${declared[@]}"; do
   case "$d" in */) continue;; esac
-  printf '%s\n' $changed | grep -qxF "$d" || untouched="$untouched$d
+  found=0
+  for f in "${changed[@]}"; do
+    [ "$f" = "$d" ] && { found=1; break; }
+  done
+  [ "$found" -eq 0 ] && untouched="$untouched$d
 "
 done
 if [ -n "$untouched" ]; then
