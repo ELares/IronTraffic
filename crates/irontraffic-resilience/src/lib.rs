@@ -8,6 +8,7 @@
 //! function that needs randomness takes `&mut irontraffic_rand::Rng`.
 
 pub mod clock;
+pub mod concurrency;
 pub mod config;
 pub mod deadline;
 pub mod health;
