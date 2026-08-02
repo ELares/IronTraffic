@@ -14,7 +14,7 @@ workspace = true
 # Compiles the ITPL token definition into a DFA at build time. Lexing is the one part
 # of the front end where a generator is clearly better than hand-written code, and
 # `logos` has no transitive dependencies of its own beyond its proc-macro.
-logos = "0.15"
+logos = "0.16"
 # `Phase` only. Per-phase attribute availability is the whole point of the schema and
 # the phase vocabulary is defined once, in the filter crate, for every layer. This is
 # the only item `irontraffic-policy` needs from it until
