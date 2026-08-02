@@ -34,7 +34,7 @@
 //! limitation).
 
 use std::collections::BTreeMap;
-use std::net::{SocketAddr, TcpListener};
+use std::net::{SocketAddr, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -872,14 +872,63 @@ fn unpinned_probe_is_marked_unpublishable() {
     //   - deleting the probe tuple from the fold leaves NOTHING able to set
     //     `pinning_incomplete`, since origin/sut/client are empty here, so
     //     the second assertion fails;
-    //   - `pin_to_core` over-claiming `true` for core 999_999 makes
+    //   - `pin_to_core` over-claiming `true` for the invalid core below makes
     //     `probe_outcome.pinned` true when it was actually never even
     //     attempted successfully (`core_affinity::set_for_current` cannot
     //     succeed for a core index no host has), which flips the fold's
     //     `!pinned` to `false` and the same assertion fails the same way.
+    //
+    // Reviewed finding (BLOCKING, round 4): this used to be the crate's own
+    // `999_999`, the constant `proc.rs`'s `cores_available_to_pin` tests use
+    // to prove no real host has it. Every OTHER use of `999_999` in this
+    // crate reaches only `cores_available_to_pin` (a plain membership
+    // comparison against `get_core_ids`) or a `taskset -c` argument string;
+    // both are safe at any value. This is the first one ever routed into
+    // `core_affinity::set_for_current` itself: `params.cores.probe.first()`
+    // becomes `ProbeConfig::core_id` (runner.rs), and `pin_to_core` calls
+    // `set_for_current` as `run_probe`'s very first statement (probe.rs).
+    // `core_affinity` 0.8.3's Linux `set_for_current` calls
+    // `libc::CPU_SET(core_id.id, &mut set)` against a `cpu_set_t` whose
+    // `bits` field is a fixed `[u64; 16]` (`CPU_SETSIZE` = 1024 bits: see
+    // libc 0.2.189's own `linux_l4re_shared.rs`, pinned in this workspace's
+    // `Cargo.lock`). `CPU_SET`'s own body is plain, bounds-checked Rust
+    // indexing (`cpuset.bits[idx] |= 1 << offset`), so `999_999 / 64 =
+    // 15_624`, four orders of magnitude past that array's length, PANICS
+    // (`index out of bounds`) rather than silently corrupting memory. That
+    // panic still fully defeats this guard on Linux, this crate's own
+    // deploy target: it kills the probe thread before it ever connects or
+    // sends on `ready_tx`, so `run_repetition` returns `Err` and this test
+    // dies at its own `outcome.expect(...)` below, never reaching the
+    // discriminating assertion. It is invisible on this development host
+    // only because macOS's `set_for_current` is `thread_policy_set`, which
+    // just returns `false` for any input, and masked on CI because this
+    // test is `oha_available()`-gated and no workflow installs `oha`.
+    //
+    // The replacement keeps the one property this test actually needs (an
+    // index invalid on every real host, so `pin_to_core` returns `false`)
+    // while staying nowhere near `CPU_SETSIZE`: one past
+    // `available_parallelism()` is, by definition, one past the highest
+    // index `core_affinity::get_core_ids` (`sched_getaffinity` under the
+    // hood) can ever report as permitted to this process on THIS host, yet
+    // it is still orders of magnitude below 1024 on any real or virtualised
+    // machine, so `CPU_SET`'s indexing never panics and `sched_setaffinity`
+    // itself cleanly rejects the nonexistent core with `EINVAL`
+    // (`set_for_current` returning plain `false`). The `debug_assert!`
+    // below turns "nowhere near" into a checked invariant instead of an
+    // assumption: if it ever fired, this test would be about to
+    // reintroduce the exact out-of-bounds index it exists to rule out.
     if !oha_available() {
         return;
     }
+    let out_of_range_core = std::thread::available_parallelism()
+        .map_or(8, std::num::NonZero::get)
+        .saturating_add(1);
+    debug_assert!(
+        out_of_range_core < 1024,
+        "the probe's forced-invalid core index ({out_of_range_core}) must stay well inside \
+         cpu_set_t's own CPU_SETSIZE (1024 bits), or this test reintroduces the exact \
+         out-of-bounds CPU_SET write it exists to rule out"
+    );
     let cell = test_cell("runner_unpinned_probe");
     let oha = irontraffic_bench::Oha;
     let ceiling = CeilingProbe;
@@ -888,7 +937,7 @@ fn unpinned_probe_is_marked_unpublishable() {
     params.cores.origin = CoreSet::from_indices([]);
     params.cores.sut = CoreSet::from_indices([]);
     params.cores.client = CoreSet::from_indices([]);
-    params.cores.probe = CoreSet::from_indices([999_999]);
+    params.cores.probe = CoreSet::from_indices([out_of_range_core]);
     let provenance = test_provenance();
 
     let outcome = run_repetition(&cell, &oha, &adapters, &params, &provenance);
@@ -1557,11 +1606,36 @@ fn teardown_kills_the_whole_process_group() {
     let bind_wait_start = Instant::now();
     let mut grandchild_bound = false;
     while bind_wait_start.elapsed() < bind_poll_deadline {
-        // A successful bind means nothing is listening yet: the listener is
-        // dropped at the end of this statement, releasing the port again
-        // immediately, exactly as the pre-fix one-shot check did.
-        if TcpListener::bind(&bind_addr).is_err() {
+        // Reviewed finding (SHOULD_FIX, round 4): this used to poll with
+        // `TcpListener::bind(&bind_addr).is_err()`, a LIVE bind attempt.
+        // Binding does not merely observe the port, it briefly TAKES it (the
+        // temporary listener is dropped, and so releases it again,
+        // immediately after this statement), and the fixture's grandchild
+        // (runner.rs:190) does a single `TcpListener::bind(&bind).expect(...)`
+        // with no retry of its own, so a poll tick that lands inside the
+        // grandchild's own bind attempt can win the race and kill it
+        // outright: the port then never gets bound at all, this loop burns
+        // its whole 10s deadline, and the panic below would misreport a
+        // self-inflicted collision as "a real defect, not host starvation"
+        // (measured collision window ~0.2% of each 20ms tick, i.e. up to 500
+        // chances across this deadline, versus a single chance in the
+        // pre-fix one-shot check). `TcpStream::connect`, the exact
+        // non-invasive probe `Child::wait_ready` already uses in proc.rs for
+        // this identical "did the other side reach the point I'm waiting
+        // for" shape, only ever finds a listener already there or finds
+        // nothing: it cannot itself take the port the grandchild is racing
+        // to bind.
+        if TcpStream::connect(&bind_addr).is_ok() {
             grandchild_bound = true;
+            break;
+        }
+        // Mirrors `Child::wait_ready` (proc.rs), which checks liveness
+        // INSIDE its own poll loop rather than only after a full deadline:
+        // a direct child that has already exited will never bind, so there
+        // is nothing left to wait for, and breaking here fails this test in
+        // one poll interval instead of burning the entire 10s deadline
+        // first.
+        if !child.is_alive() {
             break;
         }
         std::thread::sleep(bind_poll_interval);
@@ -1585,10 +1659,11 @@ fn teardown_kills_the_whole_process_group() {
         let diagnosis = if child.is_alive() {
             format!(
                 "the direct child is still running, but the grandchild did not bind within \
-                 {bind_poll_deadline:?} of polling for it; the cold first exec of this fixture \
-                 binary was measured to bind within 1133ms on an idle host (see the comment \
-                 above), so exceeding a 10 second poll here is not that same cost recurring and \
-                 points to a real defect, not host starvation"
+                 {bind_poll_deadline:?} of polling for it; the slowest of 15 measured cold \
+                 first execs of this fixture binary on an idle host was 1133ms (see the \
+                 comment above, a sample maximum, not a guaranteed ceiling), so exceeding a \
+                 10 second poll here is not that same cost recurring and points to a real \
+                 defect, not host starvation"
             )
         } else {
             "the direct child has ALREADY EXITED, which rules out slow startup outright: a \
