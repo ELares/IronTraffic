@@ -1118,6 +1118,59 @@ mod tests {
         );
     }
 
+    /// True when `taskset` is reachable on `PATH`, mirroring
+    /// `tests/runner.rs`'s own `oha_available` convention (a plain presence
+    /// probe, not a correctness check of what it does).
+    fn taskset_available() -> bool {
+        std::process::Command::new("taskset")
+            .arg("--version")
+            .output()
+            .is_ok()
+    }
+
+    #[test]
+    fn pinning_actually_succeeds_for_a_valid_core_when_taskset_is_present() {
+        // Reviewed finding (SHOULD_FIX, PR 828 round 2): every pinning
+        // assertion in this module up to this point is NEGATIVE (`pinned()`
+        // must be `false`, for an index no host has or for `taskset` being
+        // absent). Nothing anywhere asserts pinning ever SUCCEEDS, so a
+        // change that silently disabled pinning altogether (for example
+        // `cores_available_to_pin` always returning `false`, or
+        // `spawn_with_pin` never actually building the `taskset` wrapper)
+        // would leave every test in this crate green. Skips silently (this
+        // crate denies `print_stdout`/`print_stderr` workspace wide, matching
+        // `tests/runner.rs`'s own `oha_available` skip convention) when
+        // `taskset` is not on `PATH`, the normal case on this crate's own
+        // macOS development host; it IS installed on the `ubuntu-latest` CI
+        // runner this workspace targets, where this assertion actually runs.
+        if !taskset_available() {
+            return;
+        }
+        let invocation = Invocation {
+            program: "sleep".to_owned(),
+            args: vec!["30".to_owned()],
+            env: Vec::new(),
+        };
+        // Core 0 exists on every real host (see
+        // `cores_available_to_pin_accepts_core_zero` above), so this needs
+        // no simulated small-host scenario to be valid everywhere CI runs it.
+        let cores = CoreSet::from_unsorted(vec![0]);
+        let mut child = Child::spawn(&invocation, &cores, "pinning_positive_control_test")
+            .unwrap_or_else(|e| {
+                panic!("spawn must succeed when taskset is present and core 0 is valid: {e:?}")
+            });
+        assert!(
+            child.pinned(),
+            "pinned() must be true: taskset is present on PATH and core 0 is a valid, \
+             always-available index, so nothing here should have fallen back to unpinned"
+        );
+        assert!(
+            child.is_alive(),
+            "the pinned child must actually have started running, not merely reported pinned"
+        );
+        child.stop();
+    }
+
     #[test]
     fn spawn_falls_back_to_unpinned_when_the_requested_core_does_not_exist() {
         // The exact mechanism PR 828's own CI failure needed: `Child::spawn`

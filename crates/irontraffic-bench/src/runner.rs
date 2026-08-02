@@ -635,8 +635,8 @@ pub fn run_repetition(
 
     // Reviewed finding (BLOCKING, PR 828): `Child::spawn`'s EINVAL fallback
     // (`crate::proc`'s own "# Pinning" doc) can silently run any of these
-    // three children unpinned when a requested core index is not one the
-    // host has. Before that fallback existed, such a host failed the
+    // four threads/children unpinned when a requested core index is not one
+    // the host has. Before that fallback existed, such a host failed the
     // repetition outright, so a contended run could never reach here
     // labelled isolated. Fold the OBSERVED outcome, never the mere request,
     // into THIS repetition's own provenance: a clone, not the shared
@@ -646,10 +646,33 @@ pub fn run_repetition(
     // `unpublishable_reasons` from `Provenance`'s own fields, so the fact
     // has to live in a field (`pinning_incomplete`) rather than be pushed
     // into the vector directly, which a later call would just clear.
+    //
+    // Reviewed finding (SHOULD_FIX, PR 828 round 2): the probe's own thread
+    // is the one whose percentiles are published as
+    // `CellAggregate::median_p99_ns`, this module's own headline number, and
+    // its pinning was not folded in above even though `ProbeOutcome::pinned`
+    // is exactly the same shape of real, observed `core_affinity::
+    // set_for_current` outcome as the three `Child::pinned()` calls already
+    // here (see `crate::probe::ProbeOutcome`'s own doc on that field).
+    // `probe_outcome` was already captured two steps above (it has to be, to
+    // read `probe_outcome.latency` for `probe_latency`), so folding it in is
+    // one more tuple, not new plumbing.
+    //
+    // The ceiling and warmup one-shot children (`run_one_shot_client`,
+    // `origin_ceiling_rps` and `direct_rps` below) are spawned pinned to
+    // `params.cores.client`, the IDENTICAL `CoreSet` the measurement
+    // `client_child` above is spawned with, and `cores_available_to_pin`'s
+    // pre-spawn check is a pure function of that `CoreSet` against this
+    // host's cores: it cannot pass for one spawn and fail for another within
+    // the same repetition. `client_child.pinned()` folded in below already
+    // stands in for all three client-role spawns; it is not repeated for
+    // each one because there is nothing a repeat check could observe that
+    // this one has not already observed.
     let pinning_incomplete = [
         (&params.cores.origin, origin_child.pinned()),
         (&params.cores.sut, sut_child.pinned()),
         (&params.cores.client, client_child.pinned()),
+        (&params.cores.probe, probe_outcome.pinned),
     ]
     .into_iter()
     .any(|(cores, pinned)| !cores.is_empty() && !pinned);
