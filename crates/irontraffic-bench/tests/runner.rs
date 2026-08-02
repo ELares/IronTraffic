@@ -780,6 +780,28 @@ fn unpinned_repetition_is_marked_unpublishable() {
     // back to unpinned without needing an actual small-core machine to
     // prove it, and asserts the repetition's own provenance now NAMES that,
     // rather than silently trusting the fallback happened.
+    //
+    // Reviewed finding (BLOCKING, round 3): `core_affinity::set_for_current`
+    // on this crate's own macOS development host is `thread_policy_set
+    // (THREAD_AFFINITY_POLICY)`, which Apple Silicon does not implement, so
+    // `probe_outcome.pinned` is ALWAYS `false` here regardless of what the
+    // SUT leg this test names actually did. `test_params` gives every role,
+    // probe included, a real non-empty `CoreSet` via `core_assignment`, so
+    // before this fix the fourth (probe) tuple in `run_repetition`'s own
+    // `pinning_incomplete` fold made this test pass unconditionally on this
+    // host: deleting the origin/sut/client tuples entirely left it green.
+    // Origin and client are emptied below for the identical reason on the
+    // OTHER side: without a real `taskset` on this host (the normal case
+    // off Linux), `Child::pinned()` also falls back to `false` for ANY
+    // non-empty `CoreSet`, valid or not, so a real origin/client core
+    // assignment would ALSO mask a reverted SUT-leg fold, just via a
+    // different mechanism than the probe's platform limitation. An empty
+    // `CoreSet` is the one input every leg's own "was pinning requested at
+    // all" check (`!cores.is_empty()`) reads as "not requested", so it can
+    // never contribute to the fold on any platform, with or without
+    // `taskset` installed: only the forced-invalid SUT leg can. See
+    // `unpinned_probe_is_marked_unpublishable` below for the probe leg's
+    // own identically isolated counterpart.
     if !oha_available() {
         return;
     }
@@ -788,7 +810,10 @@ fn unpinned_repetition_is_marked_unpublishable() {
     let ceiling = CeilingProbe;
     let adapters: Vec<&dyn LoadGenerator> = vec![&oha, &ceiling];
     let mut params = test_params("unpinned", 2, 3);
+    params.cores.origin = CoreSet::from_indices([]);
     params.cores.sut = CoreSet::from_indices([999_999]);
+    params.cores.client = CoreSet::from_indices([]);
+    params.cores.probe = CoreSet::from_indices([]);
     let provenance = test_provenance();
 
     let outcome = run_repetition(&cell, &oha, &adapters, &params, &provenance);
@@ -810,7 +835,78 @@ fn unpinned_repetition_is_marked_unpublishable() {
     // finding added to `run_repetition` (folding the observed
     // `Child::pinned` into a `pinning_incomplete` clone of `provenance`
     // before `recompute_publishable`) is reverted, verified by hand while
-    // implementing this fix.
+    // implementing this fix. With origin, client and probe all emptied
+    // above, nothing but the SUT tuple can make this assertion pass: delete
+    // the SUT tuple (or all three child tuples) from that fold's `.into_iter
+    // ().any(...)` list and this specific assertion fails, on any host,
+    // with or without a real `taskset` on `PATH`.
+    assert!(
+        result
+            .provenance
+            .unpublishable_reasons
+            .iter()
+            .any(|r| r.contains("pinned")),
+        "unpublishable_reasons {:?} must name the pinning failure specifically, not merely \
+         happen to be unpublishable for some unrelated reason",
+        result.provenance.unpublishable_reasons
+    );
+}
+
+#[test]
+fn unpinned_probe_is_marked_unpublishable() {
+    // Reviewed finding (BLOCKING, round 3): the probe's own fold tuple
+    // (`(&params.cores.probe, probe_outcome.pinned)` in `run_repetition`)
+    // had no test in either direction. Deleting the tuple left the crate
+    // green with and without a `taskset` shim on this host; separately,
+    // making `probe::pin_to_core` over-claim `pinned = true` regardless of
+    // whether `core_affinity::set_for_current` actually succeeded, the
+    // precise lie this leg exists to catch, also left the crate green. This
+    // is `unpinned_repetition_is_marked_unpublishable`'s own construction
+    // (see that test's comment for why every OTHER role must be an empty
+    // `CoreSet`), mirrored onto the probe leg instead of the SUT leg: origin,
+    // sut and client are all emptied so only the probe's own forced-invalid
+    // core index can make this repetition unpublishable-for-pinning.
+    //
+    // Both directions are closed by the SAME two assertions below, applied
+    // to a cell where only the probe leg can satisfy them:
+    //   - deleting the probe tuple from the fold leaves NOTHING able to set
+    //     `pinning_incomplete`, since origin/sut/client are empty here, so
+    //     the second assertion fails;
+    //   - `pin_to_core` over-claiming `true` for core 999_999 makes
+    //     `probe_outcome.pinned` true when it was actually never even
+    //     attempted successfully (`core_affinity::set_for_current` cannot
+    //     succeed for a core index no host has), which flips the fold's
+    //     `!pinned` to `false` and the same assertion fails the same way.
+    if !oha_available() {
+        return;
+    }
+    let cell = test_cell("runner_unpinned_probe");
+    let oha = irontraffic_bench::Oha;
+    let ceiling = CeilingProbe;
+    let adapters: Vec<&dyn LoadGenerator> = vec![&oha, &ceiling];
+    let mut params = test_params("unpinned_probe", 2, 3);
+    params.cores.origin = CoreSet::from_indices([]);
+    params.cores.sut = CoreSet::from_indices([]);
+    params.cores.client = CoreSet::from_indices([]);
+    params.cores.probe = CoreSet::from_indices([999_999]);
+    let provenance = test_provenance();
+
+    let outcome = run_repetition(&cell, &oha, &adapters, &params, &provenance);
+    let (result, _recorder) = outcome.expect(
+        "a probe that falls back to unpinned must still complete the repetition, never fail it \
+         outright",
+    );
+    assert!(
+        !result.provenance.publishable,
+        "a repetition where the probe could not be pinned to its requested core must never be \
+         publishable; unpublishable_reasons was {:?}",
+        result.provenance.unpublishable_reasons
+    );
+    // Naming the specific reason, not merely `!publishable` (which this
+    // host's own fallback build stamps would already satisfy on their own),
+    // is what actually discriminates: with origin, sut and client all
+    // emptied above, this is the assertion that fails if either the probe
+    // tuple is deleted from the fold or `pin_to_core` over-claims success.
     assert!(
         result
             .provenance
@@ -1436,46 +1532,71 @@ fn teardown_kills_the_whole_process_group() {
     let mut child =
         Child::spawn(&invocation, &cores, "fork_listener_test").expect("spawn fork-listener");
 
-    // Give the grandchild a moment to actually bind before tearing down.
-    // Timing-sensitive: on a sufficiently starved host this wait might not
-    // be enough for the grandchild to have bound yet, in which case the
-    // port-free assertion below would pass for the wrong reason (nothing
-    // ever bound) rather than the reason under test (teardown killed it);
-    // that ambiguity, not a confident pass or fail either way, is the
-    // correct reading of this test on a loaded host. `Child::spawn` now
-    // checks the requested core against `core_affinity::get_core_ids`
-    // before ever invoking `taskset` (PR 828's own CI failure: `taskset`
-    // refused a core index ubuntu-latest's 4-core runner does not have, so
-    // the direct child never started at all and could not possibly have
-    // forked a grandchild to bind anything), so that specific,
-    // previously-seen, IDENTIFIABLE cause should no longer explain a
-    // failure below.
-    std::thread::sleep(Duration::from_millis(500));
+    // Poll for the grandchild to actually bind, rather than sleeping a fixed
+    // grace period.
+    //
+    // Reviewed finding (round 3, instrumented rather than inferred): a fixed
+    // 500ms grace here failed 3 of 12 in-file runs and 18 of 40 isolated
+    // runs, all at this same check, on an otherwise idle 14-core host. The
+    // failure's own message blamed "host starvation", but a direct
+    // instrumented repro (15 fresh processes doing exactly this spawn, then
+    // continuing to poll past the old fixed grace) showed the real cause: in
+    // 6 of 15 runs the port was still free at 500ms, and in every one of
+    // those the grandchild went on to bind at 561 to 1133ms, while the
+    // direct child stayed alive throughout and a WARM process binds in
+    // 3ms. That is the cold first exec of a fixture binary `rustc` has just
+    // written into a per-pid temp dir, not host starvation: a fixed sleep
+    // is either too short for that cold-exec cost or wasted time once the
+    // process is warm, exactly the reasoning `Child::wait_ready`'s own
+    // poll-a-deadline loop in proc.rs already documents for the identical
+    // shape of problem. `BIND_POLL_DEADLINE` here is an order of magnitude
+    // above the slowest cold bind measured (1133ms), so a timeout below is
+    // evidence of a real defect, not this same race recurring.
+    let bind_poll_deadline = Duration::from_secs(10);
+    let bind_poll_interval = Duration::from_millis(20);
+    let bind_wait_start = Instant::now();
+    let mut grandchild_bound = false;
+    while bind_wait_start.elapsed() < bind_poll_deadline {
+        // A successful bind means nothing is listening yet: the listener is
+        // dropped at the end of this statement, releasing the port again
+        // immediately, exactly as the pre-fix one-shot check did.
+        if TcpListener::bind(&bind_addr).is_err() {
+            grandchild_bound = true;
+            break;
+        }
+        std::thread::sleep(bind_poll_interval);
+    }
 
     // Reviewed finding: without this check, this test could pass for the
-    // wrong reason on a starved host where the 500ms grace above was not
-    // enough for the grandchild to have bound yet (nothing to kill means
-    // the port-free assertion below trivially holds, proving nothing about
-    // teardown at all). This turns that silent ambiguity into an explicit,
-    // separately labelled signal, and if it fires, distinguishes the two
-    // remaining live possibilities by an actual liveness check on the
-    // direct child rather than a blind hedge: a direct child that has
-    // ALREADY EXITED cannot be merely slow (a process that is not running
-    // is not "starved", it is gone, which is a real spawn or fixture defect,
-    // not evidence about timing); a direct child that is STILL RUNNING but
-    // has not bound yet is consistent with (though, since binding happens
-    // in a grandchild this check cannot see into, not proof of) starvation.
-    if TcpListener::bind(&bind_addr).is_ok() {
+    // wrong reason if the grandchild never bound at all within the poll
+    // deadline above (nothing to kill means the port-free assertion below
+    // trivially holds, proving nothing about teardown at all). This turns
+    // that silent ambiguity into an explicit, separately labelled signal,
+    // and if it fires, distinguishes the two remaining live possibilities by
+    // an actual liveness check on the direct child rather than a blind
+    // hedge: a direct child that has ALREADY EXITED cannot be merely slow (a
+    // process that is not running is not "starved", it is gone, which is a
+    // real spawn or fixture defect, not evidence about timing); a direct
+    // child that is STILL RUNNING but has not bound within ten seconds is,
+    // per the measurement above, no longer explained by cold-exec cost and
+    // is itself a real defect worth reporting as one, not a hedge toward
+    // "host starvation".
+    if !grandchild_bound {
         let diagnosis = if child.is_alive() {
-            "the direct child is still running, consistent with the 500ms grace period above \
-             not being enough on this host for the grandchild to bind yet (host starvation), \
-             not evidence that teardown itself is broken"
+            format!(
+                "the direct child is still running, but the grandchild did not bind within \
+                 {bind_poll_deadline:?} of polling for it; the cold first exec of this fixture \
+                 binary was measured to bind within 1133ms on an idle host (see the comment \
+                 above), so exceeding a 10 second poll here is not that same cost recurring and \
+                 points to a real defect, not host starvation"
+            )
         } else {
-            "the direct child has ALREADY EXITED, which rules out host starvation: a process \
-             that is not running cannot be merely slow. This points to a real defect in \
+            "the direct child has ALREADY EXITED, which rules out slow startup outright: a \
+             process that is not running cannot be merely slow. This points to a real defect in \
              spawning or running the fixture itself (for example a `taskset` pinning failure \
              that kept it from ever starting at all, PR 828's own diagnosed root cause), not in \
              teardown, which has not even run yet at this point in the test"
+                .to_owned()
         };
         panic!(
             "the grandchild must already be bound to {bind_addr} before teardown is exercised: \
@@ -1485,13 +1606,22 @@ fn teardown_kills_the_whole_process_group() {
 
     child.stop();
 
-    // Give the killed grandchild's socket a moment to actually release.
-    std::thread::sleep(Duration::from_millis(200));
-
-    let rebind = TcpListener::bind(&bind_addr);
+    // Poll for the killed grandchild's socket to actually release, rather
+    // than sleeping a fixed grace period; same reasoning as the bind poll
+    // above (the sibling of that finding, same fixed-sleep shape).
+    let rebind_wait_start = Instant::now();
+    let mut rebound = false;
+    while rebind_wait_start.elapsed() < bind_poll_deadline {
+        if TcpListener::bind(&bind_addr).is_ok() {
+            rebound = true;
+            break;
+        }
+        std::thread::sleep(bind_poll_interval);
+    }
     assert!(
-        rebind.is_ok(),
-        "the port must be free after teardown; the grandchild must be gone, not just the direct child"
+        rebound,
+        "the port must be free after teardown within {bind_poll_deadline:?}; the grandchild \
+         must be gone, not just the direct child"
     );
 }
 
