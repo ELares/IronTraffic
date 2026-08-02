@@ -62,6 +62,28 @@ git show HEAD:scripts/pr-scope-check.sh > "$SCOPE"
 chmod +x "$SCOPE"
 
 FAILED=0
+# Vacuity guard (round seven, SHOULD_FIX). Nothing previously counted how
+# much of this file actually RAN: an `exit 0` inserted before case 1, or
+# most of the cases below simply deleted, both left this file printing
+# "clean" with rc=0, because `FAILED` only ever records a case that ran and
+# found something wrong, never the absence of cases to run in the first
+# place.
+#
+# A plain shell variable cannot do the counting: almost every case invokes
+# `run_scope` as `OUT="$(run_scope ...)"`, and `$( )` command substitution
+# ALWAYS forks a subshell, so any `CASES=$((CASES+1))` executed from inside
+# `run_scope` would increment a copy that vanishes the instant the
+# substitution completes, leaving the parent shell's `$CASES` at 0
+# regardless of how many cases actually ran (caught directly: the first
+# version of this guard did exactly that and reported "3 case(s) ran" -- the
+# three case-47 guards below, which are the only call sites that do not go
+# through `run_scope`'s `$( )`, the rest silently lost). A byte appended to a
+# FILE survives a subshell exiting the same way any other filesystem write
+# does, so `run_scope` appends one byte to `$CASES_FILE` per call (see
+# there), case 47's three direct guards do the same, and the byte count of
+# that file, read back after every case has run, is `$CASES`.
+CASES_FILE="$WORK/.cases-ran"
+: > "$CASES_FILE"
 note() { printf '  %s\n' "$1"; }
 
 # new_repo <dir> -- an empty throwaway git repo, ready for a base commit.
@@ -141,6 +163,16 @@ FAKEGH
 # refusal for the WRONG reason (right rc, wrong message) still fails.
 run_scope() {
   local dir="$1" base="${2:-}" head="${3:-}"
+  # Vacuity guard bookkeeping (round seven). A FILE append, not a variable
+  # increment: nearly every call site is `OUT="$(run_scope ...)"`, and `$( )`
+  # runs this whole function in a subshell, so a `CASES=$((CASES+1))` here
+  # would increment a copy the parent shell never sees (verified directly:
+  # that was tried first, and reported "3 case(s) ran" for the three case-47
+  # guards that do not go through `$( )`, silently losing the other 73). A
+  # write to `$CASES_FILE` survives the subshell exiting the same way any
+  # other filesystem change would. See the final assertion at the bottom of
+  # this file for what this guards against.
+  printf '.' >> "$CASES_FILE"
   ( cd "$dir"
     [ -z "$base" ] && base="$(git rev-parse main)"
     [ -z "$head" ] && head="$(git rev-parse HEAD)"
@@ -264,18 +296,28 @@ fi
 # ---------------------------------------------------------------------------
 # 4. A nested crate manifest, crates/a/b/Cargo.toml, must be refused: the
 #    [^/]+ segment in BOT_ALLOWED is deliberately exactly one path component.
+#
+#    ROUND SEVEN CORRECTION. The fixture used to bump `package.version`,
+#    which the manifest CAPABILITY engine refuses on its own (`package.*` is
+#    never allowed to change, path or no path), so the case's "not EXEMPT"
+#    assertion was true for a reason that had nothing to do with the path
+#    anchor it claims to pin: widening `[^/]+` to `.+` left the whole suite
+#    green (mutant E04, PR 837 round seven review). The fixture now moves
+#    ONLY a dependency version string, the one change the capability engine
+#    never refuses on its own, so the path anchor is the ONLY thing that can
+#    still refuse it.
 # ---------------------------------------------------------------------------
 D4="$WORK/nested-crate"
 new_repo "$D4"
 mkdir -p "$D4/crates/a/b"
 printf '[workspace]\nmembers=["crates/a/b"]\n' > "$D4/Cargo.toml"
-printf '[package]\nname="b"\nversion="0.1.0"\n' > "$D4/crates/a/b/Cargo.toml"
+printf '[package]\nname="b"\nversion="0.1.0"\n\n[dependencies]\nserde = "1.0"\n' > "$D4/crates/a/b/Cargo.toml"
 commit_all "$D4" base
 git -C "$D4" checkout -qb pr
-printf '[package]\nname="b"\nversion="0.2.0"\n' > "$D4/crates/a/b/Cargo.toml"
-commit_all "$D4" attack
+printf '[package]\nname="b"\nversion="0.1.0"\n\n[dependencies]\nserde = "1.1"\n' > "$D4/crates/a/b/Cargo.toml"
+commit_all "$D4" "chore(deps): bump serde"
 fake_gh 'dependabot[bot]' ''
-echo "== crates/a/b/Cargo.toml (nested) must be refused =="
+echo "== crates/a/b/Cargo.toml (nested, PURE dependency-version bump) must still be refused by the path anchor alone =="
 OUT4="$(run_scope "$D4")" && RC4=0 || RC4=$?
 if [ "$RC4" -eq 0 ]; then
   echo "FAIL: case 4 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
@@ -285,11 +327,16 @@ if [ "$RC4" -eq 0 ]; then
   FAILED=1
 fi
 if echo "$OUT4" | grep -qF 'pr-scope-check: EXEMPT'; then
-  echo "FAIL: a nested crate manifest was reported EXEMPT. Got:"
+  echo "FAIL: a nested crate manifest's pure dependency-version bump was reported EXEMPT. Got:"
+  echo "$OUT4" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT4" | grep -qF 'outside the dependency allowlist'; then
+  echo "FAIL: refused, but not for being outside the path allowlist (the capability engine may have refused it" >&2
+  echo "instead, which would not actually pin the [^/]+ anchor this case exists to test). Got:" >&2
   echo "$OUT4" | sed 's/^/    /'
   FAILED=1
 else
-  note "crates/a/b/Cargo.toml is refused"
+  note "crates/a/b/Cargo.toml (a pure, otherwise-legal dependency bump) is refused by the path anchor alone"
 fi
 
 # ---------------------------------------------------------------------------
@@ -2233,6 +2280,920 @@ fi
 
 echo
 # ---------------------------------------------------------------------------
+
+# ===========================================================================
+# ROUND SEVEN. Round six's own review found this file's earlier rounds had a
+# recurring shape: pin the exact mutant a reviewer named, leave its sibling
+# open. This round instead enumerates EVERY array expansion in the script
+# (both `changed` and `declared`), and adds one case per site that was not
+# already pinned by an existing case, verified mechanically: every one of the
+# 13 `for x in "${arr[@]}"` loops in scripts/pr-scope-check.sh (lines 251, 632,
+# 640, 653, 764, 768, 785, 790, 802, 817, 824, 876, 879) plus the DECLARED
+# array's own population (lines 758-761) was unquoted one at a time and run
+# against the pre-round-seven suite; four sites (251, 632, 785, 802) were
+# already caught by cases 10, 1/2, 20 and 19 respectively and needed nothing
+# new; the remaining nine were green (unpinned) and each gets its own case
+# below (48-54). Cases 55-69 close the review's SHOULD_FIX findings the same
+# way: every one was reproduced as a real, green mutant against this file
+# before its case was written.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# 48. BLOCKING (round seven). The manifest-capability loop (line 640) that
+#     decides WHICH Cargo.toml files get handed to manifest_disallowed_diff
+#     must be pinned the same way the allowlist-membership loop at line 632
+#     already is. BOT_ALLOWED's `crates/[^/]+/fuzz/Cargo\.toml` accepts a
+#     crate directory name containing a SPACE, so `crates/my crate/fuzz/
+#     Cargo.toml` is a real, single, allowlisted path. An unquoted `for f in
+#     ${changed[*]}` at line 640 re-splits that ONE path into two words,
+#     "crates/my" and "crate/fuzz/Cargo.toml", neither of which is the real
+#     manifest; the second happens to still match the `*/Cargo.toml` case
+#     pattern, so `manifest_disallowed_diff` is called on a PATH THAT DOES
+#     NOT EXIST at either commit, silently returns no offense, and the real,
+#     capability-gaining manifest is never inspected at all.
+# ---------------------------------------------------------------------------
+D48="$WORK/manifest-loop-unquoted-space-crate"
+new_repo "$D48"
+mkdir -p "$D48/crates/my crate/fuzz/fuzz_targets"
+printf '[package]\nname="pol-fuzz"\nversion="0.0.0"\npublish=false\nedition="2021"\n\n[workspace]\n\n[dependencies]\nlibfuzzer-sys="0.4"\n\n[[bin]]\nname="t"\npath="fuzz_targets/t.rs"\n' > "$D48/crates/my crate/fuzz/Cargo.toml"
+printf '#![no_main]\n' > "$D48/crates/my crate/fuzz/fuzz_targets/t.rs"
+printf '# placeholder fuzz lockfile\n' > "$D48/crates/my crate/fuzz/Cargo.lock"
+commit_all "$D48" base
+git -C "$D48" checkout -qb pr
+printf '[package]\nname="pol-fuzz"\nversion="0.0.0"\npublish=false\nedition="2021"\n\n[workspace]\n\n[dependencies]\nlibfuzzer-sys="0.4"\n\n[[bin]]\nname="t"\npath="fuzz_targets/t.rs"\n\n[[bin]]\nname="evil"\npath="Cargo.lock"\n' > "$D48/crates/my crate/fuzz/Cargo.toml"
+printf 'fn main(){ /* arbitrary code smuggled via a space-containing allowlisted crate dir */ }\n' > "$D48/crates/my crate/fuzz/Cargo.lock"
+commit_all "$D48" "chore(deps): bump libfuzzer-sys"
+fake_gh 'dependabot[bot]' ''
+echo "== the manifest-capability loop must inspect a space-containing allowlisted crate manifest by its real path =="
+OUT48="$(run_scope "$D48")" && RC48=0 || RC48=$?
+if [ "$RC48" -eq 0 ]; then
+  echo "FAIL: case 48 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT48" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT48" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: an appended [[bin]] entry inside a space-containing allowlisted crate manifest was reported EXEMPT. Got:"
+  echo "$OUT48" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT48" | grep -qF 'my crate/fuzz/Cargo.toml'; then
+  echo "FAIL: refused, but not by naming the real, space-containing manifest path. Got:"
+  echo "$OUT48" | sed 's/^/    /'
+  FAILED=1
+else
+  note "the space-containing allowlisted crate manifest is inspected by its real path, and refused"
+fi
+
+# ---------------------------------------------------------------------------
+# 49. BLOCKING (round seven). The DECLARED array's population itself (the
+#     `while IFS= read -r d` loop building `declared` from `declared_raw`)
+#     must be pinned, not just the loops that later consume it. Reverting
+#     that population to `for d in $declared_raw` (unquoted) word-splits
+#     every declared path on whitespace at the point the array is BUILT, so
+#     every downstream loop over `"${declared[@]}"`, even though each one is
+#     itself correctly quoted, ends up iterating over the WRONG elements. The
+#     issue declares exactly ONE path, containing a literal space:
+#     `docs.md src/evil.rs`. The PR touches ONLY `src/evil.rs`, which was
+#     never declared on its own.
+# ---------------------------------------------------------------------------
+D49="$WORK/declared-population-unquoted-bypass"
+new_repo "$D49"
+mkdir -p "$D49/src"
+printf 'safe\n' > "$D49/src/keep.rs"
+commit_all "$D49" base
+git -C "$D49" checkout -qb pr
+printf 'evil\n' > "$D49/src/evil.rs"
+commit_all "$D49" implement
+fake_gh 'coder-agent' 'Closes #42' '## Files
+
+| Path | Action | Purpose |
+| --- | --- | --- |
+| `docs.md src/evil.rs` | modify | one declared row, one backtick span, a literal space inside it |
+'
+echo "== the declared array's own population must not word-split a single space-containing declared row =="
+OUT49="$(run_scope "$D49")" && RC49=0 || RC49=$?
+if [ "$RC49" -eq 0 ]; then
+  echo "FAIL: case 49 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT49" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT49" | grep -qF 'pr-scope-check: the diff matches issue'; then
+  echo "FAIL: src/evil.rs was reported as matching, even though only 'docs.md src/evil.rs' (one space-containing row) was declared. Got:"
+  echo "$OUT49" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT49" | grep -qF 'src/evil.rs'; then
+  echo "FAIL: refused, but src/evil.rs was not named among the undeclared paths. Got:"
+  echo "$OUT49" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a single space-containing declared row is not word-split into two separately-matching declared paths"
+fi
+
+# ---------------------------------------------------------------------------
+# 50. BLOCKING (round seven). The cargo_lock_exempt loop's DECLARED side
+#     (line 790) must be pinned independently of its CHANGED side (already
+#     pinned by case 20). The issue declares one row containing a literal
+#     space that is NOT the real manifest path: `unrelated.md
+#     crates/pol/Cargo.toml`. The PR changes the real `crates/pol/Cargo.toml`
+#     (itself correctly refused as undeclared either way) alongside the root
+#     `Cargo.lock`. A properly quoted `for d in "${declared[@]}"` never finds
+#     an exact match for `crates/pol/Cargo.toml` against the one, whole,
+#     space-containing declared string, so `cargo_lock_exempt` stays 0 and
+#     the root `Cargo.lock` is ALSO refused, named. `for d in ${declared[*]}`
+#     re-splits that one element into "unrelated.md" and
+#     "crates/pol/Cargo.toml", the second of which exactly matches the real
+#     manifest path, wrongly sets `cargo_lock_exempt=1`, and the root
+#     `Cargo.lock` silently disappears from the refusal listing even though
+#     the overall PR is still refused for the unrelated manifest, exactly the
+#     "still refused overall, but one real offense goes unnamed" shape case
+#     20 already tests for the changed side.
+# ---------------------------------------------------------------------------
+D50="$WORK/cargo-lock-exempt-declared-loop-unquoted-bypass"
+new_repo "$D50"
+mkdir -p "$D50/crates/pol"
+printf '[package]\nname="pol"\nversion="0.1.0"\n' > "$D50/crates/pol/Cargo.toml"
+printf 'placeholder\n' > "$D50/Cargo.lock"
+commit_all "$D50" base
+git -C "$D50" checkout -qb pr
+printf '[package]\nname="pol"\nversion="0.1.1"\n' > "$D50/crates/pol/Cargo.toml"
+printf 'bumped\n' > "$D50/Cargo.lock"
+commit_all "$D50" implement
+fake_gh 'coder-agent' 'Closes #42' '## Files
+
+| Path | Action | Purpose |
+| --- | --- | --- |
+| `unrelated.md crates/pol/Cargo.toml` | modify | one declared row, one backtick span, a literal space inside it |
+'
+echo "== the cargo_lock_exempt loop must not be fooled by a declared row that word-splits into the real manifest path =="
+OUT50="$(run_scope "$D50")" && RC50=0 || RC50=$?
+if [ "$RC50" -eq 0 ]; then
+  echo "FAIL: case 50 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT50" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT50" | grep -qF 'pr-scope-check: the diff matches issue'; then
+  echo "FAIL: reported as matching, even though the manifest is only declared inside a space-containing row. Got:"
+  echo "$OUT50" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT50" | grep -qE '^ {4}Cargo\.lock$'; then
+  echo "FAIL: root Cargo.lock was not named among the refused (undeclared) paths, meaning cargo_lock_exempt was wrongly set. Got:"
+  echo "$OUT50" | sed 's/^/    /'
+  FAILED=1
+else
+  note "root Cargo.lock is correctly named as undeclared; a space-splitting declared row does not silently exempt it"
+fi
+
+# ---------------------------------------------------------------------------
+# 51. BLOCKING (round seven). The nested-lockfile sibling-declared loop (line
+#     817) must be pinned independently. The issue declares one row
+#     containing a literal space that is NOT the real sibling manifest path:
+#     `notes.md crates/pol/fuzz/Cargo.toml`. The PR touches ONLY the nested
+#     lockfile `crates/pol/fuzz/Cargo.lock`; its sibling manifest is
+#     untouched and, read as a WHOLE string, was never actually declared. A
+#     properly quoted `for d in "${declared[@]}"` never matches the sibling
+#     against the one, whole, space-containing declared string, so the
+#     lockfile is refused as undeclared, same as case 46 above. `for d in
+#     ${declared[*]}` re-splits it into "notes.md" and
+#     "crates/pol/fuzz/Cargo.toml", the second of which exactly equals the
+#     sibling, wrongly sets `sib_declared=1`, and the loop `continue`s past
+#     this path ENTIRELY: since it is the only changed file, the whole PR is
+#     reported as matching its issue with rc=0, a FULL false pass, not merely
+#     a differently-worded refusal.
+# ---------------------------------------------------------------------------
+D51="$WORK/nested-lockfile-sibling-declared-loop-unquoted-bypass"
+new_repo "$D51"
+mkdir -p "$D51/crates/pol/fuzz/fuzz_targets"
+printf '[package]\nname="pol"\nversion="0.1.0"\n' > "$D51/crates/pol/Cargo.toml"
+printf '[package]\nname="pol-fuzz"\nversion="0.0.0"\npublish=false\n\n[workspace]\n\n[dependencies]\nlibfuzzer-sys="0.4"\n\n[[bin]]\nname="t"\npath="fuzz_targets/t.rs"\n' > "$D51/crates/pol/fuzz/Cargo.toml"
+printf '#![no_main]\n' > "$D51/crates/pol/fuzz/fuzz_targets/t.rs"
+printf 'placeholder\n' > "$D51/crates/pol/fuzz/Cargo.lock"
+commit_all "$D51" base
+git -C "$D51" checkout -qb pr
+printf 'attacker-controlled content, no DECLARED sibling ties it to anything reviewed\n' > "$D51/crates/pol/fuzz/Cargo.lock"
+commit_all "$D51" implement
+fake_gh 'coder-agent' 'Closes #42' '## Files
+
+| Path | Action | Purpose |
+| --- | --- | --- |
+| `notes.md crates/pol/fuzz/Cargo.toml` | modify | one declared row, one backtick span, a literal space inside it |
+'
+echo "== the nested-lockfile sibling loop must not be fooled by a declared row that word-splits into the sibling path =="
+OUT51="$(run_scope "$D51")" && RC51=0 || RC51=$?
+if [ "$RC51" -eq 0 ]; then
+  echo "FAIL: case 51 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT51" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT51" | grep -qF 'pr-scope-check: the diff matches issue'; then
+  echo "FAIL: the nested lockfile was forgiven, even though its sibling is only declared inside a space-containing row. Got:"
+  echo "$OUT51" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT51" | grep -qF 'crates/pol/fuzz/Cargo.lock'; then
+  echo "FAIL: refused, but the nested lockfile was not named among the undeclared paths. Got:"
+  echo "$OUT51" | sed 's/^/    /'
+  FAILED=1
+else
+  note "the nested lockfile is refused and named; a space-splitting declared row does not silently exempt it"
+fi
+
+# ---------------------------------------------------------------------------
+# 52. The "declared but not modified" NOTE loop (lines 876/879) must be
+#     pinned on BOTH its declared (outer) and changed (inner) sides. A single
+#     file, `x y.rs`, containing a literal space, is declared AND actually
+#     touched by this PR: read as a WHOLE, "x y.rs" (declared) equals
+#     "x y.rs" (changed), so no NOTE should be printed at all. Unquoting
+#     EITHER `for d in "${declared[@]}"` (876) or `for f in "${changed[@]}"`
+#     (879) re-splits the one space-containing element into "x" and "y.rs" on
+#     whichever side is unquoted; neither fragment equals the other side's
+#     value (whole or fragment), so `found` stays 0 and a spurious "declared
+#     but not modified" NOTE is printed for a file that was, in fact,
+#     modified. This is message-quality, not a scope bypass (the overall
+#     verdict does not change), but it is exactly the kind of silently wrong
+#     human-facing signal #836 already showed this file cannot afford.
+# ---------------------------------------------------------------------------
+D52="$WORK/untouched-note-loop-unquoted-space-file"
+new_repo "$D52"
+printf 'orig\n' > "$D52/x y.rs"
+commit_all "$D52" base
+git -C "$D52" checkout -qb pr
+printf 'changed\n' > "$D52/x y.rs"
+commit_all "$D52" implement
+fake_gh 'coder-agent' 'Closes #42' '## Files
+
+| Path | Action | Purpose |
+| --- | --- | --- |
+| `x y.rs` | modify | one declared row, one backtick span, a literal space inside it, actually touched |
+'
+echo "== a space-containing file that is both declared and touched must not spuriously appear as declared-but-not-modified =="
+OUT52="$(run_scope "$D52")" && RC52=0 || RC52=$?
+if [ "$RC52" -ne 0 ]; then
+  echo "FAIL: case 52 was expected to pass (rc=0) but exited non-zero (rc=$RC52)." >&2
+  echo "$OUT52" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT52" | grep -qF 'declared but not modified'; then
+  echo "FAIL: a space-containing file that WAS modified was reported as declared but not modified. Got:"
+  echo "$OUT52" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT52" | grep -qF 'pr-scope-check: the diff matches issue'; then
+  echo "FAIL: the matching PR was not reported as matching. Got:"
+  echo "$OUT52" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a space-containing declared-and-touched file produces no spurious untouched NOTE"
+fi
+
+# ---------------------------------------------------------------------------
+# 53. The EXEMPT file-listing loop (line 653) must be pinned. It is cosmetic
+#     (the verdict is already decided before it runs), but a human reviewing
+#     an EXEMPT verdict reads exactly this listing, and `--no-renames`
+#     earlier in this file exists BECAUSE that listing is trusted. A
+#     legitimate bot bump touches a real, single, space-containing
+#     allowlisted path (`crates/my crate/Cargo.toml`, one dependency version
+#     string moved). A properly quoted `for f in "${changed[@]}"` prints that
+#     one path whole. `for f in ${changed[*]}` re-splits it into two lines,
+#     "crates/my" and "crate/Cargo.toml", neither of which is the real path
+#     a reviewer could act on.
+# ---------------------------------------------------------------------------
+D53="$WORK/exempt-listing-loop-unquoted-space-path"
+new_repo "$D53"
+mkdir -p "$D53/crates/my crate"
+printf '[package]\nname="pol"\nversion="0.1.0"\n\n[dependencies]\nserde = "1.0"\n' > "$D53/crates/my crate/Cargo.toml"
+commit_all "$D53" base
+git -C "$D53" checkout -qb pr
+printf '[package]\nname="pol"\nversion="0.1.0"\n\n[dependencies]\nserde = "1.1"\n' > "$D53/crates/my crate/Cargo.toml"
+commit_all "$D53" "chore(deps): bump serde"
+fake_gh 'dependabot[bot]' ''
+echo "== the EXEMPT listing loop must print a space-containing allowlisted path whole =="
+OUT53="$(run_scope "$D53")" && RC53=0 || RC53=$?
+if [ "$RC53" -ne 0 ]; then
+  echo "FAIL: case 53 was expected to pass (rc=0) but exited non-zero (rc=$RC53)." >&2
+  echo "$OUT53" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if ! echo "$OUT53" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: a legitimate space-containing-path bot bump was not reported EXEMPT. Got:"
+  echo "$OUT53" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT53" | grep -qE '^ {4}crates/my crate/Cargo\.toml$'; then
+  echo "FAIL: the EXEMPT listing did not print the real, whole, space-containing path. Got:"
+  echo "$OUT53" | sed 's/^/    /'
+  FAILED=1
+else
+  note "the EXEMPT listing prints a space-containing allowlisted path whole, not re-split"
+fi
+
+# ---------------------------------------------------------------------------
+# 54. The two informational listing loops on the non-bot path ("declared in
+#     issue #N:" at line 764, and "changed by this PR:" at line 768) must
+#     each print a space-containing path whole, not re-split. One declared,
+#     matching, space-containing file: `a b.rs`.
+# ---------------------------------------------------------------------------
+D54="$WORK/nonbot-listing-loops-unquoted-space-path"
+new_repo "$D54"
+printf 'orig\n' > "$D54/a b.rs"
+commit_all "$D54" base
+git -C "$D54" checkout -qb pr
+printf 'changed\n' > "$D54/a b.rs"
+commit_all "$D54" implement
+fake_gh 'coder-agent' 'Closes #42' '## Files
+
+| Path | Action | Purpose |
+| --- | --- | --- |
+| `a b.rs` | modify | one declared row, one backtick span, a literal space inside it |
+'
+echo "== the non-bot declared/changed listing loops must print a space-containing path whole =="
+OUT54="$(run_scope "$D54")" && RC54=0 || RC54=$?
+if [ "$RC54" -ne 0 ]; then
+  echo "FAIL: case 54 was expected to pass (rc=0) but exited non-zero (rc=$RC54)." >&2
+  echo "$OUT54" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if ! echo "$OUT54" | grep -qF 'pr-scope-check: the diff matches issue'; then
+  echo "FAIL: a matching space-containing declared/changed file was not reported as matching. Got:"
+  echo "$OUT54" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT54" | grep -qE '^declared in issue #42:$'; then
+  echo "FAIL: could not even find the 'declared in issue' header. Got:"
+  echo "$OUT54" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT54" | awk '/^declared in issue #42:$/{f=1;next}/^changed by this PR:$/{f=0}f' | grep -qE '^  a b\.rs$'; then
+  echo "FAIL: the 'declared in issue' listing did not print the space-containing path whole. Got:"
+  echo "$OUT54" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT54" | awk '/^changed by this PR:$/{f=1;next}/^$/{f=0}f' | grep -qE '^  a b\.rs$'; then
+  echo "FAIL: the 'changed by this PR' listing did not print the space-containing path whole. Got:"
+  echo "$OUT54" | sed 's/^/    /'
+  FAILED=1
+else
+  note "both non-bot listing loops print a space-containing path whole, not re-split"
+fi
+
+# ---------------------------------------------------------------------------
+# 55. dep_entry_offenses' INTRODUCE arm (line 521) must be pinned. An
+#     existing detailed-table dependency gains a brand new `git` sub-key,
+#     retargeting where Cargo fetches it from. Only the CHANGED arm (cases 29
+#     and 37) had a case; introduce and remove did not.
+# ---------------------------------------------------------------------------
+D55="$WORK/dep-entry-introduce-arm"
+new_repo "$D55"
+mkdir -p "$D55/crates/pol"
+printf '[package]\nname="pol"\nversion="0.1.0"\n\n[dependencies]\nserde = { version = "1.0" }\n' > "$D55/crates/pol/Cargo.toml"
+commit_all "$D55" base
+git -C "$D55" checkout -qb pr
+printf '[package]\nname="pol"\nversion="0.1.0"\n\n[dependencies]\nserde = { version = "1.0", git = "https://evil.example/serde" }\n' > "$D55/crates/pol/Cargo.toml"
+commit_all "$D55" "chore(deps): bump"
+fake_gh 'dependabot[bot]' ''
+echo "== a newly INTRODUCED sub-key (git) on an existing detailed dependency must be refused =="
+OUT55="$(run_scope "$D55")" && RC55=0 || RC55=$?
+if [ "$RC55" -eq 0 ]; then
+  echo "FAIL: case 55 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT55" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT55" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: a newly introduced git= sub-key was reported EXEMPT. Got:"
+  echo "$OUT55" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT55" | grep -qF 'introduces dependencies.serde.git'; then
+  echo "FAIL: refused, but the introduced git sub-key was not named. Got:"
+  echo "$OUT55" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a newly introduced dependency sub-key is refused and named"
+fi
+
+# ---------------------------------------------------------------------------
+# 56. dep_entry_offenses' REMOVE arm (line 523) must be pinned. An existing
+#     detailed-table dependency's `default-features = false` disappears,
+#     silently switching on default features that were deliberately off.
+# ---------------------------------------------------------------------------
+D56="$WORK/dep-entry-remove-arm"
+new_repo "$D56"
+mkdir -p "$D56/crates/pol"
+printf '[package]\nname="pol"\nversion="0.1.0"\n\n[dependencies]\nserde = { version = "1.0", default-features = false }\n' > "$D56/crates/pol/Cargo.toml"
+commit_all "$D56" base
+git -C "$D56" checkout -qb pr
+printf '[package]\nname="pol"\nversion="0.1.0"\n\n[dependencies]\nserde = { version = "1.0" }\n' > "$D56/crates/pol/Cargo.toml"
+commit_all "$D56" "chore(deps): bump"
+fake_gh 'dependabot[bot]' ''
+echo "== a REMOVED sub-key (default-features) on an existing detailed dependency must be refused =="
+OUT56="$(run_scope "$D56")" && RC56=0 || RC56=$?
+if [ "$RC56" -eq 0 ]; then
+  echo "FAIL: case 56 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT56" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT56" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: a removed default-features sub-key was reported EXEMPT. Got:"
+  echo "$OUT56" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT56" | grep -qF 'removes dependencies.serde.default-features'; then
+  echo "FAIL: refused, but the removed default-features sub-key was not named. Got:"
+  echo "$OUT56" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a removed dependency sub-key is refused and named"
+fi
+
+# ---------------------------------------------------------------------------
+# 57. The list branch's REMOVED-entry arm (line 576) must be pinned; round
+#     six pinned append (46b) and edit (38) but left this third arm of the
+#     same three-arm branch. A `[[bin]]` array shrinks from two entries to
+#     one: the whole second entry disappears.
+# ---------------------------------------------------------------------------
+D57="$WORK/list-branch-remove-arm"
+new_repo "$D57"
+mkdir -p "$D57/crates/pol"
+printf '[package]\nname="pol"\nversion="0.1.0"\nedition="2021"\n\n[[bin]]\nname="a"\npath="a.rs"\n\n[[bin]]\nname="b"\npath="b.rs"\n' > "$D57/crates/pol/Cargo.toml"
+commit_all "$D57" base
+git -C "$D57" checkout -qb pr
+printf '[package]\nname="pol"\nversion="0.1.0"\nedition="2021"\n\n[[bin]]\nname="a"\npath="a.rs"\n' > "$D57/crates/pol/Cargo.toml"
+commit_all "$D57" "chore(deps): bump"
+fake_gh 'dependabot[bot]' ''
+echo "== a REMOVED array entry ([[bin]] shrinking) must be refused, named by its index =="
+OUT57="$(run_scope "$D57")" && RC57=0 || RC57=$?
+if [ "$RC57" -eq 0 ]; then
+  echo "FAIL: case 57 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT57" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT57" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: a shrunken [[bin]] array was reported EXEMPT. Got:"
+  echo "$OUT57" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT57" | grep -qF 'removes bin[1]'; then
+  echo "FAIL: refused, but the removed array entry was not named as bin[1]. Got:"
+  echo "$OUT57" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a removed array entry is refused and named, pinning the list branch's remove arm"
+fi
+
+# ---------------------------------------------------------------------------
+# 58. FAIL CLOSED: `set -e` (line 20) is the only thing that turns "the
+#     manifest engine could not run at all" into a refusal, because
+#     `cap="$(manifest_disallowed_diff "$f")"` is a plain assignment whose
+#     own exit status is the embedded python3's. Without `set -e`, a python3
+#     that cannot run leaves `cap` empty, `[ -n "$cap" ]` false, and the
+#     manifest silently contributes no offense. This puts a FAILING `python3`
+#     ahead of the real one on PATH for the one case that needs it (the same
+#     technique case 35 already uses for `git`), so the bot PR's own manifest
+#     capability check cannot actually run.
+# ---------------------------------------------------------------------------
+D58="$WORK/manifest-engine-python3-unavailable"
+new_repo "$D58"
+mkdir -p "$D58/crates/pol"
+printf '[package]\nname="pol"\nversion="0.1.0"\n\n[dependencies]\nserde = "1.0"\n' > "$D58/crates/pol/Cargo.toml"
+commit_all "$D58" base
+git -C "$D58" checkout -qb pr
+printf '[package]\nname="pol"\nversion="0.1.0"\n\n[dependencies]\nserde = "1.1"\n' > "$D58/crates/pol/Cargo.toml"
+commit_all "$D58" "chore(deps): bump serde"
+fake_gh 'dependabot[bot]' ''
+cat > "$FAKEBIN/python3" <<'PYWRAP'
+#!/usr/bin/env bash
+echo "fake python3: simulated missing interpreter" >&2
+exit 1
+PYWRAP
+chmod +x "$FAKEBIN/python3"
+echo "== a bot PR whose manifest engine cannot run (no working python3) must fail closed, not EXEMPT =="
+OUT58="$(run_scope "$D58")" && RC58=0 || RC58=$?
+rm -f "$FAKEBIN/python3"
+if [ "$RC58" -eq 0 ]; then
+  echo "FAIL: case 58 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT58" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT58" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: a bot PR whose manifest engine could not run was reported EXEMPT. Got:"
+  echo "$OUT58" | sed 's/^/    /'
+  FAILED=1
+else
+  note "an unavailable manifest engine fails the whole check closed (rc=$RC58), not EXEMPT"
+fi
+
+# ---------------------------------------------------------------------------
+# 59. The declared_raw parser's "reset on ANY heading" rule (line 712) must
+#     be pinned. An issue puts a `## Files` section declaring one real file,
+#     then a LATER `## Notes` section containing its own backticked table
+#     with an unrelated path. That path must NOT be treated as declared. The
+#     PR touches ONLY that unrelated path.
+# ---------------------------------------------------------------------------
+D59="$WORK/files-parser-heading-reset"
+new_repo "$D59"
+mkdir -p "$D59/src"
+printf 'orig\n' > "$D59/src/keep.rs"
+commit_all "$D59" base
+git -C "$D59" checkout -qb pr
+printf 'evil\n' > "$D59/src/evil.rs"
+commit_all "$D59" implement
+fake_gh 'coder-agent' 'Closes #42' '## Files
+
+| Path | Action | Purpose |
+| --- | --- | --- |
+| `src/keep.rs` | modify | the one real declared file |
+
+## Notes
+
+Some unrelated commentary with its own table, not a Files declaration:
+
+| Path | Detail |
+| --- | --- |
+| `src/evil.rs` | this is NOT a Files row |
+'
+echo "== a backticked table inside a LATER, non-Files heading must not be treated as declared =="
+OUT59="$(run_scope "$D59")" && RC59=0 || RC59=$?
+if [ "$RC59" -eq 0 ]; then
+  echo "FAIL: case 59 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT59" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT59" | grep -qF 'pr-scope-check: the diff matches issue'; then
+  echo "FAIL: src/evil.rs, declared only inside a ## Notes table, was reported as matching. Got:"
+  echo "$OUT59" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT59" | grep -qF 'src/evil.rs'; then
+  echo "FAIL: refused, but src/evil.rs was not named among the undeclared paths. Got:"
+  echo "$OUT59" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a table nested inside a later, non-Files heading is not treated as a Files declaration"
+fi
+
+# ---------------------------------------------------------------------------
+# 60. The declared_raw parser's "every legitimate row backticks its path"
+#     rule (line 727) must be pinned. The `## Files` table has one properly
+#     backticked row and one row whose first cell is bare (unbackticked); the
+#     bare row must be skipped, not declared. The PR touches ONLY the bare
+#     row's path.
+# ---------------------------------------------------------------------------
+D60="$WORK/files-parser-unbackticked-row"
+new_repo "$D60"
+mkdir -p "$D60/src"
+printf 'orig\n' > "$D60/src/keep.rs"
+commit_all "$D60" base
+git -C "$D60" checkout -qb pr
+printf 'evil\n' > "$D60/src/evil.rs"
+commit_all "$D60" implement
+fake_gh 'coder-agent' 'Closes #42' '## Files
+
+| Path | Action | Purpose |
+| --- | --- | --- |
+| `src/keep.rs` | modify | the one real, properly backticked, declared file |
+| src/evil.rs | modify | NOT backticked; belongs to some other table shape, must be skipped |
+'
+echo "== an unbackticked Files-table cell must not be treated as a declared path =="
+OUT60="$(run_scope "$D60")" && RC60=0 || RC60=$?
+if [ "$RC60" -eq 0 ]; then
+  echo "FAIL: case 60 was expected to be refused (non-zero exit) but exited 0. A refusal-shaped" >&2
+  echo "message with rc=0 is exactly the branch-protection bypass this suite exists to catch" >&2
+  echo "(round six's own finding). Got:" >&2
+  echo "$OUT60" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT60" | grep -qF 'pr-scope-check: the diff matches issue'; then
+  echo "FAIL: src/evil.rs, declared only via an unbackticked cell, was reported as matching. Got:"
+  echo "$OUT60" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT60" | grep -qF 'src/evil.rs'; then
+  echo "FAIL: refused, but src/evil.rs was not named among the undeclared paths. Got:"
+  echo "$OUT60" | sed 's/^/    /'
+  FAILED=1
+else
+  note "an unbackticked Files-table cell is skipped, not treated as a declared path"
+fi
+
+# ---------------------------------------------------------------------------
+# 61. POSITIVE CONTROL: a `[target.'cfg(windows)'.build-dependencies]` string
+#     bump must stay EXEMPT. Case 36b already covers the target-cfg variant
+#     of `dev-dependencies`; nothing covers the target-cfg variant of
+#     `build-dependencies`, so dropping `build-dependencies` from
+#     `DEP_TABLE_NAMES` (which only gates the target-cfg branch of
+#     `is_dep_table_path`; the plain `[build-dependencies]` table case 36
+#     covers is a separate, hardcoded tuple entry) is invisible.
+# ---------------------------------------------------------------------------
+D61="$WORK/target-cfg-build-dependencies-string-bump"
+new_repo "$D61"
+mkdir -p "$D61/crates/pol"
+printf '[package]\nname="pol"\nversion="0.1.0"\n\n[target.\x27cfg(windows)\x27.build-dependencies]\ncc = "1.0"\n' > "$D61/crates/pol/Cargo.toml"
+commit_all "$D61" base
+git -C "$D61" checkout -qb pr
+printf '[package]\nname="pol"\nversion="0.1.0"\n\n[target.\x27cfg(windows)\x27.build-dependencies]\ncc = "1.1"\n' > "$D61/crates/pol/Cargo.toml"
+commit_all "$D61" "chore(deps): bump cc"
+fake_gh 'dependabot[bot]' ''
+echo "== a target.'cfg(windows)'.build-dependencies string bump must stay EXEMPT =="
+OUT61="$(run_scope "$D61")" && RC61=0 || RC61=$?
+if [ "$RC61" -ne 0 ]; then
+  echo "FAIL: case 61 was expected to pass (rc=0) but exited non-zero (rc=$RC61)." >&2
+  echo "$OUT61" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT61" | grep -qF 'pr-scope-check: EXEMPT'; then
+  note "a target-specific build-dependencies string bump stays EXEMPT"
+else
+  echo "FAIL: a target.'cfg(windows)'.build-dependencies string bump was refused. Got:"
+  echo "$OUT61" | sed 's/^/    /'
+  FAILED=1
+fi
+
+# ---------------------------------------------------------------------------
+# 62. POSITIVE CONTROL: `renovate[bot]`, one of the three trusted logins in
+#     the author case arm, must actually be recognised. No case exercised
+#     this login; only `dependabot[bot]` had positive coverage.
+# ---------------------------------------------------------------------------
+D62="$WORK/renovate-bot-recognised"
+new_repo "$D62"
+mkdir -p "$D62/crates/pol"
+printf '[package]\nname="pol"\nversion="0.1.0"\n\n[dependencies]\nserde = "1.0"\n' > "$D62/crates/pol/Cargo.toml"
+commit_all "$D62" base
+git -C "$D62" checkout -qb pr
+printf '[package]\nname="pol"\nversion="0.1.0"\n\n[dependencies]\nserde = "1.1"\n' > "$D62/crates/pol/Cargo.toml"
+commit_all "$D62" "chore(deps): bump serde"
+fake_gh 'renovate[bot]' ''
+echo "== renovate[bot] must take the bot-exempt path for a legitimate bump =="
+OUT62="$(run_scope "$D62")" && RC62=0 || RC62=$?
+if [ "$RC62" -ne 0 ]; then
+  echo "FAIL: case 62 was expected to pass (rc=0) but exited non-zero (rc=$RC62)." >&2
+  echo "$OUT62" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT62" | grep -qF 'pr-scope-check: EXEMPT'; then
+  note "renovate[bot] is recognised and a legitimate bump stays EXEMPT"
+else
+  echo "FAIL: a legitimate renovate[bot] bump was refused. Got:"
+  echo "$OUT62" | sed 's/^/    /'
+  FAILED=1
+fi
+
+# ---------------------------------------------------------------------------
+# 63. POSITIVE CONTROL: `github-actions[bot]`, the third trusted login, must
+#     also be recognised, bumping a workflow file (its realistic payload).
+# ---------------------------------------------------------------------------
+D63="$WORK/github-actions-bot-recognised"
+new_repo "$D63"
+mkdir -p "$D63/.github/workflows"
+printf 'name: ci\non: push\njobs:\n  x:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v3\n' > "$D63/.github/workflows/ci.yml"
+commit_all "$D63" base
+git -C "$D63" checkout -qb pr
+printf 'name: ci\non: push\njobs:\n  x:\n    runs-on: ubuntu-latest\n    steps:\n      - uses: actions/checkout@v4\n' > "$D63/.github/workflows/ci.yml"
+commit_all "$D63" "chore: bump actions/checkout"
+fake_gh 'github-actions[bot]' ''
+echo "== github-actions[bot] must take the bot-exempt path for a workflow bump =="
+OUT63="$(run_scope "$D63")" && RC63=0 || RC63=$?
+if [ "$RC63" -ne 0 ]; then
+  echo "FAIL: case 63 was expected to pass (rc=0) but exited non-zero (rc=$RC63)." >&2
+  echo "$OUT63" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT63" | grep -qF 'pr-scope-check: EXEMPT'; then
+  note "github-actions[bot] is recognised and a workflow bump stays EXEMPT"
+else
+  echo "FAIL: a legitimate github-actions[bot] workflow bump was refused. Got:"
+  echo "$OUT63" | sed 's/^/    /'
+  FAILED=1
+fi
+
+# ---------------------------------------------------------------------------
+# 64. POSITIVE CONTROL: the closing-keyword regex's `resolve[sd]?` alternative
+#     must actually be recognised. Every other non-bot case in this file uses
+#     "Closes #NN"; nothing exercises "Resolves #NN".
+# ---------------------------------------------------------------------------
+D64="$WORK/resolves-keyword-recognised"
+new_repo "$D64"
+mkdir -p "$D64/src"
+printf 'orig\n' > "$D64/src/lib.rs"
+commit_all "$D64" base
+git -C "$D64" checkout -qb pr
+printf 'changed\n' > "$D64/src/lib.rs"
+commit_all "$D64" implement
+fake_gh 'coder-agent' 'Resolves #42' '## Files
+
+| Path | Action | Purpose |
+| --- | --- | --- |
+| `src/lib.rs` | modify | the declared file |
+'
+echo "== 'Resolves #NN' must be recognised as a closing keyword =="
+OUT64="$(run_scope "$D64")" && RC64=0 || RC64=$?
+if [ "$RC64" -ne 0 ]; then
+  echo "FAIL: case 64 was expected to pass (rc=0) but exited non-zero (rc=$RC64)." >&2
+  echo "$OUT64" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT64" | grep -qF 'pr-scope-check: the diff matches issue #42'; then
+  note "'Resolves #NN' is recognised as a closing keyword"
+else
+  echo "FAIL: a PR body using 'Resolves #42' was not recognised. Got:"
+  echo "$OUT64" | sed 's/^/    /'
+  FAILED=1
+fi
+
+# ---------------------------------------------------------------------------
+# 65. POSITIVE CONTROL: the non-bot nested-lockfile sibling exemption must
+#     actually forgive a real, undeclared `crates/<n>/fuzz/Cargo.lock` change
+#     when its sibling manifest IS declared (even though the diff itself does
+#     not touch that manifest, a real "the fuzz crate's own dependency
+#     resolution shifted" bump). Cases 42/46/46/51 above only exercise the
+#     REFUSAL side of this rule; nothing exercised the EXEMPTION it exists to
+#     grant, so a plain narrowing or disabling of the exemption (independent
+#     of any word-splitting trick) would silently start refusing every real
+#     fuzz-lockfile-only bump and nothing here would notice.
+# ---------------------------------------------------------------------------
+D65="$WORK/nested-lockfile-sibling-exemption-plain-positive"
+new_repo "$D65"
+mkdir -p "$D65/crates/pol/fuzz/fuzz_targets"
+printf '[package]\nname="pol"\nversion="0.1.0"\n' > "$D65/crates/pol/Cargo.toml"
+printf '[package]\nname="pol-fuzz"\nversion="0.0.0"\npublish=false\n\n[workspace]\n\n[dependencies]\nlibfuzzer-sys="0.4"\n\n[[bin]]\nname="t"\npath="fuzz_targets/t.rs"\n' > "$D65/crates/pol/fuzz/Cargo.toml"
+printf '#![no_main]\n' > "$D65/crates/pol/fuzz/fuzz_targets/t.rs"
+printf 'placeholder\n' > "$D65/crates/pol/fuzz/Cargo.lock"
+commit_all "$D65" base
+git -C "$D65" checkout -qb pr
+printf 'resolved differently, same manifest text\n' > "$D65/crates/pol/fuzz/Cargo.lock"
+commit_all "$D65" implement
+fake_gh 'coder-agent' 'Closes #42' '## Files
+
+| Path | Action | Purpose |
+| --- | --- | --- |
+| `crates/pol/fuzz/Cargo.toml` | modify | the fuzz crate manifest, declared even though this diff only moved its lockfile |
+'
+echo "== a nested fuzz lockfile change must be EXEMPT when its own sibling manifest is genuinely declared =="
+OUT65="$(run_scope "$D65")" && RC65=0 || RC65=$?
+if [ "$RC65" -ne 0 ]; then
+  echo "FAIL: case 65 was expected to pass (rc=0) but exited non-zero (rc=$RC65)." >&2
+  echo "$OUT65" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT65" | grep -qF 'pr-scope-check: the diff matches issue'; then
+  note "a nested fuzz lockfile change is forgiven when its own sibling manifest is declared"
+else
+  echo "FAIL: a legitimate nested fuzz lockfile change, with its sibling declared, was refused. Got:"
+  echo "$OUT65" | sed 's/^/    /'
+  FAILED=1
+fi
+
+# ---------------------------------------------------------------------------
+# 66. POSITIVE CONTROL: cargo_lock_exempt must actually forgive the ROOT
+#     Cargo.lock when a NESTED crate's Cargo.toml (not the root manifest) is
+#     the declared, changed file. Case 6 (issue #836's own motivation)
+#     exercises a nested crate manifest bump but does not also touch the root
+#     Cargo.lock; nothing here confirms the tie actually reaches a nested
+#     manifest rather than only the root one.
+# ---------------------------------------------------------------------------
+D66="$WORK/cargo-lock-exempt-nested-manifest-plain-positive"
+new_repo "$D66"
+mkdir -p "$D66/crates/pol"
+printf '[package]\nname="pol"\nversion="0.1.0"\n\n[dependencies]\nserde = "1.0"\n' > "$D66/crates/pol/Cargo.toml"
+printf 'placeholder\n' > "$D66/Cargo.lock"
+commit_all "$D66" base
+git -C "$D66" checkout -qb pr
+printf '[package]\nname="pol"\nversion="0.1.0"\n\n[dependencies]\nserde = "1.0"\nlog = "0.4"\n' > "$D66/crates/pol/Cargo.toml"
+printf 'bumped\n' > "$D66/Cargo.lock"
+commit_all "$D66" "add log dependency"
+fake_gh 'coder-agent' 'Closes #42' '## Files
+
+| Path | Action | Purpose |
+| --- | --- | --- |
+| `crates/pol/Cargo.toml` | modify | add the log dependency |
+'
+echo "== the root Cargo.lock must be forgiven when a DECLARED, CHANGED nested manifest triggered it =="
+OUT66="$(run_scope "$D66")" && RC66=0 || RC66=$?
+if [ "$RC66" -ne 0 ]; then
+  echo "FAIL: case 66 was expected to pass (rc=0) but exited non-zero (rc=$RC66)." >&2
+  echo "$OUT66" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT66" | grep -qF 'pr-scope-check: the diff matches issue'; then
+  note "root Cargo.lock is forgiven when a declared, changed nested manifest is its plausible trigger"
+else
+  echo "FAIL: root Cargo.lock was refused even though a declared, changed nested manifest is its plausible trigger. Got:"
+  echo "$OUT66" | sed 's/^/    /'
+  FAILED=1
+fi
+
+# ---------------------------------------------------------------------------
+# 67. POSITIVE CONTROL: a declared entry ending in `/` must actually cover a
+#     file underneath it, in the MAIN undeclared loop. No case exercised the
+#     accept side of the directory-declaration feature the script documents
+#     at line 800; only its absence (an ordinary undeclared file) is implied
+#     by every other case's exact-match fixtures.
+# ---------------------------------------------------------------------------
+D67="$WORK/directory-declaration-undeclared-loop-plain-positive"
+new_repo "$D67"
+mkdir -p "$D67/crates/pol/src"
+printf 'orig\n' > "$D67/crates/pol/src/lib.rs"
+commit_all "$D67" base
+git -C "$D67" checkout -qb pr
+printf 'changed\n' > "$D67/crates/pol/src/lib.rs"
+commit_all "$D67" implement
+fake_gh 'coder-agent' 'Closes #42' '## Files
+
+| Path | Action | Purpose |
+| --- | --- | --- |
+| `crates/pol/` | modify | the whole crate tree, declared as a directory |
+'
+echo "== a directory declaration (trailing slash) must cover a file underneath it =="
+OUT67="$(run_scope "$D67")" && RC67=0 || RC67=$?
+if [ "$RC67" -ne 0 ]; then
+  echo "FAIL: case 67 was expected to pass (rc=0) but exited non-zero (rc=$RC67)." >&2
+  echo "$OUT67" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT67" | grep -qF 'pr-scope-check: the diff matches issue'; then
+  note "a directory declaration covers a file underneath it in the main undeclared loop"
+else
+  echo "FAIL: a file under a directory-declared path was refused as undeclared. Got:"
+  echo "$OUT67" | sed 's/^/    /'
+  FAILED=1
+fi
+
+# ---------------------------------------------------------------------------
+# 68. POSITIVE CONTROL: a declared entry ending in `/` must also feed
+#     cargo_lock_exempt, not only the main undeclared loop. A nested crate's
+#     Cargo.toml, covered ONLY by a directory declaration (no exact-path row
+#     anywhere), is changed alongside the root Cargo.lock.
+# ---------------------------------------------------------------------------
+D68="$WORK/directory-declaration-cargo-lock-exempt-plain-positive"
+new_repo "$D68"
+mkdir -p "$D68/crates/pol"
+printf '[package]\nname="pol"\nversion="0.1.0"\n\n[dependencies]\nserde = "1.0"\n' > "$D68/crates/pol/Cargo.toml"
+printf 'placeholder\n' > "$D68/Cargo.lock"
+commit_all "$D68" base
+git -C "$D68" checkout -qb pr
+printf '[package]\nname="pol"\nversion="0.1.0"\n\n[dependencies]\nserde = "1.0"\nlog = "0.4"\n' > "$D68/crates/pol/Cargo.toml"
+printf 'bumped\n' > "$D68/Cargo.lock"
+commit_all "$D68" "add log dependency"
+fake_gh 'coder-agent' 'Closes #42' '## Files
+
+| Path | Action | Purpose |
+| --- | --- | --- |
+| `crates/pol/` | modify | the whole crate tree, declared as a directory, no exact Cargo.toml row |
+'
+echo "== a directory declaration must also feed cargo_lock_exempt, forgiving the root Cargo.lock =="
+OUT68="$(run_scope "$D68")" && RC68=0 || RC68=$?
+if [ "$RC68" -ne 0 ]; then
+  echo "FAIL: case 68 was expected to pass (rc=0) but exited non-zero (rc=$RC68)." >&2
+  echo "$OUT68" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT68" | grep -qF 'pr-scope-check: the diff matches issue'; then
+  note "a directory declaration feeds cargo_lock_exempt, forgiving the root Cargo.lock"
+else
+  echo "FAIL: root Cargo.lock was refused even though its manifest is covered by a directory declaration. Got:"
+  echo "$OUT68" | sed 's/^/    /'
+  FAILED=1
+fi
+
+# ---------------------------------------------------------------------------
+# 69. POSITIVE CONTROL: ALWAYS_ALLOWED must actually exempt CHANGELOG.md from
+#     needing its own Files row. Every other case's issue either does not
+#     touch CHANGELOG.md at all, or declares it explicitly; nothing confirms
+#     the blanket exemption itself does anything.
+# ---------------------------------------------------------------------------
+D69="$WORK/always-allowed-changelog-plain-positive"
+new_repo "$D69"
+mkdir -p "$D69/docs"
+printf 'orig\n' > "$D69/docs/other.md"
+commit_all "$D69" base
+git -C "$D69" checkout -qb pr
+printf '# Changelog\n\n## 0.2.0\n- did a thing\n' > "$D69/CHANGELOG.md"
+commit_all "$D69" implement
+fake_gh 'coder-agent' 'Closes #42' '## Files
+
+| Path | Action | Purpose |
+| --- | --- | --- |
+| `docs/other.md` | modify | an unrelated declared file this diff does not touch, so the Files table is non-empty |
+'
+echo "== CHANGELOG.md must be exempt without its own Files row =="
+OUT69="$(run_scope "$D69")" && RC69=0 || RC69=$?
+if [ "$RC69" -ne 0 ]; then
+  echo "FAIL: case 69 was expected to pass (rc=0) but exited non-zero (rc=$RC69)." >&2
+  echo "$OUT69" | sed 's/^/    /' >&2
+  FAILED=1
+fi
+if echo "$OUT69" | grep -qF 'pr-scope-check: the diff matches issue'; then
+  note "CHANGELOG.md is exempt from needing its own Files row"
+else
+  echo "FAIL: an undeclared CHANGELOG.md change was refused even though ALWAYS_ALLOWED should exempt it. Got:"
+  echo "$OUT69" | sed 's/^/    /'
+  FAILED=1
+fi
+
 # 47. Each of the three required environment variables must fail this script
 #     CLOSED (rc=1, with its own message) when unset, checked by EXIT CODE,
 #     not merely by scanning the text for something that looks like a
@@ -2256,6 +3217,7 @@ echo
 # ---------------------------------------------------------------------------
 echo "== each required environment variable must fail closed (checked by exit code) when unset =="
 
+printf '.' >> "$CASES_FILE"
 RC47_PR="0"
 PR_NUMBER=1 BASE_SHA=deadbeef HEAD_SHA=deadbeef bash -c 'unset PR_NUMBER; exec bash "$1"' _ "$SCOPE" >"$WORK/out47pr" 2>&1 || RC47_PR="$?"
 OUT47_PR="$(cat "$WORK/out47pr")"; rm -f "$WORK/out47pr"
@@ -2271,6 +3233,7 @@ else
   note "PR_NUMBER unset fails closed: rc=$RC47_PR, its own message present"
 fi
 
+printf '.' >> "$CASES_FILE"
 RC47_BASE="0"
 PR_NUMBER=1 BASE_SHA=deadbeef HEAD_SHA=deadbeef bash -c 'unset BASE_SHA; exec bash "$1"' _ "$SCOPE" >"$WORK/out47base" 2>&1 || RC47_BASE="$?"
 OUT47_BASE="$(cat "$WORK/out47base")"; rm -f "$WORK/out47base"
@@ -2286,6 +3249,7 @@ else
   note "BASE_SHA unset fails closed: rc=$RC47_BASE, its own message present"
 fi
 
+printf '.' >> "$CASES_FILE"
 RC47_HEAD="0"
 PR_NUMBER=1 BASE_SHA=deadbeef HEAD_SHA=deadbeef bash -c 'unset HEAD_SHA; exec bash "$1"' _ "$SCOPE" >"$WORK/out47head" 2>&1 || RC47_HEAD="$?"
 OUT47_HEAD="$(cat "$WORK/out47head")"; rm -f "$WORK/out47head"
@@ -2302,6 +3266,43 @@ else
 fi
 
 echo
+# Vacuity guard (round seven, SHOULD_FIX). This file currently makes 73
+# `run_scope` calls plus 3 case-47 guards checked directly: 76, EXACTLY, is
+# the floor, deliberately tight rather than "comfortably beneath" -- round
+# six's own review found that deleting a SINGLE case (46b) still reported
+# "clean", and a loose floor set safely below the total would not have
+# caught that either. An exact floor means the next round that legitimately
+# adds or removes a case MUST update this number in the same commit, which
+# is the point: a silent case loss becomes a loud, must-fix build failure
+# instead of a number nobody had to look at.
+#
+# WATCHED TO FIRE, both ways, directly against this file (not merely
+# reasoned about): (b) deleting every case from case 2 through the end
+# leaves CASES at 1, this guard fires, rc=1, before `$FAILED` is even
+# consulted. (d) deleting case 46b alone (the round-six regression this
+# guard exists to catch) leaves CASES at 75, one short of the floor, and
+# this guard fires. NOT caught, and provably CANNOT be caught by anything
+# placed later in this same linear script: an `exit 0` inserted before case
+# 1 (experiment (a) in the round-seven review) terminates the script before
+# this code is ever reached at all, the same way it terminates every case
+# after it. `wc -c` on `$CASES_FILE` at that point would read 0, but the
+# process has already exited 0 three thousand lines earlier; no assertion
+# placed after an unconditional early exit can run. Closing (a) needs an
+# external check (the CI step, or a wrapper, asserting the literal string
+# "pr-scope-check-selftest: clean" appears in this script's OWN stdout, not
+# merely that its exit code was 0), which is a change to ci.yml, not to this
+# file, and is out of scope for a script-logic freeze. This guard closes (b)
+# and (d); it does not, and structurally cannot, close (a) from inside this
+# file.
+CASES="$(wc -c < "$CASES_FILE" | tr -d ' ')"
+CASES_FLOOR=76
+if [ "$CASES" -lt "$CASES_FLOOR" ]; then
+  echo "pr-scope-check-selftest: FAILED. Only $CASES case(s) actually ran (expected at least" >&2
+  echo "$CASES_FLOOR). A self-test that runs (almost) nothing, or silently drops one of its own" >&2
+  echo "cases, must not report success for having found nothing." >&2
+  exit 1
+fi
+note "$CASES case(s) actually ran (floor $CASES_FLOOR)"
 if [ "$FAILED" -ne 0 ]; then
   echo "pr-scope-check-selftest: FAILED. The scope check no longer enforces what it claims."
   exit 1
