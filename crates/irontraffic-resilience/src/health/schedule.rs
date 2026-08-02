@@ -276,7 +276,23 @@ impl EndpointSchedule {
         has_traffic: bool,
     ) -> Self {
         let (eff, _) = cfg.effective_interval_ms();
-        let phase = phase_ms(instance_id, endpoint_id, eff);
+        Self::init_with_effective_interval(t0, instance_id, endpoint_id, eff, has_traffic)
+    }
+
+    /// Like [`EndpointSchedule::init`], but taking an ALREADY-EFFECTIVE interval so a
+    /// caller building thousands of endpoints computes the rate-cap stretch once.
+    ///
+    /// `eff_interval_ms` must be the `.0` of `HealthCheckConfig::effective_interval_ms`;
+    /// passing the raw `interval_ms` would bypass the per-endpoint probe rate cap.
+    #[must_use]
+    pub fn init_with_effective_interval(
+        t0: Millis,
+        instance_id: u64,
+        endpoint_id: u64,
+        eff_interval_ms: u32,
+        has_traffic: bool,
+    ) -> Self {
+        let phase = phase_ms(instance_id, endpoint_id, eff_interval_ms);
         let interval_state = if has_traffic {
             IntervalState::Steady
         } else {
