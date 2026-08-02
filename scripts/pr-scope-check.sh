@@ -52,7 +52,7 @@ set -euo pipefail
 set -f
 cd "$(git rev-parse --show-toplevel)"
 
-# Working directory for the manifest capability check below (bot path only).
+# Working directory for the manifest diff check below (bot path only).
 # One trap for the whole script: every exit, including an early `exit 1`
 # from any check above or below this line, must still clean this up.
 MANIFEST_TMP="$(mktemp -d)"
@@ -169,6 +169,39 @@ while IFS= read -r -d '' f; do
   changed+=("$f")
 done < <(git diff --no-renames --name-only -z "$MERGE_BASE" "$HEAD_SHA")
 
+# An empty diff must never read as "nothing to enforce, so EXEMPT" or
+# "nothing to enforce, so it matches". Every other lane in this workflow
+# fails closed when its inputs are missing rather than reporting success for
+# having found nothing; this script was the one exception, on the bot path
+# only, where an empty diff printed EXEMPT with a blank file list and exited
+# 0. A `pull_request` event always has at least one changed file in practice;
+# if this ever fires, something upstream (a bad BASE_SHA/HEAD_SHA pair, most
+# likely) is broken and deserves investigation, not a silent pass.
+#
+# THIS GUARD RUNS BEFORE ANYTHING ELSE TOUCHES `changed`, DELIBERATELY (PR
+# 837's third review round, re-verified directly). `"${changed[@]}"` element
+# expansion on a still-empty array is an "unbound variable" error under
+# `set -u` on bash below 4.4 (fixed upstream in 4.4, but this workflow does
+# not pin the runner's bash minor version); `${#changed[@]}` length expansion
+# is not, on any bash version, because the array itself is declared even when
+# it holds nothing. Checking the length FIRST and exiting before any
+# `"${changed[@]}"` expansion is reached means this script's own behaviour on
+# an empty diff no longer depends on which bash is running it: previously the
+# newline guard below expanded `"${changed[@]}"` first, so whether an empty
+# diff produced this script's own FAIL message or bash's "unbound variable"
+# depended on the runner's bash version, and a self-test mutation that
+# deleted this guard could pass locally (bash 3.2) for a reason that would
+# not hold in CI (bash 5.x).
+if [ "${#changed[@]}" -eq 0 ]; then
+  cat >&2 <<EOF
+FAIL: no files changed between the merge base and HEAD_SHA ($HEAD_SHA). A pull
+request with no diff has nothing for this check to enforce, and reporting a
+pass here would be exactly the vacuous pass this workflow refuses everywhere
+else. Investigate rather than trust it.
+EOF
+  exit 1
+fi
+
 # A path containing a literal embedded newline is rejected outright, rather
 # than trusted to any particular grep flavour's handling of one. Every match
 # below is done with `grep -qE` against a single value, which is safe for an
@@ -195,24 +228,6 @@ for f in "${changed[@]}"; do
   esac
 done
 
-# An empty diff must never read as "nothing to enforce, so EXEMPT" or
-# "nothing to enforce, so it matches". Every other lane in this workflow
-# fails closed when its inputs are missing rather than reporting success for
-# having found nothing; this script was the one exception, on the bot path
-# only, where an empty diff printed EXEMPT with a blank file list and exited
-# 0. A `pull_request` event always has at least one changed file in practice;
-# if this ever fires, something upstream (a bad BASE_SHA/HEAD_SHA pair, most
-# likely) is broken and deserves investigation, not a silent pass.
-if [ "${#changed[@]}" -eq 0 ]; then
-  cat >&2 <<EOF
-FAIL: no files changed between the merge base and HEAD_SHA ($HEAD_SHA). A pull
-request with no diff has nothing for this check to enforce, and reporting a
-pass here would be exactly the vacuous pass this workflow refuses everywhere
-else. Investigate rather than trust it.
-EOF
-  exit 1
-fi
-
 # Automated dependency and workflow bumps have no issue and never will. They are
 # exempt ONLY when the author is a known bot AND every file they touch is a
 # dependency manifest or a workflow. A bot PR that touches source code is NOT
@@ -229,85 +244,159 @@ fi
 # a security refusal, which reads as the bot having done something suspicious
 # rather than as a hole in this list. PR 832 (logos) hit it.
 #
-# CORRECTED CLAIM, TWICE OVER (PR 837's review caught both). This comment and
-# issue #836 originally said the widening below "admits nothing the previous
-# list did not", on the theory that a crate manifest can add a dependency but
-# so can the root manifest that was already allowed. That equivalence does
-# NOT hold in this repository: the root `Cargo.toml` is a VIRTUAL workspace
-# manifest (`[workspace]`, no `[package]`), so Cargo refuses `build =`,
-# `[[bin]] path =`, `[lib] path =` and `[[test]] path =` there entirely. A
-# crate manifest accepts all of them. So a crate manifest carries a
-# capability the root manifest never had: it can retarget what Cargo COMPILES
-# AND RUNS at an arbitrary path already in the tree.
+# ROUND TWO CORRECTIONS. This comment and issue #836 originally said the
+# widening below "admits nothing the previous list did not", on the theory that
+# a crate manifest can add a dependency but so can the root manifest that was
+# already allowed. That equivalence does NOT hold: the root `Cargo.toml` is a
+# VIRTUAL workspace manifest (`[workspace]`, no `[package]`), so Cargo refuses
+# `build =`, `[[bin]] path =`, `[lib] path =` and `[[test]] path =` there
+# entirely. A crate manifest accepts all of them: it can retarget what Cargo
+# COMPILES AND RUNS at an arbitrary path already in the tree. Reading every
+# changed path literally (fixed elsewhere in this script, see the NUL-delimited
+# loop above) is necessary but not sufficient, because a file AT an allowlisted
+# path can simply BE the payload: a per-crate `Cargo.lock`, never read by Cargo
+# for a workspace member, is completely unconstrained content sitting at a path
+# this list used to allow outright. Round two's fix dropped `crates/[^/]+/Cargo\.lock`
+# from BOT_ALLOWED for exactly that reason.
 #
-# The FIRST correction (PR 837 round two) said reading every path literally
-# was enough, because "an allowlisted crate manifest can only point Cargo at
-# a file that is ALSO part of this same reviewed diff, never at a payload
-# smuggled under a different name via a glob or a space". That is true and
-# it does not follow that the diff is safe: a file at an allowlisted path IS
-# the payload. `crates/[^/]+/Cargo\.lock` used to be on this allowlist. A
-# per-crate `Cargo.lock` is never read by Cargo for a workspace member (only
-# the WORKSPACE ROOT lockfile is), so its content is completely
-# unconstrained, and the repository tracks zero of them outside `fuzz/`
-# (verified against `git ls-files`; the fuzz ones are real and stay
-# allowlisted below, each its own workspace root's genuine lockfile). PR
-# 837's third review round proved, with real cargo, that
-# `crates/pol/Cargo.toml` declaring `build = "Cargo.lock"` alongside a
-# `crates/pol/Cargo.lock` containing `fn main(){ ... }` is EXEMPT under the
-# literal-path fix and then compiles and runs during `cargo build`. Removing
-# the crate-lockfile alternative below closes that specific container.
+# ROUND THREE CORRECTION. Dropping that one container was still not the fix,
+# because the container was never the actual capability, only the cheapest
+# example of it. Round three added `manifest_capability_offense`: refuse a bot
+# PR outright if any `Cargo.toml` it touches introduces or changes `package.build`,
+# `[lib] path`, `[[bin]] path`, `[[test]] path`, or `[[bench]] path`, comparing
+# MERGE_BASE against HEAD_SHA regardless of which path the payload itself lives
+# at. That closed the three vectors known at the time.
 #
-# But the container was never the actual capability, only the cheapest
-# example of it. The capability is: a crate manifest can point `build`,
-# `[[bin]] path`, `[lib] path`, `[[test]] path`, or `[[bench]] path` at ANY
-# path already present in the same diff, allowlisted or not (an attacker
-# controls both halves of a bot PR). A dependency bump never needs to do
-# that; it only ever edits a version string inside a `[dependencies]`,
-# `[dev-dependencies]`, or `[build-dependencies]` table. So the second, real
-# fix is `manifest_capability_offense` below: refuse a bot PR outright if any
-# `Cargo.toml` it touches introduces or changes one of those five keys,
-# comparing the manifest at MERGE_BASE against HEAD_SHA, regardless of which
-# allowlisted (or non-allowlisted, already-offending) path the payload itself
-# would live at. That is what actually makes the allowlist widening below
-# safe, not the literal-path reading by itself and not the lockfile removal
-# by itself; per the review, either alone leaves the class open. Note the
-# [^/]+ segments are still deliberate: crates/<name>/Cargo.toml matches,
-# crates/<name>/src/anything does not.
+# ROUND FOUR CORRECTION, AND THE LAST TIME THIS SHOULD NEED SAYING. Five keys is
+# still a DENYLIST over a manifest format that keeps gaining keys, and the round
+# three review proved it: `[[example]]` is a sixth Cargo target kind, absent from
+# that list, and a target setting the Cargo book documents, `test = true`, makes
+# `cargo test` build AND RUN an example. A two-file bot PR (a crate manifest
+# gaining `[[example]] path = "fuzz/Cargo.lock" test = true`, plus that fuzz
+# lockfile now holding Rust) was EXEMPT, and `cargo test --workspace` ran the
+# payload. Proven on a clone of the real repository, with real cargo. Two more
+# doors were found in the same shape: `[[example]]` inside a fuzz crate's OWN
+# manifest, and `[workspace] members` or `[patch.crates-io]` in the ROOT
+# manifest (never inspected by the five-key check at all, since none of those
+# five keys are even legal there).
+#
+# The denylist chases containers one at a time forever, because Cargo defines
+# the containers, not this script. A dependency bump never needs the manifest to
+# gain a NEW capability of any kind; it only ever moves a version string that was
+# already there. So `manifest_disallowed_diff` below inverts the check: instead
+# of naming what to refuse, it names EXACTLY what to allow, and refuses every
+# other structural difference between the manifest at MERGE_BASE and at HEAD_SHA
+# by default, whatever key it is under, printing the key path that differs so a
+# human can see what happened. This is a smaller, closed statement of what a bot
+# bump IS ("a version string moved inside a dependency table") rather than an
+# ever-growing statement of what it must not be.
+#
+# THE ALLOWLIST, STATED EXPLICITLY, because the next reader needs to know the
+# rule is "only version strings move", not a list of banned keys:
+#
+#   - Inside `[dependencies]`, `[dev-dependencies]`, `[build-dependencies]`,
+#     `[workspace.dependencies]`, or any `[target.'cfg(...)'.dependencies]` /
+#     `.dev-dependencies` / `.build-dependencies` table: an EXISTING entry's
+#     value may change, and ONLY in the following ways.
+#       * If the value is a bare string (`serde = "1.0"`), any new string is
+#         allowed. A bare string in a dependency table position IS the version
+#         requirement; the TOML/Cargo format gives it no other meaning, so
+#         there is nothing else for a change here to be.
+#       * If the value is a detailed table (`serde = { version = "1.0",
+#         features = [...] }`), only its `version` sub-key may change. Every
+#         OTHER sub-key (`path`, `features`, `optional`, `default-features`,
+#         `workspace`, `git`, `branch`, `rev`, `tag`, `package`, `registry`,
+#         anything else) must be byte-for-byte identical to the base version,
+#         or it is refused and named. A real bump never touches these; #832,
+#         #831, #833, #834 and #835 (this repo's own real Dependabot PRs) only
+#         ever moved a bare version string, never a table sub-key.
+#   - A dependency entry may NOT be newly introduced or removed. Dependabot
+#     bumps an EXISTING declared dependency; it does not add or delete one.
+#     Adding a dependency is exactly the kind of scope growth issue #836 never
+#     asked for and this check still refuses it, named.
+#   - EVERYTHING ELSE is refused unconditionally: `package.*` (including a
+#     version bump of the crate's own version, which is a release action, not
+#     a dependency bump), `[lib]`, every `[[bin]]` / `[[test]]` / `[[bench]]` /
+#     `[[example]]` entry whether introduced, removed, or merely edited,
+#     `[workspace]` (members, exclude, resolver, the workspace's own
+#     `[workspace.package]`), `[patch.*]`, `[profile.*]`, `[features]`, and any
+#     key this comment does not name, because the check does not enumerate
+#     what to refuse: it enumerates what to allow, above, and refuses the
+#     complement. A manifest with no base version at all (a brand new file) is
+#     compared against an empty document, so every key in it is "introduced"
+#     and the whole file is refused: a bot never legitimately authors a new
+#     manifest, so this is not a new restriction on any real bump.
+#
+# Validated both directions on the real repository at the commit this change
+# was proposed on: all 49 tracked Cargo/npm manifests and lockfiles stay exempt
+# for a real per-file bump, a single combined bump, and the real shapes of PRs
+# #829, #830, #832, #835 plus a constructed fuzz-crate dependency bump; and the
+# four known vectors plus `[[example]] test = true`, the fuzz-manifest
+# `[[example]]` variant, and root `[patch.crates-io]` are all refused. See
+# `scripts/pr-scope-check-selftest.sh` for the executable form of both claims.
+#
+# `crates/[^/]+/fuzz/Cargo\.lock` STAYS on BOT_ALLOWED below, after
+# consideration: it is a real, cargo-fuzz-required lockfile (11 of them are
+# tracked) and a real fuzz-dependency bump touches its content the same way a
+# root bump touches the root `Cargo.lock`. Round three's finding was never that
+# this file's content is safe to read as a lockfile; it is that nothing stops
+# some OTHER part of the same diff from pointing a Cargo target at it as
+# something else entirely (source, in vector 4). What makes that safe now is
+# not this file's presence on the allowlist, it is that `manifest_disallowed_diff`
+# refuses ANY manifest change that could create such a pointer, in ANY
+# Cargo.toml this PR touches, not just the five kinds round three checked for.
+# Verified against `git ls-files`: no manifest in this repository, at the
+# commit this change was proposed on, has any `build`, `[lib] path`,
+# `[[bin]]`/`[[test]]`/`[[bench]]`/`[[example]] path` already pointing at any
+# `Cargo.lock` anywhere in the tree, so there is also no PRE-EXISTING pointer a
+# lockfile-content-only bot diff could ride, the way #21's fixture rides an
+# already-declared `build =` for the single-level case.
+#
+# `.github/workflows/[^/]+\.ya?ml` and `packages/[^/]+/package(-lock)?\.json`
+# also stay on BOT_ALLOWED, and this check does NOT validate their content.
+# Said plainly, because a prior draft of this comment implied otherwise: a
+# `run:` step added to a workflow, or a lifecycle script (`postinstall` and
+# friends) added to `packages/dashboard/package.json`, is NOT caught by
+# anything in this file. That gap predates this change, `manifest_disallowed_diff`
+# only ever runs over `Cargo.toml`, and closing it is a different, larger check
+# (workflow diff semantics, npm lifecycle scripts) that does not belong folded
+# into a manifest-diff function. Tracked separately in issue #840 rather than
+# asserted as covered here.
 BOT_ALLOWED='^(Cargo\.toml|Cargo\.lock|crates/[^/]+/Cargo\.toml|crates/[^/]+/fuzz/Cargo\.toml|crates/[^/]+/fuzz/Cargo\.lock|\.github/workflows/[^/]+\.ya?ml|\.github/dependabot\.yml|packages/[^/]+/package(-lock)?\.json)$'
 
-# manifest_capability_offense <path> -- prints one line per capability key
-# (`package.build`, `lib.path`, `[[bin]] path`, `[[test]] path`,
-# `[[bench]] path`) that HEAD_SHA's version of <path> introduces or changes
-# relative to MERGE_BASE's version, or nothing if none did. Used only on the
-# bot path, and only to decide whether a bot PR that touches a `Cargo.toml`
-# may be exempted: a real dependency bump changes version strings, never
-# these keys, so this refuses nothing #836 needs and refuses exactly the
-# capability PR 837's third round demonstrated.
+# manifest_disallowed_diff <path> -- prints one line per way HEAD_SHA's version
+# of <path> differs from MERGE_BASE's version that is NOT a dependency-table
+# version string moving, or nothing if the only differences are that. Used only
+# on the bot path, to decide whether a bot PR that touches a `Cargo.toml` may be
+# exempted. See the long comment above BOT_ALLOWED for exactly what is allowed
+# and why; this function is the executable form of that rule, not a second,
+# separate one.
 #
-# Parsed with Python's stdlib `tomllib` (3.11+, already relied on elsewhere
-# in this repository's CI: see the fuzz `[[bin]]` path cross-check in
-# ci.yml) rather than a regex, specifically so a legitimate internal
-# dependency such as `irontraffic-time = { path = "../irontraffic-time" }`
-# is never confused with the `[lib]`/`[[bin]]`/`[[test]]`/`[[bench]]` `path`
-# this check actually cares about: tomllib knows which table a key belongs
-# to, a regex would have to guess.
+# Parsed with Python's stdlib `tomllib` (3.11+, already relied on elsewhere in
+# this repository's CI: see the fuzz `[[bin]]` path cross-check in ci.yml)
+# rather than a regex, specifically so table structure (which key belongs to
+# which parent) is known rather than guessed.
 #
-# FAIL CLOSED, both directions PR 837's third round named:
-#   - A manifest that exists at MERGE_BASE but cannot be read there (`git
-#     show` fails despite `git cat-file -e` confirming it exists) is reported
-#     as an offense, never silently treated as having no prior keys.
+# FAIL CLOSED, every direction:
+#   - A manifest that exists at MERGE_BASE but cannot be read there (`git show`
+#     fails despite `git cat-file -e` confirming it exists) is reported as an
+#     offense, never silently treated as having no prior content.
 #   - A HEAD_SHA version that does not parse as valid TOML at all is reported
-#     as an offense too, since a check that cannot verify safety must not
-#     report safety.
-#   - A manifest with NO base version at all (a brand new file; `git
-#     cat-file -e` says it does not exist at MERGE_BASE) is treated as an
-#     empty base, i.e. any of these five keys in it counts as introduced. A
-#     bot never legitimately authors a brand new manifest, so this is not a
-#     new restriction on any real dependency bump.
-#   - A manifest deleted at HEAD_SHA is not checked at all: nothing is left
-#     for Cargo to compile from that path, so there is no capability to
-#     introduce.
-manifest_capability_offense() {
+#     as an offense: a check that cannot verify safety must not report safety.
+#   - A BASE version that exists but does not parse as valid TOML is reported
+#     as an offense too, for the same reason: there is nothing to diff against.
+#   - A manifest with NO base version at all (a brand new file; `git cat-file
+#     -e` says it does not exist at MERGE_BASE) is diffed against an empty
+#     document, so every key in it counts as introduced. A bot never
+#     legitimately authors a brand new manifest, so this is not a new
+#     restriction on any real dependency bump.
+#   - A manifest deleted at HEAD_SHA is not checked at all: nothing is left for
+#     Cargo to compile from that path, so there is no capability to introduce.
+#   - A dependency table, or a dependency entry's value, that is present but is
+#     not the TOML shape expected (a table where a dependency value should be a
+#     string or a detailed table, say) is refused rather than guessed at: an
+#     unrecognized shape is treated the same as "cannot verify", not as safe.
+manifest_disallowed_diff() {
   local f="$1" base_file="$MANIFEST_TMP/base.toml" head_file="$MANIFEST_TMP/head.toml"
   : > "$base_file"
   if git cat-file -e "$MERGE_BASE:$f" 2>/dev/null; then
@@ -323,6 +412,14 @@ manifest_capability_offense() {
 import sys
 import tomllib
 
+# The exact and only shape a dependency-version bump takes. Everything this
+# script allows through the bot path lives entirely in this tuple and the
+# "workspace.dependencies" / "target.*.<name>" special cases just below; every
+# other key in the document is refused by the generic recursive diff at the
+# bottom, by default, with no separate enumeration to keep in sync.
+DEP_TABLE_NAMES = ("dependencies", "dev-dependencies", "build-dependencies")
+_MISSING = object()
+
 
 def load(path):
     with open(path, "rb") as fh:
@@ -335,42 +432,135 @@ def load(path):
         return None
 
 
-def capability_keys(doc):
-    # None means "did not parse", which the caller must treat as
-    # unverifiable, and therefore an offense, rather than as safe.
-    if doc is None:
-        return None
-    out = {}
-    build = doc.get("package", {}).get("build")
-    if build is not None:
-        out["package.build"] = repr(build)
-    lib_path = doc.get("lib", {}).get("path")
-    if lib_path is not None:
-        out["lib.path"] = repr(lib_path)
-    for kind in ("bin", "test", "bench"):
-        entries = doc.get(kind, [])
-        if isinstance(entries, list):
-            for i, entry in enumerate(entries):
-                if isinstance(entry, dict) and entry.get("path") is not None:
-                    out["[[%s]][%d].path" % (kind, i)] = repr(entry["path"])
-    return out
+def fmt(path):
+    out = ""
+    for part in path:
+        if isinstance(part, int):
+            out += "[%d]" % part
+        elif out:
+            out += ".%s" % part
+        else:
+            out = str(part)
+    return out or "(the whole manifest)"
 
 
-base_keys = capability_keys(load(sys.argv[1]))
-head_keys = capability_keys(load(sys.argv[2]))
+def short(value, limit=120):
+    r = repr(value)
+    if len(r) > limit:
+        r = r[: limit - 3] + "..."
+    return r
 
-if head_keys is None:
-    print("the proposed version does not parse as TOML; cannot verify it introduces no build/path key")
+
+def is_dep_table_path(path):
+    # The three package-level tables, the one workspace-level table, and each
+    # of the three again inside every [target.'cfg(...)'] section. Nothing
+    # else is ever treated as "a table whose entries may move version only".
+    if path in (
+        ("dependencies",),
+        ("dev-dependencies",),
+        ("build-dependencies",),
+        ("workspace", "dependencies"),
+    ):
+        return True
+    return len(path) == 3 and path[0] == "target" and path[2] in DEP_TABLE_NAMES
+
+
+def dep_entry_offenses(path, base_entry, head_entry):
+    # A bare string dependency value IS the version requirement; the format
+    # gives it no other meaning, so any string-to-string change here is
+    # exactly what a bump does, whatever the new string says.
+    if isinstance(base_entry, str) and isinstance(head_entry, str):
+        return []
+    if not (isinstance(base_entry, dict) and isinstance(head_entry, dict)):
+        return [
+            "changes %s from %s to %s: not a version-string move"
+            % (fmt(path), short(base_entry), short(head_entry))
+        ]
+    offenses = []
+    for key in sorted(set(base_entry) | set(head_entry)):
+        if key == "version":
+            continue
+        b = base_entry.get(key, _MISSING)
+        h = head_entry.get(key, _MISSING)
+        if b == h:
+            continue
+        sub = path + (key,)
+        if b is _MISSING:
+            offenses.append("introduces %s = %s" % (fmt(sub), short(h)))
+        elif h is _MISSING:
+            offenses.append("removes %s (was %s)" % (fmt(sub), short(b)))
+        else:
+            offenses.append("changes %s from %s to %s" % (fmt(sub), short(b), short(h)))
+    return offenses
+
+
+def diff(base, head, path=()):
+    if is_dep_table_path(path):
+        if isinstance(base, dict) and isinstance(head, dict):
+            offenses = []
+            for name in sorted(set(base) | set(head)):
+                b = base.get(name, _MISSING)
+                h = head.get(name, _MISSING)
+                if b == h:
+                    continue
+                entry_path = path + (name,)
+                if b is _MISSING:
+                    offenses.append("introduces %s" % fmt(entry_path))
+                elif h is _MISSING:
+                    offenses.append("removes %s (was %s)" % (fmt(entry_path), short(b)))
+                else:
+                    offenses.extend(dep_entry_offenses(entry_path, b, h))
+            return offenses
+        if base == head:
+            return []
+        return ["changes %s: no longer a table (%s to %s)" % (fmt(path), short(base), short(head))]
+
+    if base == head:
+        return []
+
+    if isinstance(base, dict) and isinstance(head, dict):
+        offenses = []
+        for key in sorted(set(base) | set(head)):
+            b = base.get(key, _MISSING)
+            h = head.get(key, _MISSING)
+            if b == h:
+                continue
+            sub = path + (key,)
+            if b is _MISSING:
+                offenses.append("introduces %s = %s" % (fmt(sub), short(h)))
+            elif h is _MISSING:
+                offenses.append("removes %s (was %s)" % (fmt(sub), short(b)))
+            else:
+                offenses.extend(diff(b, h, sub))
+        return offenses
+
+    if isinstance(base, list) and isinstance(head, list):
+        offenses = []
+        for i in range(max(len(base), len(head))):
+            sub = path + (i,)
+            if i >= len(base):
+                offenses.append("introduces %s = %s" % (fmt(sub), short(head[i])))
+            elif i >= len(head):
+                offenses.append("removes %s (was %s)" % (fmt(sub), short(base[i])))
+            elif base[i] != head[i]:
+                offenses.extend(diff(base[i], head[i], sub))
+        return offenses
+
+    return ["changes %s from %s to %s" % (fmt(path), short(base), short(head))]
+
+
+base_doc = load(sys.argv[1])
+head_doc = load(sys.argv[2])
+
+if head_doc is None:
+    print("the proposed version does not parse as TOML; cannot verify it changes only a dependency version")
     sys.exit(0)
-if base_keys is None:
+if base_doc is None:
     print("the base version exists but does not parse as TOML; cannot verify what it already declared")
     sys.exit(0)
 
-for key, value in head_keys.items():
-    if key not in base_keys:
-        print("introduces %s = %s" % (key, value))
-    elif base_keys[key] != value:
-        print("changes %s from %s to %s" % (key, base_keys[key], value))
+for offense in diff(base_doc, head_doc):
+    print(offense)
 PYEOF
 }
 
@@ -381,7 +571,7 @@ case "$author" in
       printf '%s' "$f" | grep -qE "$BOT_ALLOWED" || offending="$offending$f
 "
     done
-    # The capability check runs over every Cargo.toml this PR touches, not
+    # The manifest diff check runs over every Cargo.toml this PR touches, not
     # only ones BOT_ALLOWED accepts: an offending path already fails below
     # regardless, and a manifest at an allowlisted path is exactly the case
     # this check exists for.
@@ -390,7 +580,7 @@ case "$author" in
         Cargo.toml|*/Cargo.toml) : ;;
         *) continue ;;
       esac
-      cap="$(manifest_capability_offense "$f")"
+      cap="$(manifest_disallowed_diff "$f")"
       if [ -n "$cap" ]; then
         offending="$offending$f: $(printf '%s' "$cap" | tr '\n' ' ')
 "
@@ -403,7 +593,7 @@ case "$author" in
       done
       exit 0
     fi
-    echo "FAIL: $author is a bot but this PR touches files outside the dependency allowlist, or a manifest that introduces or changes a build/path key a dependency bump never needs:" >&2
+    echo "FAIL: $author is a bot but this PR touches files outside the dependency allowlist, or a manifest that changes something other than a dependency-table version string:" >&2
     printf '%s' "$offending" | sed 's/^/    /' >&2
     exit 1
     ;;
