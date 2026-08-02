@@ -23,8 +23,40 @@ set -euo pipefail
 # `case` patterns are unaffected by this (they are not filename globbing), so
 # nothing below changes behaviour; it only removes a footgun for the next
 # edit.
+#
+# DO NOT DELETE THIS THINKING THE QUOTING BELOW MAKES IT REDUNDANT, OR
+# VICE VERSA. PR 837's own self-test mutation battery proved the two are
+# load-bearing ONLY JOINTLY for the bot-path glob vector: reverting the bot
+# loop below to `for f in ${changed[*]}` (unquoted) is caught by the
+# self-test's WHITESPACE case regardless of `set -f`, because word-splitting
+# alone already breaks it, but it is caught by the GLOB case ONLY when
+# `set -f` is present, because `set -f` is the only thing stopping
+# `Cargo.tom[l]` from pathname-expanding once the quoting that would
+# otherwise have prevented it is gone. Delete either one and the glob half
+# of that regression silently stops being tested.
+#
+# HONEST NOTE ON THIS MUTATION (PR 837's third review round, re-verified
+# directly): with every loop below already a properly quoted array
+# expansion, deleting THIS line by itself, with nothing else changed, is
+# currently an EQUIVALENT mutation. No input distinguishes the two states of
+# the script, because `set -f` only ever mattered to an UNQUOTED expansion,
+# and there is not one left. Re-landed and run through the self-test to
+# confirm: exit 0, zero failures, both before and after deleting this line
+# alone. That is not a reason to remove it: it is why deleting it is
+# invisible today and would only become dangerous the day some future edit
+# reintroduces an unquoted expansion elsewhere, at which point this line is
+# the only thing standing between that regression and the glob vector above.
+# A test cannot be written to force this line red in isolation without
+# ALSO reintroducing the very unquoted expansion this line exists to guard
+# against, which would defeat the point of testing it separately.
 set -f
 cd "$(git rev-parse --show-toplevel)"
+
+# Working directory for the manifest capability check below (bot path only).
+# One trap for the whole script: every exit, including an early `exit 1`
+# from any check above or below this line, must still clean this up.
+MANIFEST_TMP="$(mktemp -d)"
+trap 'rm -rf "$MANIFEST_TMP"' EXIT
 
 : "${PR_NUMBER:?PR_NUMBER is required}"
 : "${BASE_SHA:?BASE_SHA is required}"
@@ -115,10 +147,27 @@ fi
 # path contains. That is the only correct way to consume this output, and it
 # is why this is fixed in the loop, not in the allowlist regex: the regex was
 # never wrong, it was simply never shown the path that changed.
+#
+# --no-renames (PR 837's third review round). Rename detection is on by
+# default from git 2.9 onward, down to 50 percent similarity, and
+# `--name-only` on a detected rename prints ONLY the post-image path. So
+# `git mv crates/pol/src/lib.rs crates/pol/Cargo.lock` showed this script
+# exactly one line, `crates/pol/Cargo.lock`, an allowlisted path, and the
+# fact that a SOURCE FILE WAS DELETED never appeared in the diff this check
+# (or a human reviewing its EXEMPT listing) ever sees. Combined with the
+# manifest capability check below, that made a rename-and-replace of a real
+# crate's `src/lib.rs` into a `build`-carrying payload indistinguishable from
+# an ordinary two-file bot bump: git reported it as one rename plus one
+# modify, both allowlisted, verdict EXEMPT. `--no-renames` makes git report
+# a rename as a plain delete plus a plain add instead, two separate paths,
+# so the deleted source file is never invisible. There is no legitimate
+# reason for a bot-authored dependency bump to rename anything, and a
+# non-bot PR is compared against the issue's Files table regardless, so
+# nothing here needs rename detection to pass.
 changed=()
 while IFS= read -r -d '' f; do
   changed+=("$f")
-done < <(git diff --name-only -z "$MERGE_BASE" "$HEAD_SHA")
+done < <(git diff --no-renames --name-only -z "$MERGE_BASE" "$HEAD_SHA")
 
 # A path containing a literal embedded newline is rejected outright, rather
 # than trusted to any particular grep flavour's handling of one. Every match
@@ -180,31 +229,172 @@ fi
 # a security refusal, which reads as the bot having done something suspicious
 # rather than as a hole in this list. PR 832 (logos) hit it.
 #
-# CORRECTED CLAIM (PR 837's review caught this one). This comment and issue
-# #836 both used to say the widening below "admits nothing the previous list
-# did not", on the theory that a crate manifest can add a dependency but so
-# can the root manifest that was already allowed. That equivalence does NOT
-# hold in this repository: the root `Cargo.toml` is a VIRTUAL workspace
+# CORRECTED CLAIM, TWICE OVER (PR 837's review caught both). This comment and
+# issue #836 originally said the widening below "admits nothing the previous
+# list did not", on the theory that a crate manifest can add a dependency but
+# so can the root manifest that was already allowed. That equivalence does
+# NOT hold in this repository: the root `Cargo.toml` is a VIRTUAL workspace
 # manifest (`[workspace]`, no `[package]`), so Cargo refuses `build =`,
 # `[[bin]] path =`, `[lib] path =` and `[[test]] path =` there entirely. A
 # crate manifest accepts all of them. So a crate manifest carries a
 # capability the root manifest never had: it can retarget what Cargo COMPILES
-# AND RUNS at an arbitrary path already in the tree. That is a real widening
-# of the threat model, not a null one, and the reason it is safe to ship is
-# the fix above, not this paragraph: once every path in the diff is compared
-# literally, an allowlisted crate manifest can only point Cargo at a file
-# that is ALSO part of this same reviewed diff, never at a payload smuggled
-# under a different name via a glob or a space. Widening this allowlist and
-# reading paths literally are one change, not two. Note the [^/]+ segments
-# are still deliberate: crates/<name>/Cargo.toml matches,
+# AND RUNS at an arbitrary path already in the tree.
+#
+# The FIRST correction (PR 837 round two) said reading every path literally
+# was enough, because "an allowlisted crate manifest can only point Cargo at
+# a file that is ALSO part of this same reviewed diff, never at a payload
+# smuggled under a different name via a glob or a space". That is true and
+# it does not follow that the diff is safe: a file at an allowlisted path IS
+# the payload. `crates/[^/]+/Cargo\.lock` used to be on this allowlist. A
+# per-crate `Cargo.lock` is never read by Cargo for a workspace member (only
+# the WORKSPACE ROOT lockfile is), so its content is completely
+# unconstrained, and the repository tracks zero of them outside `fuzz/`
+# (verified against `git ls-files`; the fuzz ones are real and stay
+# allowlisted below, each its own workspace root's genuine lockfile). PR
+# 837's third review round proved, with real cargo, that
+# `crates/pol/Cargo.toml` declaring `build = "Cargo.lock"` alongside a
+# `crates/pol/Cargo.lock` containing `fn main(){ ... }` is EXEMPT under the
+# literal-path fix and then compiles and runs during `cargo build`. Removing
+# the crate-lockfile alternative below closes that specific container.
+#
+# But the container was never the actual capability, only the cheapest
+# example of it. The capability is: a crate manifest can point `build`,
+# `[[bin]] path`, `[lib] path`, `[[test]] path`, or `[[bench]] path` at ANY
+# path already present in the same diff, allowlisted or not (an attacker
+# controls both halves of a bot PR). A dependency bump never needs to do
+# that; it only ever edits a version string inside a `[dependencies]`,
+# `[dev-dependencies]`, or `[build-dependencies]` table. So the second, real
+# fix is `manifest_capability_offense` below: refuse a bot PR outright if any
+# `Cargo.toml` it touches introduces or changes one of those five keys,
+# comparing the manifest at MERGE_BASE against HEAD_SHA, regardless of which
+# allowlisted (or non-allowlisted, already-offending) path the payload itself
+# would live at. That is what actually makes the allowlist widening below
+# safe, not the literal-path reading by itself and not the lockfile removal
+# by itself; per the review, either alone leaves the class open. Note the
+# [^/]+ segments are still deliberate: crates/<name>/Cargo.toml matches,
 # crates/<name>/src/anything does not.
-BOT_ALLOWED='^(Cargo\.toml|Cargo\.lock|crates/[^/]+/Cargo\.toml|crates/[^/]+/Cargo\.lock|crates/[^/]+/fuzz/Cargo\.toml|crates/[^/]+/fuzz/Cargo\.lock|\.github/workflows/[^/]+\.ya?ml|\.github/dependabot\.yml|packages/[^/]+/package(-lock)?\.json)$'
+BOT_ALLOWED='^(Cargo\.toml|Cargo\.lock|crates/[^/]+/Cargo\.toml|crates/[^/]+/fuzz/Cargo\.toml|crates/[^/]+/fuzz/Cargo\.lock|\.github/workflows/[^/]+\.ya?ml|\.github/dependabot\.yml|packages/[^/]+/package(-lock)?\.json)$'
+
+# manifest_capability_offense <path> -- prints one line per capability key
+# (`package.build`, `lib.path`, `[[bin]] path`, `[[test]] path`,
+# `[[bench]] path`) that HEAD_SHA's version of <path> introduces or changes
+# relative to MERGE_BASE's version, or nothing if none did. Used only on the
+# bot path, and only to decide whether a bot PR that touches a `Cargo.toml`
+# may be exempted: a real dependency bump changes version strings, never
+# these keys, so this refuses nothing #836 needs and refuses exactly the
+# capability PR 837's third round demonstrated.
+#
+# Parsed with Python's stdlib `tomllib` (3.11+, already relied on elsewhere
+# in this repository's CI: see the fuzz `[[bin]]` path cross-check in
+# ci.yml) rather than a regex, specifically so a legitimate internal
+# dependency such as `irontraffic-time = { path = "../irontraffic-time" }`
+# is never confused with the `[lib]`/`[[bin]]`/`[[test]]`/`[[bench]]` `path`
+# this check actually cares about: tomllib knows which table a key belongs
+# to, a regex would have to guess.
+#
+# FAIL CLOSED, both directions PR 837's third round named:
+#   - A manifest that exists at MERGE_BASE but cannot be read there (`git
+#     show` fails despite `git cat-file -e` confirming it exists) is reported
+#     as an offense, never silently treated as having no prior keys.
+#   - A HEAD_SHA version that does not parse as valid TOML at all is reported
+#     as an offense too, since a check that cannot verify safety must not
+#     report safety.
+#   - A manifest with NO base version at all (a brand new file; `git
+#     cat-file -e` says it does not exist at MERGE_BASE) is treated as an
+#     empty base, i.e. any of these five keys in it counts as introduced. A
+#     bot never legitimately authors a brand new manifest, so this is not a
+#     new restriction on any real dependency bump.
+#   - A manifest deleted at HEAD_SHA is not checked at all: nothing is left
+#     for Cargo to compile from that path, so there is no capability to
+#     introduce.
+manifest_capability_offense() {
+  local f="$1" base_file="$MANIFEST_TMP/base.toml" head_file="$MANIFEST_TMP/head.toml"
+  : > "$base_file"
+  if git cat-file -e "$MERGE_BASE:$f" 2>/dev/null; then
+    if ! git show "$MERGE_BASE:$f" > "$base_file" 2>/dev/null; then
+      echo "could not read the base ($MERGE_BASE) version of $f to compare it against; failing closed"
+      return 0
+    fi
+  fi
+  if ! git show "$HEAD_SHA:$f" > "$head_file" 2>/dev/null; then
+    return 0
+  fi
+  python3 - "$base_file" "$head_file" <<'PYEOF'
+import sys
+import tomllib
+
+
+def load(path):
+    with open(path, "rb") as fh:
+        data = fh.read()
+    if not data.strip():
+        return {}
+    try:
+        return tomllib.loads(data.decode("utf-8"))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError):
+        return None
+
+
+def capability_keys(doc):
+    # None means "did not parse", which the caller must treat as
+    # unverifiable, and therefore an offense, rather than as safe.
+    if doc is None:
+        return None
+    out = {}
+    build = doc.get("package", {}).get("build")
+    if build is not None:
+        out["package.build"] = repr(build)
+    lib_path = doc.get("lib", {}).get("path")
+    if lib_path is not None:
+        out["lib.path"] = repr(lib_path)
+    for kind in ("bin", "test", "bench"):
+        entries = doc.get(kind, [])
+        if isinstance(entries, list):
+            for i, entry in enumerate(entries):
+                if isinstance(entry, dict) and entry.get("path") is not None:
+                    out["[[%s]][%d].path" % (kind, i)] = repr(entry["path"])
+    return out
+
+
+base_keys = capability_keys(load(sys.argv[1]))
+head_keys = capability_keys(load(sys.argv[2]))
+
+if head_keys is None:
+    print("the proposed version does not parse as TOML; cannot verify it introduces no build/path key")
+    sys.exit(0)
+if base_keys is None:
+    print("the base version exists but does not parse as TOML; cannot verify what it already declared")
+    sys.exit(0)
+
+for key, value in head_keys.items():
+    if key not in base_keys:
+        print("introduces %s = %s" % (key, value))
+    elif base_keys[key] != value:
+        print("changes %s from %s to %s" % (key, base_keys[key], value))
+PYEOF
+}
+
 case "$author" in
   dependabot\[bot\]|renovate\[bot\]|github-actions\[bot\])
     offending=""
     for f in "${changed[@]}"; do
       printf '%s' "$f" | grep -qE "$BOT_ALLOWED" || offending="$offending$f
 "
+    done
+    # The capability check runs over every Cargo.toml this PR touches, not
+    # only ones BOT_ALLOWED accepts: an offending path already fails below
+    # regardless, and a manifest at an allowlisted path is exactly the case
+    # this check exists for.
+    for f in "${changed[@]}"; do
+      case "$f" in
+        Cargo.toml|*/Cargo.toml) : ;;
+        *) continue ;;
+      esac
+      cap="$(manifest_capability_offense "$f")"
+      if [ -n "$cap" ]; then
+        offending="$offending$f: $(printf '%s' "$cap" | tr '\n' ' ')
+"
+      fi
     done
     if [ -z "$offending" ]; then
       echo "pr-scope-check: EXEMPT. Automated dependency bump by $author touching only manifests and workflows:"
@@ -213,7 +403,7 @@ case "$author" in
       done
       exit 0
     fi
-    echo "FAIL: $author is a bot but this PR touches files outside the dependency allowlist:" >&2
+    echo "FAIL: $author is a bot but this PR touches files outside the dependency allowlist, or a manifest that introduces or changes a build/path key a dependency bump never needs:" >&2
     printf '%s' "$offending" | sed 's/^/    /' >&2
     exit 1
     ;;
@@ -412,6 +602,24 @@ fi
 
 # A declared file that was never touched is a signal, not a failure: the issue
 # may have over-declared, or the implementer may have missed a required edit.
+#
+# EQUIVALENT MUTATION, DOCUMENTED RATHER THAN FAKED (PR 837's third review
+# round, re-verified directly). Rewriting this as
+# `printf '%s\n' "${changed[@]}" | grep -qxF "$d" || untouched="$untouched$d\n"`
+# is behaviorally IDENTICAL to the explicit loop below, given the invariants
+# this script already establishes by this point: `changed` is guaranteed
+# non-empty (the empty-diff guard above exits before this line is reached),
+# both forms quote `"${changed[@]}"` correctly, and `-F -x` performs the same
+# whole-element, literal comparison the loop performs by hand. No declared
+# path can contain an embedded newline either (every `declared` entry comes
+# from a single line of the issue body via splitlines(), so the "embedded
+# newline turns one grep pattern into several alternatives" concern that
+# motivated hand-rolling the newline guard for `changed` earlier in this
+# script does not apply here). Re-landed this exact substitution and ran the
+# self-test: exit 0, zero failures, both forms agree on every case in this
+# file. It is written as an explicit loop for uniformity with the other
+# loops below doing the identical shape of comparison, not because the
+# pipeline form is unsafe.
 untouched=""
 for d in "${declared[@]}"; do
   case "$d" in */) continue;; esac

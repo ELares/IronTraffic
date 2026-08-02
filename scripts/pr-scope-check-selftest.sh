@@ -22,10 +22,40 @@
 # test-census-selftest.sh already apply to their own scripts.
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
-SCOPE="$PWD/scripts/pr-scope-check.sh"
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 FAKEBIN="$WORK/fakebin"
+
+# Exercise the PROPOSED script, not whatever happens to be sitting on disk at
+# scripts/pr-scope-check.sh (PR 837's third review round). The `invariants`
+# job's earlier "Restore every gate script from the BASE branch" step
+# overwrites the ON-DISK copy of scripts/pr-scope-check.sh with BASE's
+# version, THE JUDGE MAY NOT BE EDITED BY THE DEFENDANT, exactly the same
+# protection pr-scope-check.sh itself gets in the separate `scope` job. But
+# this selftest is new on this PR (it does not exist on base yet), so it is
+# NOT restored: it runs from HEAD while the file it tests has just been
+# reverted to BASE underneath it. Reading the on-disk file would therefore
+# make head's test judge base's (pre-hardening) script, never the change
+# this PR is actually proposing: reproduced verbatim by the reviewer, exit 1
+# with 4 failing cases, on this very PR.
+#
+# `git show HEAD:scripts/pr-scope-check.sh` reads the committed blob at the
+# current commit instead, which the restore step's `git checkout FETCH_HEAD
+# -- scripts/pr-scope-check.sh` does not move (that command only touches the
+# working tree and the index for that one path, never HEAD itself), so it
+# always resolves to the PROPOSED script regardless of what the restore step
+# left on disk.
+#
+# On a LATER PR, once this selftest itself exists on the base branch, THIS
+# file is what the restore step puts back (unmodified, trusted), and it is
+# what runs; it still resolves SCOPE via `git show HEAD:...`, so a trusted
+# test judges the proposed judge, which is the property this exists for. A
+# PR that tries to weaken both the script and this selftest in the same
+# commit gains nothing: the invariants job runs base's copy of this file,
+# not head's.
+SCOPE="$WORK/pr-scope-check-under-test.sh"
+git show HEAD:scripts/pr-scope-check.sh > "$SCOPE"
+chmod +x "$SCOPE"
 
 FAILED=0
 note() { printf '  %s\n' "$1"; }
@@ -424,6 +454,342 @@ else
   echo "FAIL: an undeclared file did not trip the scope check, or was not named. Got:"
   echo "$OUT12" | sed 's/^/    /'
   FAILED=1
+fi
+
+# ---------------------------------------------------------------------------
+# 13. Exploit vector 3 (PR 837's third review round): crates/<n>/Cargo.toml
+#     declaring `build = "Cargo.lock"` alongside crates/<n>/Cargo.lock
+#     carrying the payload, both shapes that used to be on BOT_ALLOWED and
+#     both compared literally by the fix above, no glob, no whitespace, no
+#     newline, no rename. A per-crate Cargo.lock is never read by Cargo for a
+#     workspace member, so its content was completely unconstrained. Must be
+#     refused, and the manifest introducing `build` must be named.
+# ---------------------------------------------------------------------------
+D13="$WORK/vector3-crate-lockfile-payload"
+new_repo "$D13"
+mkdir -p "$D13/crates/pol/src"
+printf '[workspace]\nmembers=["crates/pol"]\n' > "$D13/Cargo.toml"
+printf 'pub fn x(){}\n' > "$D13/crates/pol/src/lib.rs"
+printf '[package]\nname="pol"\nversion="0.1.0"\nedition="2021"\n' > "$D13/crates/pol/Cargo.toml"
+printf '# placeholder\n' > "$D13/crates/pol/Cargo.lock"
+commit_all "$D13" base
+git -C "$D13" checkout -qb pr
+printf '[package]\nname="pol"\nversion="0.1.0"\nedition="2021"\nbuild="Cargo.lock"\n' > "$D13/crates/pol/Cargo.toml"
+printf 'fn main(){ /* arbitrary code on the CI runner */ }\n' > "$D13/crates/pol/Cargo.lock"
+commit_all "$D13" "chore(deps): bump serde from 1.0.1 to 1.0.2"
+fake_gh 'dependabot[bot]' ''
+echo "== exploit vector 3: crates/<n>/Cargo.toml declaring build=Cargo.lock, both allowlisted-shaped, must be refused =="
+OUT13="$(run_scope "$D13")"
+if echo "$OUT13" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: the crate manifest + crate lockfile payload was reported EXEMPT. Got:"
+  echo "$OUT13" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT13" | grep -qF 'crates/pol/Cargo.toml'; then
+  echo "FAIL: the payload was refused, but the offending manifest was not named. Got:"
+  echo "$OUT13" | sed 's/^/    /'
+  FAILED=1
+else
+  note "refused, and the offending manifest is named"
+fi
+
+# ---------------------------------------------------------------------------
+# 14. The [[bin]] path variant of vector 3 must be refused too: a manifest
+#     never needs to name a [[bin]] whose path is the lockfile sitting next
+#     to it either.
+# ---------------------------------------------------------------------------
+D14="$WORK/vector3-bin-path-payload"
+new_repo "$D14"
+mkdir -p "$D14/crates/pol/src"
+printf '[workspace]\nmembers=["crates/pol"]\n' > "$D14/Cargo.toml"
+printf 'pub fn x(){}\n' > "$D14/crates/pol/src/lib.rs"
+printf '[package]\nname="pol"\nversion="0.1.0"\nedition="2021"\n' > "$D14/crates/pol/Cargo.toml"
+printf '# placeholder\n' > "$D14/crates/pol/Cargo.lock"
+commit_all "$D14" base
+git -C "$D14" checkout -qb pr
+printf '[package]\nname="pol"\nversion="0.1.0"\nedition="2021"\n\n[[bin]]\nname="tool"\npath="Cargo.lock"\n' > "$D14/crates/pol/Cargo.toml"
+printf 'fn main(){ /* arbitrary code */ }\n' > "$D14/crates/pol/Cargo.lock"
+commit_all "$D14" "chore(deps): bump"
+fake_gh 'dependabot[bot]' ''
+echo "== exploit vector 3 variant: [[bin]] path=Cargo.lock must be refused too =="
+OUT14="$(run_scope "$D14")"
+if echo "$OUT14" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: the [[bin]] path=Cargo.lock payload was reported EXEMPT. Got:"
+  echo "$OUT14" | sed 's/^/    /'
+  FAILED=1
+else
+  note "the [[bin]] path variant is refused too"
+fi
+
+# ---------------------------------------------------------------------------
+# 15. The capability check must fire regardless of WHERE the payload file
+#     lives, including at a path that STAYS allowlisted after this fix:
+#     crates/<n>/fuzz/Cargo.lock is real and tracked (cargo-fuzz needs it),
+#     so dropping crates/<n>/Cargo.lock from BOT_ALLOWED (fix a) does not
+#     touch it at all. `build = "Cargo.lock"` inside the fuzz crate's own
+#     manifest, resolved relative to that manifest, still points at that
+#     still-allowlisted sibling. Only refusing the introduced/changed KEY
+#     (fix b), not just the container file, closes this.
+# ---------------------------------------------------------------------------
+D15="$WORK/vector3b-fuzz-lockfile-stays-allowlisted"
+new_repo "$D15"
+mkdir -p "$D15/crates/pol/fuzz/fuzz_targets"
+printf '[package]\nname="pol-fuzz"\nversion="0.0.0"\npublish=false\nedition="2021"\n\n[workspace]\n\n[dependencies]\nlibfuzzer-sys="0.4"\n\n[[bin]]\nname="t"\npath="fuzz_targets/t.rs"\n' > "$D15/crates/pol/fuzz/Cargo.toml"
+printf 'placeholder\n' > "$D15/crates/pol/fuzz/Cargo.lock"
+printf '#![no_main]\n' > "$D15/crates/pol/fuzz/fuzz_targets/t.rs"
+commit_all "$D15" base
+git -C "$D15" checkout -qb pr
+printf '[package]\nname="pol-fuzz"\nversion="0.0.0"\npublish=false\nedition="2021"\nbuild="Cargo.lock"\n\n[workspace]\n\n[dependencies]\nlibfuzzer-sys="0.4"\n\n[[bin]]\nname="t"\npath="fuzz_targets/t.rs"\n' > "$D15/crates/pol/fuzz/Cargo.toml"
+printf 'fn main(){ /* arbitrary code */ }\n' > "$D15/crates/pol/fuzz/Cargo.lock"
+commit_all "$D15" "chore(deps): bump libfuzzer-sys"
+fake_gh 'dependabot[bot]' ''
+echo "== build= pointed at a lockfile path that STAYS allowlisted (crates/<n>/fuzz/Cargo.lock) must still be refused =="
+OUT15="$(run_scope "$D15")"
+if echo "$OUT15" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: build= into an allowlisted fuzz lockfile was reported EXEMPT. Got:"
+  echo "$OUT15" | sed 's/^/    /'
+  FAILED=1
+else
+  note "refused even though the payload lives at a path fix (a) alone would not touch"
+fi
+
+# ---------------------------------------------------------------------------
+# 16. No false positive: a real fuzz-crate dependency bump whose [[bin]] path
+#     is PRESENT but UNCHANGED between base and head must stay EXEMPT. The
+#     capability check compares values, not mere presence.
+# ---------------------------------------------------------------------------
+D16="$WORK/legit-fuzz-bump-unchanged-bin-path"
+new_repo "$D16"
+mkdir -p "$D16/crates/pol/fuzz/fuzz_targets"
+printf '[package]\nname="pol-fuzz"\nversion="0.0.0"\npublish=false\nedition="2021"\n\n[workspace]\n\n[dependencies]\nlibfuzzer-sys="0.4"\n\n[[bin]]\nname="t"\npath="fuzz_targets/t.rs"\n' > "$D16/crates/pol/fuzz/Cargo.toml"
+printf '#![no_main]\n' > "$D16/crates/pol/fuzz/fuzz_targets/t.rs"
+commit_all "$D16" base
+git -C "$D16" checkout -qb pr
+printf '[package]\nname="pol-fuzz"\nversion="0.0.0"\npublish=false\nedition="2021"\n\n[workspace]\n\n[dependencies]\nlibfuzzer-sys="0.5"\n\n[[bin]]\nname="t"\npath="fuzz_targets/t.rs"\n' > "$D16/crates/pol/fuzz/Cargo.toml"
+commit_all "$D16" "chore(deps): bump libfuzzer-sys"
+fake_gh 'dependabot[bot]' ''
+echo "== a legitimate fuzz-crate bump with an UNCHANGED [[bin]] path must stay EXEMPT (no false positive) =="
+OUT16="$(run_scope "$D16")"
+if echo "$OUT16" | grep -qF 'pr-scope-check: EXEMPT'; then
+  note "unchanged [[bin]] path across a real bump is not a false positive"
+else
+  echo "FAIL: a legitimate fuzz-crate bump with an unchanged [[bin]] path was refused. Got:"
+  echo "$OUT16" | sed 's/^/    /'
+  FAILED=1
+fi
+
+# ---------------------------------------------------------------------------
+# 17. The reviewer's own combined case (V3C): a rename that hides a source
+#     file being deleted, replaced with a payload, at an allowlisted path,
+#     alongside a manifest capability change. `--no-renames` must list all
+#     three real paths, and the PR must be refused regardless.
+# ---------------------------------------------------------------------------
+D17="$WORK/vector3c-rename-plus-capability"
+new_repo "$D17"
+mkdir -p "$D17/crates/pol/src"
+{ printf 'pub fn x(){}\n'; for i in $(seq 1 40); do printf '// filler line %s\n' "$i"; done; } > "$D17/crates/pol/src/lib.rs"
+printf '[package]\nname="pol"\nversion="0.1.0"\nedition="2021"\n' > "$D17/crates/pol/Cargo.toml"
+commit_all "$D17" base
+git -C "$D17" checkout -qb pr
+git -C "$D17" mv crates/pol/src/lib.rs crates/pol/Cargo.lock
+{ printf 'fn main(){ /* arbitrary code */ }\n'; for i in $(seq 1 40); do printf '// filler line %s\n' "$i"; done; } > "$D17/crates/pol/Cargo.lock"
+printf '[package]\nname="pol"\nversion="0.1.0"\nedition="2021"\nbuild="Cargo.lock"\n\n[lib]\npath="Cargo.lock"\n' > "$D17/crates/pol/Cargo.toml"
+commit_all "$D17" "chore(deps): bump"
+NAMEONLY="$(git -C "$D17" diff --name-status main HEAD | tr '\n' '|')"
+NORENAME="$(git -C "$D17" diff --no-renames --name-only main HEAD | tr '\n' '|')"
+note "with rename detection (name-status): $NAMEONLY"
+note "with --no-renames (name-only):       $NORENAME"
+if ! { echo "$NORENAME" | grep -qF 'crates/pol/src/lib.rs' \
+    && echo "$NORENAME" | grep -qF 'crates/pol/Cargo.lock' \
+    && echo "$NORENAME" | grep -qF 'crates/pol/Cargo.toml'; }; then
+  echo "FAIL: --no-renames did not list all three real paths on the reviewer's own V3C case. Got:"
+  echo "    $NORENAME"
+  FAILED=1
+else
+  note "--no-renames lists all three real paths"
+fi
+fake_gh 'dependabot[bot]' ''
+echo "== the V3C combined case (rename hides deletion + capability change) must be refused =="
+OUT17="$(run_scope "$D17")"
+if echo "$OUT17" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: the rename-plus-capability payload was reported EXEMPT. Got:"
+  echo "$OUT17" | sed 's/^/    /'
+  FAILED=1
+else
+  note "refused"
+fi
+
+# ---------------------------------------------------------------------------
+# 18. The rename hole on its OWN, non-bot path (SHOULD_FIX, independent of
+#     the capability check, which only runs on the bot path): a coder-agent
+#     PR renames an UNDECLARED file onto a path the issue DID declare,
+#     replacing its content. Without --no-renames, git shows only the
+#     declared destination and the deletion of the undeclared file is
+#     invisible to a human reading the EXEMPT/MATCHES listing. With
+#     --no-renames, the deleted source is its own entry, is not declared,
+#     and must be refused and named.
+# ---------------------------------------------------------------------------
+D18="$WORK/rename-hides-undeclared-deletion-nonbot"
+new_repo "$D18"
+mkdir -p "$D18/crates/pol/src"
+{ printf 'secret sauce\n'; for i in $(seq 1 40); do printf '// filler %s\n' "$i"; done; } > "$D18/crates/pol/src/undeclared_secret.rs"
+printf '[package]\nname="pol"\nversion="0.1.0"\n' > "$D18/crates/pol/Cargo.toml"
+commit_all "$D18" base
+git -C "$D18" checkout -qb pr
+git -C "$D18" mv -f crates/pol/src/undeclared_secret.rs crates/pol/Cargo.toml
+{ printf '[package]\nname="pol"\nversion="0.2.0"\n'; for i in $(seq 1 40); do printf '// filler %s\n' "$i"; done; } > "$D18/crates/pol/Cargo.toml"
+commit_all "$D18" implement
+fake_gh 'coder-agent' 'Closes #42' '## Files
+
+| Path | Action | Purpose |
+| --- | --- | --- |
+| `crates/pol/Cargo.toml` | modify | bump the version |
+'
+NORENAME18="$(git -C "$D18" diff --no-renames --name-only main HEAD | tr '\n' '|')"
+note "with --no-renames: $NORENAME18"
+echo "== a rename onto a DECLARED path must not hide the deletion of an undeclared source file =="
+OUT18="$(run_scope "$D18")"
+if echo "$OUT18" | grep -qF 'pr-scope-check: the diff matches issue'; then
+  echo "FAIL: a rename that hid an undeclared source-file deletion was reported as matching. Got:"
+  echo "$OUT18" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT18" | grep -qF 'undeclared_secret.rs'; then
+  echo "FAIL: the rename-hidden deletion was refused, but the deleted file was not named. Got:"
+  echo "$OUT18" | sed 's/^/    /'
+  FAILED=1
+else
+  note "the deleted-then-renamed-away file is refused and named"
+fi
+
+# ---------------------------------------------------------------------------
+# 19. The non-bot UNDECLARED loop must not be foolable by re-word-splitting
+#     an already-atomic changed path. Two files are declared, both at repo
+#     root so the exploit needs no directory trickery: a.rs and b.rs. The PR
+#     does NOT touch either of those; it touches exactly ONE different file,
+#     at repo root, whose real single-component name is "a.rs b.rs" (one
+#     path, a literal space in the middle, no additional slash on either
+#     side). A properly quoted `for f in "${changed[@]}"` compares this one
+#     weird path against each declared entry as a whole and never matches,
+#     so it is correctly refused and named. `for f in ${changed[*]}` (M11)
+#     lets the shell re-split that single element on the space it contains,
+#     producing exactly the two declared strings "a.rs" and "b.rs" as
+#     separate words, so both "match" and the real, unreviewed file is
+#     silently reported as matching the issue instead of being refused: a
+#     false PASS, not merely a differently worded failure.
+# ---------------------------------------------------------------------------
+D19="$WORK/undeclared-loop-unquoted-bypass"
+new_repo "$D19"
+printf 'a\n' > "$D19/a.rs"
+printf 'b\n' > "$D19/b.rs"
+commit_all "$D19" base
+git -C "$D19" checkout -qb pr
+printf 'evil\n' > "$D19/a.rs b.rs"
+commit_all "$D19" implement
+fake_gh 'coder-agent' 'Closes #42' '## Files
+
+| Path | Action | Purpose |
+| --- | --- | --- |
+| `a.rs` | modify | first declared file |
+| `b.rs` | modify | second declared file |
+'
+echo "== the undeclared loop must not be fooled by a changed path that word-splits into two declared paths =="
+OUT19="$(run_scope "$D19")"
+if echo "$OUT19" | grep -qF 'pr-scope-check: the diff matches issue'; then
+  echo "FAIL: a single undeclared file whose name splits into two declared paths was reported as matching. Got:"
+  echo "$OUT19" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT19" | grep -qF 'a.rs b.rs'; then
+  echo "FAIL: the weird path was refused, but not named by its real (space-containing) name. Got:"
+  echo "$OUT19" | sed 's/^/    /'
+  FAILED=1
+else
+  note "the weird path is refused and named by its real, single, space-containing name"
+fi
+
+# ---------------------------------------------------------------------------
+# 20. The CARGO_LOCK_EXEMPT loop must not be foolable the same way. The issue
+#     declares only crates/pol/Cargo.toml. The PR bumps the root Cargo.lock
+#     (which needs cargo_lock_exempt=1 to be forgiven) alongside ONE
+#     different file, a sibling of the real manifest, whose real
+#     single-component name is "Cargo.toml x" (a literal space, no further
+#     slash). As a WHOLE string "crates/pol/Cargo.toml x" is not equal to
+#     the declared "crates/pol/Cargo.toml", so a properly quoted `for f in
+#     "${changed[@]}"` never sets cargo_lock_exempt, and BOTH the root
+#     Cargo.lock and the weird path are correctly refused. `for f in
+#     ${changed[*]}` (M12) re-splits that single element into
+#     "crates/pol/Cargo.toml" and "x", the first of which IS the declared
+#     string and DOES match the `*/Cargo.toml` case pattern, so
+#     cargo_lock_exempt is wrongly set to 1 and the root Cargo.lock bump is
+#     silently forgiven: it disappears from the failure listing even though
+#     the PR is still refused overall (the independent, unrelated weird path
+#     is still caught by the untouched undeclared loop), so this
+#     specifically checks that "Cargo.lock" is named among the refused
+#     paths, not merely that the run exits non-zero.
+# ---------------------------------------------------------------------------
+D20="$WORK/cargo-lock-exempt-loop-unquoted-bypass"
+new_repo "$D20"
+mkdir -p "$D20/crates/pol"
+printf '[package]\nname="pol"\nversion="0.1.0"\n' > "$D20/crates/pol/Cargo.toml"
+printf 'placeholder\n' > "$D20/Cargo.lock"
+commit_all "$D20" base
+git -C "$D20" checkout -qb pr
+printf 'bumped\n' > "$D20/Cargo.lock"
+printf 'evil\n' > "$D20/crates/pol/Cargo.toml x"
+commit_all "$D20" implement
+fake_gh 'coder-agent' 'Closes #42' '## Files
+
+| Path | Action | Purpose |
+| --- | --- | --- |
+| `crates/pol/Cargo.toml` | modify | the declared manifest |
+'
+echo "== the cargo_lock_exempt loop must not be fooled into forgiving root Cargo.lock =="
+OUT20="$(run_scope "$D20")"
+if echo "$OUT20" | grep -qF 'pr-scope-check: the diff matches issue'; then
+  echo "FAIL: a bare root Cargo.lock bump alongside an unrelated undeclared file was reported as matching. Got:"
+  echo "$OUT20" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT20" | grep -qE '^ {4}Cargo\.lock$'; then
+  echo "FAIL: root Cargo.lock was not named among the refused (undeclared) paths, meaning cargo_lock_exempt was wrongly set. Got:"
+  echo "$OUT20" | sed 's/^/    /'
+  FAILED=1
+else
+  note "root Cargo.lock is correctly named as undeclared, not silently exempted"
+fi
+
+# ---------------------------------------------------------------------------
+# 21. Fix (a) (dropping crates/<n>/Cargo.lock from BOT_ALLOWED) and fix (b)
+#     (the manifest capability check) are independently load-bearing, not
+#     redundant: this case is refused ONLY by (a). A crate's Cargo.toml
+#     ALREADY has `build = "Cargo.lock"` (imagine it landed in some earlier,
+#     human-reviewed commit; it is not this PR's doing). This bot PR touches
+#     ONLY the sibling Cargo.lock's content; the manifest is not part of the
+#     diff at all. The capability check in manifest_capability_offense only
+#     runs on files THIS DIFF touches and only flags a key that is
+#     INTRODUCED or CHANGED, so it never even looks at this manifest, let
+#     alone flags it: the key is present and unchanged. If crates/<n>/Cargo.lock
+#     were still on BOT_ALLOWED, this would print EXEMPT while a real build
+#     script silently changed underneath an already-declared build=. Refusing
+#     it depends entirely on the lockfile no longer matching BOT_ALLOWED.
+# ---------------------------------------------------------------------------
+D21="$WORK/preexisting-build-key-lockfile-swap"
+new_repo "$D21"
+mkdir -p "$D21/crates/pol/src"
+printf '[workspace]\nmembers=["crates/pol"]\n' > "$D21/Cargo.toml"
+printf 'pub fn x(){}\n' > "$D21/crates/pol/src/lib.rs"
+printf '[package]\nname="pol"\nversion="0.1.0"\nedition="2021"\nbuild="Cargo.lock"\n' > "$D21/crates/pol/Cargo.toml"
+printf '# placeholder, not yet malicious\n' > "$D21/crates/pol/Cargo.lock"
+commit_all "$D21" base
+git -C "$D21" checkout -qb pr
+printf 'fn main(){ /* arbitrary code; build= was already there before this PR */ }\n' > "$D21/crates/pol/Cargo.lock"
+commit_all "$D21" "chore(deps): bump serde from 1.0.1 to 1.0.2"
+fake_gh 'dependabot[bot]' ''
+echo "== a lockfile swap under a PRE-EXISTING, unchanged build= key must still be refused (fix a, independent of fix b) =="
+OUT21="$(run_scope "$D21")"
+if echo "$OUT21" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: a Cargo.lock content swap under an unchanged, pre-existing build= key was reported EXEMPT. Got:"
+  echo "$OUT21" | sed 's/^/    /'
+  FAILED=1
+else
+  note "refused: crates/<n>/Cargo.lock is no longer allowlisted regardless of what the manifest already declared"
 fi
 
 echo
