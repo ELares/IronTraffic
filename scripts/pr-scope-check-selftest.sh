@@ -4316,23 +4316,35 @@ else
 fi
 
 echo
-# Vacuity guard verdict (round seven, hardened round eight). The actual
-# floor enforcement (CASES_FLOOR and the "did we even get this far" check)
-# now lives entirely in the `_finish` EXIT trap installed at the top of this
-# file, which is the fix for round seven's own finding that a check placed
-# only HERE, after every case, cannot see an early `exit 0` that never lets
-# execution reach this point at all. This block's only remaining job is to
-# report the count for a human reading the log, and to set `DONE=1`, the
-# single flag the trap requires before it will treat this run as anything
-# other than a vacuous or early exit. `DONE=1` is set on BOTH the clean path
-# and the ordinary case-failure path below, deliberately: reaching this
-# point at all, with $FAILED evaluated either way, means the suite actually
-# ran its own accounting rather than being cut short, so the trap should
-# relay this script's own explicit exit status rather than override it with
-# a "vacuous" message that would be true of the exit code and false of the
-# reason.
-note "$(wc -c < "$CASES_FILE" | tr -d ' ') case(s) actually ran (floor $CASES_FLOOR)"
+# Vacuity guard verdict (round seven, hardened round eight). The AUTHORITATIVE
+# floor enforcement (CASES_FLOOR and the "did we even get this far" check) now
+# lives in the `_finish` EXIT trap installed at the top of this file, which is
+# the fix for round seven's own finding that a check placed only HERE, after
+# every case, cannot see an early `exit 0` that never lets execution reach
+# this point at all: the trap fires on every exit, this code does not. `DONE`
+# is set to 1 the moment the count is known, before either verdict below, so
+# that a genuine case-failure or a genuine clean pass is relayed by the trap
+# as itself, not overridden by a "vacuous" message that would be true of the
+# exit code and false of the reason.
+#
+# The explicit floor check just below is a FAST PATH, not a second source of
+# truth: without it, a run that legitimately reaches this point with too few
+# cases (case 46b's own regression: everything above ran, one case was
+# quietly deleted) would print "clean" here and only THEN have the trap
+# override it with a failure a few lines later, a confusing "clean" followed
+# immediately by "FAILED" in the same log. Catching it here first prints one
+# unambiguous message; the trap still independently re-derives and checks the
+# identical count on every exit, including this one, so removing this fast
+# path would weaken nothing but a human's reading experience.
+CASES="$(wc -c < "$CASES_FILE" | tr -d ' ')"
 DONE=1
+if [ "$CASES" -lt "$CASES_FLOOR" ]; then
+  echo "pr-scope-check-selftest: FAILED. Only $CASES case(s) actually ran (expected at least" >&2
+  echo "$CASES_FLOOR). A self-test that silently drops one of its own cases must not report" >&2
+  echo "success for having found nothing." >&2
+  exit 1
+fi
+note "$CASES case(s) actually ran (floor $CASES_FLOOR)"
 if [ "$FAILED" -ne 0 ]; then
   echo "pr-scope-check-selftest: FAILED. The scope check no longer enforces what it claims."
   exit 1
