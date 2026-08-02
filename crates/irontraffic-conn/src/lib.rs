@@ -54,6 +54,7 @@ pub mod drain;
 pub mod inflight;
 pub mod listener;
 pub mod proxyproto;
+pub mod purity;
 pub mod registry;
 pub mod settings;
 
