@@ -30,10 +30,19 @@ pub(crate) fn extract_sha384(salt: &[u8], ikm: &[u8]) -> Zeroizing<[u8; 48]> {
     if let Some(head) = full.get(..48) {
         prk.copy_from_slice(head);
     }
-    // Zeroize the HMAC's own output buffer in place: `GenericArray` derefs to `[u8]`, so
-    // `fill` reaches every byte without needing `zeroize::Zeroize` implemented for it, which
-    // would require a dependency feature (`generic-array`) this crate is not authorized to
-    // add. `prk` itself is returned wrapped in `Zeroizing`, so both copies are covered.
+    // Zeroize the HMAC's own output buffer in place: `hybrid_array::Array` derefs to `[u8]`,
+    // so `fill` reaches every byte without needing `zeroize::Zeroize` implemented for it.
+    // `prk` itself is returned wrapped in `Zeroizing`, so both copies are covered.
+    //
+    // This comment used to say `GenericArray` and cite a `generic-array` dependency feature
+    // this crate was not authorized to add. The hmac 0.13 / sha2 0.11 bump moved
+    // `finalize().into_bytes()` to `crypto_common::Output<T>`, which is a
+    // `hybrid_array::Array`, and hybrid-array declares only `alloc` and `extra-sizes`, so
+    // the feature the old text pointed at does not exist to add. The MECHANISM is unchanged
+    // and still correct, which is exactly why nothing failed when the type moved: a reader
+    // chasing the reasoning would have gone looking for a crate the bump removed from the
+    // graph. This is the key schedule for the product's highest value secret and this is the
+    // only in-tree explanation of why the wipe is done by hand.
     full.fill(0);
     Zeroizing::new(prk)
 }
