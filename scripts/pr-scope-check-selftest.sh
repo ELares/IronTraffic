@@ -320,6 +320,16 @@ fi
 #    changed_now, offending stayed empty, and the script printed EXEMPT with
 #    a blank file list and exit 0: a vacuous pass, exactly the shape this
 #    workflow's own header legislates against for every other lane.
+#
+#    The assertion checks for the GUARD'S OWN MESSAGE, not merely the absence
+#    of "EXEMPT" (round four's own review battery, M06: deleting the guard
+#    entirely). A mutant that removes the guard falls through to
+#    `"${changed[@]}"` on a still-empty array a few lines below; on bash below
+#    4.4 under `set -u` that is a fatal "unbound variable" abort with no
+#    "EXEMPT" text anywhere in its output, so a check that only looks for the
+#    ABSENCE of "EXEMPT" cannot tell that apart from this guard firing
+#    correctly, and passes either way. Requiring the guard's own text closes
+#    that regardless of which of the two ways a deleted guard fails.
 # ---------------------------------------------------------------------------
 D8="$WORK/empty-diff"
 new_repo "$D8"
@@ -333,8 +343,12 @@ if echo "$OUT8" | grep -qF 'pr-scope-check: EXEMPT'; then
   echo "FAIL: an empty diff was reported EXEMPT. Got:"
   echo "$OUT8" | sed 's/^/    /'
   FAILED=1
+elif ! echo "$OUT8" | grep -qF 'FAIL: no files changed between the merge base'; then
+  echo "FAIL: an empty diff was not reported EXEMPT, but the guard's own message is missing, so this cannot distinguish the guard firing from some OTHER abort (for example an unbound-variable abort with no 'EXEMPT' text either). Got:"
+  echo "$OUT8" | sed 's/^/    /'
+  FAILED=1
 else
-  note "an empty diff is refused rather than vacuously EXEMPT"
+  note "an empty diff is refused rather than vacuously EXEMPT, by the guard's own message"
 fi
 
 # ---------------------------------------------------------------------------
@@ -1525,6 +1539,233 @@ elif ! echo "$OUT42" | grep -qF 'crates/pol/fuzz/Cargo.lock'; then
   FAILED=1
 else
   note "a nested lockfile with an undeclared sibling manifest is refused and named"
+fi
+
+# ===========================================================================
+# ROUND FIVE. Cases 43 to 46 close four of the five survivors of the
+# reviewer's own 37-mutation battery against the round-four allowlist engine
+# and the author gate (the fifth, M06, is case 8 above, tightened rather than
+# added to). Two of these, 43 and 44, are on the allowlist engine itself, the
+# function this whole round exists to add.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# 43. M19: a dependency entry changing SHAPE, a bare string becoming a
+#     detailed table, must be refused. `dep_entry_offenses` has an explicit
+#     branch for exactly this ("if not (isinstance base dict and isinstance
+#     head dict): return [an offense]"); disabling it (returning [] instead)
+#     is undetected by every other case in this file, because no other case
+#     makes a dependency value change TYPE, only its version or, in cases 29
+#     and 37, a sub-key of an already-detailed table. This is the single
+#     branch stopping `logos = "0.15"` becoming `logos = { git =
+#     "https://evil.example/logos" }`: a version bump never needs to change
+#     what KIND of value a dependency is, only what the string or the version
+#     sub-key says.
+# ---------------------------------------------------------------------------
+D43="$WORK/dependency-shape-change-string-to-table"
+new_repo "$D43"
+mkdir -p "$D43/crates/pol"
+printf '[package]\nname="pol"\nversion="0.1.0"\n\n[dependencies]\nlogos = "0.15"\n' > "$D43/crates/pol/Cargo.toml"
+commit_all "$D43" base
+git -C "$D43" checkout -qb pr
+printf '[package]\nname="pol"\nversion="0.1.0"\n\n[dependencies]\nlogos = { git = "https://evil.example/logos" }\n' > "$D43/crates/pol/Cargo.toml"
+commit_all "$D43" "chore(deps): bump logos"
+fake_gh 'dependabot[bot]' ''
+echo "== M19: a dependency value changing from a bare string to a detailed table (git source) must be refused =="
+OUT43="$(run_scope "$D43")"
+if echo "$OUT43" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: a dependency shape change (string to detailed table) was reported EXEMPT. Got:"
+  echo "$OUT43" | sed 's/^/    /'
+  FAILED=1
+elif ! { echo "$OUT43" | grep -qF 'logos' && echo "$OUT43" | grep -qF 'not a version-string move'; }; then
+  echo "FAIL: refused, but not naming the dependency and the shape-change reason. Got:"
+  echo "$OUT43" | sed 's/^/    /'
+  FAILED=1
+else
+  note "a dependency value changing shape (string to table) is refused and named"
+fi
+
+# ---------------------------------------------------------------------------
+# 44. M29: widening `is_dep_table_path` to also accept `("package",)` makes
+#     `[package]` itself read as a dependency table, so any of ITS
+#     string-valued keys, including `build`, changing from one string to
+#     another string falls into the bare-string-to-bare-string branch of
+#     `dep_entry_offenses` ("any new string is allowed") and is silently
+#     treated as a version move. No existing case changes an existing
+#     package.build VALUE: case 21 has one that stays byte-identical, case 28
+#     covers it being REMOVED, neither exercises it being RETARGETED.
+#     `crates/irontraffic-origin/Cargo.toml` has a real `build = "build.rs"`
+#     today, so this is not a hypothetical shape.
+# ---------------------------------------------------------------------------
+D44="$WORK/package-build-retargeted-string-to-string"
+new_repo "$D44"
+mkdir -p "$D44/crates/pol"
+printf 'fn main(){ println!("legit"); }\n' > "$D44/crates/pol/build.rs"
+printf '[package]\nname="pol"\nversion="0.1.0"\nbuild="build.rs"\n' > "$D44/crates/pol/Cargo.toml"
+commit_all "$D44" base
+git -C "$D44" checkout -qb pr
+printf '[package]\nname="pol"\nversion="0.1.0"\nbuild="fuzz/Cargo.lock"\n' > "$D44/crates/pol/Cargo.toml"
+commit_all "$D44" "chore(deps): bump"
+fake_gh 'dependabot[bot]' ''
+echo "== M29: package.build retargeted from one string to another must be refused (package is not a dependency table) =="
+OUT44="$(run_scope "$D44")"
+if echo "$OUT44" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: package.build retargeted string-to-string was reported EXEMPT. Got:"
+  echo "$OUT44" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT44" | grep -qF 'package.build'; then
+  echo "FAIL: refused, but package.build was not named as the reason. Got:"
+  echo "$OUT44" | sed 's/^/    /'
+  FAILED=1
+else
+  note "package.build being retargeted string-to-string is refused and named"
+fi
+
+# ---------------------------------------------------------------------------
+# 45. M11: widening the author match from the three named bot logins to any
+#     `[bot]`-suffixed author (`case "$author" in *\[bot\]\)`) would exempt
+#     any GitHub App installed on the repository, not only the three this
+#     script actually trusts. A PR from an unrecognised bot-suffixed author,
+#     touching only an allowlisted-shaped manifest path and with no closing
+#     keyword in its body, must be refused for the ORDINARY non-bot reason
+#     ("does not close an issue"), never take the bot-exempt branch at all.
+# ---------------------------------------------------------------------------
+D45="$WORK/unrecognised-bot-suffixed-author"
+new_repo "$D45"
+mkdir -p "$D45/crates/pol"
+printf '[package]\nname="pol"\nversion="0.1.0"\n' > "$D45/crates/pol/Cargo.toml"
+commit_all "$D45" base
+git -C "$D45" checkout -qb pr
+printf '[package]\nname="pol"\nversion="0.1.1"\n' > "$D45/crates/pol/Cargo.toml"
+commit_all "$D45" bump
+fake_gh 'sneaky-app[bot]' 'no closing keyword here'
+echo "== an unrecognised bot-suffixed author must NOT take the bot-exempt path =="
+OUT45="$(run_scope "$D45")"
+if echo "$OUT45" | grep -qF 'pr-scope-check: EXEMPT'; then
+  echo "FAIL: an author outside the three named bot logins was exempted as a bot. Got:"
+  echo "$OUT45" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT45" | grep -qF 'does not close an issue'; then
+  echo "FAIL: refused, but not for the ordinary non-bot reason, so it may have taken the bot branch anyway. Got:"
+  echo "$OUT45" | sed 's/^/    /'
+  FAILED=1
+else
+  note "an author outside the three named bot logins is treated as an ordinary non-bot author"
+fi
+
+# ---------------------------------------------------------------------------
+# 46. M34: the non-bot nested-lockfile exemption must tie
+#     `crates/<n>/fuzz/Cargo.lock` to its OWN sibling manifest being declared,
+#     not to SOME declared manifest existing anywhere in the tree. Case 42
+#     above declares no Cargo.toml at all, so it cannot distinguish "checks
+#     the specific sibling" from "checks whether anything is declared": both
+#     rules refuse it, for want of any declared manifest. Here a DIFFERENT,
+#     unrelated crate's manifest IS declared (`crates/other/Cargo.toml`),
+#     while the lockfile's actual sibling (`crates/pol/fuzz/Cargo.toml`) is
+#     not declared anywhere. The correct, sibling-specific rule still refuses
+#     the lockfile; a mutant that widens the tie to "any declared manifest"
+#     would incorrectly forgive it because SOME manifest is declared.
+# ---------------------------------------------------------------------------
+D46="$WORK/nonbot-nested-lockfile-wrong-manifest-declared"
+new_repo "$D46"
+mkdir -p "$D46/crates/pol/fuzz/fuzz_targets" "$D46/crates/other"
+printf '[package]\nname="pol"\nversion="0.1.0"\n' > "$D46/crates/pol/Cargo.toml"
+printf '[package]\nname="pol-fuzz"\nversion="0.0.0"\npublish=false\n\n[workspace]\n\n[dependencies]\nlibfuzzer-sys="0.4"\n\n[[bin]]\nname="t"\npath="fuzz_targets/t.rs"\n' > "$D46/crates/pol/fuzz/Cargo.toml"
+printf '#![no_main]\n' > "$D46/crates/pol/fuzz/fuzz_targets/t.rs"
+printf 'placeholder\n' > "$D46/crates/pol/fuzz/Cargo.lock"
+printf '[package]\nname="other"\nversion="0.1.0"\n' > "$D46/crates/other/Cargo.toml"
+commit_all "$D46" base
+git -C "$D46" checkout -qb pr
+printf 'attacker-controlled content, no DECLARED sibling ties it to anything reviewed\n' > "$D46/crates/pol/fuzz/Cargo.lock"
+commit_all "$D46" implement
+fake_gh 'coder-agent' 'Closes #42' '## Files
+
+| Path | Action | Purpose |
+| --- | --- | --- |
+| `crates/other/Cargo.toml` | modify | a completely unrelated crate, declared but not touched by this diff |
+'
+echo "== a nested fuzz lockfile must be tied to its OWN sibling manifest, not to some OTHER declared manifest =="
+OUT46="$(run_scope "$D46")"
+if echo "$OUT46" | grep -qF 'pr-scope-check: the diff matches issue'; then
+  echo "FAIL: a nested lockfile was forgiven because an UNRELATED manifest was declared, not its own sibling. Got:"
+  echo "$OUT46" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT46" | grep -qF 'crates/pol/fuzz/Cargo.lock'; then
+  echo "FAIL: refused, but the nested lockfile was not named among the undeclared paths. Got:"
+  echo "$OUT46" | sed 's/^/    /'
+  FAILED=1
+else
+  note "the nested lockfile is refused and named; an unrelated declared manifest does not forgive it"
+fi
+
+echo
+# ---------------------------------------------------------------------------
+# 47. Each of the three required environment variables must fail this script
+#     CLOSED (rc=1, with its own message) when unset, checked by EXIT CODE,
+#     not merely by scanning the text for something that looks like a
+#     refusal. This is the direct regression test for the round-four review's
+#     BLOCKING finding: `ab1a295` put `MANIFEST_TMP="$(mktemp -d)"` plus
+#     `trap 'rm -rf "$MANIFEST_TMP"' EXIT` above the three `: "${VAR:?...}"`
+#     guards, and on bash below 4.4 a `${VAR:?}` failure is a fatal
+#     expansion error whose exit status does NOT survive an EXIT trap
+#     installed earlier in the script: the guard still printed its message to
+#     stderr, but the shell then exited 0. Every case above this one runs
+#     with all three variables set (`run_scope` hardcodes them), so none of
+#     them could ever have caught this; it needs its own case, checking rc
+#     directly, because a text-only check cannot tell "refused, rc=1" apart
+#     from "printed a refusal-shaped message anyway, rc=0" the way case 8
+#     above could not tell an empty-diff refusal apart from an unrelated
+#     abort until its assertion was tightened for the same reason.
+#
+#     Uses the real script directly rather than `run_scope` (which hardcodes
+#     all three variables), and bypasses `set -e` for the one command whose
+#     exit code is the entire point of the assertion.
+# ---------------------------------------------------------------------------
+echo "== each required environment variable must fail closed (checked by exit code) when unset =="
+
+RC47_PR="0"
+PR_NUMBER=1 BASE_SHA=deadbeef HEAD_SHA=deadbeef bash -c 'unset PR_NUMBER; exec bash "$1"' _ "$SCOPE" >"$WORK/out47pr" 2>&1 || RC47_PR="$?"
+OUT47_PR="$(cat "$WORK/out47pr")"; rm -f "$WORK/out47pr"
+if [ "$RC47_PR" -eq 0 ]; then
+  echo "FAIL: PR_NUMBER unset did not fail closed (rc=0). Got:"
+  echo "$OUT47_PR" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT47_PR" | grep -qF 'PR_NUMBER is required'; then
+  echo "FAIL: PR_NUMBER unset failed (rc=$RC47_PR), but not with its own message. Got:"
+  echo "$OUT47_PR" | sed 's/^/    /'
+  FAILED=1
+else
+  note "PR_NUMBER unset fails closed: rc=$RC47_PR, its own message present"
+fi
+
+RC47_BASE="0"
+PR_NUMBER=1 BASE_SHA=deadbeef HEAD_SHA=deadbeef bash -c 'unset BASE_SHA; exec bash "$1"' _ "$SCOPE" >"$WORK/out47base" 2>&1 || RC47_BASE="$?"
+OUT47_BASE="$(cat "$WORK/out47base")"; rm -f "$WORK/out47base"
+if [ "$RC47_BASE" -eq 0 ]; then
+  echo "FAIL: BASE_SHA unset did not fail closed (rc=0). Got:"
+  echo "$OUT47_BASE" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT47_BASE" | grep -qF 'BASE_SHA is required'; then
+  echo "FAIL: BASE_SHA unset failed (rc=$RC47_BASE), but not with its own message. Got:"
+  echo "$OUT47_BASE" | sed 's/^/    /'
+  FAILED=1
+else
+  note "BASE_SHA unset fails closed: rc=$RC47_BASE, its own message present"
+fi
+
+RC47_HEAD="0"
+PR_NUMBER=1 BASE_SHA=deadbeef HEAD_SHA=deadbeef bash -c 'unset HEAD_SHA; exec bash "$1"' _ "$SCOPE" >"$WORK/out47head" 2>&1 || RC47_HEAD="$?"
+OUT47_HEAD="$(cat "$WORK/out47head")"; rm -f "$WORK/out47head"
+if [ "$RC47_HEAD" -eq 0 ]; then
+  echo "FAIL: HEAD_SHA unset did not fail closed (rc=0). Got:"
+  echo "$OUT47_HEAD" | sed 's/^/    /'
+  FAILED=1
+elif ! echo "$OUT47_HEAD" | grep -qF 'HEAD_SHA is required'; then
+  echo "FAIL: HEAD_SHA unset failed (rc=$RC47_HEAD), but not with its own message. Got:"
+  echo "$OUT47_HEAD" | sed 's/^/    /'
+  FAILED=1
+else
+  note "HEAD_SHA unset fails closed: rc=$RC47_HEAD, its own message present"
 fi
 
 echo

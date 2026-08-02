@@ -52,15 +52,47 @@ set -euo pipefail
 set -f
 cd "$(git rev-parse --show-toplevel)"
 
-# Working directory for the manifest diff check below (bot path only).
-# One trap for the whole script: every exit, including an early `exit 1`
-# from any check above or below this line, must still clean this up.
-MANIFEST_TMP="$(mktemp -d)"
-trap 'rm -rf "$MANIFEST_TMP"' EXIT
-
-: "${PR_NUMBER:?PR_NUMBER is required}"
-: "${BASE_SHA:?BASE_SHA is required}"
-: "${HEAD_SHA:?HEAD_SHA is required}"
+# Required-input guards, checked explicitly rather than with `: "${VAR:?...}"`.
+#
+# PR 837's own fourth review round found that the `:?` form is NOT safe to
+# rely on here, and that this very script had already regressed on it. A
+# `${VAR:?msg}` failure is neither a `set -e`-triggered false nor an explicit
+# `exit`; it is bash's own fatal "parameter null or unset" abort, and on at
+# least bash 3.2 that abort does not carry its exit status through an EXIT
+# trap installed earlier in the script: the trap's own command runs and
+# succeeds, and the shell then exits 0, silently. The round's own commit
+# (ab1a295) had put exactly such a trap above these guards for an unrelated
+# reason (cleaning up the manifest-diff temp directory below), so a required
+# variable being unset went from failing the job (base script, before that
+# commit: rc=1) to passing it in total silence (rc=0), which is precisely the
+# "GitHub reports a skipped job as SUCCESS" failure mode this whole file
+# exists to refuse, just reached by a different mechanism than a skipped job.
+# Measured directly, all three variables, same command: base 8cb2482 rc=1,
+# this file before this fix rc=0.
+#
+# An explicit `[ -z ... ]` test followed by an explicit `exit 1` does not have
+# this problem: `set -e` and an explicit `exit` both propagate their status
+# through an EXIT trap correctly (verified directly: `false` under `set -e`
+# gives rc=1 through the same trap, `exit 7` gives rc=7), it is only the
+# implicit fatal-expansion abort that does not. Do not revert this to the
+# `:?` form, with or without a trap present: the trap is moved below (see the
+# comment at MANIFEST_TMP) specifically so nothing between here and there can
+# ever again share this failure mode with a trap that has not been installed
+# yet, but a `:?` guard here would still be one fatal-expansion abort away
+# from losing its exit status the day some earlier line needs a trap of its
+# own again.
+if [ -z "${PR_NUMBER:-}" ]; then
+  echo "FAIL: PR_NUMBER is required" >&2
+  exit 1
+fi
+if [ -z "${BASE_SHA:-}" ]; then
+  echo "FAIL: BASE_SHA is required" >&2
+  exit 1
+fi
+if [ -z "${HEAD_SHA:-}" ]; then
+  echo "FAIL: HEAD_SHA is required" >&2
+  exit 1
+fi
 
 REPO="${GITHUB_REPOSITORY:-$(gh repo view --json nameWithOwner --jq .nameWithOwner)}"
 
@@ -566,6 +598,36 @@ PYEOF
 
 case "$author" in
   dependabot\[bot\]|renovate\[bot\]|github-actions\[bot\])
+    # Working directory for the manifest diff check below, created here,
+    # inside the one case arm that ever reads it, rather than at the top of
+    # the script.
+    #
+    # `manifest_disallowed_diff` is the only thing that reads `$MANIFEST_TMP`,
+    # and it is only ever called from inside THIS arm, so nothing before this
+    # line, and nothing on the non-bot path below the whole `case`, needs it.
+    # Installing the trap this late, immediately before the first (and only)
+    # code that needs the directory it protects, means every line above this
+    # one, including the required-variable guards near the top of the script
+    # and the `"${changed[@]}"` expansions in the empty-diff guard and the
+    # embedded-newline check, runs with NO EXIT trap installed at all. That
+    # matters for exactly the failure mode PR 837's fourth review round found:
+    # an implicit fatal-expansion abort (`${VAR:?}`, or `"${changed[@]}"` on a
+    # still-empty array under `set -u` on bash below 4.4) does not carry its
+    # exit status through an EXIT trap, so a trap installed too early silently
+    # turns that abort into rc=0. A trap that is not installed yet cannot do
+    # that; bash is left to its own default behaviour on the abort, which is a
+    # plain nonzero exit (verified directly, both with and without a trap in
+    # place, same command: no trap rc=1, trap already installed rc=0). Every
+    # exit reachable from this point on, for the rest of this arm, is either
+    # this function's own `return 0` (a normal function return, not a fatal
+    # abort) or this arm's two explicit `exit 0` / `exit 1` statements, both of
+    # which propagate their status through an EXIT trap correctly regardless
+    # of where the trap sits, so there is no similar reason to install this
+    # any later than here, and no reason to install it at all for a PR whose
+    # author never matches this case.
+    MANIFEST_TMP="$(mktemp -d)"
+    trap 'rm -rf "$MANIFEST_TMP"' EXIT
+
     offending=""
     for f in "${changed[@]}"; do
       printf '%s' "$f" | grep -qE "$BOT_ALLOWED" || offending="$offending$f
