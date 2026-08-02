@@ -1101,20 +1101,39 @@ fn readiness_timeout_includes_stderr() {
     // 3 seconds, not a tight bound: the fixture's stderr write is captured
     // by a background reader thread this call does not control the
     // scheduling of, and a short timeout here would race that thread on a
-    // busy host. If this assertion ever fails, that is EITHER genuine host
-    // starvation (the reader thread never got scheduled in time) OR a real
-    // capture defect, and this test cannot tell the two apart from inside
-    // itself; treat a failure as inconclusive, not as confidently one or
-    // the other.
+    // busy host. `Child::spawn` now checks the requested core against
+    // `core_affinity::get_core_ids` before ever invoking `taskset` (PR 828's
+    // own CI failure: `taskset` refused a core index ubuntu-latest's 4-core
+    // runner does not have, so the fixture never started at all and never
+    // printed anything), so that specific, previously-seen, IDENTIFIABLE
+    // cause should no longer reach here. If this assertion still fails, the
+    // message below names the cause when the captured text still shows it,
+    // and hedges only the genuinely ambiguous residue.
     let err = child
         .wait_ready(never_listens, Duration::from_secs(3))
         .expect_err("a child that never listens must time out");
     let text = err.to_string();
+    // The ENOENT ("`taskset` not installed") fallback happens entirely inside
+    // `Child::spawn`, before this test ever sees a capture, so it can never
+    // appear in `text`. Only the EINVAL text can, and only if
+    // `cores_available_to_pin` ever has a gap: check for it explicitly
+    // rather than silently blaming an unrelated cause the way PR 828's own
+    // CI failure did.
+    let taskset_refused = text.contains("taskset: failed to set");
+    let diagnosis = if taskset_refused {
+        "the excerpt above already names a real, identifiable cause (`taskset` refused the \
+         requested core, so the fixture never ran at all): a genuine defect in \
+         `cores_available_to_pin` or this test's own core assignment, NOT host starvation"
+    } else {
+        "with that specific cause ruled out, the remaining explanation is genuinely ambiguous \
+         from inside this test: either the capture reader thread lost the race against a \
+         starved host before the 3 second deadline, or a real defect in the capture path \
+         itself. The two are distinguished only from OUTSIDE this test, by whether the failure \
+         reproduces on an otherwise idle host: starvation would not, a capture defect would"
+    };
     assert!(
         text.contains("distinctive-marker-9f3e"),
-        "readiness-timeout error {text:?} must include the child's own stderr text (this is \
-         either genuine host starvation of the capture reader thread or a real capture defect, \
-         not distinguishable from inside this test)"
+        "readiness-timeout error {text:?} must include the child's own stderr text: {diagnosis}"
     );
     child.stop();
 }
@@ -1307,7 +1326,14 @@ fn teardown_kills_the_whole_process_group() {
     // port-free assertion below would pass for the wrong reason (nothing
     // ever bound) rather than the reason under test (teardown killed it);
     // that ambiguity, not a confident pass or fail either way, is the
-    // correct reading of this test on a loaded host.
+    // correct reading of this test on a loaded host. `Child::spawn` now
+    // checks the requested core against `core_affinity::get_core_ids`
+    // before ever invoking `taskset` (PR 828's own CI failure: `taskset`
+    // refused a core index ubuntu-latest's 4-core runner does not have, so
+    // the direct child never started at all and could not possibly have
+    // forked a grandchild to bind anything), so that specific,
+    // previously-seen, IDENTIFIABLE cause should no longer explain a
+    // failure below.
     std::thread::sleep(Duration::from_millis(500));
 
     // Reviewed finding: without this check, this test could pass for the
@@ -1315,15 +1341,31 @@ fn teardown_kills_the_whole_process_group() {
     // enough for the grandchild to have bound yet (nothing to kill means
     // the port-free assertion below trivially holds, proving nothing about
     // teardown at all). This turns that silent ambiguity into an explicit,
-    // separately labelled signal: if THIS fails, the rest of the test is
-    // inconclusive about teardown specifically and should be read as host
-    // starvation, not a defect in Child::stop.
-    assert!(
-        TcpListener::bind(&bind_addr).is_err(),
-        "the grandchild must already be bound to {bind_addr} before teardown is exercised; if \
-         this fails, the 500ms grace period above was not enough on this host for the grandchild \
-         to bind (host starvation), not evidence that teardown itself is broken"
-    );
+    // separately labelled signal, and if it fires, distinguishes the two
+    // remaining live possibilities by an actual liveness check on the
+    // direct child rather than a blind hedge: a direct child that has
+    // ALREADY EXITED cannot be merely slow (a process that is not running
+    // is not "starved", it is gone, which is a real spawn or fixture defect,
+    // not evidence about timing); a direct child that is STILL RUNNING but
+    // has not bound yet is consistent with (though, since binding happens
+    // in a grandchild this check cannot see into, not proof of) starvation.
+    if TcpListener::bind(&bind_addr).is_ok() {
+        let diagnosis = if child.is_alive() {
+            "the direct child is still running, consistent with the 500ms grace period above \
+             not being enough on this host for the grandchild to bind yet (host starvation), \
+             not evidence that teardown itself is broken"
+        } else {
+            "the direct child has ALREADY EXITED, which rules out host starvation: a process \
+             that is not running cannot be merely slow. This points to a real defect in \
+             spawning or running the fixture itself (for example a `taskset` pinning failure \
+             that kept it from ever starting at all, PR 828's own diagnosed root cause), not in \
+             teardown, which has not even run yet at this point in the test"
+        };
+        panic!(
+            "the grandchild must already be bound to {bind_addr} before teardown is exercised: \
+             {diagnosis}"
+        );
+    }
 
     child.stop();
 

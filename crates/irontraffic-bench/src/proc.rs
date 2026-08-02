@@ -33,12 +33,50 @@
 //! # Pinning
 //!
 //! [`Child::spawn`] pins with `taskset -c <cpuset> <program> <args...>` when
-//! `cores` is non-empty. `taskset` is Linux-only and is not installed on this
-//! crate's own macOS development host; a spawn failure whose `ErrorKind` is
-//! `NotFound` falls back to spawning `<program> <args...>` unpinned rather
-//! than failing the repetition, matching edge case 11 ("`taskset`
-//! unavailable: pinning is skipped, `pinned` is recorded false, and
-//! provenance is already unpublishable").
+//! `cores` is non-empty AND [`cores_available_to_pin`] confirms every
+//! requested index is one this process is currently permitted to run on
+//! (via `core_affinity::get_core_ids`, the same crate `crate::probe` already
+//! uses to pin its own thread). Two different ways `taskset` can fail to
+//! deliver pinning are both handled the same way, a fallback to an unpinned
+//! spawn rather than a failed repetition:
+//!
+//! - **`taskset` is not installed at all.** `Command::spawn` itself returns
+//!   `Err` with `ErrorKind::NotFound`; the normal case on this crate's own
+//!   macOS development host, matching edge case 11 ("`taskset` unavailable:
+//!   pinning is skipped, `pinned` is recorded false, and provenance is
+//!   already unpublishable").
+//! - **`taskset` is installed but the requested cpu index is not one this
+//!   host has.** `taskset` calls `sched_setaffinity` on itself and, on
+//!   failure, exits `EINVAL` ("failed to set pid <pid>'s affinity: Invalid
+//!   argument") BEFORE it ever execs into `<program>`, so `Command::spawn`
+//!   itself returns `Ok` (a real process was created; it just never became
+//!   the target). The child never starts, never prints its own stderr and
+//!   never binds its port. This is PR 828's own CI failure on
+//!   `ubuntu-latest` (4 logical cores): the test fixture's own core
+//!   assignment assumed at least 8. [`cores_available_to_pin`] checks for
+//!   exactly this BEFORE `taskset` is ever invoked, so the failure is
+//!   prevented rather than discovered after the fact by parsing a captured
+//!   stderr string, which is not guaranteed stable across `taskset`
+//!   versions or locales.
+//!
+//! [`Child::pinned`] records which of the two happened: `true` only when
+//! pinning was both requested (`cores` non-empty) and actually applied.
+//!
+//! ## A known gap this fix does not close
+//!
+//! `Child::pinned` is the crate-local half of "a benchmark result can never
+//! silently claim pinned numbers it did not get" (this crate's own
+//! dominant-defect concern). The other half, threading that fact into
+//! [`crate::provenance::Provenance`]'s publishability, is deliberately NOT
+//! done here: `Provenance::recompute_publishable` (`provenance.rs`, issue
+//! #407) derives `unpublishable_reasons` from a fixed six-condition table
+//! "per [its own] Design" and clears the vector before every re-derivation,
+//! so a reason pushed from outside would not survive the result writer's own
+//! later call to it; and `RunResult` (`result.rs`, also from an earlier
+//! issue) documents its own field list as closed ("One later issue adds
+//! fields to this struct and no other does"). Both files sit outside this
+//! issue's own `## Files` table. Filed as
+//! <https://github.com/ELares/IronTraffic/issues/838> rather than fixed here.
 //!
 //! # CPU accounting is Linux-only
 //!
@@ -289,6 +327,7 @@ pub struct Child {
     stdout: CapturedReader,
     stderr: CapturedReader,
     reaped: bool,
+    pinned: bool,
 }
 
 impl Child {
@@ -302,18 +341,30 @@ impl Child {
         cores: &CoreSet,
         name: &'static str,
     ) -> Result<Self, BenchError> {
-        let attempt_pin = !cores.is_empty();
+        let requested_pin = !cores.is_empty();
+        // A cpu index this host does not have makes `taskset` exit EINVAL
+        // before ever exec'ing `invocation.program` (PR 828's own CI
+        // failure: ubuntu-latest has 4 logical cores, and the fixture's own
+        // core assignment assumed at least 8). Checked BEFORE the spawn
+        // below so that case is handled the same way `taskset` being
+        // entirely ABSENT already is (edge case 11): skip pinning, spawn
+        // unpinned, and record `pinned = false`, rather than discovering a
+        // dead-on-arrival child only once `wait_ready` times out. See this
+        // module's own "# Pinning" doc for why `core_affinity` is the right
+        // tool to check this with.
+        let attempt_pin = requested_pin && cores_available_to_pin(cores);
         let spawned = spawn_with_pin(invocation, cores, attempt_pin);
-        let mut child = match spawned {
-            Ok(child) => child,
+        let (mut child, pinned) = match spawned {
+            Ok(child) => (child, attempt_pin),
             Err(source) if attempt_pin && source.kind() == std::io::ErrorKind::NotFound => {
                 // `taskset` itself is what was not found (edge case 11: not
                 // installed off Linux, the normal case on this crate's own
                 // macOS development host), not `invocation.program`. Fall
                 // back to spawning unpinned rather than failing the whole
                 // repetition over a missing pinning tool.
-                spawn_with_pin(invocation, cores, false)
-                    .map_err(|e| BenchError::io(&invocation.program, e))?
+                let child = spawn_with_pin(invocation, cores, false)
+                    .map_err(|e| BenchError::io(&invocation.program, e))?;
+                (child, false)
             }
             Err(source) => return Err(BenchError::io(&invocation.program, source)),
         };
@@ -340,7 +391,40 @@ impl Child {
             stdout,
             stderr,
             reaped: false,
+            pinned,
         })
+    }
+
+    /// Whether pinning was both requested and actually applied: `true` only
+    /// when `cores` was non-empty AND the `taskset` invocation it produced
+    /// actually ran `invocation.program` (as opposed to `taskset` itself
+    /// failing, whether because it is not installed or because a requested
+    /// cpu index is not one this host has; see this module's own "#
+    /// Pinning" doc for both cases).
+    ///
+    /// `false` never fails a spawn on its own: a caller that requires real
+    /// core isolation for a published measurement must check this and treat
+    /// `false` as unpublishable itself, matching edge case 11's existing
+    /// "provenance is already unpublishable" convention for a non-pinned
+    /// run.
+    #[must_use]
+    pub fn pinned(&self) -> bool {
+        self.pinned
+    }
+
+    /// Whether this child has not yet exited: a bounded, non-blocking
+    /// liveness probe (`try_wait`, never a signal or a wait that can
+    /// block), not a claim that the process is making progress.
+    ///
+    /// Exists for a caller that needs to tell "the process already exited"
+    /// (never host starvation: a process that is not running cannot be
+    /// merely slow) apart from "the process is still running but has not
+    /// yet reached some later observable state" (consistent with, though
+    /// not proof of, starvation). A query error is treated as `false`: this
+    /// method only ever claims liveness it could positively confirm.
+    #[must_use]
+    pub fn is_alive(&mut self) -> bool {
+        matches!(self.process.try_wait(), Ok(None))
     }
 
     /// Polls a TCP connect to `addr` every 50 ms until it succeeds or
@@ -525,6 +609,36 @@ impl Drop for Child {
     fn drop(&mut self) {
         self.stop();
     }
+}
+
+/// True when every core index in `cores` is one this process is currently
+/// permitted to run on, per `core_affinity::get_core_ids`.
+///
+/// `taskset -c <cpuset> <program>` fails with `EINVAL`, before `<program>`
+/// is ever exec'd, the moment `<cpuset>` shares no index with a CPU that is
+/// "currently physically on the system and permitted to the thread"
+/// (`sched_setaffinity(2)`'s own wording for that error). `get_core_ids`
+/// reads exactly that same permitted set via `sched_getaffinity` on Linux:
+/// both this crate's own eventual `taskset` invocation and `core_affinity`
+/// resolve the identical syscall against the identical target, `0` ("the
+/// calling thread"), so a core absent here is a core `taskset` would also
+/// refuse. Checking it here means [`spawn_with_pin`] can skip an invocation
+/// this function already knows would fail, rather than discovering the
+/// failure only after the fact from a captured stderr string, which is not
+/// guaranteed stable across `taskset` versions or locales.
+///
+/// `None` (this platform's `core_affinity` support could not determine the
+/// permitted set at all) means "cannot verify": returns `true` so the
+/// caller proceeds to attempt `taskset` exactly as it did before this check
+/// existed, relying on the pre-existing `ErrorKind::NotFound` fallback for
+/// whatever it finds.
+fn cores_available_to_pin(cores: &CoreSet) -> bool {
+    let Some(available) = core_affinity::get_core_ids() else {
+        return true;
+    };
+    cores
+        .iter()
+        .all(|&wanted| available.iter().any(|id| id.id == wanted))
 }
 
 /// Spawns `invocation`, either wrapped in `taskset -c <cpuset>` (when `pin`
@@ -932,5 +1046,64 @@ mod tests {
              stop() explicitly; a live process here means Drop is not actually tearing children \
              down"
         );
+    }
+
+    #[test]
+    fn cores_available_to_pin_rejects_an_index_this_host_does_not_have() {
+        // `core_affinity::get_core_ids` (both the Linux and the macOS
+        // implementation this crate's own development host runs) never
+        // reports an index at or beyond the real logical core count, so an
+        // absurdly large index is invalid on ANY real host: exactly the
+        // property PR 828's own CI failure needed and did not have (a
+        // fixture requesting a core index only a machine with 8 or more
+        // logical cores has, run on a 4-core `ubuntu-latest` runner).
+        assert!(
+            !super::cores_available_to_pin(&CoreSet::from_unsorted(vec![999_999])),
+            "an index no real host has must never be reported as pinnable"
+        );
+    }
+
+    #[test]
+    fn cores_available_to_pin_accepts_core_zero() {
+        // The negative-space check for the test above: every real host with
+        // at least one logical core has core 0, so a
+        // `cores_available_to_pin` that rejected EVERYTHING (for example a
+        // membership check compared against the wrong field) would fail
+        // this test even while passing the one above.
+        assert!(
+            super::cores_available_to_pin(&CoreSet::from_unsorted(vec![0])),
+            "core 0 must be pinnable on any real host"
+        );
+    }
+
+    #[test]
+    fn spawn_falls_back_to_unpinned_when_the_requested_core_does_not_exist() {
+        // The exact mechanism PR 828's own CI failure needed: `Child::spawn`
+        // must not hand `taskset` a core index this host does not have.
+        // Before this fix, the only thing standing between a fixture like
+        // this and a dead-on-arrival child was `taskset` being entirely
+        // ABSENT (this crate's own macOS development host); on a host where
+        // `taskset` IS installed but refuses a bad index, the child would
+        // never start at all. A core index of 999_999 is invalid on every
+        // real host (see the two tests above), so this exercises the same
+        // fallback an actually small host's over-provisioned core
+        // assignment would trigger, without needing one to prove it.
+        let invocation = Invocation {
+            program: "sleep".to_owned(),
+            args: vec!["30".to_owned()],
+            env: Vec::new(),
+        };
+        let cores = CoreSet::from_unsorted(vec![999_999]);
+        let mut child = Child::spawn(&invocation, &cores, "unpinnable_core_test")
+            .unwrap_or_else(|e| panic!("spawn must fall back to unpinned, not fail: {e:?}"));
+        assert!(
+            !child.pinned(),
+            "pinned() must be false: the requested core does not exist on this host"
+        );
+        assert!(
+            child.is_alive(),
+            "the child must actually have run, unpinned, rather than never starting at all"
+        );
+        child.stop();
     }
 }
