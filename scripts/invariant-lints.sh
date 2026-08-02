@@ -2356,8 +2356,9 @@ integer arithmetic instead:
 #     THERE: deleting it, commenting it out, spelling it out only in a
 #     comment or a string literal, hiding it behind one of the #[cfg(test)]
 #     spellings this rule's shadow-tree stripper recognizes (see the
-#     CFG-SPELLING LIMIT paragraph below for exactly which, and for what
-#     still evades), or moving the file it lives in must all still fail
+#     CFG-SPELLING LIMIT paragraph below for the ones verified caught, and
+#     for why the rest cannot be enumerated), or moving the file it lives in
+#     must all still fail
 #     this rule.
 #
 #     WHY THIS EXISTS (review of PR 839, review-zeroize.json finding 2). The
@@ -2369,9 +2370,14 @@ integer arithmetic instead:
 #     under test. A disassembly-level review proved this by reconstructing
 #     the pre-fix tree: reverting `.zeroize()` back to `.fill(0)` on `full`
 #     and `t` compiled, passed all 397 lib tests, passed the pinned
-#     known-answer vector, and passed review twice, while the release object
-#     code emitted zero key-schedule wipe instructions for either function. A
-#     green gate that cannot see this regression is exactly how it got here.
+#     known-answer vector, and passed review twice, while contributing no
+#     wipe instructions of its own to the release object code. Stated that
+#     way deliberately: an earlier version of this sentence said the object
+#     code emitted ZERO wipe instructions for either function, which is false
+#     for `extract_sha384` and is corrected with measured counts in the
+#     `.fill(0)` paragraph below. The point that survives is the one that
+#     matters here: `.fill(0)` buys nothing. A green gate that cannot see
+#     this regression is exactly how it got here.
 #
 #     HARDENED AGAIN (review-delta2.json, three BLOCKING findings against the
 #     first version of the positive check below, all reproduced directly
