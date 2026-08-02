@@ -445,6 +445,70 @@ leaves the decision of what the trailing bytes mean to the caller, which owns th
 next request" question; the decoder never assumes trailing bytes are either safe or an error on its
 own.
 
+### HTTP/2 and HTTP/3 header block (`mplex-pseudo-header-validation`, #38)
+
+**Parses:** a decoded HTTP/2 or HTTP/3 header block, pushed one `(name, value)` pair at a time by an
+HPACK or QPACK decoder, via `MplexHeadBuilder`, `MplexTrailerBuilder` and `MplexResponseBuilder`. Every
+byte of every pair is attacker chosen, and the decoded field LIST is the thing attacker bytes expand
+into: the same field validation tables `h1-head-parser` (#34) applies to HTTP/1 apply here unchanged, so
+a field one protocol version accepts and another refuses does not exist in this product.
+
+**Charge before store, per pair, always first.** `MplexHeadBuilder::push`'s very first action is
+`HeaderListBudget::charge(name.len(), value.len())`, before the pair is validated, stored, or joined
+into anything. HPACK and QPACK are compression formats: a small number of compressed bytes can expand
+into a large number of uncompressed ones, and a limit checked after decode bounds nothing, because the
+memory was already spent producing the value that failed the check. Charging first means the whole
+block's cost is bounded by `max_header_list_bytes` regardless of how few compressed bytes the peer
+actually sent.
+
+**Pseudo-header values go through the same value validation as fields.** `:method`, `:scheme`,
+`:authority`, `:path` and `:protocol` are not exempt from `field::validate_value`: a CRLF, a NUL, or (on
+this multiplexed path) a leading or trailing SP or HTAB in a pseudo-header value is refused exactly as
+it would be in an ordinary field. This is what stops a `:path` carrying an embedded CRLF from becoming
+two lines in a request line if the connection is later downgraded to HTTP/1 by `h1-request-serializer`
+(#37): without this check, a `:path` of `/a\r\nX-Injected: y` would smuggle a second header line into
+the downgraded request that no HTTP/2 or HTTP/3 client-visible representation ever showed.
+
+**Connection-specific fields are refused, never silently stripped.** RFC 9113 Section 8.2.2 makes
+`connection`, `proxy-connection`, `keep-alive`, `transfer-encoding`, `upgrade` and `http2-settings`
+malformed on a multiplexed protocol. `MplexHeadBuilder::push` refuses each with `ConnectionSpecificField`
+before the field ever reaches a section a decoder-facing caller could read; a proxy that instead
+stripped these silently would let a `transfer-encoding: chunked` on HTTP/2 (the H2.TE smuggling variant)
+reach as far as the strip pass before being noticed, rather than being refused at the parse boundary.
+This is the same connection this file's `push` closes independently of `resolve_request_framing`
+refusing a `Transfer-Encoding` on any multiplexed version: two refusals of the same thing, deliberately.
+
+**A trailer block is a separate builder with a fresh budget, and the two are never merged.**
+`MplexTrailerBuilder` charges its own, independent `HeaderListBudget` (a message with trailers therefore
+costs up to `2 * max_header_list_bytes`, the number to size memory against), refuses every
+pseudo-header outright (`PseudoHeaderInTrailer`), and refuses the same 18-entry deny list
+`h1-chunked-and-trailers` (#36) already enforces for HTTP/1 trailers. There is no method on
+`MplexTrailerBuilder`, and none on `MplexHeadBuilder`, that merges a trailer section into
+`CanonicalRequest::headers` or `CanonicalResponse::headers`: a request that passed an
+`Authorization`-based policy on its header block must not be able to add a `host`, a `content-length`
+or a `cookie` in a trailer afterward, and the only way to make that true unconditionally is to make it
+structurally impossible to reach.
+
+**`cookie` crumbs are charged individually; the join charges nothing (Envoy CVE-2026-47774).** RFC 9113
+Section 8.2.3 lets a client split `cookie` into multiple field lines so each crumb can be HPACK indexed.
+Envoy's header size limit did not account for the uncompressed bytes of those crumbs before
+concatenating them, giving an HPACK amplification path to memory exhaustion: a client could send many
+small, cheaply-compressed crumbs whose JOINED length passed a post-join size check while their
+individually-charged cost would not have. `MplexHeadBuilder::push` charges every crumb against the
+header-list budget at the moment it is pushed, before any join happens; `finish` then joins the accepted
+crumbs with `"; "` (a semicolon and a space, never a bare semicolon) into exactly one `cookie` field. A
+crumb that cannot be read back from the builder's own scratch buffer refuses the whole request rather
+than substituting an empty value: `cookie` is authorization data, and a silently emptied one is a
+different request from the one the peer sent.
+
+**The whole block's work is bounded by the budget, not by the compressed input size.** Every step of
+`push` and `finish` after the initial charge is `O(1)` or `O(l + v)` in the pair just charged; nothing
+in this file re-scans the whole accumulated block per pair. A fuzz target
+(`fuzz_targets/fuzz_mplex_head.rs`) asserts, over an arbitrary sequence of decoded pairs, that
+`charged()` never exceeds `max_header_list_bytes` by more than one entry's worth (the charge that
+crosses the limit is itself recorded before being refused) and that the first refusal is terminal for
+the rest of the sequence.
+
 ## Listening sockets and socket options
 
 **What the listening socket exposes.** A TCP port reachable by anyone who can route to the bound
