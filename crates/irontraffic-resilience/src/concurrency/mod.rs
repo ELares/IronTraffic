@@ -21,43 +21,86 @@
 //! is reached only inside that worker's `CoreScope`, so there is no shared mutable state
 //! and no lock.
 //!
-//! # Wiring: one [`LeasedSemaphore`] per worker, never one shared across workers
+//! # Wiring: a private [`LeasedSemaphore`] per worker for `requests` only; the other
+//! three semaphores stay cluster-wide
 //!
 //! `GradientController` is per (worker, cluster, priority): [`GradientConfig::min_limit`]
 //! and [`GradientConfig::max_limit`] are documented as PER-WORKER figures, and
 //! [`GradientController::maybe_close_window`] calls `sem.set_limit` with that worker's
-//! own limit, unmultiplied and unsummed. [`LeasedSemaphore`], in
-//! contrast, CAN be constructed either way: `ResourceLimits::new(cfg, workers)` builds
-//! one instance meant to be shared by `workers` callers (its `credits` array has one
-//! cache-padded cell per worker specifically so many workers can draw permits from ONE
-//! shared ceiling without contending on the same cache line), but nothing stops calling
-//! it with `workers == 1` to build a private, per-worker instance instead.
+//! own limit, unmultiplied and unsummed. `ResourceLimits` is not one semaphore, it is
+//! four (`connections`, `pending_requests`, `requests`, `retries`), all four built from
+//! one `ResourceLimitsConfig` by a single `ResourceLimits::new(cfg, workers)` call, and
+//! only `requests` is gradient-governed. `connections`, `pending_requests`, and `retries`
+//! are static, operator-configured, CLUSTER-WIDE circuit breakers that must keep exactly
+//! their configured ceiling whether or not gradient control is on for this pair.
 //!
-//! **The wiring MUST use the second shape for a gradient-controlled pair: one
-//! `LeasedSemaphore` per worker per (cluster, priority), never the single semaphore
-//! shared by every worker that the static, non-adaptive `max_requests` config path
-//! uses.** Concretely, when [`GradientConfig::enabled`] is set for a (cluster, priority),
-//! the assembly component that builds `ResourceLimits` for it must call
-//! `ResourceLimits::new(cfg, 1)` once per worker rather than once per cluster, and route
-//! each worker's requests through only its own instance. [`GradientController::note_inflight`]
-//! must then be fed THAT SAME per-worker semaphore's `LeasedSemaphore::in_use()`, not a
-//! cluster-wide sum, so the `inflight < limit / 2` app-limited gate compares two
-//! per-worker quantities rather than a cluster-wide count against a per-worker one.
+//! **The wiring MUST NOT build a whole `ResourceLimits` per worker.** Calling
+//! `ResourceLimits::new(cfg, 1)` once per worker does not privatize just `requests`; it
+//! replicates ALL FOUR semaphores `workers` times, because `new()` builds all four from
+//! the same `cfg`. Measured with `ResourceLimitsConfig::default()` at 16 workers: a
+//! single shared `ResourceLimits::new(cfg, 16)` keeps `connections` at 1024,
+//! `pending_requests` at 1024, and the retry floor at 3, exactly as configured, while 16
+//! separate `ResourceLimits::new(cfg, 1)` calls instead give aggregates of `16_384`,
+//! `16_384`, and `48`: three operator-configured circuit breakers silently multiplied by the
+//! worker count, with no breaker trip reported anywhere, because each worker's private
+//! 1024 looks unbreached from inside itself. The wiring MUST instead do two separate
+//! things for a pair with [`GradientConfig::enabled`] set:
 //!
-//! This is the shape the rest of the module already assumes: every test below
-//! constructs its own single-worker `LeasedSemaphore::new(limit, 1, 1, ..)`, and the
-//! "aggregate floor an operator observes is `min_limit * workers`" note on
+//! 1. Build ONE shared `ResourceLimits::new(cfg, workers)` per (cluster, priority) with
+//!    the real worker count, the same call the static, non-adaptive path already makes.
+//!    Use its `connections()`, `pending_requests()`, and `retries()` unchanged: they
+//!    keep exactly `cfg.max_connections`, `cfg.max_pending_requests`, and the retry
+//!    floor as their ceiling, shared across all workers through that semaphore's
+//!    per-worker credit cells.
+//! 2. For `requests` only, ignore that shared bundle's `requests()` and build `workers`
+//!    independent, private semaphores instead, one per worker:
+//!    `LeasedSemaphore::new(cfg.max_requests, 1, cfg.lease_batch, cfg.lease_max_age_ms)`.
+//!    Route each worker's request permits through only its own instance, and feed each
+//!    worker's own [`GradientController`] from that same instance's `set_limit` and
+//!    `in_use`. This is the shape every test in this module already builds by hand:
+//!    `LeasedSemaphore::new(limit, 1, 1, ..)`.
+//!
+//! **A per-worker `requests` semaphore built with `workers = 1` is always acquired with
+//! worker index `0`, never the global worker id.** [`LeasedSemaphore::new`] with
+//! `workers = 1` allocates exactly one credit cell, and
+//! [`LeasedSemaphore::try_acquire`]'s first line is `self.credits.get(worker)?`, so any
+//! index other than 0 returns `None` on every call, forever, without incrementing
+//! `stats().rejections` (the out-of-range branch returns before touching any counter,
+//! rejections included). This repo's own established idiom for the SHARED semaphores
+//! built in step 1 above is to pass the global worker id (`benches/limits.rs` loops
+//! `0..WORKERS` calling `sem.try_acquire(w, ..)` against a `WORKERS`-wide semaphore); an
+//! implementer who keeps that idiom while adopting the per-worker shape from step 2 and
+//! writes `per_worker_requests[w].try_acquire(w, now)` gets code that COMPILES and is
+//! silently catastrophic: only the worker whose index happens to be 0 is ever served,
+//! every other worker is refused forever, and the rejection counter stays 0 throughout,
+//! so the dashboard shows a healthy cluster serving a fraction of its offered load.
+//! `ResourceLimits::new` already treats this exact hazard as serious enough to reject
+//! `workers == 0` at construction, because it "would refuse every acquisition forever,
+//! which reads as a total outage rather than as a misconfiguration"; this is the same
+//! trap one index over. Always call `per_worker_requests[w].try_acquire(0, now)`, never
+//! `per_worker_requests[w].try_acquire(w, now)`. The
+//! `wiring_per_worker_requests_semaphore_uses_worker_zero` test below builds this exact
+//! shape for several workers and exercises the acquisition side directly, not just
+//! construction.
+//!
+//! [`GradientController::note_inflight`] must then be fed THAT SAME per-worker
+//! `requests` semaphore's `LeasedSemaphore::in_use()`, always read at worker index 0 for
+//! the same reason, not a cluster-wide sum, so the `inflight < limit / 2` app-limited
+//! gate compares two per-worker quantities rather than a cluster-wide count against a
+//! per-worker one.
+//!
+//! The "aggregate floor an operator observes is `min_limit * workers`" note on
 //! [`GradientConfig::min_limit`] is true only when each worker enforces its own
-//! independent floor through its own semaphore, so a cluster's realized ceiling is the
-//! SUM of `workers` independent per-worker ceilings rather than one shared value that
-//! the last worker to call `set_limit` happens to win. The alternative (one shared
-//! semaphore, with each worker multiplying its limit by `workers` before publishing)
-//! was considered and rejected: it still has one worker's write clobber another's on
-//! every window (`set_limit` is not additive), it does not match the per-worker figures
-//! `min_limit`/`max_limit` are documented as, and no code in this module multiplies by
-//! `workers` anywhere. This module has no caller today, so nothing breaks by shipping
-//! with the ambiguity unresolved in code; this section is the resolution the wiring
-//! issue must follow.
+//! independent floor through its own per-worker `requests` semaphore, so a cluster's
+//! realized `requests` ceiling is the SUM of `workers` independent per-worker ceilings
+//! rather than one shared value that the last worker to call `set_limit` happens to win.
+//! The alternative (one shared `requests` semaphore, with each worker multiplying its
+//! limit by `workers` before publishing) was considered and rejected: it still has one
+//! worker's write clobber another's on every window (`set_limit` is not additive), it
+//! does not match the per-worker figures `min_limit`/`max_limit` are documented as, and
+//! no code in this module multiplies by `workers` anywhere. This module has no caller
+//! today, so nothing breaks by shipping with the ambiguity unresolved in code; this
+//! section is the resolution the wiring issue must follow.
 //!
 //! # The residual attack, and its bound
 //!
@@ -2201,6 +2244,119 @@ mod tests {
             "did not recover to within 20% of the fixed point {expected} and stay there \
              within {recovery_windows} windows after the flood stopped; worst observed \
              limit during the whole run was {worst}"
+        );
+    }
+
+    /// The module's "Wiring" recipe, run for real rather than only reasoned about.
+    ///
+    /// Half 1: building ONE shared `ResourceLimits::new(cfg, workers)` per (cluster,
+    /// priority) keeps `connections`, `pending_requests`, and the retry floor at
+    /// exactly their configured, cluster-wide ceiling; building `workers` SEPARATE
+    /// `ResourceLimits::new(cfg, 1)` instead (the shape the doc used to prescribe)
+    /// replicates all three by the worker count, which is exactly the outage the
+    /// "Wiring" section's example measures.
+    ///
+    /// Half 2: a `requests`-only per-worker semaphore, built the way the doc now
+    /// prescribes, grants a permit at worker index 0 on every worker's own instance,
+    /// and is refused, silently and without incrementing `rejections`, when acquired
+    /// with the global worker id instead, which is the established idiom this repo
+    /// uses against the SHARED semaphores from half 1 (see `benches/limits.rs`). This
+    /// is the acquisition-side coverage the construction-only tests elsewhere in this
+    /// module do not provide.
+    #[test]
+    fn wiring_per_worker_requests_semaphore_uses_worker_zero() {
+        use crate::limits::{ResourceLimits, ResourceLimitsConfig};
+        use core::sync::atomic::Ordering::Relaxed as StdRelaxed;
+
+        const WORKERS: usize = 16;
+        let cfg = ResourceLimitsConfig::default();
+        assert_eq!(cfg.max_connections, 1024);
+        assert_eq!(cfg.max_pending_requests, 1024);
+        assert_eq!(cfg.min_retry_concurrency, 3);
+
+        // Half 1, correct shape: one shared bundle for the whole cluster.
+        let shared = ResourceLimits::new(cfg, WORKERS).expect("valid config");
+        assert_eq!(
+            shared.connections().limit(),
+            cfg.max_connections,
+            "a single ResourceLimits::new(cfg, WORKERS) must keep the configured \
+             cluster-wide connection ceiling, not multiply it by WORKERS"
+        );
+        assert_eq!(shared.pending_requests().limit(), cfg.max_pending_requests);
+        assert_eq!(shared.retries().limit(), cfg.min_retry_concurrency);
+
+        // Half 1, the rejected shape: WORKERS separate bundles, aggregated by hand the
+        // way an operator's monitoring would see them. This is the literal reading the
+        // doc used to invite, pinned here as a regression sentinel against it coming
+        // back.
+        let mut connections_aggregate: u64 = 0;
+        let mut pending_aggregate: u64 = 0;
+        let mut retries_aggregate: u64 = 0;
+        for _ in 0..WORKERS {
+            let one = ResourceLimits::new(cfg, 1).expect("valid config");
+            connections_aggregate += u64::from(one.connections().limit());
+            pending_aggregate += u64::from(one.pending_requests().limit());
+            retries_aggregate += u64::from(one.retries().limit());
+        }
+        assert_eq!(connections_aggregate, 16_384);
+        assert_eq!(pending_aggregate, 16_384);
+        assert_eq!(retries_aggregate, 48);
+        assert_ne!(
+            connections_aggregate,
+            u64::from(cfg.max_connections),
+            "one ResourceLimits per worker silently multiplies the connection ceiling; \
+             this is the failure mode half 1 above must not exhibit"
+        );
+
+        // Half 2: `requests` built as WORKERS independent, private semaphores, per the
+        // corrected recipe.
+        let per_worker_requests: Vec<LeasedSemaphore> = (0..WORKERS)
+            .map(|_| {
+                LeasedSemaphore::new(cfg.max_requests, 1, cfg.lease_batch, cfg.lease_max_age_ms)
+            })
+            .collect();
+
+        // Correct: every worker acquires from its OWN instance at index 0.
+        for (w, sem) in per_worker_requests.iter().enumerate() {
+            assert!(
+                sem.try_acquire(0, Millis(0)).is_some(),
+                "worker {w}'s own per-worker requests semaphore must grant a permit at \
+                 index 0"
+            );
+        }
+
+        // The trap the doc now names explicitly: indexing a FRESH workers=1 semaphore
+        // with the global worker id, which is this repo's own idiom for the SHARED
+        // semaphores (see `benches/limits.rs`), refuses every worker but 0 forever and
+        // never touches `rejections`. A fresh semaphore per worker isolates each
+        // attempt from the credits already spent above.
+        let mut granted_by_global_id = 0u32;
+        for w in 0..WORKERS {
+            let fresh =
+                LeasedSemaphore::new(cfg.max_requests, 1, cfg.lease_batch, cfg.lease_max_age_ms);
+            let rejections_before = fresh.stats().rejections.load(StdRelaxed);
+            let granted = fresh.try_acquire(w, Millis(0)).is_some();
+            if granted {
+                granted_by_global_id += 1;
+            }
+            assert_eq!(
+                granted,
+                w == 0,
+                "worker {w} indexing its own workers=1 semaphore with its global id must \
+                 be granted only when w == 0"
+            );
+            assert_eq!(
+                fresh.stats().rejections.load(StdRelaxed),
+                rejections_before,
+                "the out-of-range branch must return before touching any counter, \
+                 rejections included, so this hazard reports itself as healthy"
+            );
+        }
+        assert_eq!(
+            granted_by_global_id, 1,
+            "only worker index 0 may ever be granted a permit when the global worker id \
+             is used against a workers=1 semaphore; measuring anything else means the \
+             trap this test exists to pin has changed shape"
         );
     }
 }
