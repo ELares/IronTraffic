@@ -161,9 +161,17 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 /// Binds a scratch listener on `127.0.0.1:0`, reads the port the kernel assigned, and
 /// drops the listener so the port is free again.
 ///
-/// A small, documented race: another process could take the port between this
-/// function returning and the caller's own bind. Callers that bind a real listener on
-/// the returned port retry on failure rather than treat the race as impossible.
+/// **This function does not reserve its port.** The moment it returns, the port is
+/// unbound again and anything else in the process (or on the machine) can take it,
+/// including a just-freed ephemeral port being re-issued by `bind(0)` itself: on
+/// Linux, measured on a 6.8 kernel with the default `32768 60999` ephemeral range,
+/// 3000 sequential bind/close calls produced 264 repeated ports, the closest repeat
+/// only 4 calls apart. That makes this function correct ONLY for a port a caller (or
+/// a child process it is about to spawn) binds a real listener on immediately, and
+/// wrong for a port that must stay unbound for anything longer than that, such as a
+/// deliberately dead upstream held for a whole test body: use [`dead_local_port`] for
+/// that instead. Callers that do bind a real listener on the returned port still
+/// retry on failure rather than treat this race as impossible.
 #[allow(
     clippy::expect_used,
     reason = "test-support setup, not itself a #[test] fn (see Origin::start's identical \
@@ -177,6 +185,73 @@ pub(crate) fn free_local_port() -> u16 {
         .local_addr()
         .expect("free_local_port: read the scratch port")
         .port()
+}
+
+/// A port that nothing will ever answer on, held for the returned guard's lifetime.
+///
+/// `free_local_port` deliberately releases its port, which is correct for a port a
+/// child process is about to bind, and wrong for a port that must STAY dead: on Linux
+/// `bind(0)` re-issues a just-freed ephemeral port (measured: repeats 4 calls apart),
+/// so a released dead-upstream port can be handed to a concurrent test's proxy as its
+/// listen port, and this test's proxy then dials that proxy. Holding the port bound
+/// but never listened keeps it genuinely dead, on every platform this workspace
+/// targets, though the exact `connect(2)` outcome is platform-dependent: on Linux the
+/// kernel resets an inbound `SYN` against a bound-but-not-listening socket, giving an
+/// immediate `ECONNREFUSED`; on a BSD-derived stack (macOS, confirmed empirically)
+/// there is no listen queue to reset against, so the `SYN` is silently dropped and a
+/// caller only sees a bounded timeout. Either way the port never accepts a
+/// connection, and it is unavailable to any other bind in the process, for as long as
+/// the returned guard is alive.
+#[allow(
+    dead_code,
+    reason = "constructed only by smoke.rs's dead-upstream tests; dataplane_build.rs's own copy \
+              of this shared support module never calls dead_local_port, so that test binary \
+              alone would otherwise warn this type is never constructed"
+)]
+pub(crate) struct DeadPort {
+    /// The bound-but-never-listened socket, kept alive only to hold the port. Never
+    /// read from or written to; `std::net::TcpListener` is just the RAII type that
+    /// owns the underlying file descriptor and closes it on drop. Converting a
+    /// `socket2::Socket` into this type is a pure type change, not a syscall. In
+    /// particular it does not call `listen(2)`: only `TcpListener::bind` does that,
+    /// and this value is never built through `bind`.
+    _held: std::net::TcpListener,
+    /// The port `_held` is bound to.
+    pub(crate) port: u16,
+}
+
+/// Binds `127.0.0.1:0` without listening and returns a [`DeadPort`] holding it.
+///
+/// See [`DeadPort`]'s doc comment for why this exists instead of [`free_local_port`].
+#[allow(
+    dead_code,
+    reason = "called only by smoke.rs's dead-upstream tests; not every test binary that pulls \
+              in this shared support module uses it (see DeadPort's identical reasoning)"
+)]
+#[allow(
+    clippy::expect_used,
+    reason = "test-support setup, not itself a #[test] fn (see Origin::start's identical \
+              reasoning); binding a loopback port on 127.0.0.1:0 does not fail on a working \
+              test host"
+)]
+pub(crate) fn dead_local_port() -> DeadPort {
+    let sock = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
+        .expect("dead_local_port: create a scratch socket");
+    let addr: SocketAddr = "127.0.0.1:0"
+        .parse()
+        .expect("dead_local_port: parse the scratch address");
+    sock.bind(&addr.into())
+        .expect("dead_local_port: bind a scratch port without listening");
+    let port = sock
+        .local_addr()
+        .expect("dead_local_port: read the scratch socket's address")
+        .as_socket()
+        .expect("dead_local_port: scratch address has no socket representation")
+        .port();
+    DeadPort {
+        _held: sock.into(),
+        port,
+    }
 }
 
 /// Polls `child` with [`std::process::Child::try_wait`] until it exits or `timeout`

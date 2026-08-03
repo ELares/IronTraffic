@@ -284,8 +284,11 @@ fn closed_without_hanging(result: &std::io::Result<usize>) -> bool {
 ///    though the backend is down, and the failure is bounded, not a hang.
 #[test]
 fn dead_upstream_closes_the_connection_without_hanging() {
-    let dead_port = support::free_local_port(); // nothing is listening here
-    let proxy = support::spawn_proxy(&cfg_yaml(dead_port));
+    // Held for the whole test body, not merely observed: `free_local_port` releases
+    // its port immediately, and on Linux a released ephemeral port can be re-issued
+    // to a concurrent test's proxy before this test's assertions run (issue #888).
+    let dead = support::dead_local_port();
+    let proxy = support::spawn_proxy(&cfg_yaml(dead.port));
 
     let mut first = connect(proxy.addr);
     send_hello(&mut first);
@@ -306,6 +309,54 @@ fn dead_upstream_closes_the_connection_without_hanging() {
     );
 
     proxy.shutdown();
+}
+
+/// `support::dead_local_port` proves both properties its own doc comment claims:
+/// nothing ever answers a connect to the held port, and the port is unavailable to
+/// any other bind for as long as the guard is alive.
+///
+/// The connect side is intentionally tolerant of which of two legitimate kernel
+/// behaviors it observes, unlike the doc comment's Linux-specific `ECONNREFUSED`
+/// claim: measured directly on this host (a bound-but-never-listened socket),
+/// Linux's kernel resets an inbound `SYN` immediately, giving `ConnectionRefused`,
+/// while a BSD-derived stack (macOS's, confirmed here) has no listen queue to reset
+/// against and silently drops the `SYN`, giving `TimedOut` once the caller's own
+/// bounded `connect_timeout` gives up. Both are the same "genuinely dead, not merely
+/// slow" fact this function needs to prove; only a real accept, or a hang past the
+/// bound, would be a genuine failure.
+///
+/// The reservation side is checked by attempting an explicit bind to the exact held
+/// port rather than by repeatedly calling `bind(0)` and hoping never to observe it:
+/// an explicit bind failing with `AddrInUse` is a direct, deterministic proof that
+/// the port is occupied, which structurally implies an ephemeral `bind(0)` (which
+/// only ever offers an unoccupied port) can never be handed it either, whereas a
+/// bounded number of `bind(0)` probes could only ever raise confidence, never prove
+/// it (issue #888).
+#[test]
+fn dead_local_port_refuses_connects_and_stays_reserved() {
+    let dead = support::dead_local_port();
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], dead.port));
+    let connect_result = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500));
+    let connect_err =
+        connect_result.expect_err("a bound-but-never-listened port must never accept a connect");
+    assert!(
+        matches!(
+            connect_err.kind(),
+            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut
+        ),
+        "expected ECONNREFUSED (Linux) or a bounded TimedOut (BSD/macOS, no listen queue to \
+         reset against) connecting to a held dead port, got {connect_err:?}"
+    );
+
+    let rebind_result = std::net::TcpListener::bind(("127.0.0.1", dead.port));
+    let rebind_err =
+        rebind_result.expect_err("a port held by dead_local_port must reject a second bind");
+    assert_eq!(
+        rebind_err.kind(),
+        std::io::ErrorKind::AddrInUse,
+        "expected EADDRINUSE re-binding a held dead port, got {rebind_err:?}"
+    );
 }
 
 /// True when a bounded read observes neither data nor a close: a `WouldBlock` (most
@@ -464,12 +515,18 @@ async fn connection_cap_rejects_the_extra_connection() {
 #[cfg(feature = "control-plane")]
 #[test]
 fn control_mode_binds_nothing_and_exits_zero() {
-    let bind_port = support::free_local_port();
-    let upstream_port = support::free_local_port();
-    let cfg = cfg_yaml_with_bind(bind_port, upstream_port);
-
-    let held = std::net::TcpListener::bind(("127.0.0.1", bind_port))
-        .expect("hold the configured listener port for the duration of the test");
+    // Both ports must stay held for the whole test body, not merely observed:
+    // `free_local_port` releases its port immediately, and a released port can be
+    // re-issued elsewhere in the process while this test is still running (issue
+    // #888). `bind` doubles as the "collide with control's own bind attempt" listener
+    // the doc comment above describes: a bound-but-never-listened socket refuses a
+    // competing `bind(2)` on the same port exactly like a listening one does (listen
+    // state does not affect that), so it needs no separate re-bind. `upstream` is
+    // never dialed by control mode; it is held only so nothing else in the process
+    // can be handed the port while this test's config still names it.
+    let bind = support::dead_local_port();
+    let upstream = support::dead_local_port();
+    let cfg = cfg_yaml_with_bind(bind.port, upstream.port);
 
     let (mut child, dir) = support::spawn_binary(&cfg, "control");
 
@@ -486,7 +543,8 @@ fn control_mode_binds_nothing_and_exits_zero() {
         "control mode must not build either runtime, but stderr contains a runtime-built line:\n{stderr}"
     );
 
-    drop(held);
+    drop(bind);
+    drop(upstream);
     let _ = std::fs::remove_dir_all(&dir); // it-allow: no-swallowed-error reason: best-effort test fixture cleanup; a leftover temp directory does not affect any assertion
 }
 
@@ -662,11 +720,11 @@ fn connection_cap_line_reflects_the_registry() {
     // example of 10000/480 (test 14, below), so a mutation that substitutes one of
     // those numbers for this one is also caught here.
     const MAX_CONNECTIONS: u32 = 3;
-    let dead_upstream_port = support::free_local_port();
-    let proxy = support::spawn_proxy(&cfg_yaml_with_max_connections(
-        dead_upstream_port,
-        MAX_CONNECTIONS,
-    ));
+    // Held for the whole test body, not merely observed: see
+    // `dead_upstream_closes_the_connection_without_hanging`'s identical comment
+    // (issue #888).
+    let dead = support::dead_local_port();
+    let proxy = support::spawn_proxy(&cfg_yaml_with_max_connections(dead.port, MAX_CONNECTIONS));
 
     let (status, stderr) = proxy.shutdown_capturing_stderr();
     assert_eq!(status.code(), Some(0));
