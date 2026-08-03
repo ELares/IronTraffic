@@ -2484,9 +2484,14 @@ fi
 # tracking quote state, from a `#` starting a trailing comment, and the
 # connector deliberately excludes `#` so a trailing comment mentioning this
 # shape in prose is never mistaken for a live pipeline (see rule 29's
-# comment block above). This corpus pins that limitation down so it stays a
-# visible, tracked decision rather than something that silently drifts
-# either way unnoticed.
+# comment block above). Neither branch below sets FAILED: this corpus
+# cannot go red under any behaviour of rule 29, on purpose, because both
+# directions are legitimate (asserting the gap stays open would fail the
+# day someone closes it, a test that punishes improvement; asserting it
+# is closed cannot ship today). What it DOES do is RECORD, in this run's
+# own log, which side of the gap the current code is on, so a change to
+# either direction is visible to a reader of that log rather than
+# passing through silently as an unremarked green run.
 # ---------------------------------------------------------------------------
 O="$WORK/hash_in_writer"
 mkdir -p "$O/scripts"
@@ -2497,11 +2502,118 @@ RAW="deadbeefx"
 printf '%s\n' "${RAW#x}" | grep -qF "needle" || true
 OSH
 
-echo "== corpus O: a '#' inside the writer's own parameter expansion is a documented gap, not caught =="
+echo "== corpus O: a '#' inside the writer's own parameter expansion is a documented gap (recorded, not asserted) =="
 if fired_rules "$O" | grep -q '^no-racy-early-exit-pipe$'; then
-  note "this spelling is now caught (documentation above is stale and should be updated)"
+  note "RECORDED: this spelling is now caught (documentation above is stale and should be updated)"
 else
-  note "this spelling is not caught, matching the documented limitation in rule 29's comment block"
+  note "RECORDED: this spelling is not caught, matching the documented limitation in rule 29's comment block"
+fi
+
+# ---------------------------------------------------------------------------
+# Corpus P: the reader anchor must not require `grep`/`head` to be the FIRST
+# token after the pipe. This repository's own house style prefixes a
+# locale-sensitive reader with an environment assignment (`LC_ALL=C`,
+# written nine times already in these tracked scripts) or a `command`/`env`
+# wrapper, and every one of those spellings races exactly like the bare
+# form. A prior tightening of this anchor (from "anything but `|`/`#`" to
+# "whitespace only") silently stopped seeing all of them; this corpus pins
+# both spellings down so that regression cannot recur unnoticed.
+# ---------------------------------------------------------------------------
+P1="$WORK/env_prefixed_reader"
+mkdir -p "$P1/scripts"
+cat > "$P1/scripts/p1.sh" <<'P1SH'
+#!/usr/bin/env bash
+set -euo pipefail
+RAW="deadbeef"
+printf '%s\n' "$RAW" | LC_ALL=C grep -qF "needle" || true
+P1SH
+
+echo "== corpus P1: an LC_ALL=C-prefixed grep -qF reader must trip no-racy-early-exit-pipe =="
+if fired_rules "$P1" | grep -q '^no-racy-early-exit-pipe$'; then
+  note "the LC_ALL=C-prefixed reintroduction is caught"
+else
+  echo "FAIL: an environment-assignment prefix (LC_ALL=C, this repository's own"
+  echo "      house style for locale-stable text) in front of the reader command"
+  echo "      hid a genuine reintroduction from no-racy-early-exit-pipe. Got:"
+  run_lints_in "$P1" | sed 's/^/    /'
+  FAILED=1
+fi
+
+P2="$WORK/command_prefixed_reader"
+mkdir -p "$P2/scripts"
+cat > "$P2/scripts/p2.sh" <<'P2SH'
+#!/usr/bin/env bash
+set -euo pipefail
+RAW="deadbeef"
+printf '%s\n' "$RAW" | command grep -qF "needle" || true
+P2SH
+
+echo "== corpus P2: a command-wrapped grep -qF reader must trip no-racy-early-exit-pipe =="
+if fired_rules "$P2" | grep -q '^no-racy-early-exit-pipe$'; then
+  note "the command-wrapped reintroduction is caught"
+else
+  echo "FAIL: a 'command' prefix in front of the reader hid a genuine"
+  echo "      reintroduction from no-racy-early-exit-pipe. Got:"
+  run_lints_in "$P2" | sed 's/^/    /'
+  FAILED=1
+fi
+
+# ---------------------------------------------------------------------------
+# Corpus Q: join_continuations.py must not fold a COMMENT line into the next
+# line. bash does not continue a comment across a trailing backslash (the
+# backslash is comment text, not a continuation), so a racy pipe directly
+# below a comment that itself happens to end in an odd number of trailing
+# backslashes must still be caught on its own line, not silently merged into
+# the comment above it and dropped whole by the `#`-line post-filter.
+# ---------------------------------------------------------------------------
+Q="$WORK/backslash_comment_above_racy"
+mkdir -p "$Q/scripts"
+cat > "$Q/scripts/q.sh" <<'QSH'
+#!/usr/bin/env bash
+set -euo pipefail
+RAW="deadbeef"
+# The shape is written with a trailing backslash \
+printf '%s\n' "$RAW" | grep -qF "needle" || true
+QSH
+
+echo "== corpus Q: a racy pipe directly below a comment ending in a trailing backslash must trip no-racy-early-exit-pipe =="
+if fired_rules "$Q" | grep -q '^no-racy-early-exit-pipe$'; then
+  note "the racy pipe below the backslash-ending comment is caught, not swallowed by it"
+else
+  echo "FAIL: a comment line ending in a trailing backslash folded the next,"
+  echo "      live line into itself, and the joined '#'-prefixed line was then"
+  echo "      discarded whole, hiding a genuine reintroduction. Got:"
+  run_lints_in "$Q" | sed 's/^/    /'
+  FAILED=1
+fi
+
+# ---------------------------------------------------------------------------
+# Corpus R: join_continuations.py must fold a THREE-OR-MORE-line backslash
+# continuation chain onto a single logical line, not just the first pair,
+# leaving the tail of the chain stranded and separately unmatchable. Corpus
+# L above pins the two-line case only; this is the narrowest input that
+# distinguishes "folds the whole chain" from "folds only the first pair".
+# ---------------------------------------------------------------------------
+R="$WORK/three_line_continuation"
+mkdir -p "$R/scripts"
+cat > "$R/scripts/r.sh" <<'RSH'
+#!/usr/bin/env bash
+set -euo pipefail
+RAW="deadbeef"
+printf '%s\n' \
+  "$RAW" \
+  | grep -qF "needle" || true
+RSH
+
+echo "== corpus R: a racy pipe split across a three-line backslash continuation chain must trip no-racy-early-exit-pipe =="
+if fired_rules "$R" | grep -q '^no-racy-early-exit-pipe$'; then
+  note "the three-line-chain reintroduction is caught"
+else
+  echo "FAIL: a pipeline split across a chain of three or more backslash"
+  echo "      continuations did not trip no-racy-early-exit-pipe (the tail of"
+  echo "      the chain was stranded on its own, unmatchable line). Got:"
+  run_lints_in "$R" | sed 's/^/    /'
+  FAILED=1
 fi
 
 echo

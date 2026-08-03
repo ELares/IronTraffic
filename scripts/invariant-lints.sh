@@ -2770,16 +2770,33 @@ PY
 # already writes split across lines, such as
 #     printf '%s\n' "$RAW" \
 #       | grep -qF "$needle"
-# as one line instead of two it cannot each independently match. A line is
+# as one line instead of two it cannot each independently match. (That
+# two-line illustration is itself, right here, a comment ending in a
+# trailing backslash -- see below for why folding a COMMENT the same way
+# would silently eat the rest of this rule's own explanation.) A line is
 # folded into the next only when it ends in an ODD number of trailing
 # backslashes (an escaped backslash pair at end of line is data, not a
-# continuation, the same rule bash itself uses); the continuation backslash
-# is replaced with a single space and the line it swallows is blanked in its
-# place, keeping every other line's number aligned with the real file, the
-# same convention heredoc_mask.py above already uses for heredoc bodies. A
-# chain of several continued lines folds onto the first line of the chain,
-# not just the first pair, so `a \` / `b \` / `c` becomes one logical `a b c`
-# rather than `a b` with `c` left stranded on its own.
+# continuation, the same rule bash itself uses); the continuation
+# backslash is replaced with a single space and the line it swallows is
+# blanked in its place, keeping every other line's number aligned with
+# the real file, the same convention heredoc_mask.py above already uses
+# for heredoc bodies. A chain of several continued lines folds onto the
+# first line of the chain, not just the first pair, so `a \` / `b \` /
+# `c` becomes one logical `a b c` rather than `a b` with `c` left
+# stranded on its own: the fold keeps absorbing the next physical line,
+# from the SAME head line, for as long as the accumulated text keeps
+# ending in an odd backslash count, rather than re-pairing with whatever
+# already-blanked line happens to sit next after only one fold.
+#
+# bash does NOT continue a comment line: in `# text \` the trailing
+# backslash is comment text, not a continuation, so the following
+# physical line is a separate command. A COMMENT line is therefore
+# never folded here, whether or not it ends in a backslash; folding one
+# into the next line would produce a `#`-prefixed joined line that the
+# post-filter below rule 29's shape scan then discards whole, taking any
+# live line it swallowed down with it -- exactly the illustration two
+# paragraphs up, which is why that comment is safe only because this
+# skip exists.
 cat > "$WORK/join_continuations.py" <<'PY2'
 import re
 import sys
@@ -2789,14 +2806,20 @@ TRAILING_BACKSLASHES = re.compile(r'(\\+)$')
 
 def join_continuations(text):
     lines = text.split('\n')
+    n = len(lines)
     i = 0
-    while i < len(lines) - 1:
+    while i < n:
+        if lines[i].lstrip().startswith('#'):
+            i += 1
+            continue
+        nxt = i + 1
         m = TRAILING_BACKSLASHES.search(lines[i])
-        if m and len(m.group(1)) % 2 == 1:
-            lines[i] = lines[i][:-1] + ' ' + lines[i + 1]
-            lines[i + 1] = ''
-            continue  # re-examine the folded line: it may itself continue
-        i += 1
+        while m and len(m.group(1)) % 2 == 1 and nxt < n:
+            lines[i] = lines[i][:-1] + ' ' + lines[nxt]
+            lines[nxt] = ''
+            nxt += 1
+            m = TRAILING_BACKSLASHES.search(lines[i])
+        i = nxt
     return '\n'.join(lines)
 
 
@@ -2835,13 +2858,19 @@ PY2
 #     than running it) is excluded by skipping any matched line whose
 #     first non-blank character is `#`. The reader alternative requires
 #     `grep` or `head` to be the command actually invoked right after
-#     the pipe (only whitespace in between), not merely the word `head`
-#     appearing anywhere later in that segment, so `... | grep -c
-#     "$HOME/head"` is not mistaken for the early-exiting `head(1)`; the
-#     `grep` branch also accepts the long forms `--quiet` and
-#     `--max-count`, not only `-q`/`-m`, and the writer's variable may be
-#     a positional or special parameter (`"$1"`, `"$@"`) as well as a
-#     named one. Both the `pipefail` file-level guard and the shape scan
+#     the pipe, not merely the word `head` appearing anywhere later in
+#     that segment, so `... | grep -c "$HOME/head"` is not mistaken for
+#     the early-exiting `head(1)`; between the pipe and the command name
+#     it allows only whitespace and zero or more prefixes of the kind
+#     this repository actually writes there -- `VAR=val` environment
+#     assignments (`| LC_ALL=C grep -qF ...`, this file's own house
+#     style for locale-stable text, used nine times already), and the
+#     `command`/`env` wrappers -- so those spellings still race exactly
+#     as the bare form does and must still be caught; the `grep` branch
+#     also accepts the long forms `--quiet` and `--max-count`, not only
+#     `-q`/`-m`, and the writer's variable may be a positional or special
+#     parameter (`"$1"`, `"$@"`) as well as a named one. Both the
+#     `pipefail` file-level guard and the shape scan
 #     itself run against the heredoc_mask.py output rather than the raw
 #     file, so a heredoc payload -- a fixture script written out as DATA
 #     by `cat >`, never executed as a pipeline in the file that contains
@@ -2901,7 +2930,7 @@ racy_pipe_hits() {
     masked="$(python3 "$WORK/heredoc_mask.py" "$f")"
     grep -q 'pipefail' <<<"$masked" || continue
     joined="$(python3 "$WORK/join_continuations.py" <<<"$masked")"
-    grep -nE '(printf|echo)\b[^|#]*\$[A-Za-z_{0-9@*][^|#]*\|[[:space:]]*(grep(([[:space:]]+-[A-Za-z]+)|([[:space:]]+--[A-Za-z-]+))*[[:space:]]+(-[A-Za-z]*[qm]|--quiet|--max-count(=[0-9]+)?)|head\b)' <<<"$joined" \
+    grep -nE '(printf|echo)\b[^|#]*\$[A-Za-z_{0-9@*][^|#]*\|([[:space:]]*([A-Za-z_][A-Za-z0-9_]*=[^[:space:]|#]*|command|env))*[[:space:]]*(grep(([[:space:]]+-[A-Za-z]+)|([[:space:]]+--[A-Za-z-]+))*[[:space:]]+(-[A-Za-z]*[qm]|--quiet|--max-count(=[0-9]+)?)|head\b)' <<<"$joined" \
       | grep -vE '^[0-9]+:[[:space:]]*#' \
       | while IFS=: read -r lineno rest; do
           printf '%s:%s:%s\n' "$f" "$lineno" "$rest"
