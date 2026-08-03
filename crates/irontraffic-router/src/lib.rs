@@ -25,6 +25,7 @@ pub use ids::{
 };
 pub use intern::{CompiledNameSet, MAX_NAMES, NameSetBuilder, NameSetError, is_tchar};
 pub use matching::path::{Descent, descend, prefix_boundary_ok};
+pub use matching::pred::{PredOutcome, eval_preds};
 pub use normalize::{
     AuthorityError, HOST_KEY_BUF_BYTES, HostKind, host_key, normalize_authority,
     normalize_host_pattern,
