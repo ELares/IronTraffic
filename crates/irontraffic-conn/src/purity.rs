@@ -223,11 +223,24 @@ impl ExchangeLedger {
     /// Records `n` response body octets.
     ///
     /// # Errors
-    /// The current `Purity` when the count exceeds the declared length, or when already
-    /// poisoned.
+    /// The current `Purity` when the octets arrive with no exchange in flight (for
+    /// example, after the response already completed, regardless of whether that
+    /// response declared a length), when the count exceeds a declared length, or when
+    /// already poisoned.
     pub fn response_body_bytes(&mut self, n: u64) -> Result<(), Purity> {
         if self.purity != Purity::Clean {
             return Err(self.purity);
+        }
+        if !self.in_flight {
+            // No exchange is in flight to attribute these octets to: either the
+            // response already completed (`response_complete` cleared `in_flight`)
+            // or none was ever begun. This must fire regardless of `declared_body`,
+            // unlike the mid-response check below, because `Streamed` and
+            // `UntilClose` legitimately have no declared length (`declared_body ==
+            // None`) while an exchange is genuinely in flight; that absence of a
+            // declaration is not license to accept octets with nothing in flight at
+            // all. Same poison family as `TrailingBytes`, per edge case 22.
+            return Err(self.poison(PoisonReason::BodyLengthMismatch));
         }
         self.received_body = self.received_body.saturating_add(n);
         if let Some(declared) = self.declared_body
@@ -253,11 +266,19 @@ impl ExchangeLedger {
         {
             return Err(self.poison(PoisonReason::BodyLengthMismatch));
         }
-        self.responses_received = self.responses_received.saturating_add(1);
         self.in_flight = false;
-        if self.responses_received != self.requests_sent {
+        // The documented invariant is `responses_received <= requests_sent` at all
+        // times. Checking against the WOULD-BE count first, and only committing it
+        // to `self.responses_received` once it is known not to exceed
+        // `requests_sent`, is what makes that true on the poisoning call itself: a
+        // fresh ledger plus one `response_complete` now leaves `responses_received()
+        // == 0` (not 1) against `requests_sent() == 0`, because the surplus response
+        // is never written into the counter at all.
+        let next_responses_received = self.responses_received.saturating_add(1);
+        if next_responses_received != self.requests_sent {
             return Err(self.poison(PoisonReason::ExchangeCountMismatch));
         }
+        self.responses_received = next_responses_received;
         Ok(())
     }
 
@@ -584,15 +605,17 @@ mod tests {
 
         // Review finding 4 on PR 843: this is the consequence of saturating at
         // the ceiling, measured rather than changed. Once both counters have
-        // saturated at u32::MAX, response_complete's own saturating_add(1) on
-        // responses_received is *also* a no-op, so the mismatch comparison two
-        // lines later can never observe a surplus response again: the
-        // one-request-one-response accounting this module's own doc header
-        // calls "the structural defense against response queue poisoning" goes
-        // permanently vacuous on a connection that has served u32::MAX
-        // requests. `## Design` mandates saturating_add and `## Do NOT`
-        // forbids `+` on these counters, so the counters must not wrap
-        // either; this is not a defect this test is asking to be fixed.
+        // saturated at u32::MAX, the WOULD-BE responses_received that
+        // response_complete computes via saturating_add(1) is *also* a no-op
+        // (it equals the ceiling either way), so the mismatch comparison
+        // against requests_sent can never observe a surplus response again:
+        // the one-request-one-response accounting this module's own doc
+        // header calls "the structural defense against response queue
+        // poisoning" goes permanently vacuous on a connection that has
+        // served u32::MAX requests. `## Design` mandates saturating_add and
+        // `## Do NOT` forbids `+` on these counters, so the counters must
+        // not wrap either; this is not a defect this test is asking to be
+        // fixed.
         assert_eq!(at_ceiling.response_complete(), Ok(()));
         assert_eq!(at_ceiling.responses_received(), u32::MAX);
         assert!(
@@ -611,6 +634,70 @@ mod tests {
             at_ceiling.may_pool(),
             "a surplus response at the counter ceiling still pools cleanly"
         );
+    }
+
+    #[test]
+    fn responses_received_never_exceeds_requests_sent() {
+        // The `## Invariants` section states `responses_received <= requests_sent`
+        // at all times. Before this fix that was false on exactly the call that
+        // detects a poisoning mismatch: response_complete incremented
+        // responses_received and only afterwards compared it to requests_sent, so
+        // the very call that poisons the connection also (briefly, but
+        // observably: the accessor returns it) let the counter run one ahead. A
+        // fresh ledger plus one response_complete used to give
+        // responses_received() == 1 against requests_sent() == 0 -- measured. This
+        // pins the corrected shape: the would-be count is checked before it is
+        // committed, so a surplus response is never written into the counter at
+        // all.
+        //
+        // This is not academic: issue #85's connection pool is the documented
+        // consumer of these two accessors, and reading the stated invariant, it
+        // would compute outstanding depth as `requests_sent() - responses_received()`.
+        // With the old ordering that underflows on the poisoning call --
+        // panicking on a debug build, wrapping to 4_294_967_295 on release -- and
+        // either outcome wedges a pool slot on the proxy's request path.
+        let mut fresh = ExchangeLedger::new();
+        assert_eq!(
+            fresh.response_complete(),
+            Err(Purity::Poisoned(PoisonReason::ExchangeCountMismatch))
+        );
+        assert_eq!(fresh.requests_sent(), 0);
+        assert_eq!(
+            fresh.responses_received(),
+            0,
+            "the poisoning call itself must not let responses_received run ahead \
+             of requests_sent"
+        );
+        assert!(fresh.responses_received() <= fresh.requests_sent());
+
+        // The other poisoning ordering the invariant must survive: a second
+        // response_complete for a single begin_request.
+        let mut double_complete = ExchangeLedger::new();
+        assert_eq!(double_complete.begin_request(), Ok(()));
+        double_complete.request_body_written();
+        assert_eq!(
+            double_complete.response_head(ResponseFraming::Empty),
+            Ok(())
+        );
+        assert_eq!(double_complete.response_complete(), Ok(()));
+        assert_eq!(double_complete.requests_sent(), 1);
+        assert_eq!(double_complete.responses_received(), 1);
+        assert_eq!(
+            double_complete.response_complete(),
+            Err(Purity::Poisoned(PoisonReason::ExchangeCountMismatch))
+        );
+        assert_eq!(
+            double_complete.responses_received(),
+            1,
+            "the second, poisoning response_complete must not push the counter \
+             past requests_sent"
+        );
+        assert!(double_complete.responses_received() <= double_complete.requests_sent());
+
+        // Every ordering the state machine permits, not just these two hand-picked
+        // ones, is fuzzed by prop_counters_never_diverge_silently below, which
+        // asserts this same `<=` invariant unconditionally after every generated
+        // operation.
     }
 
     #[test]
@@ -1114,6 +1201,16 @@ mod tests {
                     Op::TrailingBytes => ledger.socket_had_trailing_bytes(),
                     Op::Closed => ledger.upstream_closed(),
                 }
+
+                // The `## Invariants` section's `responses_received <= requests_sent`,
+                // asserted unconditionally after every generated operation: across
+                // every ordering the state machine permits, not just Clean-and-idle
+                // states, including the poisoning orderings (a bare response_complete
+                // on a fresh ledger, a second response_complete for one begin_request)
+                // that this invariant used to fail under before response_complete
+                // checked the would-be count against requests_sent before committing
+                // it.
+                prop_assert!(ledger.responses_received() <= ledger.requests_sent());
 
                 // The property: a Clean ledger with no exchange in flight always has
                 // matching counters. There is no state in which it is Clean, idle, and
