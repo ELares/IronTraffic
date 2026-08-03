@@ -167,6 +167,16 @@ pub struct ToolStamp {
 /// Records the instance TYPE and the CPU model. Never an instance id, an
 /// account id, an ARN, an IP address, a hostname or a username.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[allow(
+    clippy::struct_excessive_bools,
+    reason = "physical_cores_assumed, burstable, publishable and pinning_incomplete (the last \
+              added by a PR 828 review finding) are four orthogonal facts about one provenance \
+              record, not a state machine with forbidden combinations: publishable is even \
+              DERIVED from the other three among Design's own six-plus-one independent \
+              conditions, so folding any pair into a two-variant enum would either lose \
+              information recompute_publishable still needs or invent a combined state nothing \
+              in Design describes"
+)]
 pub struct Provenance {
     /// RFC 3339 UTC timestamp, seconds precision, always ending in `Z`.
     pub utc_date: String,
@@ -202,6 +212,29 @@ pub struct Provenance {
     pub ulimit_nofile: u64,
     /// `net.ipv4.ip_local_port_range` as `(low, high)`.
     pub ip_local_port_range: Option<(u32, u32)>,
+    /// True when at least one child that requested core pinning (a
+    /// non-empty `crate::proc::CoreSet`) during this repetition was NOT
+    /// actually pinned, per `crate::proc::Child::pinned`.
+    ///
+    /// Reviewed finding (PR 828): `Child::spawn`'s EINVAL fallback (see
+    /// `crate::proc`'s own "# Pinning" doc) can run a repetition unpinned on
+    /// a host with fewer cores than the assignment requests, and does so ON
+    /// LINUX, where the `ip_local_port_range` condition below (the
+    /// off-Linux case) does not apply: before that fallback existed, such a
+    /// host failed the repetition outright, so a contended run could never
+    /// reach here labelled isolated. `false` at [`Provenance::capture`]
+    /// time, always: capture runs FIRST, before anything is spawned, so
+    /// nothing is yet known about pinning. Set afterward, per repetition, by
+    /// `crate::runner::run_repetition` from what it actually observed, on
+    /// that repetition's own clone, immediately before a second call to
+    /// [`Provenance::recompute_publishable`] folds it in.
+    ///
+    /// `#[serde(default)]`: a `RunResult` written by a harness build that
+    /// predates this field has no such key, and the honest reading of a file
+    /// that predates the check is "not known to have failed", never a
+    /// retroactive claim that it passed a check that did not exist yet.
+    #[serde(default)]
+    pub pinning_incomplete: bool,
     /// The system under test.
     pub sut: BuildStamp,
     /// The origin binary.
@@ -1595,6 +1628,7 @@ fn assemble_provenance(host: HostFacts, parts: AssembledParts) -> Provenance {
         thermal_throttle_count: host.thermal_throttle_count,
         ulimit_nofile,
         ip_local_port_range: host.ip_local_port_range,
+        pinning_incomplete: false,
         sut,
         origin,
         loadgen,
@@ -1673,11 +1707,15 @@ impl Provenance {
         ))
     }
 
-    /// Re-evaluates `publishable` and `unpublishable_reasons` from the current
-    /// field values, per the six-condition table in Design. Clears the
-    /// existing reasons first, then re-derives them, then sorts and
-    /// deduplicates, so calling it twice is idempotent. Called by `capture`
-    /// and again by the result writer.
+    /// Re-evaluates `publishable` and `unpublishable_reasons` from the
+    /// current field values: the six conditions in Design, plus
+    /// `pinning_incomplete` (reviewed finding, PR 828: see that field's own
+    /// doc for why a seventh condition was folded into what was originally a
+    /// closed six-entry table). Clears the existing reasons first, then
+    /// re-derives them, then sorts and deduplicates, so calling it twice is
+    /// idempotent. Called by `capture`; called again, per repetition, by
+    /// `crate::runner::run_repetition` once pinning is known; and again by
+    /// the result writer.
     pub fn recompute_publishable(&mut self) {
         self.unpublishable_reasons.clear();
 
@@ -1709,6 +1747,10 @@ impl Provenance {
         if self.ip_local_port_range.is_none() {
             self.unpublishable_reasons
                 .push("ephemeral port range unavailable".to_owned());
+        }
+        if self.pinning_incomplete {
+            self.unpublishable_reasons
+                .push("a child could not be pinned to its requested cores".to_owned());
         }
 
         self.unpublishable_reasons.sort();

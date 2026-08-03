@@ -256,6 +256,17 @@ pub struct RunResult {
     /// attribution issue's `attribute` divides by.
     /// `provenance.logical_cores` is the whole machine and is the wrong
     /// denominator for both. Zero is treated as 1 by every consumer.
+    ///
+    /// Reviewed finding (PR 828): this count is the cores the run
+    /// REQUESTED the system under test be pinned to, not proof that pinning
+    /// held. Whether it actually did is `provenance.pinning_incomplete`
+    /// (false means it did); check that, and `provenance.publishable`
+    /// alongside it, before treating this field as a real isolation
+    /// denominator. A repetition where pinning fell back unpinned
+    /// (`crate::proc::Child::spawn`'s own EINVAL or ENOENT fallback) is
+    /// marked unpublishable for exactly that reason, so a consumer that
+    /// already refuses an unpublishable result never reaches the case this
+    /// field alone cannot rule out.
     pub sut_cores: u32,
     /// How many releases were capped because the client fell behind.
     pub catchup_burst_count: u64,

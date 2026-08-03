@@ -36,6 +36,7 @@
 //! by its own doc comment) is the precedent.
 #![deny(missing_docs)]
 
+mod aggregate;
 mod cell;
 mod corpus;
 mod error;
@@ -44,10 +45,13 @@ mod hist;
 mod loadgen;
 mod matrix;
 mod probe;
+mod proc;
 mod provenance;
 mod result;
+mod runner;
 mod schedule;
 
+pub use aggregate::{CellAggregate, median, median_f64, quartiles};
 pub use cell::{
     BenchCell, CacheMode, CellId, KeepaliveMode, PathCorpus, Protocol, RESERVED_STEMS, RateMode,
     TlsMode,
@@ -83,6 +87,9 @@ pub use probe::{
     MAX_RESPONSE_BODY_BYTES, ProbeConfig, ProbeHandle, ProbeOutcome, REQUEST_DEADLINE_NS,
     ResponseHead, SPIN_THRESHOLD_NS, ScanOutcome, build_request, scan_response_head, wait_until,
 };
+pub use proc::{
+    Child, CoreAssignment, CoreSet, MAX_CAPTURED_BYTES, TEARDOWN_GRACE, parse_stat_cpu_ticks,
+};
 pub use provenance::{
     BURSTABLE_PREFIXES, BuildStamp, CaptureInputs, CpuInfoFields, LARGE_FILE_CAP, MAX_CPU_ENTRIES,
     PROBE_OUTPUT_CAP, PROBE_TIMEOUT_SECONDS, Provenance, SMALL_FILE_CAP, StampSource, ToolStamp,
@@ -92,5 +99,9 @@ pub use provenance::{
 pub use result::{
     Bottleneck, DeepestPercentile, InvariantId, MAX_COMMAND_LINE, RunResult, SuspectReason,
     Validity,
+};
+pub use runner::{
+    DEFAULT_MEASURE_SECS, DEFAULT_REPETITIONS, DEFAULT_WARMUP_SECS, RECONCILE_TOLERANCE_PERMILLE,
+    RunParamsFull, reconcile, run_cell, run_repetition,
 };
 pub use schedule::{MAX_BURST_CAP, Release, Schedule, StallTracker};
