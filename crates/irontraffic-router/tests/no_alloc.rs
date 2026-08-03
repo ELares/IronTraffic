@@ -131,3 +131,41 @@ fn descend_allocates_nothing() {
          nothing in this repository catching it"
     );
 }
+
+#[test]
+fn eval_preds_allocates_nothing() {
+    // `predicate-bytecode-eval` (#59) originally intended to prove this with
+    // a process-wide counting `#[global_allocator]` that builds every table
+    // and scratch its own named tests use, resets the counter, replays every
+    // `eval_preds` call, and asserts the count stayed zero. That does not
+    // compile in this tree for the identical reason documented above
+    // `normalize_and_host_key_allocate_nothing`: `GlobalAlloc` is an `unsafe
+    // trait`, this crate's root is `#![forbid(unsafe_code)]` with no
+    // per-crate exception, and a process-wide allocator would be unsound
+    // here regardless, since it would count every OTHER test's allocations
+    // too, whichever happen to run in the same binary at the same time. The
+    // issue's own dependency list also names `authority-normalization` (#50)
+    // as the issue that creates a `tests/common/mod.rs` this test would
+    // append to; no such file exists in this tree, and this issue's `##
+    // Files` table does not list one either, so creating it here would both
+    // touch an undeclared file and resurrect the banned allocator.
+    //
+    // `src/matching/pred.rs` instead carries the same `//! HOT PATH` marker
+    // that already protects `normalize_authority`, `MatchScratch` and
+    // `descend`, which puts `eval_preds` (production, non-test code in that
+    // file) under `scripts/invariant-lints.sh`'s `hot-path-allocation` and
+    // `hot-path-lock` rules for every pull request. This test's only job is
+    // to guard against that marker line being deleted, which would silently
+    // drop the module out of that CI-enforced net; `assertions weakened` and
+    // `test removed` in `scripts/test-census.sh` both refuse a change that
+    // shrinks this test's body without a written justification.
+    let source = include_str!("../src/matching/pred.rs");
+    assert!(
+        source.lines().any(|line| line == HOT_PATH_MARKER),
+        "crates/irontraffic-router/src/matching/pred.rs must carry a line \
+         that is exactly `{HOT_PATH_MARKER}` so scripts/invariant-lints.sh's \
+         hot-path-allocation and hot-path-lock rules scan this module; \
+         without it, eval_preds could allocate or lock with nothing in this \
+         repository catching it"
+    );
+}

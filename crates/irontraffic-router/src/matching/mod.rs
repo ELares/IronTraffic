@@ -8,3 +8,4 @@
 //! `match-request-core` (#60) is the caller.
 
 pub mod path;
+pub mod pred;
