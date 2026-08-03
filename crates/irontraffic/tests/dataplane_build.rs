@@ -97,6 +97,23 @@ fn write_fixture(contents: &str) -> (PathBuf, PathBuf) {
 }
 
 /// 1. `run_mode_matches_the_build`.
+///
+/// `free_local_port()`'s result in both arms below is always the config's UPSTREAM
+/// address, never a port either arm binds itself, so neither is the "binds a real
+/// listener on the returned port immediately" shape this crate's `free_local_port`
+/// audit (see the commit that introduced `dead_local_port`) classified them as. What
+/// actually makes each arm safe from issue #888's race differs:
+/// - control-plane arm (below): a live `run`-mode proxy dials this dead upstream
+///   exactly once, from `spawn_proxy_with_mode`'s own readiness probe, at the moment
+///   its listener first answers (see `support::Origin::start`'s doc comment on why a
+///   bare connect-then-close probe still reaches the upstream dial). That is the same
+///   narrow, child-startup-scale window issue #888 itself scopes out as an accepted
+///   residual (the `free_local_port` to child-bind race for the LISTEN port; see the
+///   issue's "Proposed fix" section), not the whole-test-body exposure this PR's fix
+///   closes elsewhere: no other connection ever reaches this proxy in the 500 ms it
+///   runs before `shutdown()`.
+/// - dataplane-only arm (below): the binary rejects `run` with exit code 2 before it
+///   ever reaches the bind/dial logic, so this port is never touched by anything.
 #[test]
 fn run_mode_matches_the_build() {
     #[cfg(feature = "control-plane")]
@@ -129,6 +146,13 @@ fn run_mode_matches_the_build() {
 }
 
 /// 2. `control_mode_matches_the_build`.
+///
+/// `free_local_port()`'s result in both arms below is, again, only ever the config's
+/// upstream address, and control mode never binds a listener or dials an upstream at
+/// all (see `control_mode_binds_nothing_and_exits_zero`'s doc comment in smoke.rs), so
+/// this port is inert in the control-plane arm. The trimmed-build arm additionally
+/// exits with an error before ever reaching that logic, the same as
+/// `run_mode_matches_the_build`'s own trimmed-build arm above.
 #[test]
 fn control_mode_matches_the_build() {
     #[cfg(feature = "control-plane")]

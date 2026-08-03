@@ -50,3 +50,7 @@ irontraffic-upstream = { path = "../irontraffic-upstream", version = "0.1.0" }
 # async runtime; the binary itself never names tokio (see
 # `crates/irontraffic/src/serve.rs`).
 tokio = { workspace = true }
+# `tests/support/mod.rs`'s `dead_local_port` needs a socket that is bound but
+# never listened, which `std::net::TcpListener::bind` cannot express (it always
+# calls `listen(2)`); already in the tree via `irontraffic-io`.
+socket2 = { workspace = true }

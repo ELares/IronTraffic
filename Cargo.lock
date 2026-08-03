@@ -1169,6 +1169,7 @@ dependencies = [
  "irontraffic-runtime",
  "irontraffic-time",
  "irontraffic-upstream",
+ "socket2",
  "tokio",
  "tracing",
  "tracing-subscriber",

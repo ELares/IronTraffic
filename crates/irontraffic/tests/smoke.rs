@@ -282,10 +282,38 @@ fn closed_without_hanging(result: &std::io::Result<usize>) -> bool {
 
 /// 6. `dead_upstream_closes_the_connection_without_hanging`: startup succeeds even
 ///    though the backend is down, and the failure is bounded, not a hang.
+///
+/// Switching to `dead_local_port` changed WHICH bounded failure this test measures on
+/// macOS, and that is worth being explicit about rather than leaving it to surprise the
+/// next reader. `free_local_port`'s unheld port used to give an instant `ECONNREFUSED`
+/// on every platform (nothing was listening). `dead_local_port`'s held,
+/// bound-but-never-listened socket gives that same instant refusal on Linux, but on
+/// macOS (a BSD-derived stack, no listen queue to reset a `SYN` against) it silently
+/// drops the `SYN` instead, so the proxy's dial now runs its full `connect_ms: 2000`
+/// budget and fails with a timeout rather than a refusal.
+///
+/// Measured directly on this host, 5 runs at `--test-threads=4`, all green: this test
+/// alone went from sub-millisecond to 4.3 to 5.2 s per run. The static headroom against
+/// `connect`'s own 10 s read timeout below also dropped, from roughly four orders of
+/// magnitude (an instant refusal against a 10 s bound) to 5x (`connect_ms: 2000`'s own
+/// worst case against the same 10 s bound): a slower macOS host, or a config that
+/// raised `connect_ms`, could in principle close that gap in a way it never could
+/// before this change.
+///
+/// ACCEPTED: nothing here fails (5/5 runs green, full smoke binary 3/3 green), the cost
+/// is confined to macOS, and Linux, the platform issue #888 is actually about, is
+/// unaffected (an unlistened bind still refuses instantly there). A future config that
+/// pushes `connect_ms` close to 10 s would be the thing to revisit this decision for.
 #[test]
 fn dead_upstream_closes_the_connection_without_hanging() {
-    let dead_port = support::free_local_port(); // nothing is listening here
-    let proxy = support::spawn_proxy(&cfg_yaml(dead_port));
+    // Held for the whole test body, not merely observed: `free_local_port` releases
+    // its port immediately, and on Linux a released ephemeral port can be re-issued
+    // to a concurrent test's proxy before this test's assertions run (issue #888).
+    // On macOS this same hold is also why THIS particular connect attempt below now
+    // takes up to `connect_ms: 2000` instead of failing instantly: see the doc comment
+    // above.
+    let dead = support::dead_local_port();
+    let proxy = support::spawn_proxy(&cfg_yaml(dead.port));
 
     let mut first = connect(proxy.addr);
     send_hello(&mut first);
@@ -306,6 +334,54 @@ fn dead_upstream_closes_the_connection_without_hanging() {
     );
 
     proxy.shutdown();
+}
+
+/// `support::dead_local_port` proves both properties its own doc comment claims:
+/// nothing ever answers a connect to the held port, and the port is unavailable to
+/// any other bind for as long as the guard is alive.
+///
+/// The connect side is intentionally tolerant of which of two legitimate kernel
+/// behaviors it observes, unlike the doc comment's Linux-specific `ECONNREFUSED`
+/// claim: measured directly on this host (a bound-but-never-listened socket),
+/// Linux's kernel resets an inbound `SYN` immediately, giving `ConnectionRefused`,
+/// while a BSD-derived stack (macOS's, confirmed here) has no listen queue to reset
+/// against and silently drops the `SYN`, giving `TimedOut` once the caller's own
+/// bounded `connect_timeout` gives up. Both are the same "genuinely dead, not merely
+/// slow" fact this function needs to prove; only a real accept, or a hang past the
+/// bound, would be a genuine failure.
+///
+/// The reservation side is checked by attempting an explicit bind to the exact held
+/// port rather than by repeatedly calling `bind(0)` and hoping never to observe it:
+/// an explicit bind failing with `AddrInUse` is a direct, deterministic proof that
+/// the port is occupied, which structurally implies an ephemeral `bind(0)` (which
+/// only ever offers an unoccupied port) can never be handed it either, whereas a
+/// bounded number of `bind(0)` probes could only ever raise confidence, never prove
+/// it (issue #888).
+#[test]
+fn dead_local_port_refuses_connects_and_stays_reserved() {
+    let dead = support::dead_local_port();
+
+    let addr = SocketAddr::from(([127, 0, 0, 1], dead.port));
+    let connect_result = std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(500));
+    let connect_err =
+        connect_result.expect_err("a bound-but-never-listened port must never accept a connect");
+    assert!(
+        matches!(
+            connect_err.kind(),
+            std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::TimedOut
+        ),
+        "expected ECONNREFUSED (Linux) or a bounded TimedOut (BSD/macOS, no listen queue to \
+         reset against) connecting to a held dead port, got {connect_err:?}"
+    );
+
+    let rebind_result = std::net::TcpListener::bind(("127.0.0.1", dead.port));
+    let rebind_err =
+        rebind_result.expect_err("a port held by dead_local_port must reject a second bind");
+    assert_eq!(
+        rebind_err.kind(),
+        std::io::ErrorKind::AddrInUse,
+        "expected EADDRINUSE re-binding a held dead port, got {rebind_err:?}"
+    );
 }
 
 /// True when a bounded read observes neither data nor a close: a `WouldBlock` (most
@@ -464,12 +540,32 @@ async fn connection_cap_rejects_the_extra_connection() {
 #[cfg(feature = "control-plane")]
 #[test]
 fn control_mode_binds_nothing_and_exits_zero() {
-    let bind_port = support::free_local_port();
-    let upstream_port = support::free_local_port();
-    let cfg = cfg_yaml_with_bind(bind_port, upstream_port);
-
-    let held = std::net::TcpListener::bind(("127.0.0.1", bind_port))
-        .expect("hold the configured listener port for the duration of the test");
+    // Both ports must stay held for the whole test body, not merely observed:
+    // `free_local_port` releases its port immediately, and a released port can be
+    // re-issued elsewhere in the process while this test is still running (issue
+    // #888). `bind` doubles as the "collide with control's own bind attempt" listener
+    // the doc comment above describes, and the reason that works is narrower than an
+    // earlier version of this comment claimed: listen state is NOT irrelevant to a
+    // competing `bind(2)` in general, on Linux.
+    //
+    // Measured directly on Linux 6.8 (20 trials each, raw socket probes against the
+    // real option sets involved): a challenger that sets `SO_REUSEADDR` and
+    // `SO_REUSEPORT`, which is what `irontraffic-io/src/sys/mod.rs`'s `bind_listener`
+    // always sets before binding, gets `EADDRINUSE` against `dead_local_port`'s socket
+    // (which sets neither flag, see its own doc comment) whether or not that socket is
+    // listening: bind only, 20/20 refused; bind and listen, 20/20 refused. So `bind`
+    // above needs no separate re-bind call. But give that SAME incumbent socket
+    // `SO_REUSEADDR` instead (still not listening) and the identical challenger bind
+    // now SUCCEEDS 20/20; give it `SO_REUSEPORT` alone instead (still not listening)
+    // and it succeeds 20/20 too. Listen state only stopped mattering above because
+    // `dead_local_port` sets neither flag; it is not a general property of a bound
+    // socket. Adding `SO_REUSEADDR` or `SO_REUSEPORT` to `dead_local_port` would
+    // silently let a control-mode regression's bind through this exact test on Linux.
+    // `upstream` is never dialed by control mode; it is held only so nothing else in
+    // the process can be handed the port while this test's config still names it.
+    let bind = support::dead_local_port();
+    let upstream = support::dead_local_port();
+    let cfg = cfg_yaml_with_bind(bind.port, upstream.port);
 
     let (mut child, dir) = support::spawn_binary(&cfg, "control");
 
@@ -486,7 +582,8 @@ fn control_mode_binds_nothing_and_exits_zero() {
         "control mode must not build either runtime, but stderr contains a runtime-built line:\n{stderr}"
     );
 
-    drop(held);
+    drop(bind);
+    drop(upstream);
     let _ = std::fs::remove_dir_all(&dir); // it-allow: no-swallowed-error reason: best-effort test fixture cleanup; a leftover temp directory does not affect any assertion
 }
 
@@ -655,6 +752,29 @@ async fn counters_are_reported_at_shutdown() {
 /// No origin needed: startup succeeds even with nothing listening on the upstream
 /// port (edge case 1, also exercised by `dead_upstream_closes_the_connection_
 /// without_hanging`), and this test only inspects the startup log, not forwarding.
+///
+/// On macOS specifically, holding the dead upstream with `dead_local_port` (see that
+/// test's identical doc comment for the mechanism) means `spawn_proxy`'s own readiness
+/// probe now leaves one dial to this dead upstream in flight when `shutdown_capturing_
+/// stderr` sends SIGTERM immediately after. Measured directly on this host, 9 runs at
+/// `--test-threads=4`, all green: this test alone went from sub-millisecond to
+/// consistently just over 2 s per run (`elapsed_ms` 1994 to 2056, read from the
+/// "shutdown complete" line itself, against this config's `graceful_timeout_ms: 2000`),
+/// because the drain's own deadline and the dial's `connect_ms: 2000` timeout are
+/// racing on the same clock. That race lands close enough to call either way: 2 of the
+/// 9 runs logged `irontraffic-conn/src/drain.rs`'s "drain deadline reached" WARN, the
+/// other 7 finished (`drain complete; no connections remained`) a handful of
+/// milliseconds before that check next ran. `killed=0` and `escalated=false` in all 9
+/// either way. ACCEPTED for the same reason as `dead_upstream_closes_the_connection_
+/// without_hanging`: nothing here fails, because `drain.rs` grants a further
+/// `poll_interval * 20` (50 ms * 20 = 1000 ms, read directly from that file, not
+/// assumed) past the graceful deadline before reporting `killed`, which is comfortably
+/// more than the handful of milliseconds the WARN runs overran by; and Linux, where
+/// this test's failure mode (issue #888) actually lives, is unaffected (an unlistened
+/// bind still refuses instantly there, so no dial is ever left in flight). This test
+/// does not assert on timing or on the shutdown log's `killed`/`escalated` fields, only
+/// on `max_connections`, so the added latency changes this test's wall-clock cost but
+/// not what it proves.
 #[test]
 fn connection_cap_line_reflects_the_registry() {
     // Distinctive: far below any real host's descriptor budget (so it is never
@@ -662,11 +782,11 @@ fn connection_cap_line_reflects_the_registry() {
     // example of 10000/480 (test 14, below), so a mutation that substitutes one of
     // those numbers for this one is also caught here.
     const MAX_CONNECTIONS: u32 = 3;
-    let dead_upstream_port = support::free_local_port();
-    let proxy = support::spawn_proxy(&cfg_yaml_with_max_connections(
-        dead_upstream_port,
-        MAX_CONNECTIONS,
-    ));
+    // Held for the whole test body, not merely observed: see
+    // `dead_upstream_closes_the_connection_without_hanging`'s identical comment
+    // (issue #888).
+    let dead = support::dead_local_port();
+    let proxy = support::spawn_proxy(&cfg_yaml_with_max_connections(dead.port, MAX_CONNECTIONS));
 
     let (status, stderr) = proxy.shutdown_capturing_stderr();
     assert_eq!(status.code(), Some(0));
