@@ -667,10 +667,36 @@ impl HealthScheduler {
                 new_ejected.push(self.ejected.get(j).copied().unwrap_or(false));
                 new_ramping.push(self.ramping.get(j).copied().unwrap_or(false));
                 new_draining.push(self.draining.get(j).copied().unwrap_or(false));
-                let carried_inflight = self.inflight.get(j).copied().unwrap_or(false);
+                // An outstanding `CheckOrder` the runner is holding still
+                // names the endpoint's OLD index `j`. When the index has not
+                // moved (`i == j`), the runner's eventual report still
+                // arrives addressed to the right slot and the existing id
+                // guard in `record` accepts it normally, so the in-flight
+                // bit, `dispatched_at`, and `stuck` are safe to carry. When
+                // the index HAS moved, that report will be addressed to `j`,
+                // which after this rebuild names a different endpoint (or is
+                // out of range), so `record` will discard it as
+                // `reports_for_unknown_endpoint` and nothing would ever
+                // clear an in-flight bit carried forward to `i`: the
+                // endpoint would be permanently stuck as "already in
+                // flight" and never dispatched again. Reset instead: the
+                // endpoint loses at most that one outstanding check and
+                // becomes dispatchable again on its own normal schedule via
+                // the wheel entry armed at `carried.nominal` below.
+                let index_moved = i != j;
+                let carried_inflight =
+                    !index_moved && self.inflight.get(j).copied().unwrap_or(false);
                 new_inflight.push(carried_inflight);
-                new_dispatched_at.push(self.dispatched_at.get(j).copied().unwrap_or(Millis(0)));
-                new_stuck.push(self.stuck.get(j).copied().unwrap_or(false));
+                new_dispatched_at.push(if index_moved {
+                    Millis(0)
+                } else {
+                    self.dispatched_at.get(j).copied().unwrap_or(Millis(0))
+                });
+                new_stuck.push(if index_moved {
+                    false
+                } else {
+                    self.stuck.get(j).copied().unwrap_or(false)
+                });
                 if carried_inflight {
                     inflight_count = inflight_count.saturating_add(1);
                 }
@@ -1664,6 +1690,287 @@ mod tests {
             sched.len(),
             3,
             "a rejected rebuild must not have touched the scheduler's state"
+        );
+        sched.debug_assert_consistent();
+    }
+
+    // Regression test for the live defect described in issue 861: `rebuild`
+    // carried a surviving endpoint's in-flight bit forward unconditionally,
+    // even when the endpoint's index moved. The runner's outstanding
+    // `CheckOrder` for that endpoint still names the OLD index, so its
+    // eventual honest report gets discarded by `record`'s id guard and the
+    // in-flight bit at the endpoint's NEW index can never clear: the
+    // endpoint is never dispatched again for the rest of the process's
+    // life. Reproduces the measured scenario verbatim: deleting pod 20 from
+    // the middle of `[10, 20, 30]` moves id 30 from index 2 to index 1.
+    #[test]
+    fn rebuild_index_move_does_not_strand_inflight() {
+        let cfg = all_due_cfg();
+        let t0 = Millis(0);
+        // The wheel bumps a deadline scheduled exactly at the current cursor
+        // forward by one millisecond (`schedule`'s `raw == 0` case), and
+        // `HealthScheduler::new` starts the cursor at `t0` with every
+        // endpoint's nominal also at `t0` (`all_due_cfg`'s zero phase), so
+        // the very first due instant is `t0 + 1`, not `t0` itself. Every
+        // existing test that uses `all_due_cfg` polls at `t0.add_ms(1)` for
+        // the same reason (see `poll_due_respects_concurrency_cap`).
+        let t1 = t0.add_ms(1);
+        let ids = vec![10u64, 20u64, 30u64];
+        let mut sched = HealthScheduler::new(t0, 1, &ids, cfg, 3, true).expect("valid");
+        let mut rng = Rng::from_seed(861);
+        let mut out = Vec::new();
+        sched.poll_due(t1, &mut rng, &mut out);
+        assert_eq!(
+            out.len(),
+            3,
+            "all three endpoints must dispatch at t0 + 1ms"
+        );
+        assert_eq!(sched.inflight(), 3);
+
+        let order_10 = out
+            .iter()
+            .copied()
+            .find(|o| o.endpoint_id == 10)
+            .expect("order for id 10");
+        let order_30 = out
+            .iter()
+            .copied()
+            .find(|o| o.endpoint_id == 30)
+            .expect("order for id 30");
+
+        sched
+            .rebuild(t1, &[10u64, 30u64], &mut rng)
+            .expect("rebuild must succeed");
+        assert_eq!(
+            sched.inflight(),
+            1,
+            "only the unmoved endpoint's in-flight bit may survive the rebuild, not 2"
+        );
+        sched.debug_assert_consistent();
+
+        let health = ClusterHealth::new(2, 0);
+        let before_unknown = sched.stats().reports_for_unknown_endpoint;
+
+        let report_10 = CheckReport {
+            endpoint: order_10.endpoint,
+            endpoint_id: order_10.endpoint_id,
+            outcome: CheckOutcome::Pass,
+            reconnected: false,
+        };
+        assert!(
+            sched.record(t1, report_10, &mut rng, &health).is_some(),
+            "the report for the endpoint whose index did not move must be accepted"
+        );
+
+        let report_30 = CheckReport {
+            endpoint: order_30.endpoint,
+            endpoint_id: order_30.endpoint_id,
+            outcome: CheckOutcome::Pass,
+            reconnected: false,
+        };
+        assert!(
+            sched.record(t1, report_30, &mut rng, &health).is_none(),
+            "the stale report addressed to the endpoint's OLD index must be discarded"
+        );
+        assert_eq!(
+            sched.stats().reports_for_unknown_endpoint,
+            before_unknown + 1,
+            "the discard must be counted exactly once"
+        );
+        sched.debug_assert_consistent();
+
+        let mut dispatch_count_30: u32 = 0;
+        let mut now = t1;
+        for _ in 0..5000u32 {
+            now = now.add_ms(1);
+            out.clear();
+            sched.poll_due(now, &mut rng, &mut out);
+            for order in out.drain(..) {
+                if order.endpoint_id == 30 {
+                    dispatch_count_30 = dispatch_count_30.saturating_add(1);
+                }
+                let report = CheckReport {
+                    endpoint: order.endpoint,
+                    endpoint_id: order.endpoint_id,
+                    outcome: CheckOutcome::Pass,
+                    reconnected: false,
+                };
+                sched.record(now, report, &mut rng, &health);
+            }
+        }
+        assert!(
+            dispatch_count_30 > 0,
+            "endpoint 30 must recover and be dispatched again over the 5-second window \
+             (observed {dispatch_count_30} dispatches), not permanently stranded at 0"
+        );
+        sched.debug_assert_consistent();
+    }
+
+    // Regression test for issue 861, edge case 1: a rebuild that changes
+    // nothing about ordering must still carry the in-flight bit and
+    // `dispatched_at` for a surviving endpoint whose index did not move.
+    // Guards against a future edit making the `index_moved` check too
+    // aggressive (for example comparing endpoint ids instead of positions).
+    #[test]
+    fn rebuild_same_index_still_carries_inflight() {
+        let cfg = all_due_cfg();
+        let t0 = Millis(0);
+        // See `rebuild_index_move_does_not_strand_inflight` for why the
+        // first due instant is `t0 + 1`, not `t0`.
+        let t1 = t0.add_ms(1);
+        let ids = vec![10u64, 20u64, 30u64];
+        let mut sched = HealthScheduler::new(t0, 1, &ids, cfg, 3, true).expect("valid");
+        let mut rng = Rng::from_seed(862);
+        let mut out = Vec::new();
+        sched.poll_due(t1, &mut rng, &mut out);
+        assert_eq!(
+            out.len(),
+            3,
+            "all three endpoints must dispatch at t0 + 1ms"
+        );
+
+        let order_30 = out
+            .iter()
+            .copied()
+            .find(|o| o.endpoint_id == 30)
+            .expect("order for id 30");
+        let health = ClusterHealth::new(3, 0);
+        let report_30 = CheckReport {
+            endpoint: order_30.endpoint,
+            endpoint_id: order_30.endpoint_id,
+            outcome: CheckOutcome::Pass,
+            reconnected: false,
+        };
+        assert!(sched.record(t1, report_30, &mut rng, &health).is_some());
+        let pre_rebuild_inflight = sched.inflight();
+        assert_eq!(
+            pre_rebuild_inflight, 2,
+            "ids 10 and 20 must still be in flight after id 30's report is recorded"
+        );
+        let dispatched_at_10_before = sched.dispatched_at.first().copied();
+
+        // Removing only the LAST endpoint leaves every surviving index
+        // unchanged: id 10 stays at index 0, id 20 stays at index 1.
+        sched
+            .rebuild(t1, &[10u64, 20u64], &mut rng)
+            .expect("rebuild must succeed");
+
+        assert_eq!(
+            sched.inflight(),
+            pre_rebuild_inflight,
+            "removing an endpoint that is not itself in flight, and that shifts no \
+             survivor's index, must not disturb the survivors' in-flight bits"
+        );
+        assert_eq!(
+            sched.dispatched_at.first().copied(),
+            dispatched_at_10_before,
+            "dispatched_at must still be carried for an endpoint whose index did not move"
+        );
+        sched.debug_assert_consistent();
+    }
+
+    // Regression test for issue 861, edge case 7: an endpoint that is both
+    // in flight AND already marked stuck must come out of a rebuild that
+    // moves its index with `stuck == false` and `inflight == false`, and
+    // must not immediately re-trip the stuck detector from a stale
+    // `dispatched_at` once it is dispatched fresh.
+    #[test]
+    fn rebuild_index_move_resets_stuck_and_dispatched_at() {
+        // `all_due_cfg` unmodified: `timeout_ms` (1) must not exceed
+        // `interval_ms` (1) per `HealthCheckConfig::validate`'s
+        // `ordered_u32` check, so the stuck threshold here is
+        // `10 * timeout_ms` = 10 ms, not the 1000 ms a larger `timeout_ms`
+        // would give, but the property under test does not depend on the
+        // threshold's absolute size.
+        let cfg = all_due_cfg();
+        let t0 = Millis(0);
+        // See `rebuild_index_move_does_not_strand_inflight` for why the
+        // first due instant is `t0 + 1`, not `t0`.
+        let t1 = t0.add_ms(1);
+        let ids = vec![10u64, 20u64, 30u64];
+        let mut sched = HealthScheduler::new(t0, 1, &ids, cfg, 3, true).expect("valid");
+        let mut rng = Rng::from_seed(863);
+        let mut out = Vec::new();
+
+        sched.poll_due(t1, &mut rng, &mut out);
+        assert_eq!(
+            out.len(),
+            3,
+            "all three endpoints must dispatch at t0 + 1ms"
+        );
+
+        // Never respond to id 30 (index 2). Advance past the stuck
+        // threshold (10 * timeout_ms = 10 ms), exactly as
+        // `stuck_inflight_gauge_rises_and_does_not_double_count` drives a
+        // single endpoint stuck, so `poll_due`'s already-inflight branch
+        // marks it stuck before the rebuild.
+        let past_threshold = t1.add_ms(11);
+        out.clear();
+        let stuck_poll = sched.poll_due(past_threshold, &mut rng, &mut out);
+        assert!(
+            out.is_empty(),
+            "an already in-flight endpoint must never get a second order"
+        );
+        assert_eq!(stuck_poll.dispatched, 0);
+        assert_eq!(
+            sched.stuck.get(2).copied(),
+            Some(true),
+            "id 30 must be marked stuck before the rebuild"
+        );
+        assert_eq!(sched.inflight.get(2).copied(), Some(true));
+        sched.debug_assert_consistent();
+
+        // Remove id 20 from the middle: id 30 moves from index 2 to index 1
+        // while its check is still in flight and marked stuck.
+        sched
+            .rebuild(past_threshold, &[10u64, 30u64], &mut rng)
+            .expect("rebuild must succeed");
+
+        assert_eq!(
+            sched.inflight.get(1).copied(),
+            Some(false),
+            "the moved endpoint's in-flight bit must be reset, not stranded stuck-and-inflight"
+        );
+        assert_eq!(
+            sched.stuck.get(1).copied(),
+            Some(false),
+            "the moved endpoint's stuck bit must be reset, not carried across the index change"
+        );
+        assert_eq!(
+            sched.dispatched_at.get(1).copied(),
+            Some(Millis(0)),
+            "the moved endpoint's dispatched_at must reset to the fresh value, not a stale timestamp"
+        );
+        sched.debug_assert_consistent();
+
+        // A subsequent dispatch must behave exactly like a freshly
+        // scheduled endpoint: it becomes due on its own schedule and
+        // dispatches a fresh order.
+        out.clear();
+        let redispatch = sched.poll_due(past_threshold.add_ms(1), &mut rng, &mut out);
+        assert_eq!(
+            redispatch.dispatched, 1,
+            "the moved endpoint must dispatch a fresh order once due again"
+        );
+        let fresh_order = out.first().copied().expect("one fresh order");
+        assert_eq!(fresh_order.endpoint, EndpointIdx(1));
+        assert_eq!(fresh_order.endpoint_id, 30);
+        sched.debug_assert_consistent();
+
+        // One millisecond after the fresh dispatch, the stuck detector must
+        // not immediately re-trip: `dispatched_at` must be the fresh
+        // timestamp, not the pre-rebuild stale one.
+        out.clear();
+        let immediate_repoll = sched.poll_due(past_threshold.add_ms(2), &mut rng, &mut out);
+        assert!(
+            out.is_empty(),
+            "the freshly dispatched endpoint must not get a second order one millisecond later"
+        );
+        assert_eq!(immediate_repoll.dispatched, 0);
+        assert_eq!(
+            sched.stuck.get(1).copied(),
+            Some(false),
+            "one millisecond after a fresh dispatch must never re-trip the stuck detector"
         );
         sched.debug_assert_consistent();
     }
