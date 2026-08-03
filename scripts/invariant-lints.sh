@@ -2681,6 +2681,32 @@ the exactly-one-call-site requirement above, which has no escape:
 # queued in the order they appear and closed off one at a time by the
 # lines that follow, which is also the order bash itself reads their
 # bodies in, so this stays correct without any special-casing.
+#
+# COMMENTS ARE NOT SCANNED FOR A HEREDOC START. starts_on() runs on every
+# non-body line with no idea what that line IS, so `<<WORD` written as
+# PROSE inside a `#` comment (exactly the sentence two paragraphs up,
+# which shows `cat > some/path <<'MARKER'` as an example rather than
+# running one) used to be read as opening a real heredoc. Nothing in the
+# file then equals that comment's own word, so `pending` was never
+# popped and every line from the comment to EOF was blanked from both
+# the `pipefail` guard and rule 29's shape scan below -- silently,
+# because this file is grown by appending new rules at its end, which is
+# exactly the region such a comment blinds. A comment line is now
+# excluded from heredoc-start detection before that scan ever happens
+# (see the `line.lstrip().startswith('#')` check in mask() below), which
+# is the fix for that.
+#
+# TWO SHAPES THIS DOES NOT COVER, both ordinary shell, neither present in
+# this repository today: `<<` written inside a quoted string used for
+# something other than a heredoc (`grep -F "<<EOF" file`), and `<<` as
+# the arithmetic left-shift operator (`MASK=$(( 1 << SHIFT ))`). Both are
+# textually indistinguishable from a real heredoc start without tracking
+# quote and arithmetic-context state, which this scanner deliberately
+# does not do (see the file-level rationale above: this is a textual
+# scan, not a shell parser). A line of either shape appended to this
+# file today would reopen the same blind spot the comment above did.
+# Widening this into a real parser is future work, not a reason to leave
+# the comment-shaped instance of the bug in place now.
 cat > "$WORK/heredoc_mask.py" <<'PY'
 import re
 import sys
@@ -2717,12 +2743,65 @@ def mask(path):
             out.append('')
             continue
         out.append(line)
+        if line.lstrip().startswith('#'):
+            # A `<<WORD` sitting in a COMMENT is prose showing the shape,
+            # never a heredoc bash will actually open (see the paragraph
+            # above on why this file itself used to be a live example of
+            # that: this comment block's own mention of `cat > some/path
+            # <<'MARKER'` used to be read as opening a real heredoc with
+            # no closing MARKER anywhere in the file, so every line from
+            # here to EOF was blanked). starts_on() is only reached here
+            # when `pending` is empty, i.e. we are outside any real
+            # heredoc body, so skipping it on a comment line can never
+            # end an actual heredoc early; it only stops a comment's
+            # prose from being misread as one starting.
+            continue
         pending.extend(starts_on(line))
     return '\n'.join(out)
 
 
 sys.stdout.write(mask(sys.argv[1]))
 PY
+
+# join_continuations.py: fold a backslash-continued shell command onto one
+# logical line, reading the already heredoc_mask.py-masked text on stdin and
+# writing the same number of lines back out, so a downstream single-physical-
+# line regex (rule 29's shape scan below) sees a pipeline that this project
+# already writes split across lines, such as
+#     printf '%s\n' "$RAW" \
+#       | grep -qF "$needle"
+# as one line instead of two it cannot each independently match. A line is
+# folded into the next only when it ends in an ODD number of trailing
+# backslashes (an escaped backslash pair at end of line is data, not a
+# continuation, the same rule bash itself uses); the continuation backslash
+# is replaced with a single space and the line it swallows is blanked in its
+# place, keeping every other line's number aligned with the real file, the
+# same convention heredoc_mask.py above already uses for heredoc bodies. A
+# chain of several continued lines folds onto the first line of the chain,
+# not just the first pair, so `a \` / `b \` / `c` becomes one logical `a b c`
+# rather than `a b` with `c` left stranded on its own.
+cat > "$WORK/join_continuations.py" <<'PY2'
+import re
+import sys
+
+TRAILING_BACKSLASHES = re.compile(r'(\\+)$')
+
+
+def join_continuations(text):
+    lines = text.split('\n')
+    i = 0
+    while i < len(lines) - 1:
+        m = TRAILING_BACKSLASHES.search(lines[i])
+        if m and len(m.group(1)) % 2 == 1:
+            lines[i] = lines[i][:-1] + ' ' + lines[i + 1]
+            lines[i + 1] = ''
+            continue  # re-examine the folded line: it may itself continue
+        i += 1
+    return '\n'.join(lines)
+
+
+sys.stdout.write(join_continuations(sys.stdin.read()))
+PY2
 
 # ---------------------------------------------------------------------------
 # 29. no-racy-early-exit-pipe: a pipeline whose writer is `printf` or `echo`
@@ -2746,30 +2825,83 @@ PY
 #     PARSER, and it only flags a file that itself sets `pipefail`: a
 #     pipeline without `pipefail` cannot lose this race, because a
 #     non-zero writer exit status is simply discarded. It catches the
-#     shape #889 removed, written out on one physical line, reappearing
-#     verbatim; it cannot see a writer or reader reached through a
-#     variable or a function indirection, and a comment line that merely
-#     shows the shape as prose (rather than running it) is excluded by
-#     skipping any matched line whose first non-blank character is `#`.
-#     Both the `pipefail` file-level guard and the shape scan itself run
-#     against the heredoc_mask.py output rather than the raw file, so a
-#     heredoc payload -- a fixture script written out as DATA by `cat >`,
-#     never executed as a pipeline in the file that contains it -- can
-#     neither manufacture a false `pipefail` guard nor trip the shape
-#     match; the mask blanks a heredoc's body and terminator lines only,
-#     so every other line, and every genuine reintroduction of the shape
-#     in this file's own live code, is scanned exactly as before. There is
-#     no it-allow escape for this rule: the fix is mechanical, and letting
-#     one be written would mean a violation could be silenced by a comment
+#     shape #889 removed, on one physical line or split across a
+#     backslash continuation (folded back to one logical line by
+#     join_continuations.py above before this scan runs, so a pipeline
+#     written the way this repository already writes multi-line
+#     conditions elsewhere is not a blind spot); it cannot see a writer
+#     or reader reached through a variable or a function indirection,
+#     and a comment line that merely shows the shape as prose (rather
+#     than running it) is excluded by skipping any matched line whose
+#     first non-blank character is `#`. The reader alternative requires
+#     `grep` or `head` to be the command actually invoked right after
+#     the pipe (only whitespace in between), not merely the word `head`
+#     appearing anywhere later in that segment, so `... | grep -c
+#     "$HOME/head"` is not mistaken for the early-exiting `head(1)`; the
+#     `grep` branch also accepts the long forms `--quiet` and
+#     `--max-count`, not only `-q`/`-m`, and the writer's variable may be
+#     a positional or special parameter (`"$1"`, `"$@"`) as well as a
+#     named one. Both the `pipefail` file-level guard and the shape scan
+#     itself run against the heredoc_mask.py output rather than the raw
+#     file, so a heredoc payload -- a fixture script written out as DATA
+#     by `cat >`, never executed as a pipeline in the file that contains
+#     it -- can neither manufacture a false `pipefail` guard nor trip the
+#     shape match; the mask blanks a heredoc's body and terminator lines
+#     only (and, as of the fix for the bug this comment used to be a live
+#     instance of, does not mistake a `<<WORD` written as prose inside a
+#     `#` comment for a real heredoc start either), so every other line,
+#     and every genuine reintroduction of the shape in this file's own
+#     live code, is scanned exactly as before. There is no it-allow
+#     escape for this rule: the fix is mechanical, and letting one be
+#     written would mean a violation could be silenced by a comment
 #     instead of fixed. Widening this into a real parser is future work,
 #     not a reason to let the literal reintroduction back in now.
+#
+#     TWO KNOWN GAPS, disclosed rather than silently left uncovered:
+#
+#     1. A `#` inside the WRITER's own parameter expansion, such as
+#        `printf '%s\n' "${RAW#x}" | grep -q ...`, is not matched: the
+#        connector between the writer variable and the pipe excludes `#`
+#        on purpose, so a trailing `# comment` sitting after real code on
+#        the same physical line can never be read as part of the
+#        pipeline (without that exclusion, a line like `printf '%s\n'
+#        "$RAW"  # pipe this into | grep -q "x"` would be flagged for a
+#        pipeline that exists only in prose, the same "matched text, not
+#        live code" mistake this rule exists to avoid elsewhere). This
+#        scanner does not track quote state, so it cannot tell that `#`
+#        apart from a real trailing comment's `#` with a regex alone.
+#
+#     2. The CI `invariants` job restores 10 of these 13 tracked
+#        scripts/*.sh files from the base branch before this script runs
+#        (see the "THE JUDGE MAY NOT BE EDITED BY THE DEFENDANT" step in
+#        .github/workflows/ci.yml), because those files are EXECUTED as
+#        arbiters elsewhere in that same job and a PR must not be able to
+#        rewrite its own judge. Rule 29 reads those files' on-disk text
+#        purely as DATA, the same as every other rule in this file reads
+#        crates/**/*.rs, so in that CI job specifically it scans base's
+#        copy of those 10 files, not the PR's proposed one; a
+#        reintroduction of this shape in one of them (including this
+#        file) would pass the CI invariants job on the very PR that adds
+#        it. Reading each file's committed blob instead of disk (the
+#        pattern pr-scope-check-selftest.sh already uses for exactly this
+#        class of problem) is not the fix here: it would make this rule
+#        alone stop seeing a developer's own uncommitted, unstaged edits
+#        before commit, which is the property every other rule in this
+#        file relies on, and which is what actually catches this shape
+#        today when it is introduced. The LOCAL gate (gate.sh /
+#        gate-fast.sh) never performs the base restore and scans every
+#        one of the 13 files' real, current content, which is why this
+#        project's merge policy requires a green LOCAL run rather than a
+#        green CI run: the local run is the one that closes this gap for
+#        all 13 files, and CI alone does not.
 # ---------------------------------------------------------------------------
 racy_pipe_hits() {
-  local f masked
+  local f masked joined
   while IFS= read -r f; do
     masked="$(python3 "$WORK/heredoc_mask.py" "$f")"
     grep -q 'pipefail' <<<"$masked" || continue
-    grep -nE '(printf|echo)\b[^|#]*\$[A-Za-z_{][^|#]*\|[^|#]*(grep([[:space:]]+-[A-Za-z]+)*[[:space:]]+-[A-Za-z]*[qm]|head\b)' <<<"$masked" \
+    joined="$(python3 "$WORK/join_continuations.py" <<<"$masked")"
+    grep -nE '(printf|echo)\b[^|#]*\$[A-Za-z_{0-9@*][^|#]*\|[[:space:]]*(grep(([[:space:]]+-[A-Za-z]+)|([[:space:]]+--[A-Za-z-]+))*[[:space:]]+(-[A-Za-z]*[qm]|--quiet|--max-count(=[0-9]+)?)|head\b)' <<<"$joined" \
       | grep -vE '^[0-9]+:[[:space:]]*#' \
       | while IFS=: read -r lineno rest; do
           printf '%s:%s:%s\n' "$f" "$lineno" "$rest"
