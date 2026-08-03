@@ -1175,6 +1175,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "irontraffic-balancer"
+version = "0.1.0"
+dependencies = [
+ "criterion",
+ "irontraffic-upstream",
+ "proptest",
+ "thiserror",
+]
+
+[[package]]
 name = "irontraffic-bench"
 version = "0.1.0"
 dependencies = [
