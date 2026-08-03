@@ -2,17 +2,38 @@
 
 //! Unit and property tests for `irontraffic_balancer::algo::p2c`.
 //!
-//! ALLOCATION FREEDOM (KNOWN DEFECT #3 IN THE CODER-PROMPT'S CATALOGUE). This issue's own
-//! text asks for a counting `#[global_allocator]` test. `GlobalAlloc` cannot be implemented
-//! without the one keyword this workspace denies everywhere with no exception, so that
-//! design does not compile here, and a process-wide counting allocator would in any case
-//! count allocations made by every other test in this binary, including `proptest`, which
-//! allocates freely. `p2c_module_source_never_allocates` below proves the same property
-//! statically instead, by scanning `src/algo/p2c.rs`'s own source text for the same call
+//! ALLOCATION FREEDOM, STATED ACCURATELY (see finding 1 of PR 875's review). This issue's
+//! own text asks for a counting `#[global_allocator]` test. An earlier version of this doc
+//! said that design "cannot compile here" because `GlobalAlloc` needs the one keyword this
+//! workspace "denies everywhere with no exception". That is false, the same way it was false
+//! in `crates/irontraffic-tls/tests/alloc_gate.rs` before issue #719 corrected it there: the
+//! root `Cargo.toml` sets `unsafe_code = "deny"`, and `deny` is the OVERRIDABLE lint level;
+//! `forbid` is the level that cannot be overridden, and this workspace does not use it for
+//! `unsafe_code`. A counting `#[global_allocator]` behind
+//! `#![allow(unsafe_code, reason = "...")]` was verified elsewhere in this workspace to
+//! compile, run, and pass `cargo clippy --all-targets --all-features -- -D warnings`. What
+//! actually blocks it HERE is `scripts/invariant-lints.sh` rule 15, `no-unsafe`, whose own
+//! failure text grants no self-service exception: "There is no exception an implementer is
+//! authorized to make; raise it on the issue instead." Whether to grant that exception for
+//! `irontraffic-balancer`'s test files is the owner's call, and it is being raised separately
+//! rather than decided here. The issue's own pre-emptive concern that a process-wide counter
+//! "would in any case count allocations made by every other test in this binary, including
+//! `proptest`" is also not a reason to skip the design: the issue's own quoted shape already
+//! answers it with an `ARMED` flag that is set only around the calls under measurement.
+//!
+//! Pending that decision, `p2c_module_source_never_allocates` below is a SUBSTITUTE, not an
+//! equivalent: a source-text scan over `src/algo/p2c.rs`, closely mirroring the call
 //! spellings `scripts/invariant-lints.sh`'s `hot-path-allocation` rule already watches for on
-//! every module carrying a `//! HOT PATH` marker, which this file's target does. Like that
-//! rule, this is a best-effort text scan, not a proof: see its own doc comment for what it
-//! does not catch.
+//! every module carrying a `//! HOT PATH` marker, which this file's target does. State
+//! plainly what that does and does not establish, because a clean run of a deny-list text
+//! scan is not a proof of zero allocations: it catches an allocating call that appears,
+//! textually, in the scanned file, and NOTHING ELSE. It cannot distinguish a function that
+//! allocates zero times from one that allocates on every call through a spelling nobody
+//! added to the list (a call taken by function pointer, `Type::method(receiver)`'s fully
+//! qualified form instead of `receiver.method()`, or a call inside a dependency this file
+//! merely invokes), and it fires on a listed call that appears in a comment or a string
+//! literal exactly as readily as on one that runs. A clean run here means "none of the
+//! listed calls appear, textually, in `src/algo/p2c.rs`", nothing more.
 
 use std::cell::Cell;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -235,6 +256,32 @@ fn pick_two_is_exact() {
             "draw {draw}: u == 2 must always pick the lower-inflight endpoint, never sample"
         );
     }
+
+    // The loop above does not prove the exact-compare branch ran: at u == 2, sampling
+    // without replacement also returns both indices, so better_of would still compare
+    // both exhaustively and return the same Some(1) for every draw regardless of which
+    // branch produced the pair. Only a TIE distinguishes them. The exact-compare branch
+    // calls `better_of(0, 1)` directly, so a tie always resolves to Some(0) (edge case 5:
+    // "ties go to a, the first sampled index", and index 0 is always `a` here because
+    // there is no sampling to reorder it). A mutant that fell through to
+    // `sample_two(draw, 2)` instead would resolve the same tie to whichever of {0, 1}
+    // `sample_two` drew as `a` for that particular draw, which varies with the draw.
+    // Found by mutation: deleting pick_with's entire `n == 2` branch survived every
+    // assertion above.
+    set_inflight(stats.get(ids[0].0 as usize).expect("stats"), 7);
+    set_inflight(stats.get(ids[1].0 as usize).expect("stats"), 7);
+    let mut rng = 0x7A17_D1FF_5CA1_ED00u64;
+    for _ in 0..1_000 {
+        let draw = next_draw(&mut rng);
+        let result = pick_least_request(&slice, &ids, &weights, stats, &cx, draw);
+        assert_eq!(
+            result,
+            Some(0),
+            "draw {draw:#x}: u == 2 with tied costs must deterministically return \
+             Some(0), the exact-compare branch's fixed tie winner; a result that varies \
+             with the draw would mean the pick fell through to sample_two instead"
+        );
+    }
 }
 
 #[test]
@@ -359,6 +406,59 @@ fn pick_ignores_max_requests_saturated_pair_gracefully() {
             result.is_some(),
             "draw {draw}: every endpoint saturated at max_requests must still select \
              something, not None; None means an empty slice, never an overloaded one"
+        );
+    }
+}
+
+#[test]
+fn pick_prefers_the_resolvable_candidate_when_one_local_index_is_out_of_range() {
+    // Edge case 8: an out-of-range local index in `slice` (a corrupt snapshot). `key()`
+    // returns `None` for that candidate; `better_of` must prefer whichever candidate's
+    // key resolves, in EITHER position, and return `None` only when both are
+    // unresolvable. Untested before this: every slice elsewhere in this file (including
+    // every property-test generator) holds only in-range local indices, so the two
+    // single-`None` arms of `better_of`'s match were never exercised, and swapping them
+    // (so the picker returns the UNRESOLVABLE candidate instead) survived the whole
+    // suite.
+    let (reg, ids, weights, _all) = fixture(3);
+    let stats = reg.stats_slice();
+    let cx = default_ctx();
+    let out_of_range = u32::try_from(weights.len()).expect("3 fits in u32"); // past every valid local index
+
+    // Unresolvable candidate first (slice index 0): the resolvable sibling at slice
+    // index 1 must win.
+    let slice_a = vec![out_of_range, 1];
+    for draw in 0..64u64 {
+        let result = pick_least_request(&slice_a, &ids, &weights, stats, &cx, draw);
+        assert_eq!(
+            result,
+            Some(1),
+            "draw {draw}: slice index 0 names an out-of-range local index; the \
+             resolvable sibling at slice index 1 must win, never the unresolvable one"
+        );
+    }
+
+    // Unresolvable candidate second (slice index 1): the resolvable sibling at slice
+    // index 0 must win.
+    let slice_b = vec![1u32, out_of_range];
+    for draw in 0..64u64 {
+        let result = pick_least_request(&slice_b, &ids, &weights, stats, &cx, draw);
+        assert_eq!(
+            result,
+            Some(0),
+            "draw {draw}: slice index 1 names an out-of-range local index; the \
+             resolvable sibling at slice index 0 must win, never the unresolvable one"
+        );
+    }
+
+    // Both unresolvable: neither candidate can be resolved, so the picker must return
+    // None rather than an index whose local value cannot be resolved.
+    let slice_c = vec![out_of_range, out_of_range + 1];
+    for draw in 0..64u64 {
+        let result = pick_least_request(&slice_c, &ids, &weights, stats, &cx, draw);
+        assert_eq!(
+            result, None,
+            "draw {draw}: both candidates are out of range; the picker must return None"
         );
     }
 }
@@ -550,6 +650,94 @@ fn pick_excluding_never_tries_a_fourth_resample() {
          fourth would wrongly succeed on a non-minimal survivor; a correctly bounded \
          pick_excluding must fall through to the deterministic scan and return the true \
          minimum, local index {min_local}, never a fourth attempt's answer"
+    );
+}
+
+/// Pins the resample budget at EXACTLY three attempts from BELOW, complementing the test
+/// above's pin from above. Before this test, the only thing distinguishing "three
+/// attempts" from "fewer than three" was `p2c_work_is_bounded_by_slice_length`'s replica,
+/// which counts calls probabilistically: confirmed by injection, mutating the real
+/// `0..3u32` attempt range to `0..1u32` was caught by that property test in some runs and
+/// survived it in others, so the resample count's LOWER bound was pinned only
+/// probabilistically.
+///
+/// Brute-force searches for a draw whose first TWO resample attempts (rotations 0 and 21)
+/// both fail (each attempt's winner is one of the three excluded, cheapest endpoints)
+/// while the THIRD attempt (rotation 42) succeeds on a non-excluded survivor that is not
+/// the true minimum. A `pick_excluding` that tried only one or two attempts (`0..1u32` or
+/// `0..2u32` in place of `0..3u32`) would never reach that third attempt's winner and
+/// would instead fall through to the deterministic scan and return the true minimum,
+/// local index 3, so this test fails deterministically against either mutation, the same
+/// way `pick_excluding_never_tries_a_fourth_resample` above pins the upper bound.
+#[test]
+fn pick_excluding_uses_all_three_resamples() {
+    let (reg, ids, weights, slice) = fixture(8);
+    let stats = reg.stats_slice();
+    for (i, &id) in ids.iter().enumerate() {
+        let st = stats.get(id.0 as usize).expect("stats");
+        let inflight = u32::try_from(i).expect("8 endpoints fits in u32");
+        set_inflight(st, inflight);
+    }
+    let cx = default_ctx();
+    // fixture(8)'s slice is exactly [0, 1, ..., 7], so slice index, local index, and
+    // inflight all coincide here; `exclude` names local indices, which are the same
+    // values.
+    let exclude = vec![0u32, 1, 2];
+    let min_local = 3u32;
+
+    let winner_of = |draw: u64, attempt: u32| -> u32 {
+        let d = draw.rotate_left(attempt * 21);
+        let (a, b) = sample_two(d, 8);
+        let key = |i: u32| -> u32 {
+            let local = *slice
+                .get(i as usize)
+                .expect("i < 8 by sample_two's own I-P1");
+            let id = ids.get(local as usize).expect("in range");
+            stats
+                .get(id.0 as usize)
+                .expect("in range")
+                .load_key(1.0, &cx)
+        };
+        if key(b) < key(a) { b } else { a }
+    };
+
+    let mut found = None;
+    let mut rng = 0xB16B_00B5_C0DE_1234u64;
+    for _ in 0..2_000_000 {
+        let draw = next_draw(&mut rng);
+        let first_two_fail = (0..2u32).all(|attempt| exclude.contains(&winner_of(draw, attempt)));
+        if !first_two_fail {
+            continue;
+        }
+        let third = winner_of(draw, 2);
+        if !exclude.contains(&third) && third != min_local {
+            found = Some((draw, third));
+            break;
+        }
+    }
+    let (draw, expected_third) = found.expect(
+        "a distinguishing draw must exist well within 2000000 candidates, by the same \
+         probability argument as pick_excluding_never_tries_a_fourth_resample",
+    );
+
+    let result = pick_excluding(
+        CostKind::LeastRequest,
+        &slice,
+        &ids,
+        &weights,
+        stats,
+        &cx,
+        draw,
+        &exclude,
+    );
+    assert_eq!(
+        result,
+        Some(expected_third),
+        "draw {draw:#x} was constructed so the first two resample attempts fail and the \
+         third succeeds on a non-minimal survivor (local index {expected_third}); a \
+         pick_excluding that tried fewer than three attempts would fall through to the \
+         deterministic scan instead and wrongly return the true minimum, local index \
+         {min_local}"
     );
 }
 
@@ -750,6 +938,127 @@ fn pick_excluding_rejects_an_oversized_exclude_list() {
     }
 }
 
+/// `CostKind::PeakEwma` reaching `pick_excluding`'s empty-exclude dispatch (line ~403).
+/// Before this test, every `pick_excluding` call in this file and in `benches/pick.rs`
+/// passed `CostKind::LeastRequest`, so `PeakEwma` was never once exercised through this
+/// function and both of its dispatch arms survived mutation, including one that routes
+/// `PeakEwma` to `pick_least_request` instead of `pick_peak_ewma`.
+///
+/// Builds `u == 2` so the empty-exclude delegate's `n == 2` path does an exact compare
+/// for every draw (no sampling), and sets stats so `cost_key` (peak-EWMA) and `load_key`
+/// (least-request) rank the two endpoints OPPOSITELY: index 0 has the lower inflight but
+/// a far higher RTT, index 1 the reverse. `PeakEwma` must therefore return index 1 for
+/// every draw; a dispatch that fell through to `pick_least_request` would return index 0
+/// for every draw instead.
+#[test]
+fn pick_excluding_peak_ewma_empty_exclude_dispatches_to_peak_ewma() {
+    let (reg, ids, weights, slice) = fixture(2);
+    let stats = reg.stats_slice();
+    let now_ms = 1_000u32;
+    let st0 = stats.get(ids[0].0 as usize).expect("stats");
+    set_inflight(st0, 0); // lowest inflight: load_key favors this one
+    set_rtt(st0, 1000.0, now_ms); // far highest rtt: cost_key strongly disfavors this one
+    let st1 = stats.get(ids[1].0 as usize).expect("stats");
+    set_inflight(st1, 2); // higher inflight: load_key disfavors this one
+    set_rtt(st1, 1.0, now_ms); // far lowest rtt: cost_key strongly favors this one
+    let cx = CostCtx {
+        now_ms,
+        ..default_ctx()
+    };
+    for draw in 0..64u64 {
+        let result = pick_excluding(
+            CostKind::PeakEwma,
+            &slice,
+            &ids,
+            &weights,
+            stats,
+            &cx,
+            draw,
+            &[],
+        );
+        assert_eq!(
+            result,
+            Some(1),
+            "draw {draw}: the empty-exclude dispatch must call pick_peak_ewma for \
+             CostKind::PeakEwma, not pick_least_request; index 1 has the far lower \
+             peak-EWMA cost despite the higher inflight, so only the correct dispatch \
+             returns it for every draw at u == 2's exact compare"
+        );
+    }
+}
+
+/// `CostKind::PeakEwma` reaching `pick_excluding`'s resample-and-scan `key_fn` closure
+/// (line ~417), the other of the two dispatch points finding 3 named. Only reachable
+/// with a non-empty `exclude`.
+///
+/// `u == 3`, local index 0 excluded and given costs that never win any comparison it is
+/// part of (so it never confuses which of the other two "won" a resample attempt), and
+/// local indices 1 and 2 set so `cost_key` (peak-EWMA) and `load_key` (least-request)
+/// rank them OPPOSITELY: index 1 has the lower inflight but a far higher RTT, index 2
+/// the reverse. Every one of the three possible sampled pairs from `{0, 1, 2}` produces
+/// an immediate, non-excluded winner under the correct (`cost_key`) ordering (0 never
+/// wins), so the result is fully determined by which pair `sample_two`'s first attempt
+/// draws: `{0, 1}` (winner 1, roughly a third of draws) or `{0, 2}` / `{1, 2}` (winner 2,
+/// roughly two thirds). A `key_fn` that ignored `kind` and always used `load_key`
+/// instead would have index 0 win every pair it is part of and get excluded, so almost
+/// every draw would fall through to the deterministic scan or resolve on the one
+/// surviving pair, and in EITHER case would resolve on index 1 (the lower `load_key`),
+/// never index 2: `counts[2]` would collapse from roughly two thirds to zero.
+#[test]
+fn pick_excluding_peak_ewma_resample_and_scan_use_peak_ewma_cost() {
+    let (reg, ids, weights, slice) = fixture(3);
+    let stats = reg.stats_slice();
+    let now_ms = 1_000u32;
+    let inflights = [0u32, 1, 2];
+    let rtts = [1000.0f32, 50.0, 1.0];
+    for (i, &id) in ids.iter().enumerate() {
+        let st = stats.get(id.0 as usize).expect("stats");
+        set_inflight(
+            st,
+            *inflights
+                .get(i)
+                .expect("exactly 3 endpoints and 3 inflights"),
+        );
+        set_rtt(
+            st,
+            *rtts.get(i).expect("exactly 3 endpoints and 3 rtts"),
+            now_ms,
+        );
+    }
+    let cx = CostCtx {
+        now_ms,
+        ..default_ctx()
+    };
+    let exclude = vec![0u32];
+    let mut counts = [0u32; 3];
+    let mut rng = 0x9E3F_7A5A_C057_1234u64;
+    for _ in 0..10_000 {
+        let draw = next_draw(&mut rng);
+        if let Some(i) = pick_excluding(
+            CostKind::PeakEwma,
+            &slice,
+            &ids,
+            &weights,
+            stats,
+            &cx,
+            draw,
+            &exclude,
+        ) {
+            assert_ne!(i, 0, "draw {draw:#x}: returned excluded local index 0");
+            if let Some(c) = counts.get_mut(i as usize) {
+                *c += 1;
+            }
+        }
+    }
+    assert!(
+        counts[2] > 5_000,
+        "the resample/scan key_fn must prefer index 2 (peak-EWMA cost far below index \
+         1's) on roughly two thirds of draws; got {counts:?}. A key_fn that fell back to \
+         load_key for PeakEwma (index 2 has the WORST load_key of the two non-excluded \
+         candidates) would collapse this to near zero."
+    );
+}
+
 // ---------------------------------------------------------------------------------------
 // Property tests
 // ---------------------------------------------------------------------------------------
@@ -881,21 +1190,36 @@ proptest! {
     /// a test could substitute a counting wrapper for the real one. This replica calls the
     /// SAME public primitives pick_excluding's own body calls, in the same documented order.
     ///
-    /// THE COUNT BOUND ALONE IS NOT ENOUGH: a replica that always assumes exactly three
-    /// attempts is trivially bounded by construction and would not notice pick_excluding
-    /// itself trying four, or forty. Confirmed by injection: mutating the real
-    /// `0..3u32` attempt range to `0..200u32` left an earlier version of this test, which
-    /// only compared call counts, at 21 of 21 passing. The fix is the `prop_assert_eq!`
-    /// below: the replica also computes ITS OWN chosen index using the identical rotation
-    /// formula and comparator, and pins that against the real function's actual return
-    /// value. Randomised `inflight` values make an exact key tie between two different
-    /// endpoints astronomically unlikely (weights are uniformly 1, so `load_key` reduces to
-    /// `inflight + 1`, and a collision needs two of up to 64 independently drawn `u32`s to
-    /// land on the same value), so agreement is not merely consistent by construction: an
-    /// attempt count, rotation formula, or scan that drifted from the documented design
-    /// would very likely select a different winner for some generated case and fail this
-    /// assertion: re-running the same `0..200u32` injection against this version of the
-    /// test fails it within the first handful of generated cases.
+    /// THE COUNT BOUND ALONE IS NOT ENOUGH, AND IS NOT EVEN A CLAIM ABOUT THE REAL FUNCTION.
+    /// `calls.get() <= n + 6` below is a property of THIS REPLICA's own control flow (at most
+    /// three attempts times two keys, plus one pass over the slice), true by construction of
+    /// the replica regardless of what `pick_excluding` itself does: a replica that always
+    /// assumes exactly three attempts cannot, by counting its own calls, notice
+    /// `pick_excluding` itself trying four, or forty, or none. It is kept only as a sanity
+    /// check on the replica's OWN shape, so that a future edit to this test that accidentally
+    /// turns the replica's resample loop into a retry-until-success loop is caught here
+    /// rather than relying on `prop_assert_eq!` below to happen to find a disagreeing input.
+    /// Confirmed by injection: mutating the real `0..3u32` attempt range to `0..200u32` left
+    /// an earlier version of this test, which only compared call counts, at 21 of 21 passing.
+    ///
+    /// THE ENTIRE LOAD-BEARING CHECK IS `prop_assert_eq!(real, replica)` BELOW. The replica
+    /// computes ITS OWN chosen index using the identical rotation formula, comparator, AND
+    /// fallback-scan start offset as the real function's documented step 10 (reimplementing
+    /// `reduce` and `low_u32`, both `pub(crate)`, exactly as
+    /// `pick_excluding_scan_finds_the_minimum_not_the_first_hit` already does, rather than
+    /// starting the scan at slice index 0 the way an earlier version of this replica did: that
+    /// version's oracle disagreed with the real function, intermittently, whenever the
+    /// non-excluded minimum was attained at more than one slice position, a duplicate local
+    /// index the generator makes common once `slice.len() > PROPTEST_N`, because both sides
+    /// break ties with a strict `<` and a different start offset visits a tied minimum in a
+    /// different order; see the sibling test's own doc comment for a concrete replay of that
+    /// disagreement). With the offsets aligned, real and replica visit the slice in the same
+    /// order and so agree even on a duplicate-local-index tie, and a resample count, rotation
+    /// formula, or scan offset that drifted from the documented design is very likely to
+    /// select a different winner for some generated case and fail this assertion: re-running
+    /// the same `0..200u32` injection against this version of the test fails it within the
+    /// first handful of generated cases, and so does `let start = 0usize;` in place of
+    /// production's `reduce(low_u32(draw), n_u32)`.
     #[test]
     fn p2c_work_is_bounded_by_slice_length(
         slice in proptest::collection::vec(0u32..PROPTEST_N, 0..=256),
@@ -969,8 +1293,32 @@ proptest! {
                 }
             }
             found.or_else(|| {
+                // Reimplements reduce's documented Lemire formula and low_u32's documented
+                // bit split (both `pub(crate)`, unreachable from this external integration
+                // test) purely to align this replica's scan ORDER with production's step 10,
+                // exactly as `pick_excluding_scan_finds_the_minimum_not_the_first_hit`
+                // already does. Starting at slice index 0 here, as an earlier version of this
+                // replica did, disagreed with the real function whenever the non-excluded
+                // minimum was attained at more than one slice position: see this test's own
+                // doc comment above.
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "reimplements low_u32's documented bit split for a test-only \
+                              search key, not production code: intentionally takes the low \
+                              32 bits"
+                )]
+                let x = draw as u32;
+                #[allow(
+                    clippy::cast_possible_truncation,
+                    reason = "reimplements reduce's documented Lemire formula for a \
+                              test-only search key; product < 2^64 (two u32 values \
+                              multiplied), so the shifted result is provably < 2^32"
+                )]
+                let start = ((u64::from(x) * u64::from(n_u32)) >> 32) as u32 as usize;
                 let mut best: Option<(u32, u32)> = None;
-                for (i, &local) in slice.iter().enumerate() {
+                for step in 0..n {
+                    let i = (start + step) % n;
+                    let Some(&local) = slice.get(i) else { continue };
                     if exclude.contains(&local) {
                         continue;
                     }
@@ -987,7 +1335,9 @@ proptest! {
 
         prop_assert!(
             calls.get() <= n + 6,
-            "replica evaluated {} keys for n = {n}, exceeding the n + 6 bound",
+            "replica evaluated {} keys for n = {n}, exceeding the n + 6 bound (this bound \
+             holds for the REPLICA by construction, not for pick_excluding itself: see this \
+             test's own doc comment)",
             calls.get()
         );
 
@@ -1007,11 +1357,33 @@ proptest! {
 // Allocation freedom (see the module doc comment on why this is a text scan)
 // ---------------------------------------------------------------------------------------
 
-/// Call spellings that can allocate, in the exact shape
+/// Call spellings that can allocate, CLOSELY mirroring (not exactly duplicating) the shape
 /// `scripts/invariant-lints.sh`'s `hot-path-allocation` rule already watches `src/algo/p2c.rs`
 /// for on every pull request (it is marked `//! HOT PATH`); duplicated here as a Rust test so
 /// this acceptance criterion has its own assertion inside `cargo test`, not only a shell gate.
-const ALLOCATING_CALLS: [&str; 30] = [
+///
+/// PROVEN WEAKER THAN THE SHELL RULE ONCE, AND WIDENED IN RESPONSE (finding 1, PR 875's
+/// review). An earlier version of this list let a real per-request heap allocation in
+/// `excluded()`'s O(u) fallback-scan path through as `exclude.iter().copied().collect::<
+/// Vec<u32>>()`: the shell rule's `\.collect(::<|\(\))` alternative catches the turbofish
+/// form, but this list's plain `".collect("` substring is not a substring of
+/// `".collect::<Vec<u32>>("` (the text between `collect` and `(` is `::<Vec<u32>>`, not
+/// nothing), so it missed it, and the same injection also showed `parts.join(",")`,
+/// `HashMap::with_capacity(8)`, `Vec::<u32>::new()`, and `VecDeque::with_capacity(4)` all
+/// passing clean. `".collect::<"`, `".join("`, the bare `"::with_capacity("` (replacing the
+/// two type-specific entries this list used to carry, since the shell rule's form is
+/// generic over the receiver type), the bare `"::<"` (closing the turbofish-constructor gap
+/// generically rather than enumerating every collection type's own turbofish spelling), and
+/// `".into_boxed_slice("` / `".into_boxed_str("` below close every one of those five, and were
+/// re-verified against the same five injected lines after widening.
+///
+/// STILL A TEXT SCAN, STILL NOT A PROOF: this closes the specific gap proven by injection,
+/// not every gap shaped like it. It still cannot see a call taken by function pointer, or
+/// the fully qualified `Type::method(receiver)` form in place of `receiver.method()` (the
+/// shell rule's own doc comment names two real instances of that evasion elsewhere in this
+/// workspace), and it fires just as readily on a listed spelling inside a comment or a
+/// string literal as on one that runs.
+const ALLOCATING_CALLS: [&str; 34] = [
     "format!(",
     ".to_string()",
     ".to_owned()",
@@ -1019,9 +1391,9 @@ const ALLOCATING_CALLS: [&str; 30] = [
     ".to_vec()",
     "vec![",
     "Vec::new(",
-    "Vec::with_capacity(",
     "String::new(",
-    "String::with_capacity(",
+    "::with_capacity(",
+    "::<",
     "HashMap::new(",
     "HashSet::new(",
     "BTreeMap::new(",
@@ -1037,6 +1409,10 @@ const ALLOCATING_CALLS: [&str; 30] = [
     "Rc::new(",
     "Box::pin(",
     ".collect(",
+    ".collect::<",
+    ".join(",
+    ".into_boxed_slice(",
+    ".into_boxed_str(",
     ".clone()",
     ".to_lowercase()",
     ".to_uppercase()",
