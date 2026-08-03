@@ -6,6 +6,7 @@
 //! `MplexResponseBuilder` and `MplexContext`. See its own module documentation
 //! for the design rationale.
 
+pub mod body;
 pub mod head;
 
 pub use head::{MplexContext, MplexHeadBuilder, MplexResponseBuilder, MplexTrailerBuilder};
