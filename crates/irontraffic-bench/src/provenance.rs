@@ -755,6 +755,15 @@ fn drain_capped(
     }
 }
 
+/// How many times a spawn that fails with ETXTBSY is retried before the probe
+/// is reported as failed. See the comment at the retry loop in [`run_bounded`].
+const SPAWN_BUSY_RETRIES: u32 = 50;
+
+/// How long to wait between ETXTBSY spawn retries. 50 x 10ms bounds the extra
+/// wall clock at half a second, far above the microsecond-wide race it covers
+/// and far below [`PROBE_TIMEOUT_SECONDS`].
+const SPAWN_BUSY_BACKOFF: Duration = Duration::from_millis(10);
+
 /// Spawns `command` with `stdin` null, drains stdout and stderr concurrently
 /// (never `Command`'s `output` method, which reads to EOF: a binary that
 /// prints without stopping would otherwise fill the harness's memory), and
@@ -785,7 +794,31 @@ fn run_bounded(mut command: Command, label: &str, cap: usize) -> Result<Probe, B
         use std::os::unix::process::CommandExt;
         command.process_group(0);
     }
-    let mut child = command.spawn().map_err(|e| BenchError::io(label, e))?; // it-allow: no-blocking-in-async reason: irontraffic-bench is a synchronous benchmark harness with no async runtime; every probe here runs to a bounded, timed completion before the harness spawns anything else.
+    // `execve` fails with ETXTBSY while ANY process holds the target file open
+    // for writing, and that "any process" need not be this one. On Linux a
+    // `fork`/`posix_spawn` copies the whole file-descriptor table, so a spawn
+    // on any other thread that lands between this target's `open` and `close`
+    // leaves that child holding a write descriptor on the target's inode until
+    // it reaches its own `execve`. A probe target that was written moments ago
+    // (a fixture script, or a binary a build step just linked) is therefore
+    // spawnable or not depending on unrelated threads, not on anything about
+    // the target. The window is microseconds wide and always closes, so retry
+    // briefly instead of reporting a permanent failure.
+    let mut attempts = 0_u32;
+    let mut child = loop {
+        match command.spawn() {
+            // it-allow: no-blocking-in-async reason: irontraffic-bench is a synchronous benchmark harness with no async runtime; every probe here runs to a bounded, timed completion before the harness spawns anything else.
+            Ok(child) => break child,
+            Err(e)
+                if e.kind() == std::io::ErrorKind::ExecutableFileBusy
+                    && attempts < SPAWN_BUSY_RETRIES =>
+            {
+                attempts += 1;
+                std::thread::sleep(SPAWN_BUSY_BACKOFF); // it-allow: no-blocking-in-async reason: irontraffic-bench has no async runtime; this is a bounded backoff between spawn retries within one synchronous probe call, not a worker-thread stall. it-allow: no-accumulated-sleep reason: this is a fixed per-attempt backoff bounded by the attempts < SPAWN_BUSY_RETRIES check on every iteration, not an open-loop pacing schedule with an accumulating due time; the total extra wait across every retry is capped at SPAWN_BUSY_RETRIES * SPAWN_BUSY_BACKOFF regardless of how many retries fire.
+            }
+            Err(e) => return Err(BenchError::io(label, e)),
+        }
+    };
 
     let exceeded = Arc::new(AtomicBool::new(false));
     let combined_len = Arc::new(AtomicUsize::new(0));

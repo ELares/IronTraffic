@@ -489,6 +489,77 @@ fn probe_output_is_capped_and_the_child_is_reaped() {
 }
 
 // ---------------------------------------------------------------------------
+// 7e-bis (issue #890): `run_bounded` retries a spawn that fails with
+// `ExecutableFileBusy` instead of failing the probe outright.
+//
+// `execve` refuses a target ANY process holds open for writing, on Linux,
+// with `ETXTBSY`; `fork`/`posix_spawn` copies the whole file-descriptor
+// table, so this can fire for a spawn on a totally unrelated thread that
+// lands between another thread's `open` and `close` of the same fixture
+// script. That accidental, microsecond-wide race between
+// `ScriptDir::write_script` and `capture_build_stamp` running on some OTHER
+// test was the suite-wide flake this fixes. This test does not rely on
+// catching that race by luck, which is what made the original bug so hard
+// to pin down: it holds the probe target open for writing ON PURPOSE, from
+// before `capture_build_stamp` is ever called, so the very first spawn
+// attempt is guaranteed to land inside the busy window, then releases the
+// writer from another thread partway through the retry budget.
+//
+// This is deliberately `#[cfg(target_os = "linux")]`, narrower than the
+// `#[cfg(unix)]` every other fixture-script test in this file uses.
+// Confirmed empirically while implementing this fix: holding a write handle
+// open on this platform's fixture script does not make `execve` fail at
+// all (`ExecutableFileBusy` is simply never returned), so a test that
+// depends on that failure occurring would pass on such a platform whether
+// or not the retry loop below it exists, which is exactly the vacuous pass
+// the issue warns against. `.github/workflows/ci.yml` runs every job on
+// `ubuntu-latest` only, which is where this fix, and this test, actually
+// matter.
+// ---------------------------------------------------------------------------
+
+#[cfg(target_os = "linux")]
+#[test]
+fn spawn_retries_past_a_transient_text_file_busy() {
+    let scripts = ScriptDir::new();
+    let target = scripts.write_script(
+        "busy_target.sh",
+        &stamp_script_body(
+            r#"{"name":"test-binary","version":"1.0.0","git_sha":"0a1b2c3d4e5f","dirty":false,"profile":"release","features":[]}"#,
+        ),
+    );
+
+    // Opened for writing BEFORE capture_build_stamp is ever called, so the
+    // busy window is already open the instant its first spawn attempt runs:
+    // this is deliberate, not a bet against the scheduler. It is released
+    // from another thread only after a short delay, well inside the retry
+    // loop's half-second budget (50 retries times a 10ms backoff), so a
+    // retry loop that is actually running still has time left to observe
+    // the release and succeed.
+    let writer = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&target)
+        .expect("the freshly written fixture script must be reopenable for writing");
+    let release_handle = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+        drop(writer);
+    });
+
+    let stamp = capture_build_stamp(&target);
+    release_handle
+        .join()
+        .expect("the writer-release thread must not panic");
+
+    let stamp = stamp.expect(
+        "capture_build_stamp must succeed once the writer releases the target rather than \
+         return ExecutableFileBusy: this is the ETXTBSY retry loop in run_bounded actually \
+         firing. (Setting SPAWN_BUSY_RETRIES to 0 must make this assertion fail: with no \
+         retry, the first spawn attempt lands while the writer above is still holding the \
+         target open, well before its 150ms release, and returns Err immediately.)",
+    );
+    assert_eq!(stamp.git_sha, "0a1b2c3d4e5f");
+}
+
+// ---------------------------------------------------------------------------
 // 7f: hostile build-stamp fields.
 // ---------------------------------------------------------------------------
 
