@@ -13,7 +13,7 @@
 
 [workspace]
 resolver = "3"
-members = ["crates/irontraffic", "crates/irontraffic-bench", "crates/irontraffic-config", "crates/irontraffic-conn", "crates/irontraffic-dataplane", "crates/irontraffic-filter", "crates/irontraffic-http", "crates/irontraffic-io", "crates/irontraffic-k8s", "crates/irontraffic-limits", "crates/irontraffic-obs", "crates/irontraffic-origin", "crates/irontraffic-policy", "crates/irontraffic-quota", "crates/irontraffic-rand", "crates/irontraffic-resilience", "crates/irontraffic-router", "crates/irontraffic-runtime", "crates/irontraffic-time", "crates/irontraffic-tls", "crates/irontraffic-upgrade", "crates/irontraffic-upstream", "crates/irontraffic-ws"]
+members = ["crates/irontraffic", "crates/irontraffic-balancer", "crates/irontraffic-bench", "crates/irontraffic-config", "crates/irontraffic-conn", "crates/irontraffic-dataplane", "crates/irontraffic-filter", "crates/irontraffic-http", "crates/irontraffic-io", "crates/irontraffic-k8s", "crates/irontraffic-limits", "crates/irontraffic-obs", "crates/irontraffic-origin", "crates/irontraffic-policy", "crates/irontraffic-quota", "crates/irontraffic-rand", "crates/irontraffic-resilience", "crates/irontraffic-router", "crates/irontraffic-runtime", "crates/irontraffic-time", "crates/irontraffic-tls", "crates/irontraffic-upgrade", "crates/irontraffic-upstream", "crates/irontraffic-ws"]
 # The fuzz crate is intentionally not a workspace member: cargo-fuzz projects
 # The fuzz crates are intentionally not workspace members: cargo-fuzz projects
 # The fuzz crate is intentionally not a workspace member: cargo-fuzz projects

@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: MIT OR Apache-2.0
+[package]
+name = "irontraffic-balancer"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Power-of-two-choices upstream selection: sampling without replacement, the peak-EWMA and least-request pickers, and the bounded exclusion retry path."
+
+[lints]
+workspace = true
+
+[dependencies]
+# EndpointId, EndpointStats, CostCtx: the per-endpoint identity and statistics the pickers
+# in this crate read. Path dependency, pinned with an explicit version because a bare path
+# is a wildcard that cargo-deny refuses.
+irontraffic-upstream = { path = "../irontraffic-upstream", version = "0.1.0" }
+# Typed error enums without hand-written Display impls, for the algorithm-selection and
+# snapshot-building error types the milestone's later issues add to this crate.
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+criterion = { workspace = true }
+
+[[bench]]
+name = "pick"
+harness = false
