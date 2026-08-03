@@ -439,11 +439,11 @@ if [ "$RC1" -eq 0 ]; then
   echo "$OUT1" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT1" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT1"; then
   echo "FAIL: the glob-expandable payload was reported EXEMPT. Got:"
   echo "$OUT1" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT1" | grep -qF 'crates/pol/Cargo.tom[l]'; then
+elif ! grep -qF 'crates/pol/Cargo.tom[l]' <<<"$OUT1"; then
   echo "FAIL: the payload was refused, but not named by its real path. Got:"
   echo "$OUT1" | sed 's/^/    /'
   FAILED=1
@@ -478,11 +478,11 @@ if [ "$RC2" -eq 0 ]; then
   echo "$OUT2" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT2" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT2"; then
   echo "FAIL: the space-splitting payload was reported EXEMPT. Got:"
   echo "$OUT2" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT2" | grep -qF 'crates/pol/Cargo.toml Cargo.toml'; then
+elif ! grep -qF 'crates/pol/Cargo.toml Cargo.toml' <<<"$OUT2"; then
   echo "FAIL: the payload was refused, but not named by its real (space-containing) path. Got:"
   echo "$OUT2" | sed 's/^/    /'
   FAILED=1
@@ -515,7 +515,7 @@ if [ "$RC3" -eq 0 ]; then
   echo "$OUT3" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT3" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT3"; then
   echo "FAIL: a bot PR touching source was reported EXEMPT. Got:"
   echo "$OUT3" | sed 's/^/    /'
   FAILED=1
@@ -556,11 +556,11 @@ if [ "$RC4" -eq 0 ]; then
   echo "$OUT4" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT4" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT4"; then
   echo "FAIL: a nested crate manifest's pure dependency-version bump was reported EXEMPT. Got:"
   echo "$OUT4" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT4" | grep -qF 'outside the dependency allowlist'; then
+elif ! grep -qF 'outside the dependency allowlist' <<<"$OUT4"; then
   echo "FAIL: refused, but not for being outside the path allowlist (the capability engine may have refused it" >&2
   echo "instead, which would not actually pin the [^/]+ anchor this case exists to test). Got:" >&2
   echo "$OUT4" | sed 's/^/    /'
@@ -590,7 +590,7 @@ if [ "$RC5" -eq 0 ]; then
   echo "$OUT5" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT5" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT5"; then
   echo "FAIL: Cargo.toml.bak was reported EXEMPT. Got:"
   echo "$OUT5" | sed 's/^/    /'
   FAILED=1
@@ -621,7 +621,7 @@ if [ "$RC6" -ne 0 ]; then
   echo "$OUT6" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT6" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT6"; then
   note "the per-crate bump is EXEMPT"
 else
   echo "FAIL: a legitimate per-crate manifest bump was refused. Got:"
@@ -651,7 +651,7 @@ if [ "$RC7" -eq 0 ]; then
   echo "$OUT7" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT7" | grep -qF 'does not close an issue'; then
+if grep -qF 'does not close an issue' <<<"$OUT7"; then
   note "a non-bot PR with no Closes line is refused for that reason"
 else
   echo "FAIL: a non-bot PR with no closing keyword was not refused for that reason. Got:"
@@ -691,11 +691,11 @@ if [ "$RC8" -eq 0 ]; then
   echo "$OUT8" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT8" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT8"; then
   echo "FAIL: an empty diff was reported EXEMPT. Got:"
   echo "$OUT8" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT8" | grep -qF 'FAIL: no files changed between the merge base'; then
+elif ! grep -qF 'FAIL: no files changed between the merge base' <<<"$OUT8"; then
   echo "FAIL: an empty diff was not reported EXEMPT, but the guard's own message is missing, so this cannot distinguish the guard firing from some OTHER abort (for example an unbound-variable abort with no 'EXEMPT' text either). Got:"
   echo "$OUT8" | sed 's/^/    /'
   FAILED=1
@@ -731,11 +731,11 @@ if [ "$RC9" -eq 0 ]; then
   echo "$OUT9" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT9" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT9"; then
   echo "FAIL: a failed merge base on the bot path was reported EXEMPT. Got:"
   echo "$OUT9" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT9" | grep -qF 'could not compute a merge base'; then
+elif ! grep -qF 'could not compute a merge base' <<<"$OUT9"; then
   echo "FAIL: a failed merge base did not produce the expected refusal. Got:"
   echo "$OUT9" | sed 's/^/    /'
   FAILED=1
@@ -769,11 +769,11 @@ if [ "$RC10" -eq 0 ]; then
   echo "$OUT10" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT10" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT10"; then
   echo "FAIL: a path with an embedded newline was reported EXEMPT. Got:"
   echo "$OUT10" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT10" | grep -qF 'embedded newline'; then
+elif ! grep -qF 'embedded newline' <<<"$OUT10"; then
   echo "FAIL: a path with an embedded newline was refused, but not for that reason. Got:"
   echo "$OUT10" | sed 's/^/    /'
   FAILED=1
@@ -808,7 +808,7 @@ if [ "$RC11" -ne 0 ]; then
   echo "$OUT11" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT11" | grep -qF 'pr-scope-check: the diff matches issue #42'; then
+if grep -qF 'pr-scope-check: the diff matches issue #42' <<<"$OUT11"; then
   note "a declared, fully-matching non-bot PR still matches"
 else
   echo "FAIL: a PR that matches its issue's Files table exactly was not reported as matching. Got:"
@@ -844,7 +844,7 @@ if [ "$RC12" -eq 0 ]; then
   echo "$OUT12" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT12" | grep -qF 'does not declare' && echo "$OUT12" | grep -qF 'extra.rs'; then
+if grep -qF 'does not declare' <<<"$OUT12" && grep -qF 'extra.rs' <<<"$OUT12"; then
   note "the undeclared file is refused and named"
 else
   echo "FAIL: an undeclared file did not trip the scope check, or was not named. Got:"
@@ -883,11 +883,11 @@ if [ "$RC13" -eq 0 ]; then
   echo "$OUT13" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT13" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT13"; then
   echo "FAIL: the crate manifest + crate lockfile payload was reported EXEMPT. Got:"
   echo "$OUT13" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT13" | grep -qF 'crates/pol/Cargo.toml'; then
+elif ! grep -qF 'crates/pol/Cargo.toml' <<<"$OUT13"; then
   echo "FAIL: the payload was refused, but the offending manifest was not named. Got:"
   echo "$OUT13" | sed 's/^/    /'
   FAILED=1
@@ -922,7 +922,7 @@ if [ "$RC14" -eq 0 ]; then
   echo "$OUT14" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT14" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT14"; then
   echo "FAIL: the [[bin]] path=Cargo.lock payload was reported EXEMPT. Got:"
   echo "$OUT14" | sed 's/^/    /'
   FAILED=1
@@ -961,7 +961,7 @@ if [ "$RC15" -eq 0 ]; then
   echo "$OUT15" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT15" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT15"; then
   echo "FAIL: build= into an allowlisted fuzz lockfile was reported EXEMPT. Got:"
   echo "$OUT15" | sed 's/^/    /'
   FAILED=1
@@ -991,7 +991,7 @@ if [ "$RC16" -ne 0 ]; then
   echo "$OUT16" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT16" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT16"; then
   note "unchanged [[bin]] path across a real bump is not a false positive"
 else
   echo "FAIL: a legitimate fuzz-crate bump with an unchanged [[bin]] path was refused. Got:"
@@ -1020,9 +1020,9 @@ NAMEONLY="$(git -C "$D17" diff --name-status main HEAD | tr '\n' '|')"
 NORENAME="$(git -C "$D17" diff --no-renames --name-only main HEAD | tr '\n' '|')"
 note "with rename detection (name-status): $NAMEONLY"
 note "with --no-renames (name-only):       $NORENAME"
-if ! { echo "$NORENAME" | grep -qF 'crates/pol/src/lib.rs' \
-    && echo "$NORENAME" | grep -qF 'crates/pol/Cargo.lock' \
-    && echo "$NORENAME" | grep -qF 'crates/pol/Cargo.toml'; }; then
+if ! { grep -qF 'crates/pol/src/lib.rs' <<<"$NORENAME" \
+    && grep -qF 'crates/pol/Cargo.lock' <<<"$NORENAME" \
+    && grep -qF 'crates/pol/Cargo.toml' <<<"$NORENAME"; }; then
   echo "FAIL: --no-renames did not list all three real paths on the reviewer's own V3C case. Got:"
   echo "    $NORENAME"
   FAILED=1
@@ -1039,7 +1039,7 @@ if [ "$RC17" -eq 0 ]; then
   echo "$OUT17" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT17" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT17"; then
   echo "FAIL: the rename-plus-capability payload was reported EXEMPT. Got:"
   echo "$OUT17" | sed 's/^/    /'
   FAILED=1
@@ -1084,11 +1084,11 @@ if [ "$RC18" -eq 0 ]; then
   echo "$OUT18" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT18" | grep -qF 'pr-scope-check: the diff matches issue'; then
+if grep -qF 'pr-scope-check: the diff matches issue' <<<"$OUT18"; then
   echo "FAIL: a rename that hid an undeclared source-file deletion was reported as matching. Got:"
   echo "$OUT18" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT18" | grep -qF 'undeclared_secret.rs'; then
+elif ! grep -qF 'undeclared_secret.rs' <<<"$OUT18"; then
   echo "FAIL: the rename-hidden deletion was refused, but the deleted file was not named. Got:"
   echo "$OUT18" | sed 's/^/    /'
   FAILED=1
@@ -1136,11 +1136,11 @@ if [ "$RC19" -eq 0 ]; then
   echo "$OUT19" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT19" | grep -qF 'pr-scope-check: the diff matches issue'; then
+if grep -qF 'pr-scope-check: the diff matches issue' <<<"$OUT19"; then
   echo "FAIL: a single undeclared file whose name splits into two declared paths was reported as matching. Got:"
   echo "$OUT19" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT19" | grep -qF 'a.rs b.rs'; then
+elif ! grep -qF 'a.rs b.rs' <<<"$OUT19"; then
   echo "FAIL: the weird path was refused, but not named by its real (space-containing) name. Got:"
   echo "$OUT19" | sed 's/^/    /'
   FAILED=1
@@ -1193,11 +1193,11 @@ if [ "$RC20" -eq 0 ]; then
   echo "$OUT20" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT20" | grep -qF 'pr-scope-check: the diff matches issue'; then
+if grep -qF 'pr-scope-check: the diff matches issue' <<<"$OUT20"; then
   echo "FAIL: a bare root Cargo.lock bump alongside an unrelated undeclared file was reported as matching. Got:"
   echo "$OUT20" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT20" | grep -qE '^ {4}Cargo\.lock$'; then
+elif ! grep -qE '^ {4}Cargo\.lock$' <<<"$OUT20"; then
   echo "FAIL: root Cargo.lock was not named among the refused (undeclared) paths, meaning cargo_lock_exempt was wrongly set. Got:"
   echo "$OUT20" | sed 's/^/    /'
   FAILED=1
@@ -1241,7 +1241,7 @@ if [ "$RC21" -eq 0 ]; then
   echo "$OUT21" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT21" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT21"; then
   echo "FAIL: a Cargo.lock content swap under an unchanged, pre-existing build= key was reported EXEMPT. Got:"
   echo "$OUT21" | sed 's/^/    /'
   FAILED=1
@@ -1312,11 +1312,11 @@ if [ "$RC22" -eq 0 ]; then
   echo "$OUT22" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT22" | grep -qF 'pr-scope-check: the diff matches issue'; then
+if grep -qF 'pr-scope-check: the diff matches issue' <<<"$OUT22"; then
   echo "FAIL: a rename that hides an undeclared source-file deletion, with no manifest in the diff at all, was reported as matching. Got:"
   echo "$OUT22" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT22" | grep -qF 'undeclared_secret.rs'; then
+elif ! grep -qF 'undeclared_secret.rs' <<<"$OUT22"; then
   echo "FAIL: refused, but the deleted file was not named. Got:"
   echo "$OUT22" | sed 's/^/    /'
   FAILED=1
@@ -1354,11 +1354,11 @@ if [ "$RC23" -eq 0 ]; then
   echo "$OUT23" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT23" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT23"; then
   echo "FAIL: vector 4 ([[example]] test=true) was reported EXEMPT. Got:"
   echo "$OUT23" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT23" | grep -qF 'example'; then
+elif ! grep -qF 'example' <<<"$OUT23"; then
   echo "FAIL: vector 4 was refused, but the new [[example]] entry was not named. Got:"
   echo "$OUT23" | sed 's/^/    /'
   FAILED=1
@@ -1401,7 +1401,7 @@ if [ "$RC24" -eq 0 ]; then
   echo "$OUT24" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT24" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT24"; then
   echo "FAIL: door 2 was reported EXEMPT. Got:"
   echo "$OUT24" | sed 's/^/    /'
   FAILED=1
@@ -1439,7 +1439,7 @@ if [ "$RC25" -eq 0 ]; then
   echo "$OUT25" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT25" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT25"; then
   echo "FAIL: door 3 (root [patch.crates-io]) was reported EXEMPT. Got:"
   echo "$OUT25" | sed 's/^/    /'
   FAILED=1
@@ -1473,11 +1473,11 @@ if [ "$RC26" -eq 0 ]; then
   echo "$OUT26" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT26" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT26"; then
   echo "FAIL: introducing a brand-new dependency was reported EXEMPT. Got:"
   echo "$OUT26" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT26" | grep -qF 'newcrate'; then
+elif ! grep -qF 'newcrate' <<<"$OUT26"; then
   echo "FAIL: refused, but the new dependency was not named. Got:"
   echo "$OUT26" | sed 's/^/    /'
   FAILED=1
@@ -1508,11 +1508,11 @@ if [ "$RC27" -eq 0 ]; then
   echo "$OUT27" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT27" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT27"; then
   echo "FAIL: removing a dependency entry was reported EXEMPT. Got:"
   echo "$OUT27" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT27" | grep -qF 'oldcrate'; then
+elif ! grep -qF 'oldcrate' <<<"$OUT27"; then
   echo "FAIL: refused, but the removed dependency was not named. Got:"
   echo "$OUT27" | sed 's/^/    /'
   FAILED=1
@@ -1547,11 +1547,11 @@ if [ "$RC28" -eq 0 ]; then
   echo "$OUT28" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT28" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT28"; then
   echo "FAIL: removing package.build was reported EXEMPT. Got:"
   echo "$OUT28" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT28" | grep -qF 'package.build'; then
+elif ! grep -qF 'package.build' <<<"$OUT28"; then
   echo "FAIL: refused, but package.build was not named as the reason. Got:"
   echo "$OUT28" | sed 's/^/    /'
   FAILED=1
@@ -1582,11 +1582,11 @@ if [ "$RC29" -eq 0 ]; then
   echo "$OUT29" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT29" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT29"; then
   echo "FAIL: a features change riding along with a version bump was reported EXEMPT. Got:"
   echo "$OUT29" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT29" | grep -qF 'features'; then
+elif ! grep -qF 'features' <<<"$OUT29"; then
   echo "FAIL: refused, but the features sub-key was not named. Got:"
   echo "$OUT29" | sed 's/^/    /'
   FAILED=1
@@ -1618,7 +1618,7 @@ if [ "$RC30" -ne 0 ]; then
   echo "$OUT30" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT30" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT30"; then
   note "a version-only change inside a detailed dependency table stays EXEMPT"
 else
   echo "FAIL: a detailed-table dependency's version-only change was refused. Got:"
@@ -1648,7 +1648,7 @@ if [ "$RC31" -ne 0 ]; then
   echo "$OUT31" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT31" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT31"; then
   note "a workspace.dependencies string bump stays EXEMPT"
 else
   echo "FAIL: a workspace.dependencies string bump was refused. Got:"
@@ -1677,7 +1677,7 @@ if [ "$RC32" -ne 0 ]; then
   echo "$OUT32" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT32" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT32"; then
   note "a target-specific dependencies string bump stays EXEMPT"
 else
   echo "FAIL: a target.'cfg(unix)'.dependencies string bump was refused. Got:"
@@ -1708,11 +1708,11 @@ if [ "$RC33" -eq 0 ]; then
   echo "$OUT33" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT33" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT33"; then
   echo "FAIL: an unparsable HEAD manifest was reported EXEMPT. Got:"
   echo "$OUT33" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT33" | grep -qiF 'does not parse as toml'; then
+elif ! grep -qiF 'does not parse as toml' <<<"$OUT33"; then
   echo "FAIL: refused, but not for the unparsable-TOML reason. Got:"
   echo "$OUT33" | sed 's/^/    /'
   FAILED=1
@@ -1744,11 +1744,11 @@ if [ "$RC34" -eq 0 ]; then
   echo "$OUT34" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT34" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT34"; then
   echo "FAIL: an unparsable BASE manifest was reported EXEMPT. Got:"
   echo "$OUT34" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT34" | grep -qiF 'base version exists but does not parse as toml'; then
+elif ! grep -qiF 'base version exists but does not parse as toml' <<<"$OUT34"; then
   echo "FAIL: refused, but not for the unparsable-BASE reason. Got:"
   echo "$OUT34" | sed 's/^/    /'
   FAILED=1
@@ -1797,11 +1797,11 @@ if [ "$RC35" -eq 0 ]; then
   FAILED=1
 fi
 rm -f "$FAKEBIN/git"
-if echo "$OUT35" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT35"; then
   echo "FAIL: an unreadable base blob was reported EXEMPT. Got:"
   echo "$OUT35" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT35" | grep -qiF 'could not read the base'; then
+elif ! grep -qiF 'could not read the base' <<<"$OUT35"; then
   echo "FAIL: refused, but not for the unreadable-base-blob reason. Got:"
   echo "$OUT35" | sed 's/^/    /'
   FAILED=1
@@ -1833,7 +1833,7 @@ if [ "$RC36" -ne 0 ]; then
   echo "$OUT36" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT36" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT36"; then
   note "dev-dependencies and build-dependencies string bumps stay EXEMPT"
 else
   echo "FAIL: a dev-dependencies/build-dependencies string bump was refused. Got:"
@@ -1868,7 +1868,7 @@ if [ "$RC36b" -ne 0 ]; then
   echo "$OUT36b" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT36b" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT36b"; then
   note "a target-specific dev-dependencies string bump stays EXEMPT"
 else
   echo "FAIL: a target.'cfg(unix)'.dev-dependencies string bump was refused. Got:"
@@ -1902,11 +1902,11 @@ if [ "$RC37" -eq 0 ]; then
   echo "$OUT37" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT37" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT37"; then
   echo "FAIL: a dependency path retarget with version untouched was reported EXEMPT. Got:"
   echo "$OUT37" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT37" | grep -qF '.path'; then
+elif ! grep -qF '.path' <<<"$OUT37"; then
   echo "FAIL: refused, but the path sub-key was not named. Got:"
   echo "$OUT37" | sed 's/^/    /'
   FAILED=1
@@ -1942,7 +1942,7 @@ if [ "$RC38" -eq 0 ]; then
   echo "$OUT38" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT38" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT38"; then
   echo "FAIL: an in-place [[bin]] path edit was reported EXEMPT. Got:"
   echo "$OUT38" | sed 's/^/    /'
   FAILED=1
@@ -1980,15 +1980,15 @@ if [ "$RC39" -eq 0 ]; then
   echo "$OUT39" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT39" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT39"; then
   echo "FAIL: a brand-new manifest was reported EXEMPT. Got:"
   echo "$OUT39" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT39" | grep -qF 'introduces'; then
+elif ! grep -qF 'introduces' <<<"$OUT39"; then
   echo "FAIL: refused, but not because the keys were reported as introduced (the empty-base-vs-missing-base distinction may be lost). Got:"
   echo "$OUT39" | sed 's/^/    /'
   FAILED=1
-elif echo "$OUT39" | grep -qiF 'does not parse as toml'; then
+elif grep -qiF 'does not parse as toml' <<<"$OUT39"; then
   echo "FAIL: refused for the wrong reason (a base-parse-failure message), not because the keys were introduced. Got:"
   echo "$OUT39" | sed 's/^/    /'
   FAILED=1
@@ -2025,7 +2025,7 @@ if [ "$RC40" -eq 0 ]; then
   echo "$OUT40" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT40" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT40"; then
   echo "FAIL: a change under a lookalike [lib.dependencies] table was reported EXEMPT. Got:"
   echo "$OUT40" | sed 's/^/    /'
   FAILED=1
@@ -2062,11 +2062,11 @@ if [ "$RC41" -eq 0 ]; then
   echo "$OUT41" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT41" | grep -qF 'pr-scope-check: the diff matches issue'; then
+if grep -qF 'pr-scope-check: the diff matches issue' <<<"$OUT41"; then
   echo "FAIL: a PR closing two distinct issues was accepted. Got:"
   echo "$OUT41" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT41" | grep -qF 'closes 2 issues'; then
+elif ! grep -qF 'closes 2 issues' <<<"$OUT41"; then
   echo "FAIL: refused, but not for the two-issues reason. Got:"
   echo "$OUT41" | sed 's/^/    /'
   FAILED=1
@@ -2112,11 +2112,11 @@ if [ "$RC42" -eq 0 ]; then
   echo "$OUT42" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT42" | grep -qF 'pr-scope-check: the diff matches issue'; then
+if grep -qF 'pr-scope-check: the diff matches issue' <<<"$OUT42"; then
   echo "FAIL: a nested lockfile with an undeclared sibling manifest was accepted as matching. Got:"
   echo "$OUT42" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT42" | grep -qF 'crates/pol/fuzz/Cargo.lock'; then
+elif ! grep -qF 'crates/pol/fuzz/Cargo.lock' <<<"$OUT42"; then
   echo "FAIL: refused, but the nested lockfile was not named among the undeclared paths. Got:"
   echo "$OUT42" | sed 's/^/    /'
   FAILED=1
@@ -2163,11 +2163,11 @@ if [ "$RC43" -eq 0 ]; then
   echo "$OUT43" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT43" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT43"; then
   echo "FAIL: a dependency shape change (string to detailed table) was reported EXEMPT. Got:"
   echo "$OUT43" | sed 's/^/    /'
   FAILED=1
-elif ! { echo "$OUT43" | grep -qF 'logos' && echo "$OUT43" | grep -qF 'not a version-string move'; }; then
+elif ! { grep -qF 'logos' <<<"$OUT43" && grep -qF 'not a version-string move' <<<"$OUT43"; }; then
   echo "FAIL: refused, but not naming the dependency and the shape-change reason. Got:"
   echo "$OUT43" | sed 's/^/    /'
   FAILED=1
@@ -2206,11 +2206,11 @@ if [ "$RC44" -eq 0 ]; then
   echo "$OUT44" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT44" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT44"; then
   echo "FAIL: package.build retargeted string-to-string was reported EXEMPT. Got:"
   echo "$OUT44" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT44" | grep -qF 'package.build'; then
+elif ! grep -qF 'package.build' <<<"$OUT44"; then
   echo "FAIL: refused, but package.build was not named as the reason. Got:"
   echo "$OUT44" | sed 's/^/    /'
   FAILED=1
@@ -2245,11 +2245,11 @@ if [ "$RC45" -eq 0 ]; then
   echo "$OUT45" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT45" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT45"; then
   echo "FAIL: an author outside the three named bot logins was exempted as a bot. Got:"
   echo "$OUT45" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT45" | grep -qF 'does not close an issue'; then
+elif ! grep -qF 'does not close an issue' <<<"$OUT45"; then
   echo "FAIL: refused, but not for the ordinary non-bot reason, so it may have taken the bot branch anyway. Got:"
   echo "$OUT45" | sed 's/^/    /'
   FAILED=1
@@ -2297,11 +2297,11 @@ if [ "$RC46" -eq 0 ]; then
   echo "$OUT46" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT46" | grep -qF 'pr-scope-check: the diff matches issue'; then
+if grep -qF 'pr-scope-check: the diff matches issue' <<<"$OUT46"; then
   echo "FAIL: a nested lockfile was forgiven because an UNRELATED manifest was declared, not its own sibling. Got:"
   echo "$OUT46" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT46" | grep -qF 'crates/pol/fuzz/Cargo.lock'; then
+elif ! grep -qF 'crates/pol/fuzz/Cargo.lock' <<<"$OUT46"; then
   echo "FAIL: refused, but the nested lockfile was not named among the undeclared paths. Got:"
   echo "$OUT46" | sed 's/^/    /'
   FAILED=1
@@ -2364,11 +2364,11 @@ if [ "$RC46b" -eq 0 ]; then
   echo "$OUT46b" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT46b" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT46b"; then
   echo "FAIL: an appended [[bin]] entry pointed at the sibling lockfile was reported EXEMPT. Got:"
   echo "$OUT46b" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT46b" | grep -qF 'bin[1]'; then
+elif ! grep -qF 'bin[1]' <<<"$OUT46b"; then
   echo "FAIL: refused, but the appended entry was not named as bin[1]. Got:"
   echo "$OUT46b" | sed 's/^/    /'
   FAILED=1
@@ -2410,11 +2410,11 @@ if [ "$RC46c" -eq 0 ]; then
   echo "$OUT46c" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT46c" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT46c"; then
   echo "FAIL: an author only starting with dependabot, not the exact login, was exempted as a bot. Got:"
   echo "$OUT46c" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT46c" | grep -qF 'does not close an issue'; then
+elif ! grep -qF 'does not close an issue' <<<"$OUT46c"; then
   echo "FAIL: refused, but not for the ordinary non-bot reason, so it may have taken the bot branch anyway. Got:"
   echo "$OUT46c" | sed 's/^/    /'
   FAILED=1
@@ -2459,11 +2459,11 @@ if [ "$RC46d" -eq 0 ]; then
   echo "$OUT46d" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT46d" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT46d"; then
   echo "FAIL: an existing [patch.crates-io] entry retargeted was reported EXEMPT. Got:"
   echo "$OUT46d" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT46d" | grep -qF 'patch.crates-io'; then
+elif ! grep -qF 'patch.crates-io' <<<"$OUT46d"; then
   echo "FAIL: refused, but the patch.crates-io entry was not named. Got:"
   echo "$OUT46d" | sed 's/^/    /'
   FAILED=1
@@ -2496,11 +2496,11 @@ if [ "$RC46e" -eq 0 ]; then
   echo "$OUT46e" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT46e" | grep -qF 'pr-scope-check: the diff matches issue'; then
+if grep -qF 'pr-scope-check: the diff matches issue' <<<"$OUT46e"; then
   echo "FAIL: a PR whose issue has no Files table at all was reported as matching. Got:"
   echo "$OUT46e" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT46e" | grep -qF "has no '## Files' table"; then
+elif ! grep -qF "has no '## Files' table" <<<"$OUT46e"; then
   echo "FAIL: refused, but not for the missing-Files-table reason. Got:"
   echo "$OUT46e" | sed 's/^/    /'
   FAILED=1
@@ -2563,11 +2563,11 @@ if [ "$RC48" -eq 0 ]; then
   echo "$OUT48" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT48" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT48"; then
   echo "FAIL: an appended [[bin]] entry inside a space-containing allowlisted crate manifest was reported EXEMPT. Got:"
   echo "$OUT48" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT48" | grep -qF 'my crate/fuzz/Cargo.toml'; then
+elif ! grep -qF 'my crate/fuzz/Cargo.toml' <<<"$OUT48"; then
   echo "FAIL: refused, but not by naming the real, space-containing manifest path. Got:"
   echo "$OUT48" | sed 's/^/    /'
   FAILED=1
@@ -2610,11 +2610,11 @@ if [ "$RC49" -eq 0 ]; then
   echo "$OUT49" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT49" | grep -qF 'pr-scope-check: the diff matches issue'; then
+if grep -qF 'pr-scope-check: the diff matches issue' <<<"$OUT49"; then
   echo "FAIL: src/evil.rs was reported as matching, even though only 'docs.md src/evil.rs' (one space-containing row) was declared. Got:"
   echo "$OUT49" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT49" | grep -qF 'src/evil.rs'; then
+elif ! grep -qF 'src/evil.rs' <<<"$OUT49"; then
   echo "FAIL: refused, but src/evil.rs was not named among the undeclared paths. Got:"
   echo "$OUT49" | sed 's/^/    /'
   FAILED=1
@@ -2666,11 +2666,11 @@ if [ "$RC50" -eq 0 ]; then
   echo "$OUT50" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT50" | grep -qF 'pr-scope-check: the diff matches issue'; then
+if grep -qF 'pr-scope-check: the diff matches issue' <<<"$OUT50"; then
   echo "FAIL: reported as matching, even though the manifest is only declared inside a space-containing row. Got:"
   echo "$OUT50" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT50" | grep -qE '^ {4}Cargo\.lock$'; then
+elif ! grep -qE '^ {4}Cargo\.lock$' <<<"$OUT50"; then
   echo "FAIL: root Cargo.lock was not named among the refused (undeclared) paths, meaning cargo_lock_exempt was wrongly set. Got:"
   echo "$OUT50" | sed 's/^/    /'
   FAILED=1
@@ -2721,11 +2721,11 @@ if [ "$RC51" -eq 0 ]; then
   echo "$OUT51" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT51" | grep -qF 'pr-scope-check: the diff matches issue'; then
+if grep -qF 'pr-scope-check: the diff matches issue' <<<"$OUT51"; then
   echo "FAIL: the nested lockfile was forgiven, even though its sibling is only declared inside a space-containing row. Got:"
   echo "$OUT51" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT51" | grep -qF 'crates/pol/fuzz/Cargo.lock'; then
+elif ! grep -qF 'crates/pol/fuzz/Cargo.lock' <<<"$OUT51"; then
   echo "FAIL: refused, but the nested lockfile was not named among the undeclared paths. Got:"
   echo "$OUT51" | sed 's/^/    /'
   FAILED=1
@@ -2768,11 +2768,11 @@ if [ "$RC52" -ne 0 ]; then
   echo "$OUT52" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT52" | grep -qF 'declared but not modified'; then
+if grep -qF 'declared but not modified' <<<"$OUT52"; then
   echo "FAIL: a space-containing file that WAS modified was reported as declared but not modified. Got:"
   echo "$OUT52" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT52" | grep -qF 'pr-scope-check: the diff matches issue'; then
+elif ! grep -qF 'pr-scope-check: the diff matches issue' <<<"$OUT52"; then
   echo "FAIL: the matching PR was not reported as matching. Got:"
   echo "$OUT52" | sed 's/^/    /'
   FAILED=1
@@ -2808,11 +2808,11 @@ if [ "$RC53" -ne 0 ]; then
   echo "$OUT53" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if ! echo "$OUT53" | grep -qF 'pr-scope-check: EXEMPT'; then
+if ! grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT53"; then
   echo "FAIL: a legitimate space-containing-path bot bump was not reported EXEMPT. Got:"
   echo "$OUT53" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT53" | grep -qE '^ {4}crates/my crate/Cargo\.toml$'; then
+elif ! grep -qE '^ {4}crates/my crate/Cargo\.toml$' <<<"$OUT53"; then
   echo "FAIL: the EXEMPT listing did not print the real, whole, space-containing path. Got:"
   echo "$OUT53" | sed 's/^/    /'
   FAILED=1
@@ -2846,11 +2846,11 @@ if [ "$RC54" -ne 0 ]; then
   echo "$OUT54" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if ! echo "$OUT54" | grep -qF 'pr-scope-check: the diff matches issue'; then
+if ! grep -qF 'pr-scope-check: the diff matches issue' <<<"$OUT54"; then
   echo "FAIL: a matching space-containing declared/changed file was not reported as matching. Got:"
   echo "$OUT54" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT54" | grep -qE '^declared in issue #42:$'; then
+elif ! grep -qE '^declared in issue #42:$' <<<"$OUT54"; then
   echo "FAIL: could not even find the 'declared in issue' header. Got:"
   echo "$OUT54" | sed 's/^/    /'
   FAILED=1
@@ -2890,11 +2890,11 @@ if [ "$RC55" -eq 0 ]; then
   echo "$OUT55" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT55" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT55"; then
   echo "FAIL: a newly introduced git= sub-key was reported EXEMPT. Got:"
   echo "$OUT55" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT55" | grep -qF 'introduces dependencies.serde.git'; then
+elif ! grep -qF 'introduces dependencies.serde.git' <<<"$OUT55"; then
   echo "FAIL: refused, but the introduced git sub-key was not named. Got:"
   echo "$OUT55" | sed 's/^/    /'
   FAILED=1
@@ -2925,11 +2925,11 @@ if [ "$RC56" -eq 0 ]; then
   echo "$OUT56" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT56" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT56"; then
   echo "FAIL: a removed default-features sub-key was reported EXEMPT. Got:"
   echo "$OUT56" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT56" | grep -qF 'removes dependencies.serde.default-features'; then
+elif ! grep -qF 'removes dependencies.serde.default-features' <<<"$OUT56"; then
   echo "FAIL: refused, but the removed default-features sub-key was not named. Got:"
   echo "$OUT56" | sed 's/^/    /'
   FAILED=1
@@ -2961,11 +2961,11 @@ if [ "$RC57" -eq 0 ]; then
   echo "$OUT57" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT57" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT57"; then
   echo "FAIL: a shrunken [[bin]] array was reported EXEMPT. Got:"
   echo "$OUT57" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT57" | grep -qF 'removes bin[1]'; then
+elif ! grep -qF 'removes bin[1]' <<<"$OUT57"; then
   echo "FAIL: refused, but the removed array entry was not named as bin[1]. Got:"
   echo "$OUT57" | sed 's/^/    /'
   FAILED=1
@@ -3009,7 +3009,7 @@ if [ "$RC58" -eq 0 ]; then
   echo "$OUT58" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT58" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT58"; then
   echo "FAIL: a bot PR whose manifest engine could not run was reported EXEMPT. Got:"
   echo "$OUT58" | sed 's/^/    /'
   FAILED=1
@@ -3055,11 +3055,11 @@ if [ "$RC59" -eq 0 ]; then
   echo "$OUT59" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT59" | grep -qF 'pr-scope-check: the diff matches issue'; then
+if grep -qF 'pr-scope-check: the diff matches issue' <<<"$OUT59"; then
   echo "FAIL: src/evil.rs, declared only inside a ## Notes table, was reported as matching. Got:"
   echo "$OUT59" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT59" | grep -qF 'src/evil.rs'; then
+elif ! grep -qF 'src/evil.rs' <<<"$OUT59"; then
   echo "FAIL: refused, but src/evil.rs was not named among the undeclared paths. Got:"
   echo "$OUT59" | sed 's/^/    /'
   FAILED=1
@@ -3098,11 +3098,11 @@ if [ "$RC60" -eq 0 ]; then
   echo "$OUT60" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT60" | grep -qF 'pr-scope-check: the diff matches issue'; then
+if grep -qF 'pr-scope-check: the diff matches issue' <<<"$OUT60"; then
   echo "FAIL: src/evil.rs, declared only via an unbackticked cell, was reported as matching. Got:"
   echo "$OUT60" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT60" | grep -qF 'src/evil.rs'; then
+elif ! grep -qF 'src/evil.rs' <<<"$OUT60"; then
   echo "FAIL: refused, but src/evil.rs was not named among the undeclared paths. Got:"
   echo "$OUT60" | sed 's/^/    /'
   FAILED=1
@@ -3135,7 +3135,7 @@ if [ "$RC61" -ne 0 ]; then
   echo "$OUT61" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT61" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT61"; then
   note "a target-specific build-dependencies string bump stays EXEMPT"
 else
   echo "FAIL: a target.'cfg(windows)'.build-dependencies string bump was refused. Got:"
@@ -3164,7 +3164,7 @@ if [ "$RC62" -ne 0 ]; then
   echo "$OUT62" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT62" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT62"; then
   note "renovate[bot] is recognised and a legitimate bump stays EXEMPT"
 else
   echo "FAIL: a legitimate renovate[bot] bump was refused. Got:"
@@ -3192,7 +3192,7 @@ if [ "$RC63" -ne 0 ]; then
   echo "$OUT63" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT63" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT63"; then
   note "github-actions[bot] is recognised and a workflow bump stays EXEMPT"
 else
   echo "FAIL: a legitimate github-actions[bot] workflow bump was refused. Got:"
@@ -3226,7 +3226,7 @@ if [ "$RC64" -ne 0 ]; then
   echo "$OUT64" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT64" | grep -qF 'pr-scope-check: the diff matches issue #42'; then
+if grep -qF 'pr-scope-check: the diff matches issue #42' <<<"$OUT64"; then
   note "'Resolves #NN' is recognised as a closing keyword"
 else
   echo "FAIL: a PR body using 'Resolves #42' was not recognised. Got:"
@@ -3269,7 +3269,7 @@ if [ "$RC65" -ne 0 ]; then
   echo "$OUT65" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT65" | grep -qF 'pr-scope-check: the diff matches issue'; then
+if grep -qF 'pr-scope-check: the diff matches issue' <<<"$OUT65"; then
   note "a nested fuzz lockfile change is forgiven when its own sibling manifest is declared"
 else
   echo "FAIL: a legitimate nested fuzz lockfile change, with its sibling declared, was refused. Got:"
@@ -3308,7 +3308,7 @@ if [ "$RC66" -ne 0 ]; then
   echo "$OUT66" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT66" | grep -qF 'pr-scope-check: the diff matches issue'; then
+if grep -qF 'pr-scope-check: the diff matches issue' <<<"$OUT66"; then
   note "root Cargo.lock is forgiven when a declared, changed nested manifest is its plausible trigger"
 else
   echo "FAIL: root Cargo.lock was refused even though a declared, changed nested manifest is its plausible trigger. Got:"
@@ -3344,7 +3344,7 @@ if [ "$RC67" -ne 0 ]; then
   echo "$OUT67" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT67" | grep -qF 'pr-scope-check: the diff matches issue'; then
+if grep -qF 'pr-scope-check: the diff matches issue' <<<"$OUT67"; then
   note "a directory declaration covers a file underneath it in the main undeclared loop"
 else
   echo "FAIL: a file under a directory-declared path was refused as undeclared. Got:"
@@ -3381,7 +3381,7 @@ if [ "$RC68" -ne 0 ]; then
   echo "$OUT68" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT68" | grep -qF 'pr-scope-check: the diff matches issue'; then
+if grep -qF 'pr-scope-check: the diff matches issue' <<<"$OUT68"; then
   note "a directory declaration feeds cargo_lock_exempt, forgiving the root Cargo.lock"
 else
   echo "FAIL: root Cargo.lock was refused even though its manifest is covered by a directory declaration. Got:"
@@ -3416,7 +3416,7 @@ if [ "$RC69" -ne 0 ]; then
   echo "$OUT69" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT69" | grep -qF 'pr-scope-check: the diff matches issue'; then
+if grep -qF 'pr-scope-check: the diff matches issue' <<<"$OUT69"; then
   note "CHANGELOG.md is exempt from needing its own Files row"
 else
   echo "FAIL: an undeclared CHANGELOG.md change was refused even though ALWAYS_ALLOWED should exempt it. Got:"
@@ -3473,11 +3473,11 @@ if [ "$RC70" -eq 0 ]; then
   echo "$OUT70" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT70" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT70"; then
   echo "FAIL: notes.toml at repo root was reported EXEMPT. Got:"
   echo "$OUT70" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT70" | grep -qF 'notes.toml'; then
+elif ! grep -qF 'notes.toml' <<<"$OUT70"; then
   echo "FAIL: refused, but notes.toml was not named among the offending paths. Got:"
   echo "$OUT70" | sed 's/^/    /'
   FAILED=1
@@ -3507,11 +3507,11 @@ if [ "$RC71" -eq 0 ]; then
   echo "$OUT71" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT71" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT71"; then
   echo "FAIL: notes.lock at repo root was reported EXEMPT. Got:"
   echo "$OUT71" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT71" | grep -qF 'notes.lock'; then
+elif ! grep -qF 'notes.lock' <<<"$OUT71"; then
   echo "FAIL: refused, but notes.lock was not named among the offending paths. Got:"
   echo "$OUT71" | sed 's/^/    /'
   FAILED=1
@@ -3544,11 +3544,11 @@ if [ "$RC72" -eq 0 ]; then
   echo "$OUT72" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT72" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT72"; then
   echo "FAIL: crates/pol/notes.toml was reported EXEMPT. Got:"
   echo "$OUT72" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT72" | grep -qF 'crates/pol/notes.toml'; then
+elif ! grep -qF 'crates/pol/notes.toml' <<<"$OUT72"; then
   echo "FAIL: refused, but crates/pol/notes.toml was not named among the offending paths. Got:"
   echo "$OUT72" | sed 's/^/    /'
   FAILED=1
@@ -3580,11 +3580,11 @@ if [ "$RC73" -eq 0 ]; then
   echo "$OUT73" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT73" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT73"; then
   echo "FAIL: vendor/pol/Cargo.toml was reported EXEMPT. Got:"
   echo "$OUT73" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT73" | grep -qF 'vendor/pol/Cargo.toml'; then
+elif ! grep -qF 'vendor/pol/Cargo.toml' <<<"$OUT73"; then
   echo "FAIL: refused, but vendor/pol/Cargo.toml was not named among the offending paths. Got:"
   echo "$OUT73" | sed 's/^/    /'
   FAILED=1
@@ -3616,11 +3616,11 @@ if [ "$RC74" -eq 0 ]; then
   echo "$OUT74" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT74" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT74"; then
   echo "FAIL: crates/pol/Cargo.toml.bak was reported EXEMPT. Got:"
   echo "$OUT74" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT74" | grep -qF 'crates/pol/Cargo.toml.bak'; then
+elif ! grep -qF 'crates/pol/Cargo.toml.bak' <<<"$OUT74"; then
   echo "FAIL: refused, but crates/pol/Cargo.toml.bak was not named among the offending paths. Got:"
   echo "$OUT74" | sed 's/^/    /'
   FAILED=1
@@ -3651,11 +3651,11 @@ if [ "$RC75" -eq 0 ]; then
   echo "$OUT75" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT75" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT75"; then
   echo "FAIL: crates/pol/notfuzz/Cargo.toml was reported EXEMPT. Got:"
   echo "$OUT75" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT75" | grep -qF 'crates/pol/notfuzz/Cargo.toml'; then
+elif ! grep -qF 'crates/pol/notfuzz/Cargo.toml' <<<"$OUT75"; then
   echo "FAIL: refused, but crates/pol/notfuzz/Cargo.toml was not named among the offending paths. Got:"
   echo "$OUT75" | sed 's/^/    /'
   FAILED=1
@@ -3685,11 +3685,11 @@ if [ "$RC76" -eq 0 ]; then
   echo "$OUT76" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT76" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT76"; then
   echo "FAIL: vendor/pol/fuzz/Cargo.toml was reported EXEMPT. Got:"
   echo "$OUT76" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT76" | grep -qF 'vendor/pol/fuzz/Cargo.toml'; then
+elif ! grep -qF 'vendor/pol/fuzz/Cargo.toml' <<<"$OUT76"; then
   echo "FAIL: refused, but vendor/pol/fuzz/Cargo.toml was not named among the offending paths. Got:"
   echo "$OUT76" | sed 's/^/    /'
   FAILED=1
@@ -3724,11 +3724,11 @@ if [ "$RC77" -eq 0 ]; then
   echo "$OUT77" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT77" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT77"; then
   echo "FAIL: crates/pol/fuzz/build.toml was reported EXEMPT. Got:"
   echo "$OUT77" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT77" | grep -qF 'crates/pol/fuzz/build.toml'; then
+elif ! grep -qF 'crates/pol/fuzz/build.toml' <<<"$OUT77"; then
   echo "FAIL: refused, but crates/pol/fuzz/build.toml was not named among the offending paths. Got:"
   echo "$OUT77" | sed 's/^/    /'
   FAILED=1
@@ -3761,11 +3761,11 @@ if [ "$RC78" -eq 0 ]; then
   echo "$OUT78" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT78" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT78"; then
   echo "FAIL: crates/pol/notfuzz/Cargo.lock was reported EXEMPT. Got:"
   echo "$OUT78" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT78" | grep -qF 'crates/pol/notfuzz/Cargo.lock'; then
+elif ! grep -qF 'crates/pol/notfuzz/Cargo.lock' <<<"$OUT78"; then
   echo "FAIL: refused, but crates/pol/notfuzz/Cargo.lock was not named among the offending paths. Got:"
   echo "$OUT78" | sed 's/^/    /'
   FAILED=1
@@ -3795,11 +3795,11 @@ if [ "$RC79" -eq 0 ]; then
   echo "$OUT79" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT79" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT79"; then
   echo "FAIL: vendor/pol/fuzz/Cargo.lock was reported EXEMPT. Got:"
   echo "$OUT79" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT79" | grep -qF 'vendor/pol/fuzz/Cargo.lock'; then
+elif ! grep -qF 'vendor/pol/fuzz/Cargo.lock' <<<"$OUT79"; then
   echo "FAIL: refused, but vendor/pol/fuzz/Cargo.lock was not named among the offending paths. Got:"
   echo "$OUT79" | sed 's/^/    /'
   FAILED=1
@@ -3831,11 +3831,11 @@ if [ "$RC80" -eq 0 ]; then
   echo "$OUT80" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT80" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT80"; then
   echo "FAIL: crates/pol/fuzz/payload.sh was reported EXEMPT. Got:"
   echo "$OUT80" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT80" | grep -qF 'crates/pol/fuzz/payload.sh'; then
+elif ! grep -qF 'crates/pol/fuzz/payload.sh' <<<"$OUT80"; then
   echo "FAIL: refused, but crates/pol/fuzz/payload.sh was not named among the offending paths. Got:"
   echo "$OUT80" | sed 's/^/    /'
   FAILED=1
@@ -3866,11 +3866,11 @@ if [ "$RC81" -eq 0 ]; then
   echo "$OUT81" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT81" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT81"; then
   echo "FAIL: .github/workflows/helper.sh was reported EXEMPT. Got:"
   echo "$OUT81" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT81" | grep -qF '.github/workflows/helper.sh'; then
+elif ! grep -qF '.github/workflows/helper.sh' <<<"$OUT81"; then
   echo "FAIL: refused, but .github/workflows/helper.sh was not named among the offending paths. Got:"
   echo "$OUT81" | sed 's/^/    /'
   FAILED=1
@@ -3903,11 +3903,11 @@ if [ "$RC82" -eq 0 ]; then
   echo "$OUT82" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT82" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT82"; then
   echo "FAIL: .github/workflows/nested/deploy.yml was reported EXEMPT. Got:"
   echo "$OUT82" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT82" | grep -qF '.github/workflows/nested/deploy.yml'; then
+elif ! grep -qF '.github/workflows/nested/deploy.yml' <<<"$OUT82"; then
   echo "FAIL: refused, but .github/workflows/nested/deploy.yml was not named among the offending paths. Got:"
   echo "$OUT82" | sed 's/^/    /'
   FAILED=1
@@ -3940,11 +3940,11 @@ if [ "$RC83" -eq 0 ]; then
   echo "$OUT83" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT83" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT83"; then
   echo "FAIL: .github/actions/setup/action.yml was reported EXEMPT. Got:"
   echo "$OUT83" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT83" | grep -qF '.github/actions/setup/action.yml'; then
+elif ! grep -qF '.github/actions/setup/action.yml' <<<"$OUT83"; then
   echo "FAIL: refused, but .github/actions/setup/action.yml was not named among the offending paths. Got:"
   echo "$OUT83" | sed 's/^/    /'
   FAILED=1
@@ -3975,11 +3975,11 @@ if [ "$RC84" -eq 0 ]; then
   echo "$OUT84" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT84" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT84"; then
   echo "FAIL: .github/other.yml was reported EXEMPT. Got:"
   echo "$OUT84" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT84" | grep -qF '.github/other.yml'; then
+elif ! grep -qF '.github/other.yml' <<<"$OUT84"; then
   echo "FAIL: refused, but .github/other.yml was not named among the offending paths. Got:"
   echo "$OUT84" | sed 's/^/    /'
   FAILED=1
@@ -4011,11 +4011,11 @@ if [ "$RC85" -eq 0 ]; then
   echo "$OUT85" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT85" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT85"; then
   echo "FAIL: .github/dependabot.sh was reported EXEMPT. Got:"
   echo "$OUT85" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT85" | grep -qF '.github/dependabot.sh'; then
+elif ! grep -qF '.github/dependabot.sh' <<<"$OUT85"; then
   echo "FAIL: refused, but .github/dependabot.sh was not named among the offending paths. Got:"
   echo "$OUT85" | sed 's/^/    /'
   FAILED=1
@@ -4046,11 +4046,11 @@ if [ "$RC86" -eq 0 ]; then
   echo "$OUT86" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT86" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT86"; then
   echo "FAIL: packages/dashboard/malicious.json was reported EXEMPT. Got:"
   echo "$OUT86" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT86" | grep -qF 'packages/dashboard/malicious.json'; then
+elif ! grep -qF 'packages/dashboard/malicious.json' <<<"$OUT86"; then
   echo "FAIL: refused, but packages/dashboard/malicious.json was not named among the offending paths. Got:"
   echo "$OUT86" | sed 's/^/    /'
   FAILED=1
@@ -4081,11 +4081,11 @@ if [ "$RC87" -eq 0 ]; then
   echo "$OUT87" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT87" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT87"; then
   echo "FAIL: vendor/dashboard/package.json was reported EXEMPT. Got:"
   echo "$OUT87" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT87" | grep -qF 'vendor/dashboard/package.json'; then
+elif ! grep -qF 'vendor/dashboard/package.json' <<<"$OUT87"; then
   echo "FAIL: refused, but vendor/dashboard/package.json was not named among the offending paths. Got:"
   echo "$OUT87" | sed 's/^/    /'
   FAILED=1
@@ -4117,11 +4117,11 @@ if [ "$RC88" -eq 0 ]; then
   echo "$OUT88" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT88" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT88"; then
   echo "FAIL: packages/dashboard/nested/package.json was reported EXEMPT. Got:"
   echo "$OUT88" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT88" | grep -qF 'packages/dashboard/nested/package.json'; then
+elif ! grep -qF 'packages/dashboard/nested/package.json' <<<"$OUT88"; then
   echo "FAIL: refused, but packages/dashboard/nested/package.json was not named among the offending paths. Got:"
   echo "$OUT88" | sed 's/^/    /'
   FAILED=1
@@ -4177,7 +4177,7 @@ if [ "$RC89" -ne 0 ]; then
   echo "$OUT89" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT89" | grep -qF 'pr-scope-check: the diff matches issue #42'; then
+if grep -qF 'pr-scope-check: the diff matches issue #42' <<<"$OUT89"; then
   note "the diff is computed against the merge base, not BASE_SHA directly; main's later unrelated commit is not blamed on this PR"
 else
   echo "FAIL: a PR whose only real change is declared was refused, most likely because the diff" >&2
@@ -4224,11 +4224,11 @@ if [ "$RC90" -eq 0 ]; then
   echo "$OUT90" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT90" | grep -qF 'pr-scope-check: the diff matches issue'; then
+if grep -qF 'pr-scope-check: the diff matches issue' <<<"$OUT90"; then
   echo "FAIL: src/secrets.rs, listed only under a 'Do not touch' heading, was treated as declared. Got:"
   echo "$OUT90" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT90" | grep -qF 'src/secrets.rs'; then
+elif ! grep -qF 'src/secrets.rs' <<<"$OUT90"; then
   echo "FAIL: refused, but src/secrets.rs was not named among the undeclared paths. Got:"
   echo "$OUT90" | sed 's/^/    /'
   FAILED=1
@@ -4269,11 +4269,11 @@ if [ "$RC91" -eq 0 ]; then
   echo "$OUT91" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT91" | grep -qF 'pr-scope-check: the diff matches issue'; then
+if grep -qF 'pr-scope-check: the diff matches issue' <<<"$OUT91"; then
   echo "FAIL: src/secrets.rs, named only in a prose warning sentence, was treated as declared. Got:"
   echo "$OUT91" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT91" | grep -qF 'src/secrets.rs'; then
+elif ! grep -qF 'src/secrets.rs' <<<"$OUT91"; then
   echo "FAIL: refused, but src/secrets.rs was not named among the undeclared paths. Got:"
   echo "$OUT91" | sed 's/^/    /'
   FAILED=1
@@ -4312,12 +4312,12 @@ if [ "$RC92" -eq 0 ]; then
   echo "$OUT92" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT92" | grep -qF 'pr-scope-check: the diff matches issue'; then
+if grep -qF 'pr-scope-check: the diff matches issue' <<<"$OUT92"; then
   echo "FAIL: a file literally named 'Path' was treated as declared by the table's own (backticked)" >&2
   echo "header row. Got:" >&2
   echo "$OUT92" | sed 's/^/    /' >&2
   FAILED=1
-elif ! echo "$OUT92" | grep -qE '^ {4}Path$'; then
+elif ! grep -qE '^ {4}Path$' <<<"$OUT92"; then
   echo "FAIL: refused, but the file named 'Path' was not clearly named among the undeclared paths. Got:"
   echo "$OUT92" | sed 's/^/    /'
   FAILED=1
@@ -4360,12 +4360,12 @@ if [ "$RC93" -eq 0 ]; then
   echo "$OUT93" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT93" | grep -qF 'pr-scope-check: the diff matches issue'; then
+if grep -qF 'pr-scope-check: the diff matches issue' <<<"$OUT93"; then
   echo "FAIL: crates/b/fuzz/Cargo.lock, whose own sibling manifest is neither declared nor touched," >&2
   echo "rode crate a's unrelated declared bump. Got:" >&2
   echo "$OUT93" | sed 's/^/    /' >&2
   FAILED=1
-elif ! echo "$OUT93" | grep -qF 'crates/b/fuzz/Cargo.lock'; then
+elif ! grep -qF 'crates/b/fuzz/Cargo.lock' <<<"$OUT93"; then
   echo "FAIL: refused, but crates/b/fuzz/Cargo.lock was not named among the undeclared paths. Got:"
   echo "$OUT93" | sed 's/^/    /'
   FAILED=1
@@ -4404,11 +4404,11 @@ if [ "$RC94" -eq 0 ]; then
   echo "$OUT94" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT94" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT94"; then
   echo "FAIL: crates/pol/fuzz/other.lock was reported EXEMPT. Got:"
   echo "$OUT94" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT94" | grep -qF 'crates/pol/fuzz/other.lock'; then
+elif ! grep -qF 'crates/pol/fuzz/other.lock' <<<"$OUT94"; then
   echo "FAIL: refused, but crates/pol/fuzz/other.lock was not named among the offending paths. Got:"
   echo "$OUT94" | sed 's/^/    /'
   FAILED=1
@@ -4448,11 +4448,11 @@ if [ "$RC95" -eq 0 ]; then
   echo "$OUT95" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT95" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT95"; then
   echo "FAIL: .github/actions/deploy.yml was reported EXEMPT. Got:"
   echo "$OUT95" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT95" | grep -qF '.github/actions/deploy.yml'; then
+elif ! grep -qF '.github/actions/deploy.yml' <<<"$OUT95"; then
   echo "FAIL: refused, but .github/actions/deploy.yml was not named among the offending paths. Got:"
   echo "$OUT95" | sed 's/^/    /'
   FAILED=1
@@ -4526,47 +4526,47 @@ if [ "$RC96" -eq 0 ]; then
   echo "$OUT96" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT96" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT96"; then
   echo "FAIL: a dot-escape or extension-widen mutant let the whole PR through as EXEMPT. Got:" >&2
   echo "$OUT96" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if ! echo "$OUT96" | grep -qxF '    CargoXtoml'; then
+if ! grep -qxF '    CargoXtoml' <<<"$OUT96"; then
   echo "FAIL: refused, but the top-level CargoXtoml probe (alt 0's dot-escape) was not named among the offending paths. Got:"
   echo "$OUT96" | sed 's/^/    /'
   FAILED=1
 else
   note "a same-length top-level CargoXtoml (any-char instead of the literal dot) is refused (pins alt 0's dot-escape)"
 fi
-if ! echo "$OUT96" | grep -qxF '    CargoXlock'; then
+if ! grep -qxF '    CargoXlock' <<<"$OUT96"; then
   echo "FAIL: refused, but the top-level CargoXlock probe (alt 1's dot-escape) was not named among the offending paths. Got:"
   echo "$OUT96" | sed 's/^/    /'
   FAILED=1
 else
   note "a same-length top-level CargoXlock (any-char instead of the literal dot) is refused (pins alt 1's dot-escape)"
 fi
-if ! echo "$OUT96" | grep -qxF '    crates/pol/CargoXtoml'; then
+if ! grep -qxF '    crates/pol/CargoXtoml' <<<"$OUT96"; then
   echo "FAIL: refused, but crates/pol/CargoXtoml (alt 2's dot-escape) was not named among the offending paths. Got:"
   echo "$OUT96" | sed 's/^/    /'
   FAILED=1
 else
   note "crates/pol/CargoXtoml is refused (pins alt 2's dot-escape)"
 fi
-if ! echo "$OUT96" | grep -qxF '    crates/pol/fuzz/CargoXtoml'; then
+if ! grep -qxF '    crates/pol/fuzz/CargoXtoml' <<<"$OUT96"; then
   echo "FAIL: refused, but crates/pol/fuzz/CargoXtoml (alt 3's dot-escape) was not named among the offending paths. Got:"
   echo "$OUT96" | sed 's/^/    /'
   FAILED=1
 else
   note "crates/pol/fuzz/CargoXtoml is refused (pins alt 3's dot-escape)"
 fi
-if ! echo "$OUT96" | grep -qxF '    crates/pol/fuzz/CargoXlock'; then
+if ! grep -qxF '    crates/pol/fuzz/CargoXlock' <<<"$OUT96"; then
   echo "FAIL: refused, but crates/pol/fuzz/CargoXlock (alt 4's dot-escape) was not named among the offending paths. Got:"
   echo "$OUT96" | sed 's/^/    /'
   FAILED=1
 else
   note "crates/pol/fuzz/CargoXlock is refused (pins alt 4's dot-escape)"
 fi
-if ! echo "$OUT96" | grep -qxF '    crates/pol/fuzz/Cargo.evil'; then
+if ! grep -qxF '    crates/pol/fuzz/Cargo.evil' <<<"$OUT96"; then
   echo "FAIL: refused, but crates/pol/fuzz/Cargo.evil (alts 3 and 4's extension boundary) was not named among the offending paths. Got:"
   echo "$OUT96" | sed 's/^/    /'
   FAILED=1
@@ -4618,40 +4618,40 @@ if [ "$RC97" -eq 0 ]; then
   echo "$OUT97" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT97" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT97"; then
   echo "FAIL: a workflows-alternative mutant let the whole PR through as EXEMPT. Got:" >&2
   echo "$OUT97" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if ! echo "$OUT97" | grep -qxF '    Xgithub/workflows/evil.yml'; then
+if ! grep -qxF '    Xgithub/workflows/evil.yml' <<<"$OUT97"; then
   echo "FAIL: refused, but Xgithub/workflows/evil.yml was not named among the offending paths. Got:"
   echo "$OUT97" | sed 's/^/    /'
   FAILED=1
 else
   note "a top-level dir that merely ends in 'github' (no leading dot) is refused (pins the .github component both as a bare-wildcard widen and as an escape-strip)"
 fi
-if ! echo "$OUT97" | grep -qxF '    .hub/workflows/evil.yml'; then
+if ! grep -qxF '    .hub/workflows/evil.yml' <<<"$OUT97"; then
   echo "FAIL: refused, but .hub/workflows/evil.yml was not named among the offending paths. Got:"
   echo "$OUT97" | sed 's/^/    /'
   FAILED=1
 else
   note "a dot-directory that is not literally .github is refused (pins the leading dot staying escaped while 'github' itself is widened)"
 fi
-if ! echo "$OUT97" | grep -qxF '    .github/workflows/evil-yml'; then
+if ! grep -qxF '    .github/workflows/evil-yml' <<<"$OUT97"; then
   echo "FAIL: refused, but .github/workflows/evil-yml was not named among the offending paths. Got:"
   echo "$OUT97" | sed 's/^/    /'
   FAILED=1
 else
   note "a workflows file with no dot before its extension is refused (pins the extension dot's escape)"
 fi
-if ! echo "$OUT97" | grep -qxF '    .github/workflows/evil.xml'; then
+if ! grep -qxF '    .github/workflows/evil.xml' <<<"$OUT97"; then
   echo "FAIL: refused, but .github/workflows/evil.xml was not named among the offending paths. Got:"
   echo "$OUT97" | sed 's/^/    /'
   FAILED=1
 else
   note "a workflows file ending in .xml (not .yml or .yaml) is refused (pins the 'y' half of ya?ml)"
 fi
-if ! echo "$OUT97" | grep -qxF '    .github/workflows/evil.yxyz'; then
+if ! grep -qxF '    .github/workflows/evil.yxyz' <<<"$OUT97"; then
   echo "FAIL: refused, but .github/workflows/evil.yxyz was not named among the offending paths. Got:"
   echo "$OUT97" | sed 's/^/    /'
   FAILED=1
@@ -4694,26 +4694,26 @@ if [ "$RC98" -eq 0 ]; then
   echo "$OUT98" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT98" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT98"; then
   echo "FAIL: a dependabot.yml-alternative mutant let the whole PR through as EXEMPT. Got:" >&2
   echo "$OUT98" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if ! echo "$OUT98" | grep -qxF '    Xgithub/dependabot.yml'; then
+if ! grep -qxF '    Xgithub/dependabot.yml' <<<"$OUT98"; then
   echo "FAIL: refused, but Xgithub/dependabot.yml was not named among the offending paths. Got:"
   echo "$OUT98" | sed 's/^/    /'
   FAILED=1
 else
   note "a top-level dir that merely ends in 'github' (no leading dot) is refused (pins the .github component both as a bare-wildcard widen and as an escape-strip)"
 fi
-if ! echo "$OUT98" | grep -qxF '    .github/dependabotXyml'; then
+if ! grep -qxF '    .github/dependabotXyml' <<<"$OUT98"; then
   echo "FAIL: refused, but .github/dependabotXyml was not named among the offending paths. Got:"
   echo "$OUT98" | sed 's/^/    /'
   FAILED=1
 else
   note "a dependabot file with no dot before its extension is refused (pins the extension dot's escape)"
 fi
-if ! echo "$OUT98" | grep -qxF '    .hub/dependabot.yml'; then
+if ! grep -qxF '    .hub/dependabot.yml' <<<"$OUT98"; then
   echo "FAIL: refused, but .hub/dependabot.yml was not named among the offending paths. Got:"
   echo "$OUT98" | sed 's/^/    /'
   FAILED=1
@@ -4758,33 +4758,33 @@ if [ "$RC99" -eq 0 ]; then
   echo "$OUT99" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT99" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT99"; then
   echo "FAIL: a package(-lock)?.json-alternative mutant let the whole PR through as EXEMPT. Got:" >&2
   echo "$OUT99" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if ! echo "$OUT99" | grep -qxF '    packages/dash/packageXjson'; then
+if ! grep -qxF '    packages/dash/packageXjson' <<<"$OUT99"; then
   echo "FAIL: refused, but packages/dash/packageXjson was not named among the offending paths. Got:"
   echo "$OUT99" | sed 's/^/    /'
   FAILED=1
 else
   note "a package file with no dot before its extension is refused (pins the extension dot's escape)"
 fi
-if ! echo "$OUT99" | grep -qxF '    packages/dash/package.js'; then
+if ! grep -qxF '    packages/dash/package.js' <<<"$OUT99"; then
   echo "FAIL: refused, but packages/dash/package.js was not named among the offending paths. Got:"
   echo "$OUT99" | sed 's/^/    /'
   FAILED=1
 else
   note "package.js (not .json) is refused (pins the extension's own wildcard-widen boundary)"
 fi
-if ! echo "$OUT99" | grep -qxF '    packages/dash/packageXYZ.json'; then
+if ! grep -qxF '    packages/dash/packageXYZ.json' <<<"$OUT99"; then
   echo "FAIL: refused, but packages/dash/packageXYZ.json was not named among the offending paths. Got:"
   echo "$OUT99" | sed 's/^/    /'
   FAILED=1
 else
   note "package immediately followed by an unrecognised suffix before .json is refused (pins the optional group's content as a whole)"
 fi
-if ! echo "$OUT99" | grep -qxF '    packages/dash/package-evil.json'; then
+if ! grep -qxF '    packages/dash/package-evil.json' <<<"$OUT99"; then
   echo "FAIL: refused, but packages/dash/package-evil.json was not named among the offending paths. Got:"
   echo "$OUT99" | sed 's/^/    /'
   FAILED=1
@@ -4838,40 +4838,40 @@ if [ "$RC100" -eq 0 ]; then
   echo "$OUT100" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT100" | grep -qF 'pr-scope-check: the diff matches issue'; then
+if grep -qF 'pr-scope-check: the diff matches issue' <<<"$OUT100"; then
   echo "FAIL: an ALWAYS_ALLOWED mutant let the whole PR through as matching issue #5. Got:" >&2
   echo "$OUT100" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if ! echo "$OUT100" | grep -qxF '    CHANGELOGXmd'; then
+if ! grep -qxF '    CHANGELOGXmd' <<<"$OUT100"; then
   echo "FAIL: refused, but CHANGELOGXmd was not named among the undeclared paths. Got:"
   echo "$OUT100" | sed 's/^/    /'
   FAILED=1
 else
   note "CHANGELOGXmd (any char instead of the literal dot) is refused (pins ALWAYS_ALLOWED's dot-escape)"
 fi
-if ! echo "$OUT100" | grep -qxF '    README.md'; then
+if ! grep -qxF '    README.md' <<<"$OUT100"; then
   echo "FAIL: refused, but README.md was not named among the undeclared paths. Got:"
   echo "$OUT100" | sed 's/^/    /'
   FAILED=1
 else
   note "an unrelated root README.md is refused (pins ALWAYS_ALLOWED's CHANGELOG name, not just any .md file)"
 fi
-if ! echo "$OUT100" | grep -qxF '    CHANGELOG.txt'; then
+if ! grep -qxF '    CHANGELOG.txt' <<<"$OUT100"; then
   echo "FAIL: refused, but CHANGELOG.txt was not named among the undeclared paths. Got:"
   echo "$OUT100" | sed 's/^/    /'
   FAILED=1
 else
   note "CHANGELOG.txt (right name, wrong extension) is refused (pins ALWAYS_ALLOWED's .md extension)"
 fi
-if ! echo "$OUT100" | grep -qxF '    docs/CHANGELOG.md'; then
+if ! grep -qxF '    docs/CHANGELOG.md' <<<"$OUT100"; then
   echo "FAIL: refused, but docs/CHANGELOG.md was not named among the undeclared paths. Got:"
   echo "$OUT100" | sed 's/^/    /'
   FAILED=1
 else
   note "a nested docs/CHANGELOG.md is refused (pins ALWAYS_ALLOWED's leading anchor)"
 fi
-if ! echo "$OUT100" | grep -qxF '    CHANGELOG.md.bak'; then
+if ! grep -qxF '    CHANGELOG.md.bak' <<<"$OUT100"; then
   echo "FAIL: refused, but CHANGELOG.md.bak was not named among the undeclared paths. Got:"
   echo "$OUT100" | sed 's/^/    /'
   FAILED=1
@@ -4916,11 +4916,11 @@ if [ "$RC101" -eq 0 ]; then
   echo "$OUT101" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT101" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT101"; then
   echo "FAIL: cargo.toml (lowercase) was reported EXEMPT. Got:"
   echo "$OUT101" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT101" | grep -qxF '    cargo.toml'; then
+elif ! grep -qxF '    cargo.toml' <<<"$OUT101"; then
   echo "FAIL: refused, but cargo.toml was not named among the offending paths. Got:"
   echo "$OUT101" | sed 's/^/    /'
   FAILED=1
@@ -4958,11 +4958,11 @@ if [ "$RC102" -eq 0 ]; then
   echo "$OUT102" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT102" | grep -qF 'pr-scope-check: the diff matches issue'; then
+if grep -qF 'pr-scope-check: the diff matches issue' <<<"$OUT102"; then
   echo "FAIL: changelog.md (lowercase) rode ALWAYS_ALLOWED's exemption. Got:" >&2
   echo "$OUT102" | sed 's/^/    /' >&2
   FAILED=1
-elif ! echo "$OUT102" | grep -qxF '    changelog.md'; then
+elif ! grep -qxF '    changelog.md' <<<"$OUT102"; then
   echo "FAIL: refused, but changelog.md was not named among the undeclared paths. Got:"
   echo "$OUT102" | sed 's/^/    /'
   FAILED=1
@@ -5009,11 +5009,11 @@ if [ "$RC103" -eq 0 ]; then
   echo "$OUT103" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT103" | grep -qF 'pr-scope-check: the diff matches issue'; then
+if grep -qF 'pr-scope-check: the diff matches issue' <<<"$OUT103"; then
   echo "FAIL: evil/payload.rs, outside the declared docs/ directory, rode the directory declaration. Got:" >&2
   echo "$OUT103" | sed 's/^/    /' >&2
   FAILED=1
-elif ! echo "$OUT103" | grep -qxF '    evil/payload.rs'; then
+elif ! grep -qxF '    evil/payload.rs' <<<"$OUT103"; then
   echo "FAIL: refused, but evil/payload.rs was not named among the undeclared paths. Got:"
   echo "$OUT103" | sed 's/^/    /'
   FAILED=1
@@ -5069,11 +5069,11 @@ if [ "$RC104" -eq 0 ]; then
   echo "$OUT104" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT104" | grep -qF 'pr-scope-check: the diff matches issue'; then
+if grep -qF 'pr-scope-check: the diff matches issue' <<<"$OUT104"; then
   echo "FAIL: root Cargo.lock, alongside an uncovered crate manifest, rode an unrelated directory declaration. Got:" >&2
   echo "$OUT104" | sed 's/^/    /' >&2
   FAILED=1
-elif ! echo "$OUT104" | grep -qxF '    Cargo.lock'; then
+elif ! grep -qxF '    Cargo.lock' <<<"$OUT104"; then
   echo "FAIL: refused, but root Cargo.lock was not named among the undeclared paths, meaning cargo_lock_exempt was wrongly set. Got:"
   echo "$OUT104" | sed 's/^/    /'
   FAILED=1
@@ -5205,11 +5205,11 @@ if [ "$RC105" -eq 0 ]; then
   echo "$OUT105" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT105" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT105"; then
   echo "FAIL: .github/dependabot.yaml was reported EXEMPT. Got:"
   echo "$OUT105" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT105" | grep -qF '.github/dependabot.yaml'; then
+elif ! grep -qF '.github/dependabot.yaml' <<<"$OUT105"; then
   echo "FAIL: refused, but .github/dependabot.yaml was not named among the offending paths. Got:"
   echo "$OUT105" | sed 's/^/    /'
   FAILED=1
@@ -5253,11 +5253,11 @@ if [ "$RC106" -eq 0 ]; then
   echo "$OUT106" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT106" | grep -qF 'pr-scope-check: the diff matches issue'; then
+if grep -qF 'pr-scope-check: the diff matches issue' <<<"$OUT106"; then
   echo "FAIL: evil/docs/payload.rs, which merely CONTAINS docs/ as a substring, rode the directory declaration. Got:" >&2
   echo "$OUT106" | sed 's/^/    /' >&2
   FAILED=1
-elif ! echo "$OUT106" | grep -qxF '    evil/docs/payload.rs'; then
+elif ! grep -qxF '    evil/docs/payload.rs' <<<"$OUT106"; then
   echo "FAIL: refused, but evil/docs/payload.rs was not named among the undeclared paths. Got:"
   echo "$OUT106" | sed 's/^/    /'
   FAILED=1
@@ -5310,11 +5310,11 @@ if [ "$RC107" -eq 0 ]; then
   echo "$OUT107" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT107" | grep -qF 'pr-scope-check: the diff matches issue'; then
+if grep -qF 'pr-scope-check: the diff matches issue' <<<"$OUT107"; then
   echo "FAIL: root Cargo.lock, alongside a manifest that merely contains docs/, rode the declaration. Got:" >&2
   echo "$OUT107" | sed 's/^/    /' >&2
   FAILED=1
-elif ! echo "$OUT107" | grep -qxF '    Cargo.lock'; then
+elif ! grep -qxF '    Cargo.lock' <<<"$OUT107"; then
   echo "FAIL: refused, but root Cargo.lock was not named among the undeclared paths, meaning cargo_lock_exempt was wrongly set. Got:"
   echo "$OUT107" | sed 's/^/    /'
   FAILED=1
@@ -5396,33 +5396,33 @@ if [ "$RC108" -eq 0 ]; then
   echo "$OUT108" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if echo "$OUT108" | grep -qF 'pr-scope-check: EXEMPT'; then
+if grep -qF 'pr-scope-check: EXEMPT' <<<"$OUT108"; then
   echo "FAIL: a target.<cfg>.<name>/profile.<cfg>.dependencies mutant let the whole PR through as EXEMPT. Got:" >&2
   echo "$OUT108" | sed 's/^/    /' >&2
   FAILED=1
 fi
-if ! echo "$OUT108" | grep -qF 'target.cfg(unix).package.extra'; then
+if ! grep -qF 'target.cfg(unix).package.extra' <<<"$OUT108"; then
   echo "FAIL: refused, but target.'cfg(unix)'.package's change was not named among the offenses. Got:"
   echo "$OUT108" | sed 's/^/    /'
   FAILED=1
 else
   note "target.'cfg(unix)'.package is refused (pins DEP_TABLE_NAMES against gaining 'package')"
 fi
-if ! echo "$OUT108" | grep -qF 'target.cfg(unix).workspace.extra'; then
+if ! grep -qF 'target.cfg(unix).workspace.extra' <<<"$OUT108"; then
   echo "FAIL: refused, but target.'cfg(unix)'.workspace's change was not named among the offenses. Got:"
   echo "$OUT108" | sed 's/^/    /'
   FAILED=1
 else
   note "target.'cfg(unix)'.workspace is refused (pins DEP_TABLE_NAMES against gaining 'workspace')"
 fi
-if ! echo "$OUT108" | grep -qF 'target.cfg(unix).bin.extra'; then
+if ! grep -qF 'target.cfg(unix).bin.extra' <<<"$OUT108"; then
   echo "FAIL: refused, but target.'cfg(unix)'.bin's change was not named among the offenses. Got:"
   echo "$OUT108" | sed 's/^/    /'
   FAILED=1
 else
   note "target.'cfg(unix)'.bin is refused (pins DEP_TABLE_NAMES against gaining 'bin'; together with the two probes above, pins the membership predicate against collapsing to unconditional True)"
 fi
-if ! echo "$OUT108" | grep -qF 'profile.dev.dependencies.extra'; then
+if ! grep -qF 'profile.dev.dependencies.extra' <<<"$OUT108"; then
   echo "FAIL: refused, but profile.dev.dependencies's change was not named among the offenses. Got:"
   echo "$OUT108" | sed 's/^/    /'
   FAILED=1
@@ -5461,7 +5461,7 @@ if [ "$RC47_PR" -eq 0 ]; then
   echo "FAIL: PR_NUMBER unset did not fail closed (rc=0). Got:"
   echo "$OUT47_PR" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT47_PR" | grep -qF 'PR_NUMBER is required'; then
+elif ! grep -qF 'PR_NUMBER is required' <<<"$OUT47_PR"; then
   echo "FAIL: PR_NUMBER unset failed (rc=$RC47_PR), but not with its own message. Got:"
   echo "$OUT47_PR" | sed 's/^/    /'
   FAILED=1
@@ -5477,7 +5477,7 @@ if [ "$RC47_BASE" -eq 0 ]; then
   echo "FAIL: BASE_SHA unset did not fail closed (rc=0). Got:"
   echo "$OUT47_BASE" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT47_BASE" | grep -qF 'BASE_SHA is required'; then
+elif ! grep -qF 'BASE_SHA is required' <<<"$OUT47_BASE"; then
   echo "FAIL: BASE_SHA unset failed (rc=$RC47_BASE), but not with its own message. Got:"
   echo "$OUT47_BASE" | sed 's/^/    /'
   FAILED=1
@@ -5493,7 +5493,7 @@ if [ "$RC47_HEAD" -eq 0 ]; then
   echo "FAIL: HEAD_SHA unset did not fail closed (rc=0). Got:"
   echo "$OUT47_HEAD" | sed 's/^/    /'
   FAILED=1
-elif ! echo "$OUT47_HEAD" | grep -qF 'HEAD_SHA is required'; then
+elif ! grep -qF 'HEAD_SHA is required' <<<"$OUT47_HEAD"; then
   echo "FAIL: HEAD_SHA unset failed (rc=$RC47_HEAD), but not with its own message. Got:"
   echo "$OUT47_HEAD" | sed 's/^/    /'
   FAILED=1

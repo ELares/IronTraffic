@@ -823,7 +823,7 @@ NEEDED_LINES=(
 )
 MISSING_LINES=""
 for needle in "${NEEDED_LINES[@]}"; do
-  printf '%s\n' "$RAW_A" | grep -qF "$needle" || MISSING_LINES="$MISSING_LINES$needle
+  grep -qF "$needle" <<<"$RAW_A" || MISSING_LINES="$MISSING_LINES$needle
 "
 done
 if [ -n "$MISSING_LINES" ]; then
@@ -860,7 +860,7 @@ NEEDED_BENCH_LINES=(
 )
 MISSING_BENCH_LINES=""
 for needle in "${NEEDED_BENCH_LINES[@]}"; do
-  printf '%s\n' "$RAW_A" | grep -qF "$needle" || MISSING_BENCH_LINES="$MISSING_BENCH_LINES$needle
+  grep -qF "$needle" <<<"$RAW_A" || MISSING_BENCH_LINES="$MISSING_BENCH_LINES$needle
 "
 done
 if [ -n "$MISSING_BENCH_LINES" ]; then
@@ -898,7 +898,7 @@ fi
 # check) is what goes red.
 # ---------------------------------------------------------------------------
 echo "== corpus A: the hkdf-zeroize-not-fill COUNT half must be individually visible =="
-if printf '%s\n' "$RAW_A" | grep -qF "full=0 t=0"; then
+if grep -qF "full=0 t=0" <<<"$RAW_A"; then
   note "the count half's own evidence (full=0 t=0) is visible, independent of the blacklist hit"
 else
   echo "FAIL: corpus A's raw output is missing the count half's own evidence line"
@@ -934,7 +934,7 @@ fi
 # rule-name check and not the count-half check above, is what goes red.
 # ---------------------------------------------------------------------------
 echo "== corpus A: the hkdf-zeroize-not-fill BLACKLIST half must be individually visible =="
-if printf '%s\n' "$RAW_A" | grep -qF "crates/irontraffic-tls/src/hkdf.rs:20:"; then
+if grep -qF "crates/irontraffic-tls/src/hkdf.rs:20:" <<<"$RAW_A"; then
   note "the blacklist half's own evidence (hkdf.rs:20: full.fill(0)) is visible, independent of the count half's full=0 t=0"
 else
   echo "FAIL: corpus A's raw output is missing the blacklist half's own evidence line"
@@ -973,7 +973,7 @@ ALLOC_HITS="$(printf '%s\n' "$RAW_A" \
 MISSED_SPELLINGS=""
 while IFS= read -r needle; do
   [ -n "$needle" ] || continue
-  printf '%s\n' "$ALLOC_HITS" | grep -qF -- "$needle" \
+  grep -qF -- "$needle" <<<"$ALLOC_HITS" \
     || MISSED_SPELLINGS="$MISSED_SPELLINGS  $needle"$'\n'
 done <<'NEEDLES'
 tok_format = format!(
@@ -2197,8 +2197,8 @@ pub fn double(a: u8) -> u8 { a * 2 }
 RS
 echo "== corpus G, stage 3: an untracked .rs file must trip untracked-source and be named =="
 OUT_G="$(run_lints_raw "$G")"
-if printf '%s\n' "$OUT_G" | grep -q '^FAIL \[untracked-source\]$' \
-    && printf '%s\n' "$OUT_G" | grep -qF 'crates/irontraffic-router/src/new_untracked.rs'; then
+if grep -q '^FAIL \[untracked-source\]$' <<<"$OUT_G" \
+    && grep -qF 'crates/irontraffic-router/src/new_untracked.rs' <<<"$OUT_G"; then
   note "untracked .rs file trips untracked-source and is named in the output"
 else
   echo "FAIL: an untracked .rs file did not trip untracked-source, or did not name it. Got:"
@@ -2208,7 +2208,7 @@ fi
 # The ignored file must never be named as an offender, even in a run that
 # does fail for the unrelated untracked file: naming it would mean the scope
 # guard is not actually filtering by .gitignore.
-if printf '%s\n' "$OUT_G" | grep -qF 'ignored.rs: untracked'; then
+if grep -qF 'ignored.rs: untracked' <<<"$OUT_G"; then
   echo "FAIL: the gitignored file was named as an untracked-source offender."
   FAILED=1
 else
@@ -2287,6 +2287,53 @@ else
   echo "      build-prod-tree diagnostic naming the offending file:"
   sed 's/^/    /' "$WORK/h_output.txt"
   FAILED=1
+fi
+
+echo
+# ---------------------------------------------------------------------------
+# Corpus I/J: no-racy-early-exit-pipe (issue #889). A scripts/*.sh file that
+# reintroduces the exact printf-of-a-variable-into-an-early-exiting-grep
+# shape this issue removed from the six sites it named must trip the new
+# rule, and the here-string form the fix rewrites every one of them to must
+# not, so the guard neither misses the class nor false-positives on its own
+# remedy.
+# ---------------------------------------------------------------------------
+I="$WORK/racy"
+mkdir -p "$I/scripts"
+cat > "$I/scripts/racy.sh" <<'RACYSH'
+#!/usr/bin/env bash
+set -euo pipefail
+RAW="deadbeef"
+printf '%s\n' "$RAW" | grep -qF "needle" || echo missing
+RACYSH
+
+echo "== corpus I: a reintroduced printf-into-grep-q pipe under pipefail must trip no-racy-early-exit-pipe =="
+if fired_rules "$I" | grep -q '^no-racy-early-exit-pipe$'; then
+  note "the reintroduced racy pipe is caught"
+else
+  echo "FAIL: a scripts/*.sh file piping printf of a variable into grep -q under"
+  echo "      pipefail did not trip no-racy-early-exit-pipe. Got:"
+  run_lints_in "$I" | sed 's/^/    /'
+  FAILED=1
+fi
+
+J="$WORK/clean_pipe"
+mkdir -p "$J/scripts"
+cat > "$J/scripts/clean.sh" <<'CLEANSH'
+#!/usr/bin/env bash
+set -euo pipefail
+RAW="deadbeef"
+grep -qF "needle" <<<"$RAW" || echo missing
+CLEANSH
+
+echo "== corpus J: the here-string rewrite of the same check must not trip no-racy-early-exit-pipe =="
+if fired_rules "$J" | grep -q '^no-racy-early-exit-pipe$'; then
+  echo "FAIL: the here-string form (the fix this issue applies everywhere) still"
+  echo "      trips no-racy-early-exit-pipe. Got:"
+  run_lints_in "$J" | sed 's/^/    /'
+  FAILED=1
+else
+  note "the here-string rewrite does not trip no-racy-early-exit-pipe"
 fi
 
 echo

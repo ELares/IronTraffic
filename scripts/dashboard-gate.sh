@@ -301,7 +301,7 @@ selftest() {
       echo "$output" >&2
       return 1
     fi
-    if [ -n "$pattern" ] && ! printf '%s' "$output" | grep -qF "$pattern"; then
+    if [ -n "$pattern" ] && ! grep -qF "$pattern" <<<"$output"; then
       echo "selftest $name: expected output containing '$pattern'" >&2
       echo "$output" >&2
       return 1

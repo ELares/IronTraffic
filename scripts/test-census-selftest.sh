@@ -96,7 +96,7 @@ D1="$WORK/unchanged"
 base_commit "$D1" "$BASE_LIB"
 echo "== unchanged: an attribute between #[test] and fn must be counted =="
 OUT1="$(run_census "$D1")"
-if echo "$OUT1" | grep -q '^test-census: clean (1 tests on base, 1 here, none removed, none weakened)$'; then
+if grep -q '^test-census: clean (1 tests on base, 1 here, none removed, none weakened)$' <<<"$OUT1"; then
   note "counted correctly on both sides (1 test, unchanged)"
 else
   echo "FAIL: expected a clean census counting exactly 1 test on each side. Got:"
@@ -116,7 +116,7 @@ pub fn add(a: u8, b: u8) -> u8 { a + b }
 ' > "$D2/src/lib.rs"
 echo "== deleted: removing an attributed test must be reported =="
 OUT2="$(run_census "$D2")"
-if echo "$OUT2" | grep -q 'FAIL \[test-removed\]' && echo "$OUT2" | grep -q 'adds_two_numbers'; then
+if grep -q 'FAIL \[test-removed\]' <<<"$OUT2" && grep -q 'adds_two_numbers' <<<"$OUT2"; then
   note "deletion of the attributed test is caught and named"
 else
   echo "FAIL: deleting the attributed test did not trip test-removed. Got:"
@@ -158,7 +158,7 @@ mod tests {
 ' > "$D3/src/lib.rs"
 echo "== weakened: fewer real assertions in the same file must be reported =="
 OUT3="$(run_census "$D3")"
-if echo "$OUT3" | grep -q 'FAIL \[assertions-weakened\]'; then
+if grep -q 'FAIL \[assertions-weakened\]' <<<"$OUT3"; then
   note "the reduced assertion count is caught"
 else
   echo "FAIL: removing the assertion from the attributed test did not trip"
@@ -180,7 +180,7 @@ pub fn helper() -> u8 { 1 }
 '
 echo "== an attributed non-test function must not be counted as a test =="
 OUT4="$(run_census "$D4")"
-if echo "$OUT4" | grep -q '^test-census: clean (0 tests on base, 0 here, none removed, none weakened)$'; then
+if grep -q '^test-census: clean (0 tests on base, 0 here, none removed, none weakened)$' <<<"$OUT4"; then
   note "an attributed non-test function is correctly not counted"
 else
   echo "FAIL: an ordinary attributed function was miscounted as a test. Got:"
@@ -210,7 +210,7 @@ mod tests {
 '
 echo "== prose mentioning assert_eq!/#[test] must not inflate the counts =="
 OUT5="$(run_census "$D5")"
-if echo "$OUT5" | grep -q '^test-census: clean (1 tests on base, 1 here, none removed, none weakened)$'; then
+if grep -q '^test-census: clean (1 tests on base, 1 here, none removed, none weakened)$' <<<"$OUT5"; then
   note "prose mentions did not inflate the test or assertion count"
 else
   echo "FAIL: a doc comment mentioning assert_eq!/#[test] as prose changed the"
@@ -260,7 +260,7 @@ mod tests {
 ' > "$D6/src/lib.rs"
 echo "== same-total swap: assert_eq! -> assert! must be reported even though the total holds steady =="
 OUT6="$(run_census "$D6")"
-if echo "$OUT6" | grep -q 'FAIL \[assertions-weakened\]' && echo "$OUT6" | grep -q 'assert_eq!/assert_ne!'; then
+if grep -q 'FAIL \[assertions-weakened\]' <<<"$OUT6" && grep -q 'assert_eq!/assert_ne!' <<<"$OUT6"; then
   note "the same-total assert_eq!-to-assert! swap is caught by the strict count"
 else
   echo "FAIL: swapping assert_eq! for assert! one-for-one did not trip"
@@ -284,7 +284,7 @@ pub fn add(a: u8, b: u8) -> u8 { a + b }
 '
 echo "== untracked-source, stage 1: a fully tracked tree must not trip it =="
 OUT7A="$(run_census "$D7")"
-if printf '%s\n' "$OUT7A" | grep -q '^FAIL \[untracked-source\]$'; then
+if grep -q '^FAIL \[untracked-source\]$' <<<"$OUT7A"; then
   echo "FAIL: untracked-source fired on a fully tracked tree. Got:"
   echo "$OUT7A" | sed 's/^/    /'
   FAILED=1
@@ -299,7 +299,7 @@ pub fn stub() {}
 RS
 echo "== untracked-source, stage 2: a .gitignore-excluded file must not trip it =="
 OUT7B="$(run_census "$D7")"
-if printf '%s\n' "$OUT7B" | grep -q '^FAIL \[untracked-source\]$'; then
+if grep -q '^FAIL \[untracked-source\]$' <<<"$OUT7B"; then
   echo "FAIL: untracked-source fired on a file .gitignore already excludes. Got:"
   echo "$OUT7B" | sed 's/^/    /'
   FAILED=1
@@ -313,15 +313,15 @@ pub fn double(a: u8) -> u8 { a * 2 }
 RS
 echo "== untracked-source, stage 3: an untracked .rs file must trip it and be named =="
 OUT7C="$(run_census "$D7")"
-if printf '%s\n' "$OUT7C" | grep -q '^FAIL \[untracked-source\]$' \
-    && printf '%s\n' "$OUT7C" | grep -qF 'src/new_untracked.rs'; then
+if grep -q '^FAIL \[untracked-source\]$' <<<"$OUT7C" \
+    && grep -qF 'src/new_untracked.rs' <<<"$OUT7C"; then
   note "untracked .rs file trips untracked-source and is named"
 else
   echo "FAIL: an untracked .rs file did not trip untracked-source, or did not name it. Got:"
   echo "$OUT7C" | sed 's/^/    /'
   FAILED=1
 fi
-if printf '%s\n' "$OUT7C" | grep -qF 'ignored.rs'; then
+if grep -qF 'ignored.rs' <<<"$OUT7C"; then
   echo "FAIL: the gitignored file was named as an untracked-source offender."
   FAILED=1
 else
@@ -371,7 +371,7 @@ RS
 
 echo "== test-census-allow, stage 1: no PR_NUMBER at all must still fail =="
 OUT8A="$(run_census "$D8")"
-if printf '%s\n' "$OUT8A" | grep -q '^FAIL \[assertions-weakened\]$'; then
+if grep -q '^FAIL \[assertions-weakened\]$' <<<"$OUT8A"; then
   note "with no PR context, a real weakening still fails"
 else
   echo "FAIL: a genuine weakening passed with no PR_NUMBER set. Got:"
@@ -381,7 +381,7 @@ fi
 
 echo "== test-census-allow, stage 2: a non-matching allow line must still fail =="
 OUT8B="$(run_census_with_pr "$D8" 'test-census-allow: src/unrelated.rs reason: does not name the file that actually changed')"
-if printf '%s\n' "$OUT8B" | grep -q '^FAIL \[assertions-weakened\]$'; then
+if grep -q '^FAIL \[assertions-weakened\]$' <<<"$OUT8B"; then
   note "a non-matching allow line does not excuse a real weakening"
 else
   echo "FAIL: a non-matching allow line excused a weakening it does not name. Got:"
@@ -391,11 +391,11 @@ fi
 
 echo "== test-census-allow, stage 3: a matching PATH allow line clears rule 2 =="
 OUT8C="$(run_census_with_pr "$D8" 'test-census-allow: src/lib.rs reason: intentionally trimmed a redundant assertion in this selftest fixture')"
-if printf '%s\n' "$OUT8C" | grep -q '^FAIL \[assertions-weakened\]$'; then
+if grep -q '^FAIL \[assertions-weakened\]$' <<<"$OUT8C"; then
   echo "FAIL: a matching test-census-allow path line did not clear the weakening. Got:"
   echo "$OUT8C" | sed 's/^/    /'
   FAILED=1
-elif ! printf '%s\n' "$OUT8C" | grep -qF 'test-census-allow honored'; then
+elif ! grep -qF 'test-census-allow honored' <<<"$OUT8C"; then
   echo "FAIL: the census passed but never said the allowance was honored. Got:"
   echo "$OUT8C" | sed 's/^/    /'
   FAILED=1
@@ -443,12 +443,12 @@ RS
 
 echo "== test-census-allow, stage 4: naming only the TEST does not also excuse the file's own drop =="
 OUT8D="$(run_census_with_pr "$D8B" 'test-census-allow: removed_test reason: superseded, but this line does not mention the path')"
-if printf '%s\n' "$OUT8D" | grep -q '^FAIL \[test-removed\]$'; then
+if grep -q '^FAIL \[test-removed\]$' <<<"$OUT8D"; then
   echo "FAIL: naming the removed test by name did not clear rule 1. Got:"
   echo "$OUT8D" | sed 's/^/    /'
   FAILED=1
 fi
-if ! printf '%s\n' "$OUT8D" | grep -q '^FAIL \[assertions-weakened\]$'; then
+if ! grep -q '^FAIL \[assertions-weakened\]$' <<<"$OUT8D"; then
   echo "FAIL: rule 1's name-only allowance incorrectly also silenced rule 2's" \
        "independent per-file check. Got:"
   echo "$OUT8D" | sed 's/^/    /'
@@ -460,7 +460,7 @@ fi
 echo "== test-census-allow, stage 5: naming BOTH the test and the path clears both rules =="
 OUT8E="$(run_census_with_pr "$D8B" 'test-census-allow: removed_test reason: superseded by a stronger test elsewhere
 test-census-allow: src/lib.rs reason: the removed test'"'"'s assertions went with it, reviewed and accepted')"
-if printf '%s\n' "$OUT8E" | grep -qE '^FAIL \['; then
+if grep -qE '^FAIL \[' <<<"$OUT8E"; then
   echo "FAIL: naming both the test and the path still left a rule failing. Got:"
   echo "$OUT8E" | sed 's/^/    /'
   FAILED=1

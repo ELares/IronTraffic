@@ -326,6 +326,11 @@ rust_non_test_files() {
   rust_files | grep -v -E '(^|/)(tests|benches|examples)/' | grep -v -E '_test\.rs$' || true
 }
 
+# All tracked shell scripts, recursively, wherever under scripts/ they live.
+sh_files() {
+  git ls-files -z -- 'scripts/*.sh' | tr '\0' '\n' || true
+}
+
 # Build, once per subshell (see the note on PROD_TREE below), a shadow tree of
 # the non-test sources with `#[cfg(test)]`-attributed code blanked out. Same
 # relative paths, same line numbers.
@@ -1350,7 +1355,7 @@ allowlist_stale_hits() {
     trimmed="$(printf '%s' "$raw" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
     [ -z "$trimmed" ] && continue
     case "$trimmed" in '#'*) continue ;; esac
-    if ! printf '%s\n' "$valid" | grep -qxF "$trimmed"; then
+    if ! grep -qxF "$trimmed" <<<"$valid"; then
       printf '%s:%d: stale allowlist entry %s does not name a tracked file\n' "$allow" "$lineno" "$trimmed"
     fi
   done < "$allow"
@@ -2638,6 +2643,154 @@ exists for using \`.fill(0)\` on this specific line instead of \`Zeroize\`,
 say why on the same line; this suppresses only THIS blacklist match, not
 the exactly-one-call-site requirement above, which has no escape:
   // it-allow: hkdf-zeroize-not-fill reason: <why this is not a secret wipe>" "$hits"
+
+# heredoc_mask.py: blank out heredoc BODY (and terminator) lines in a shell
+# script, preserving every other line verbatim and the file's total line
+# count, so a line-number-reporting scan below sees only text bash would
+# actually execute as this file's own code.
+#
+# WHY THIS EXISTS. Rule 29 below (no-racy-early-exit-pipe) scans raw script
+# text for a shape rather than parsing it, same as most rules in this file.
+# That is fine for live code, but a heredoc body is TEXT DATA being written
+# out (almost always via `cat > some/path <<'MARKER'`), not a pipeline this
+# file runs -- and this project writes exactly that kind of fixture into its
+# own self-tests, including, concretely, `scripts/invariant-lints-selftest.sh`
+# building a THROWAWAY corpus script that contains the literal racy shape on
+# purpose, so its own rule-29 self-test (corpus I) can prove the rule still
+# fires on a real reintroduction. A scan blind to heredocs cannot tell that
+# apart from the shape actually running in this file, and fires on the
+# fixture -- the exact "matched text, not live code" mistake this project has
+# hit before (see the sweep harness that matched identical text sitting in
+# comments and reported six false survivors). Comments get the same
+# treatment already, by skipping any matched line whose first non-blank
+# character is `#`; this does the equivalent for heredoc payloads.
+#
+# Handles both quote styles bash accepts for a heredoc delimiter (`<<'EOF'`,
+# `<<"EOF"`, bare `<<EOF`, backslash-escaped `<<\EOF`) and `<<-EOF` (leading
+# tabs stripped from both body and terminator before the compare). A
+# here-string (`<<<`) is deliberately NOT a heredoc start: the lookaround on
+# both sides of `<<` requires that neither the preceding nor the following
+# character is itself `<`, so `grep -qF "$needle" <<<"$RAW"` -- the very
+# fix this rule enforces -- is never mistaken for one.
+#
+# NESTED / MULTIPLE HEREDOCS. Once a body has started, this does not look
+# for a new `<<` inside it -- exactly like bash, for which heredoc content is
+# opaque text until that heredoc's own terminator line, so a body that
+# itself contains what looks like another heredoc marker cannot end the
+# scan early or confuse it. Multiple heredoc operators on one line are
+# queued in the order they appear and closed off one at a time by the
+# lines that follow, which is also the order bash itself reads their
+# bodies in, so this stays correct without any special-casing.
+cat > "$WORK/heredoc_mask.py" <<'PY'
+import re
+import sys
+
+HEREDOC_START = re.compile(
+    r'(?<!<)<<(?!<)(-?)\s*'
+    r'(?:"([^"]*)"|\'([^\']*)\'|(\\?[A-Za-z_][A-Za-z0-9_]*))'
+)
+
+
+def starts_on(line):
+    out = []
+    for m in HEREDOC_START.finditer(line):
+        word = m.group(2)
+        if word is None:
+            word = m.group(3)
+        if word is None:
+            word = m.group(4).lstrip('\\')
+        out.append((word, m.group(1) == '-'))
+    return out
+
+
+def mask(path):
+    with open(path, encoding="utf-8", errors="replace") as fh:
+        lines = fh.read().split('\n')
+    out = []
+    pending = []  # queue of (delimiter, strip_tabs), oldest (innermost) first
+    for line in lines:
+        if pending:
+            delim, strip_tabs = pending[0]
+            probe = line.lstrip('\t') if strip_tabs else line
+            if probe == delim:
+                pending.pop(0)
+            out.append('')
+            continue
+        out.append(line)
+        pending.extend(starts_on(line))
+    return '\n'.join(out)
+
+
+sys.stdout.write(mask(sys.argv[1]))
+PY
+
+# ---------------------------------------------------------------------------
+# 29. no-racy-early-exit-pipe: a pipeline whose writer is `printf` or `echo`
+#     of a shell variable and whose reader can exit before consuming all of
+#     its input (`grep -q`/`-m`, or `head`) turns a SIGPIPE on the writer
+#     into the reader's verdict the moment `pipefail` is set. See issue
+#     #889: bash's `printf` builtin does not write a multi-KiB string in one
+#     syscall (measured: it flushes at 24,576 bytes, then writes the
+#     remainder); a `grep -q` that matches on its first read exits and
+#     closes the pipe, so a tail write landing after that close takes
+#     SIGPIPE. Under `pipefail` the pipeline's exit status becomes the
+#     writer's 141 even though the reader succeeded, so a construct written
+#     to DETECT a violation instead reports that there is none, or (this
+#     rule's own predecessor at this file's `allowlist_stale_hits`, before
+#     #889 rewrote it) lets a real violation of THIS gate go unreported. A
+#     here string, `grep -qF "$needle" <<<"$RAW"`, gives the reader the
+#     same bytes with no separate writer process left to race, so it
+#     cannot recur.
+#
+#     THIS IS A TEXTUAL SCAN OF TRACKED scripts/*.sh FILES, NOT A SHELL
+#     PARSER, and it only flags a file that itself sets `pipefail`: a
+#     pipeline without `pipefail` cannot lose this race, because a
+#     non-zero writer exit status is simply discarded. It catches the
+#     shape #889 removed, written out on one physical line, reappearing
+#     verbatim; it cannot see a writer or reader reached through a
+#     variable or a function indirection, and a comment line that merely
+#     shows the shape as prose (rather than running it) is excluded by
+#     skipping any matched line whose first non-blank character is `#`.
+#     Both the `pipefail` file-level guard and the shape scan itself run
+#     against the heredoc_mask.py output rather than the raw file, so a
+#     heredoc payload -- a fixture script written out as DATA by `cat >`,
+#     never executed as a pipeline in the file that contains it -- can
+#     neither manufacture a false `pipefail` guard nor trip the shape
+#     match; the mask blanks a heredoc's body and terminator lines only,
+#     so every other line, and every genuine reintroduction of the shape
+#     in this file's own live code, is scanned exactly as before. There is
+#     no it-allow escape for this rule: the fix is mechanical, and letting
+#     one be written would mean a violation could be silenced by a comment
+#     instead of fixed. Widening this into a real parser is future work,
+#     not a reason to let the literal reintroduction back in now.
+# ---------------------------------------------------------------------------
+racy_pipe_hits() {
+  local f masked
+  while IFS= read -r f; do
+    masked="$(python3 "$WORK/heredoc_mask.py" "$f")"
+    grep -q 'pipefail' <<<"$masked" || continue
+    grep -nE '(printf|echo)\b[^|#]*\$[A-Za-z_{][^|#]*\|[^|#]*(grep([[:space:]]+-[A-Za-z]+)*[[:space:]]+-[A-Za-z]*[qm]|head\b)' <<<"$masked" \
+      | grep -vE '^[0-9]+:[[:space:]]*#' \
+      | while IFS=: read -r lineno rest; do
+          printf '%s:%s:%s\n' "$f" "$lineno" "$rest"
+        done
+  done < <(sh_files)
+}
+hits="$(racy_pipe_hits)"
+[ -n "$hits" ] && fail no-racy-early-exit-pipe \
+"A pipeline in this file pipes \`printf\` or \`echo\` of a shell variable
+into a reader that can exit before consuming all of its input (\`grep -q\`,
+\`grep -m\`, or \`head\`), inside a script that sets \`pipefail\`. That is
+the exact shape issue #889 removed: bash's \`printf\` builtin can split a
+multi-KiB write across two syscalls, and if the reader already matched and
+exited between them, the second write takes SIGPIPE, and \`pipefail\`
+reports the WRITER's death as the pipeline's status rather than the
+reader's real verdict. Rewrite it as a here string instead, which leaves no
+separate writer process for the reader to race:
+  grep -qF \"\$needle\" <<<\"\$RAW\"
+There is no it-allow escape for this: the fix is mechanical, and the race
+is real every time this shape appears, not only in the case that happened
+to get measured." "$hits"
 
 # ---------------------------------------------------------------------------
 if [ "$FAILED" -ne 0 ]; then
