@@ -823,7 +823,7 @@ NEEDED_LINES=(
 )
 MISSING_LINES=""
 for needle in "${NEEDED_LINES[@]}"; do
-  printf '%s\n' "$RAW_A" | grep -qF "$needle" || MISSING_LINES="$MISSING_LINES$needle
+  grep -qF "$needle" <<<"$RAW_A" || MISSING_LINES="$MISSING_LINES$needle
 "
 done
 if [ -n "$MISSING_LINES" ]; then
@@ -860,7 +860,7 @@ NEEDED_BENCH_LINES=(
 )
 MISSING_BENCH_LINES=""
 for needle in "${NEEDED_BENCH_LINES[@]}"; do
-  printf '%s\n' "$RAW_A" | grep -qF "$needle" || MISSING_BENCH_LINES="$MISSING_BENCH_LINES$needle
+  grep -qF "$needle" <<<"$RAW_A" || MISSING_BENCH_LINES="$MISSING_BENCH_LINES$needle
 "
 done
 if [ -n "$MISSING_BENCH_LINES" ]; then
@@ -898,7 +898,7 @@ fi
 # check) is what goes red.
 # ---------------------------------------------------------------------------
 echo "== corpus A: the hkdf-zeroize-not-fill COUNT half must be individually visible =="
-if printf '%s\n' "$RAW_A" | grep -qF "full=0 t=0"; then
+if grep -qF "full=0 t=0" <<<"$RAW_A"; then
   note "the count half's own evidence (full=0 t=0) is visible, independent of the blacklist hit"
 else
   echo "FAIL: corpus A's raw output is missing the count half's own evidence line"
@@ -934,7 +934,7 @@ fi
 # rule-name check and not the count-half check above, is what goes red.
 # ---------------------------------------------------------------------------
 echo "== corpus A: the hkdf-zeroize-not-fill BLACKLIST half must be individually visible =="
-if printf '%s\n' "$RAW_A" | grep -qF "crates/irontraffic-tls/src/hkdf.rs:20:"; then
+if grep -qF "crates/irontraffic-tls/src/hkdf.rs:20:" <<<"$RAW_A"; then
   note "the blacklist half's own evidence (hkdf.rs:20: full.fill(0)) is visible, independent of the count half's full=0 t=0"
 else
   echo "FAIL: corpus A's raw output is missing the blacklist half's own evidence line"
@@ -973,7 +973,7 @@ ALLOC_HITS="$(printf '%s\n' "$RAW_A" \
 MISSED_SPELLINGS=""
 while IFS= read -r needle; do
   [ -n "$needle" ] || continue
-  printf '%s\n' "$ALLOC_HITS" | grep -qF -- "$needle" \
+  grep -qF -- "$needle" <<<"$ALLOC_HITS" \
     || MISSED_SPELLINGS="$MISSED_SPELLINGS  $needle"$'\n'
 done <<'NEEDLES'
 tok_format = format!(
@@ -2197,8 +2197,8 @@ pub fn double(a: u8) -> u8 { a * 2 }
 RS
 echo "== corpus G, stage 3: an untracked .rs file must trip untracked-source and be named =="
 OUT_G="$(run_lints_raw "$G")"
-if printf '%s\n' "$OUT_G" | grep -q '^FAIL \[untracked-source\]$' \
-    && printf '%s\n' "$OUT_G" | grep -qF 'crates/irontraffic-router/src/new_untracked.rs'; then
+if grep -q '^FAIL \[untracked-source\]$' <<<"$OUT_G" \
+    && grep -qF 'crates/irontraffic-router/src/new_untracked.rs' <<<"$OUT_G"; then
   note "untracked .rs file trips untracked-source and is named in the output"
 else
   echo "FAIL: an untracked .rs file did not trip untracked-source, or did not name it. Got:"
@@ -2208,7 +2208,7 @@ fi
 # The ignored file must never be named as an offender, even in a run that
 # does fail for the unrelated untracked file: naming it would mean the scope
 # guard is not actually filtering by .gitignore.
-if printf '%s\n' "$OUT_G" | grep -qF 'ignored.rs: untracked'; then
+if grep -qF 'ignored.rs: untracked' <<<"$OUT_G"; then
   echo "FAIL: the gitignored file was named as an untracked-source offender."
   FAILED=1
 else
@@ -2286,6 +2286,333 @@ else
   echo "FAIL: the gate stopped (exit $H_RC), but not with the expected"
   echo "      build-prod-tree diagnostic naming the offending file:"
   sed 's/^/    /' "$WORK/h_output.txt"
+  FAILED=1
+fi
+
+echo
+# ---------------------------------------------------------------------------
+# Corpus I/J: no-racy-early-exit-pipe (issue #889). A scripts/*.sh file that
+# reintroduces the exact printf-of-a-variable-into-an-early-exiting-grep
+# shape this issue removed from the six sites it named must trip the new
+# rule, and the here-string form the fix rewrites every one of them to must
+# not, so the guard neither misses the class nor false-positives on its own
+# remedy.
+# ---------------------------------------------------------------------------
+I="$WORK/racy"
+mkdir -p "$I/scripts"
+cat > "$I/scripts/racy.sh" <<'RACYSH'
+#!/usr/bin/env bash
+set -euo pipefail
+RAW="deadbeef"
+printf '%s\n' "$RAW" | grep -qF "needle" || echo missing
+RACYSH
+
+echo "== corpus I: a reintroduced printf-into-grep-q pipe under pipefail must trip no-racy-early-exit-pipe =="
+if fired_rules "$I" | grep -q '^no-racy-early-exit-pipe$'; then
+  note "the reintroduced racy pipe is caught"
+else
+  echo "FAIL: a scripts/*.sh file piping printf of a variable into grep -q under"
+  echo "      pipefail did not trip no-racy-early-exit-pipe. Got:"
+  run_lints_in "$I" | sed 's/^/    /'
+  FAILED=1
+fi
+
+J="$WORK/clean_pipe"
+mkdir -p "$J/scripts"
+cat > "$J/scripts/clean.sh" <<'CLEANSH'
+#!/usr/bin/env bash
+set -euo pipefail
+RAW="deadbeef"
+grep -qF "needle" <<<"$RAW" || echo missing
+CLEANSH
+
+echo "== corpus J: the here-string rewrite of the same check must not trip no-racy-early-exit-pipe =="
+if fired_rules "$J" | grep -q '^no-racy-early-exit-pipe$'; then
+  echo "FAIL: the here-string form (the fix this issue applies everywhere) still"
+  echo "      trips no-racy-early-exit-pipe. Got:"
+  run_lints_in "$J" | sed 's/^/    /'
+  FAILED=1
+else
+  note "the here-string rewrite does not trip no-racy-early-exit-pipe"
+fi
+
+# ---------------------------------------------------------------------------
+# Corpus K: heredoc_mask.py must not let a `<<WORD`-shaped COMMENT blind the
+# rest of the file to rule 29. This is a regression test for the bug this
+# very comment style (describing a heredoc in prose rather than opening one)
+# used to trigger: a phantom heredoc with no closing delimiter anywhere in
+# the file blanked every line after the comment, including a genuine
+# reintroduction of the racy shape below it.
+# ---------------------------------------------------------------------------
+K="$WORK/heredoc_comment"
+mkdir -p "$K/scripts"
+cat > "$K/scripts/k.sh" <<'KSH'
+#!/usr/bin/env bash
+set -euo pipefail
+# Fixtures in this file are written out with a `cat > f <<'MARKER'` block,
+# not run as a live pipeline.
+RAW="deadbeef"
+printf '%s\n' "$RAW" | grep -qF "needle" || true
+KSH
+
+echo "== corpus K: a racy pipe after a comment that merely SHOWS a heredoc marker must still trip no-racy-early-exit-pipe =="
+if fired_rules "$K" | grep -q '^no-racy-early-exit-pipe$'; then
+  note "the reintroduction after the heredoc-shaped comment is still caught"
+else
+  echo "FAIL: a comment describing a heredoc as prose blinded the scan to a real"
+  echo "      racy pipe below it. Got:"
+  run_lints_in "$K" | sed 's/^/    /'
+  FAILED=1
+fi
+
+# ---------------------------------------------------------------------------
+# Corpus L: the same reintroduction, split across a backslash line
+# continuation. This repository already writes multi-line conditions this
+# way (see this file and test-census-selftest.sh), so it is the most likely
+# accidental spelling of the shape #889 removed.
+# ---------------------------------------------------------------------------
+L="$WORK/backslash_continuation"
+mkdir -p "$L/scripts"
+cat > "$L/scripts/l.sh" <<'LSH'
+#!/usr/bin/env bash
+set -euo pipefail
+RAW="deadbeef"
+printf '%s\n' "$RAW" \
+  | grep -qF "needle" || true
+LSH
+
+echo "== corpus L: a racy pipe split across a backslash continuation must trip no-racy-early-exit-pipe =="
+if fired_rules "$L" | grep -q '^no-racy-early-exit-pipe$'; then
+  note "the backslash-continued reintroduction is caught"
+else
+  echo "FAIL: a pipeline split across a backslash continuation did not trip"
+  echo "      no-racy-early-exit-pipe. Got:"
+  run_lints_in "$L" | sed 's/^/    /'
+  FAILED=1
+fi
+
+# ---------------------------------------------------------------------------
+# Corpus M: the bare word `head` must not false-positive when it is not the
+# command actually invoked right after the pipe, and a genuine `head(1)`
+# reader must still be caught. Paired the same way corpus I/J pairs the
+# racy shape with its fix.
+# ---------------------------------------------------------------------------
+M1="$WORK/head_word_not_command"
+mkdir -p "$M1/scripts"
+cat > "$M1/scripts/m1.sh" <<'M1SH'
+#!/usr/bin/env bash
+set -euo pipefail
+RAW="deadbeef"
+printf '%s\n' "$RAW" | grep -c 'head'
+M1SH
+
+echo "== corpus M1: the bare word 'head' inside a grep -c argument must NOT trip no-racy-early-exit-pipe =="
+if fired_rules "$M1" | grep -q '^no-racy-early-exit-pipe$'; then
+  echo "FAIL: 'head' appearing as ordinary text, not as the command invoked"
+  echo "      right after the pipe, still trips no-racy-early-exit-pipe (grep -c"
+  echo "      reads to EOF and cannot lose this race). Got:"
+  run_lints_in "$M1" | sed 's/^/    /'
+  FAILED=1
+else
+  note "the bare word 'head' does not trip the rule when it is not the reader command"
+fi
+
+M2="$WORK/head_command_racy"
+mkdir -p "$M2/scripts"
+cat > "$M2/scripts/m2.sh" <<'M2SH'
+#!/usr/bin/env bash
+set -euo pipefail
+RAW="deadbeef"
+printf '%s\n' "$RAW" | head -n1
+M2SH
+
+echo "== corpus M2: a genuine printf-into-head pipe under pipefail must still trip no-racy-early-exit-pipe =="
+if fired_rules "$M2" | grep -q '^no-racy-early-exit-pipe$'; then
+  note "a real head(1) reader is still caught"
+else
+  echo "FAIL: anchoring the reader command silenced a genuine printf-into-head"
+  echo "      reintroduction. Got:"
+  run_lints_in "$M2" | sed 's/^/    /'
+  FAILED=1
+fi
+
+# ---------------------------------------------------------------------------
+# Corpus N: two reintroduction spellings the single-physical-line, short-flag
+# regex used to miss: a long grep option, and a positional writer parameter.
+# ---------------------------------------------------------------------------
+N1="$WORK/long_option"
+mkdir -p "$N1/scripts"
+cat > "$N1/scripts/n1.sh" <<'N1SH'
+#!/usr/bin/env bash
+set -euo pipefail
+RAW="deadbeef"
+printf '%s\n' "$RAW" | grep --quiet -F "needle" || true
+N1SH
+
+echo "== corpus N1: grep --quiet (a long option, not -q) must trip no-racy-early-exit-pipe =="
+if fired_rules "$N1" | grep -q '^no-racy-early-exit-pipe$'; then
+  note "the long-option reintroduction is caught"
+else
+  echo "FAIL: grep --quiet did not trip no-racy-early-exit-pipe. Got:"
+  run_lints_in "$N1" | sed 's/^/    /'
+  FAILED=1
+fi
+
+N2="$WORK/positional_writer"
+mkdir -p "$N2/scripts"
+cat > "$N2/scripts/n2.sh" <<'N2SH'
+#!/usr/bin/env bash
+set -euo pipefail
+check() {
+  printf '%s\n' "$1" | grep -q "needle" || true
+}
+check "deadbeef"
+N2SH
+
+echo "== corpus N2: a positional parameter (\"\$1\") as the writer must trip no-racy-early-exit-pipe =="
+if fired_rules "$N2" | grep -q '^no-racy-early-exit-pipe$'; then
+  note "the positional-parameter reintroduction is caught"
+else
+  echo "FAIL: \"\$1\" as the writer's variable did not trip no-racy-early-exit-pipe. Got:"
+  run_lints_in "$N2" | sed 's/^/    /'
+  FAILED=1
+fi
+
+# ---------------------------------------------------------------------------
+# Corpus O: a KNOWN, DOCUMENTED gap, not a false pass. A `#` inside the
+# writer's own parameter expansion is textually indistinguishable, without
+# tracking quote state, from a `#` starting a trailing comment, and the
+# connector deliberately excludes `#` so a trailing comment mentioning this
+# shape in prose is never mistaken for a live pipeline (see rule 29's
+# comment block above). Neither branch below sets FAILED: this corpus
+# cannot go red under any behaviour of rule 29, on purpose, because both
+# directions are legitimate (asserting the gap stays open would fail the
+# day someone closes it, a test that punishes improvement; asserting it
+# is closed cannot ship today). What it DOES do is RECORD, in this run's
+# own log, which side of the gap the current code is on, so a change to
+# either direction is visible to a reader of that log rather than
+# passing through silently as an unremarked green run.
+# ---------------------------------------------------------------------------
+O="$WORK/hash_in_writer"
+mkdir -p "$O/scripts"
+cat > "$O/scripts/o.sh" <<'OSH'
+#!/usr/bin/env bash
+set -euo pipefail
+RAW="deadbeefx"
+printf '%s\n' "${RAW#x}" | grep -qF "needle" || true
+OSH
+
+echo "== corpus O: a '#' inside the writer's own parameter expansion is a documented gap (recorded, not asserted) =="
+if fired_rules "$O" | grep -q '^no-racy-early-exit-pipe$'; then
+  note "RECORDED: this spelling is now caught (documentation above is stale and should be updated)"
+else
+  note "RECORDED: this spelling is not caught, matching the documented limitation in rule 29's comment block"
+fi
+
+# ---------------------------------------------------------------------------
+# Corpus P: the reader anchor must not require `grep`/`head` to be the FIRST
+# token after the pipe. This repository's own house style prefixes a
+# locale-sensitive reader with an environment assignment (`LC_ALL=C`,
+# written nine times already in these tracked scripts) or a `command`/`env`
+# wrapper, and every one of those spellings races exactly like the bare
+# form. A prior tightening of this anchor (from "anything but `|`/`#`" to
+# "whitespace only") silently stopped seeing all of them; this corpus pins
+# both spellings down so that regression cannot recur unnoticed.
+# ---------------------------------------------------------------------------
+P1="$WORK/env_prefixed_reader"
+mkdir -p "$P1/scripts"
+cat > "$P1/scripts/p1.sh" <<'P1SH'
+#!/usr/bin/env bash
+set -euo pipefail
+RAW="deadbeef"
+printf '%s\n' "$RAW" | LC_ALL=C grep -qF "needle" || true
+P1SH
+
+echo "== corpus P1: an LC_ALL=C-prefixed grep -qF reader must trip no-racy-early-exit-pipe =="
+if fired_rules "$P1" | grep -q '^no-racy-early-exit-pipe$'; then
+  note "the LC_ALL=C-prefixed reintroduction is caught"
+else
+  echo "FAIL: an environment-assignment prefix (LC_ALL=C, this repository's own"
+  echo "      house style for locale-stable text) in front of the reader command"
+  echo "      hid a genuine reintroduction from no-racy-early-exit-pipe. Got:"
+  run_lints_in "$P1" | sed 's/^/    /'
+  FAILED=1
+fi
+
+P2="$WORK/command_prefixed_reader"
+mkdir -p "$P2/scripts"
+cat > "$P2/scripts/p2.sh" <<'P2SH'
+#!/usr/bin/env bash
+set -euo pipefail
+RAW="deadbeef"
+printf '%s\n' "$RAW" | command grep -qF "needle" || true
+P2SH
+
+echo "== corpus P2: a command-wrapped grep -qF reader must trip no-racy-early-exit-pipe =="
+if fired_rules "$P2" | grep -q '^no-racy-early-exit-pipe$'; then
+  note "the command-wrapped reintroduction is caught"
+else
+  echo "FAIL: a 'command' prefix in front of the reader hid a genuine"
+  echo "      reintroduction from no-racy-early-exit-pipe. Got:"
+  run_lints_in "$P2" | sed 's/^/    /'
+  FAILED=1
+fi
+
+# ---------------------------------------------------------------------------
+# Corpus Q: join_continuations.py must not fold a COMMENT line into the next
+# line. bash does not continue a comment across a trailing backslash (the
+# backslash is comment text, not a continuation), so a racy pipe directly
+# below a comment that itself happens to end in an odd number of trailing
+# backslashes must still be caught on its own line, not silently merged into
+# the comment above it and dropped whole by the `#`-line post-filter.
+# ---------------------------------------------------------------------------
+Q="$WORK/backslash_comment_above_racy"
+mkdir -p "$Q/scripts"
+cat > "$Q/scripts/q.sh" <<'QSH'
+#!/usr/bin/env bash
+set -euo pipefail
+RAW="deadbeef"
+# The shape is written with a trailing backslash \
+printf '%s\n' "$RAW" | grep -qF "needle" || true
+QSH
+
+echo "== corpus Q: a racy pipe directly below a comment ending in a trailing backslash must trip no-racy-early-exit-pipe =="
+if fired_rules "$Q" | grep -q '^no-racy-early-exit-pipe$'; then
+  note "the racy pipe below the backslash-ending comment is caught, not swallowed by it"
+else
+  echo "FAIL: a comment line ending in a trailing backslash folded the next,"
+  echo "      live line into itself, and the joined '#'-prefixed line was then"
+  echo "      discarded whole, hiding a genuine reintroduction. Got:"
+  run_lints_in "$Q" | sed 's/^/    /'
+  FAILED=1
+fi
+
+# ---------------------------------------------------------------------------
+# Corpus R: join_continuations.py must fold a THREE-OR-MORE-line backslash
+# continuation chain onto a single logical line, not just the first pair,
+# leaving the tail of the chain stranded and separately unmatchable. Corpus
+# L above pins the two-line case only; this is the narrowest input that
+# distinguishes "folds the whole chain" from "folds only the first pair".
+# ---------------------------------------------------------------------------
+R="$WORK/three_line_continuation"
+mkdir -p "$R/scripts"
+cat > "$R/scripts/r.sh" <<'RSH'
+#!/usr/bin/env bash
+set -euo pipefail
+RAW="deadbeef"
+printf '%s\n' \
+  "$RAW" \
+  | grep -qF "needle" || true
+RSH
+
+echo "== corpus R: a racy pipe split across a three-line backslash continuation chain must trip no-racy-early-exit-pipe =="
+if fired_rules "$R" | grep -q '^no-racy-early-exit-pipe$'; then
+  note "the three-line-chain reintroduction is caught"
+else
+  echo "FAIL: a pipeline split across a chain of three or more backslash"
+  echo "      continuations did not trip no-racy-early-exit-pipe (the tail of"
+  echo "      the chain was stranded on its own, unmatchable line). Got:"
+  run_lints_in "$R" | sed 's/^/    /'
   FAILED=1
 fi
 
