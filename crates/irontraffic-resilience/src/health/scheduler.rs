@@ -237,14 +237,16 @@ fn release_stuck_gauge_for_removed(
 /// in flight" and never dispatched again. Reset instead: the endpoint loses at
 /// most that one outstanding check.
 ///
-/// Caveat NOT closed by this reset (tracked as a follow-up, not fixed here):
-/// the id guard in `record` only rejects a report whose index now names a
-/// DIFFERENT endpoint. If a LATER rebuild moves this endpoint back to index
-/// `j` before the abandoned report finally arrives, that ancient report is
-/// indistinguishable from an honest one addressed to the fresh check now
-/// occupying `j`, and `record` will apply it (clearing the fresh check's
-/// in-flight bit and feeding a stale outcome into hysteresis). Closing that
-/// properly needs a generation counter carried alongside `endpoint_id` in
+/// Caveat NOT closed by this reset, and tracked in issue #876, not fixed
+/// here: the id guard in `record` only rejects a report whose index now
+/// names a DIFFERENT endpoint. If a LATER rebuild moves this endpoint back
+/// to index `j` before the abandoned report finally arrives, that ancient
+/// report is indistinguishable from an honest one addressed to the fresh
+/// check now occupying `j`, and `record` will apply it: clearing the fresh
+/// check's in-flight bit, feeding a stale outcome into hysteresis, and in
+/// the worst case publishing the endpoint unhealthy on the strength of an
+/// abandoned check while every real probe passed. Closing that properly
+/// needs a generation counter carried alongside `endpoint_id` in
 /// `CheckOrder`/`CheckReport`, which is a larger change than this fix should
 /// carry.
 ///
@@ -253,18 +255,39 @@ fn release_stuck_gauge_for_removed(
 /// moved while a check was outstanding, one probe interval from `now`.
 /// `advance_nominal` runs only from `record`, which will never run for the
 /// check just abandoned, so `nominal` in that case is still the PAST instant
-/// the endpoint was last due. Arming the wheel there would let
+/// the endpoint was last due. Arming the wheel with that stale value would let
 /// `TimerWheel::schedule` clamp the negative delta to `now + 1ms`,
 /// re-dispatching on the very next tick and bypassing
 /// `max_checks_per_endpoint_per_sec` by orders of magnitude against the very
 /// upstream a churn-heavy cluster is already stressing.
+///
+/// `rearm_interval_ms` is the caller's `cfg.interval_for(carried.interval_state)`,
+/// i.e. THIS endpoint's own current-state interval (`Down` while unhealthy,
+/// `NoTraffic` on a cluster that has never seen a request, and so on), not the
+/// flat steady-state interval: a rearm is a substitute for one ordinary probe
+/// on this endpoint's own schedule, so it must use the same interval that
+/// schedule would have used. Every branch of `HealthCheckConfig::interval_for`
+/// is already floored by the per-endpoint rate cap, so this can never breach
+/// `max_checks_per_endpoint_per_sec` regardless of which state the endpoint
+/// carries.
+///
+/// This function only computes `rearm_at`, the instant the CALLER must arm the
+/// WHEEL entry at; it returns a `CarriedEndpointState` and does not touch
+/// `EndpointSchedule` at all. That is deliberate but easy to get half right:
+/// [`HealthScheduler::rebuild`] must ALSO copy `rearm_at` into the carried
+/// endpoint's `nominal` field before pushing it into the new schedule vector,
+/// or the fix only holds for one rebuild. Left unsynced, the very next
+/// `rebuild` (even one that does not move this endpoint again, since the
+/// `!index_moved` arm above reads the same `nominal`) recomputes `rearm_at`
+/// from the still-stale past `nominal`, reproducing the exact clamp-to-`now +
+/// 1ms` violation this reset exists to close.
 fn carry_endpoint_state(
     index_moved: bool,
     was_inflight: bool,
     was_stuck: bool,
     was_dispatched_at: Millis,
     nominal: Millis,
-    effective_interval_ms: u32,
+    rearm_interval_ms: u32,
     now: Millis,
 ) -> CarriedEndpointState {
     let inflight = !index_moved && was_inflight;
@@ -274,7 +297,7 @@ fn carry_endpoint_state(
         was_dispatched_at
     };
     let rearm_at = if index_moved && was_inflight {
-        now.add_ms(effective_interval_ms)
+        now.add_ms(rearm_interval_ms)
     } else {
         nominal
     };
@@ -722,12 +745,26 @@ impl HealthScheduler {
     /// [`HealthScheduler::publish_all`] on it afterward, which keeps the ordering
     /// explicit and prevents publishing into a stale bitmap.
     ///
+    /// An endpoint whose index moves while it has a check outstanding has that
+    /// check abandoned, not carried: see [`carry_endpoint_state`]'s doc comment
+    /// for why, and for the ABA caveat (tracked in issue #876) that reset does
+    /// NOT close.
+    ///
     /// # Errors
     /// Returns [`ConfigError`] naming `cluster.endpoints` when `endpoint_ids` has
     /// more than [`MAX_ENDPOINTS`] entries, or contains a duplicate. Applies the
     /// same two checks [`HealthScheduler::new`] applies, in the same order,
     /// because a membership update arrives from discovery on every pod churn and
     /// must not be the lenient path.
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one loop admitting every new endpoint, carried or fresh, into seven parallel \
+                  vectors that must stay in lockstep by construction; splitting the carried and \
+                  fresh arms into separate functions would let a future edit push into those \
+                  vectors out of order across two call sites instead of one, which is a sharper \
+                  hazard than the line count for a function three consecutive review rounds have \
+                  already found defects in"
+    )]
     pub fn rebuild(
         &mut self,
         now: Millis,
@@ -773,7 +810,7 @@ impl HealthScheduler {
                 if let Some(c) = old_carried.get_mut(j) {
                     *c = true;
                 }
-                let carried = self.sched.get(j).copied().unwrap_or_else(|| {
+                let mut carried = self.sched.get(j).copied().unwrap_or_else(|| {
                     EndpointSchedule::init_with_effective_interval(
                         now,
                         instance_id,
@@ -785,17 +822,16 @@ impl HealthScheduler {
                 new_ejected.push(self.ejected.get(j).copied().unwrap_or(false));
                 new_ramping.push(self.ramping.get(j).copied().unwrap_or(false));
                 new_draining.push(self.draining.get(j).copied().unwrap_or(false));
-                // See `carry_endpoint_state`'s doc comment for why a moved
-                // endpoint's in-flight check is abandoned rather than
-                // carried, the ABA caveat that leaves open, and why the
-                // rearm instant differs from the unmoved case.
+                // See `carry_endpoint_state`'s doc comment: why the check is
+                // abandoned, the ABA caveat (#876) left open, and why the
+                // rearm interval is the endpoint's OWN `interval_state`.
                 let state = carry_endpoint_state(
                     i != j,
                     self.inflight.get(j).copied().unwrap_or(false),
                     self.stuck.get(j).copied().unwrap_or(false),
                     self.dispatched_at.get(j).copied().unwrap_or(Millis(0)),
                     carried.nominal,
-                    effective_interval_ms,
+                    self.cfg.interval_for(carried.interval_state),
                     now,
                 );
                 new_inflight.push(state.inflight);
@@ -808,6 +844,10 @@ impl HealthScheduler {
                     inflight_count = inflight_count.saturating_add(1);
                 }
                 let _ = self.wheel.schedule(i_u32, state.rearm_at); // it-allow: no-swallowed-error reason: i is bounded by new_len <= MAX_ENDPOINTS, which never exceeds the wheel's fixed max_ids ceiling, so neither WheelError variant is reachable here.
+                // Keep `nominal` in step with the wheel entry just armed
+                // (a no-op when it already matches), or the NEXT rebuild
+                // re-derives `rearm_at` from a stale past `nominal`.
+                carried.nominal = state.rearm_at;
                 new_sched.push(carried);
             } else {
                 let fresh = EndpointSchedule::init_with_effective_interval(
@@ -2198,6 +2238,23 @@ mod tests {
              millisecond later"
         );
 
+        // It must not become dispatchable any EARLIER than a full probe
+        // interval either: this pins the rearm to the interval itself,
+        // rather than merely to "somewhere after the next millisecond",
+        // which the assertion above alone cannot distinguish from a rearm
+        // that fires at half, or a quarter, of `effective_interval_ms`.
+        out.clear();
+        sched.poll_due(
+            churn_at.add_ms(effective_interval_ms - 1),
+            &mut rng,
+            &mut out,
+        );
+        assert!(
+            out.iter().all(|o| o.endpoint_id != 30),
+            "the moved endpoint must not be dispatchable one millisecond before its full \
+             probe interval elapses"
+        );
+
         // It must become dispatchable again once a full probe interval has
         // elapsed from the rebuild (the rearm instant is computed from
         // `now` at rebuild time, i.e. `churn_at`, not from the original
@@ -2207,6 +2264,275 @@ mod tests {
         assert!(
             out.iter().any(|o| o.endpoint_id == 30),
             "the moved endpoint must be dispatchable again once its probe interval elapses"
+        );
+        sched.debug_assert_consistent();
+    }
+
+    // Regression test for the SECOND review round of issue 861's fix: the
+    // rearm above only holds until the NEXT rebuild unless
+    // `EndpointSchedule::nominal` is kept in step with the wheel entry.
+    // Without that sync, a second rebuild arriving before the abandoned
+    // endpoint could ever be redispatched re-derives the arming instant from
+    // the still-stale past `nominal` and reproduces the exact
+    // clamp-to-`now + 1ms` violation the first rebuild's fix exists to
+    // close. This is the shape of a rolling deploy: several membership
+    // updates land within one probe interval of each other.
+    #[test]
+    fn rebuild_a_second_rebuild_does_not_recompute_the_rearm_from_a_stale_nominal() {
+        let cfg = HealthCheckConfig {
+            interval_ms: 1000,
+            edge_interval_ms: 250,
+            unhealthy_interval_ms: 1000,
+            no_traffic_interval_ms: 60_000,
+            timeout_ms: 200,
+            jitter_bp: 0,
+            healthy_threshold: 2,
+            unhealthy_threshold: 3,
+            reconnect_every: 0,
+            max_checks_per_endpoint_per_sec: 10,
+        };
+        let (effective_interval_ms, _) = cfg.effective_interval_ms();
+        let t0 = Millis(0);
+        let ids = vec![10u64, 20u64, 30u64];
+        let mut sched = HealthScheduler::new(t0, 1, &ids, cfg, 8, true).expect("valid");
+        let mut rng = Rng::from_seed(8612);
+        let mut out = Vec::new();
+
+        // Dispatch id 30 (index 2) at its own deadline and leave it
+        // outstanding, exactly as the single-rebuild test above does.
+        let deadline_30 = sched.wheel.deadline_of(2).expect("scheduled");
+        sched.poll_due(deadline_30, &mut rng, &mut out);
+        assert!(out.iter().any(|o| o.endpoint_id == 30));
+
+        // Rebuild #1, 2ms later: prepend a pod, moving id 30 (2 -> 3) while
+        // its check is still outstanding. `carry_endpoint_state` resets
+        // `inflight` to false and arms the wheel a full interval out.
+        let churn1_at = deadline_30.add_ms(2);
+        out.clear();
+        sched.poll_due(churn1_at, &mut rng, &mut out);
+        sched
+            .rebuild(churn1_at, &[99u64, 10u64, 20u64, 30u64], &mut rng)
+            .expect("rebuild 1 must succeed");
+
+        // Rebuild #2, 2ms after that, well before id 30 could ever be
+        // redispatched (its rearm is ~1000ms out): prepend again, moving id
+        // 30 (3 -> 4). `was_inflight` is now false, since rebuild #1 already
+        // reset it and nothing has redispatched it since: this is exactly
+        // the condition under which `carry_endpoint_state` falls through to
+        // reading `nominal`.
+        let churn2_at = churn1_at.add_ms(2);
+        out.clear();
+        sched.poll_due(churn2_at, &mut rng, &mut out);
+        sched
+            .rebuild(churn2_at, &[98u64, 99u64, 10u64, 20u64, 30u64], &mut rng)
+            .expect("rebuild 2 must succeed");
+
+        // It must NOT be re-probed on the next millisecond: that is the
+        // 500x violation this fix exists to close, reappearing one rebuild
+        // later.
+        out.clear();
+        sched.poll_due(churn2_at.add_ms(1), &mut rng, &mut out);
+        assert!(
+            out.iter().all(|o| o.endpoint_id != 30),
+            "a second rebuild must not re-derive the rearm from a stale nominal and re-probe \
+             one millisecond later"
+        );
+
+        // It must become dispatchable a full probe interval from rebuild #1,
+        // the rebuild that actually abandoned the check: rebuild #2 read the
+        // already-correct future `nominal` rebuild #1 left behind (with the
+        // fix) and must not have re-derived a fresh interval from itself,
+        // since `was_inflight` was false by the time rebuild #2 ran.
+        out.clear();
+        sched.poll_due(
+            churn1_at.add_ms(effective_interval_ms - 1),
+            &mut rng,
+            &mut out,
+        );
+        assert!(
+            out.iter().all(|o| o.endpoint_id != 30),
+            "must not be dispatchable one millisecond before a full probe interval from \
+             rebuild 1 elapses"
+        );
+        out.clear();
+        sched.poll_due(churn1_at.add_ms(effective_interval_ms), &mut rng, &mut out);
+        assert!(
+            out.iter().any(|o| o.endpoint_id == 30),
+            "must become dispatchable once a full probe interval from rebuild 1 elapses"
+        );
+        sched.debug_assert_consistent();
+    }
+
+    // Companion to the test above: the second rebuild does not even need to
+    // move the endpoint again for the stale-`nominal` fallback to fire,
+    // because the `!index_moved` arm of `carry_endpoint_state` reads the
+    // same `nominal` field the `index_moved` arm would have left stale.
+    #[test]
+    fn rebuild_a_second_rebuild_that_does_not_move_the_endpoint_still_reads_a_fresh_nominal() {
+        let cfg = HealthCheckConfig {
+            interval_ms: 1000,
+            edge_interval_ms: 250,
+            unhealthy_interval_ms: 1000,
+            no_traffic_interval_ms: 60_000,
+            timeout_ms: 200,
+            jitter_bp: 0,
+            healthy_threshold: 2,
+            unhealthy_threshold: 3,
+            reconnect_every: 0,
+            max_checks_per_endpoint_per_sec: 10,
+        };
+        let (effective_interval_ms, _) = cfg.effective_interval_ms();
+        let t0 = Millis(0);
+        let ids = vec![10u64, 20u64, 30u64];
+        let mut sched = HealthScheduler::new(t0, 1, &ids, cfg, 8, true).expect("valid");
+        let mut rng = Rng::from_seed(8613);
+        let mut out = Vec::new();
+
+        let deadline_30 = sched.wheel.deadline_of(2).expect("scheduled");
+        sched.poll_due(deadline_30, &mut rng, &mut out);
+        assert!(out.iter().any(|o| o.endpoint_id == 30));
+
+        let churn1_at = deadline_30.add_ms(2);
+        out.clear();
+        sched.poll_due(churn1_at, &mut rng, &mut out);
+        sched
+            .rebuild(churn1_at, &[99u64, 10u64, 20u64, 30u64], &mut rng)
+            .expect("rebuild 1 must succeed");
+
+        // Rebuild #2 APPENDS instead of prepending: id 30 stays at index 3,
+        // so `index_moved` is false this time and `carry_endpoint_state`
+        // takes the `!index_moved` arm, which reads `nominal` directly.
+        let churn2_at = churn1_at.add_ms(2);
+        out.clear();
+        sched.poll_due(churn2_at, &mut rng, &mut out);
+        sched
+            .rebuild(churn2_at, &[99u64, 10u64, 20u64, 30u64, 77u64], &mut rng)
+            .expect("rebuild 2 (append, no move) must succeed");
+
+        out.clear();
+        sched.poll_due(churn2_at.add_ms(1), &mut rng, &mut out);
+        assert!(
+            out.iter().all(|o| o.endpoint_id != 30),
+            "an unmoved endpoint on a second rebuild must not be re-probed one millisecond \
+             later just because an earlier rebuild left `nominal` stale"
+        );
+
+        // Rebuild #2 did not move it and must not have re-armed it either:
+        // it must become dispatchable exactly when rebuild #1 armed it, one
+        // probe interval from rebuild #1, not from rebuild #2.
+        out.clear();
+        sched.poll_due(churn1_at.add_ms(effective_interval_ms), &mut rng, &mut out);
+        assert!(
+            out.iter().any(|o| o.endpoint_id == 30),
+            "must become dispatchable once the interval armed by rebuild 1 elapses"
+        );
+        sched.debug_assert_consistent();
+    }
+
+    // Regression test for the review of issue 861's fix, minor 4: the rearm
+    // interval must be the endpoint's OWN current interval state
+    // (`cfg.interval_for(carried.interval_state)`), not the flat
+    // steady-state interval. An endpoint parked `Down` after failing must
+    // rearm at its unhealthy cadence when its check is abandoned by an
+    // index move, not wait out the full steady interval.
+    #[test]
+    fn rebuild_index_move_rearms_at_the_endpoints_own_interval_state_not_steady() {
+        let cfg = HealthCheckConfig {
+            interval_ms: 30_000,
+            edge_interval_ms: 500,
+            unhealthy_interval_ms: 500,
+            no_traffic_interval_ms: 60_000,
+            timeout_ms: 200,
+            jitter_bp: 0,
+            healthy_threshold: 2,
+            unhealthy_threshold: 1,
+            reconnect_every: 0,
+            max_checks_per_endpoint_per_sec: 10,
+        };
+        let t0 = Millis(0);
+        let ids = vec![10u64, 20u64, 30u64];
+        let mut sched = HealthScheduler::new(t0, 1, &ids, cfg, 8, true).expect("valid");
+        let mut rng = Rng::from_seed(8614);
+        let mut out = Vec::new();
+        let health = ClusterHealth::new(3, 0);
+
+        // First check fails: `unhealthy_threshold = 1` means one failure is
+        // enough to transition Healthy -> Unhealthy, which parks the
+        // endpoint in `Edge`.
+        let deadline1 = sched.wheel.deadline_of(2).expect("scheduled");
+        sched.poll_due(deadline1, &mut rng, &mut out);
+        let order1 = out
+            .iter()
+            .copied()
+            .find(|o| o.endpoint_id == 30)
+            .expect("id 30 dispatched at its own deadline");
+        let transition1 = sched
+            .record(
+                deadline1,
+                CheckReport {
+                    endpoint: order1.endpoint,
+                    endpoint_id: 30,
+                    outcome: CheckOutcome::Fail(FailKind::Connect),
+                    reconnected: false,
+                },
+                &mut rng,
+                &health,
+            )
+            .expect("id 30 was inflight");
+        assert_eq!(transition1, Transition::ToUnhealthy);
+        assert_eq!(sched.sched[2].interval_state, IntervalState::Edge);
+        out.clear();
+
+        // Second check also fails: `Edge` resolves to `Down`, since the
+        // endpoint is still `Unhealthy`.
+        let deadline2 = sched.wheel.deadline_of(2).expect("scheduled");
+        sched.poll_due(deadline2, &mut rng, &mut out);
+        let order2 = out
+            .iter()
+            .copied()
+            .find(|o| o.endpoint_id == 30)
+            .expect("id 30 dispatched again");
+        sched.record(
+            deadline2,
+            CheckReport {
+                endpoint: order2.endpoint,
+                endpoint_id: 30,
+                outcome: CheckOutcome::Fail(FailKind::Connect),
+                reconnected: false,
+            },
+            &mut rng,
+            &health,
+        );
+        assert_eq!(sched.sched[2].interval_state, IntervalState::Down);
+        out.clear();
+
+        // Third check is dispatched, then abandoned by an index-moving
+        // rebuild while `interval_state` is `Down`.
+        let deadline3 = sched.wheel.deadline_of(2).expect("scheduled");
+        sched.poll_due(deadline3, &mut rng, &mut out);
+        assert!(out.iter().any(|o| o.endpoint_id == 30));
+        out.clear();
+        let churn_at = deadline3.add_ms(1);
+        sched.poll_due(churn_at, &mut rng, &mut out);
+        out.clear();
+        sched
+            .rebuild(churn_at, &[99u64, 10u64, 20u64, 30u64], &mut rng)
+            .expect("rebuild must succeed");
+
+        // It must not wait out the full 30-second steady interval: the
+        // unhealthy interval (500ms) is the endpoint's own schedule.
+        out.clear();
+        sched.poll_due(churn_at.add_ms(499), &mut rng, &mut out);
+        assert!(
+            out.iter().all(|o| o.endpoint_id != 30),
+            "must not be dispatchable one millisecond before its own unhealthy interval elapses"
+        );
+        out.clear();
+        sched.poll_due(churn_at.add_ms(500), &mut rng, &mut out);
+        assert!(
+            out.iter().any(|o| o.endpoint_id == 30),
+            "an unhealthy endpoint's abandoned check must rearm at its OWN unhealthy interval \
+             (500ms), not the flat steady interval (30_000ms)"
         );
         sched.debug_assert_consistent();
     }
@@ -2378,6 +2704,88 @@ mod tests {
             sched.stats().stuck_inflight,
             0,
             "removing a stuck endpoint outright must release its gauge contribution, not leak it"
+        );
+        sched.debug_assert_consistent();
+    }
+
+    // Regression test for the review of issue 861's fix: `release_stuck_gauge`
+    // must require BOTH `index_moved` AND `was_stuck`. An index move alone
+    // must never pay back a gauge count that move's own endpoint never
+    // raised, even while a DIFFERENT, still genuinely stuck, endpoint sits at
+    // an index that does not move. Without the `was_stuck` conjunct this
+    // would zero the gauge for id 10, which is still genuinely stuck, while
+    // its check keeps being lost forever.
+    #[test]
+    fn rebuild_index_move_of_a_never_stuck_endpoint_does_not_release_a_gauge_it_never_raised() {
+        let cfg = all_due_cfg();
+        let t0 = Millis(0);
+        let t1 = t0.add_ms(1);
+        let ids = vec![10u64, 20u64, 30u64];
+        let mut sched = HealthScheduler::new(t0, 1, &ids, cfg, 3, true).expect("valid");
+        let mut rng = Rng::from_seed(866);
+        let mut out = Vec::new();
+
+        sched.poll_due(t1, &mut rng, &mut out);
+        assert_eq!(
+            out.len(),
+            3,
+            "all three endpoints must dispatch at t0 + 1ms"
+        );
+
+        // Respond to ids 20 and 30 immediately so only id 10 is ever left
+        // outstanding; it alone crosses the stuck threshold below, and its
+        // index never moves in the rebuild that follows.
+        let health0 = ClusterHealth::new(3, 0);
+        for order in out.drain(..) {
+            if order.endpoint_id != 10 {
+                let report = CheckReport {
+                    endpoint: order.endpoint,
+                    endpoint_id: order.endpoint_id,
+                    outcome: CheckOutcome::Pass,
+                    reconnected: false,
+                };
+                sched.record(t1, report, &mut rng, &health0);
+            }
+        }
+
+        // Never respond to id 10 (index 0); push it past the stuck
+        // threshold. Ids 20 and 30 come due again under `all_due_cfg` and
+        // dispatch fresh in this same poll; that is expected (see the
+        // sibling gauge tests above) and leaves them neither inflight nor
+        // stuck.
+        let past_threshold = t1.add_ms(11);
+        out.clear();
+        sched.poll_due(past_threshold, &mut rng, &mut out);
+        assert_eq!(
+            sched.stuck.first().copied(),
+            Some(true),
+            "id 10 must be stuck"
+        );
+        assert_eq!(
+            sched.stuck.get(2).copied(),
+            Some(false),
+            "id 30 must not be stuck"
+        );
+        assert_eq!(sched.stats().stuck_inflight, 1);
+
+        // Insert a fresh endpoint between id 20 and id 30: id 10 stays at
+        // index 0 (never visited by the index-move reset at all), id 20
+        // stays at index 1, and id 30 moves from index 2 to index 3 despite
+        // never having been stuck.
+        sched
+            .rebuild(past_threshold, &[10u64, 20u64, 99u64, 30u64], &mut rng)
+            .expect("rebuild must succeed");
+
+        assert_eq!(
+            sched.stuck.first().copied(),
+            Some(true),
+            "id 10's stuck bit is untouched by an index move that is not its own"
+        );
+        assert_eq!(
+            sched.stats().stuck_inflight,
+            1,
+            "id 30's index move must not pay back a gauge count it never raised; id 10's \
+             still-genuinely-stuck bit must remain counted"
         );
         sched.debug_assert_consistent();
     }
