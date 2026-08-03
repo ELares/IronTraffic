@@ -170,8 +170,12 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 /// a child process it is about to spawn) binds a real listener on immediately, and
 /// wrong for a port that must stay unbound for anything longer than that, such as a
 /// deliberately dead upstream held for a whole test body: use [`dead_local_port`] for
-/// that instead. Callers that do bind a real listener on the returned port still
-/// retry on failure rather than treat this race as impossible.
+/// that instead. Of the two callers that bind a real listener on the returned port,
+/// only `spawn_proxy_with_mode` retries with a freshly drawn port on failure rather
+/// than treat this race as impossible; `spawn_proxy_under_nofile_limit` makes a single
+/// attempt (see its own doc comment). The four `dataplane_build.rs` call sites never
+/// bind the returned port at all (it is always the config's upstream address there,
+/// see that file's own doc comments), so they do not need to retry either.
 #[allow(
     clippy::expect_used,
     reason = "test-support setup, not itself a #[test] fn (see Origin::start's identical \
@@ -499,7 +503,10 @@ pub(crate) fn spawn_binary(cfg_yaml: &str, mode: &str) -> (Child, PathBuf) {
 /// panics rather than being folded into the same `None`.
 ///
 /// `cfg_yaml` must contain the literal bind placeholder `127.0.0.1:0`, exactly like
-/// [`spawn_proxy`].
+/// [`spawn_proxy`]. UNLIKE `spawn_proxy_with_mode`, this makes a single attempt: it
+/// does not retry `free_local_port`'s unreserved-port race (issue #888), so a
+/// concurrent bind winning that race here fails this function outright rather than
+/// drawing a fresh port and trying again.
 #[cfg(target_os = "linux")]
 #[allow(
     dead_code,
