@@ -21,6 +21,44 @@
 //! is reached only inside that worker's `CoreScope`, so there is no shared mutable state
 //! and no lock.
 //!
+//! # Wiring: one [`LeasedSemaphore`] per worker, never one shared across workers
+//!
+//! `GradientController` is per (worker, cluster, priority): [`GradientConfig::min_limit`]
+//! and [`GradientConfig::max_limit`] are documented as PER-WORKER figures, and
+//! [`GradientController::maybe_close_window`] calls `sem.set_limit` with that worker's
+//! own limit, unmultiplied and unsummed. [`LeasedSemaphore`], in
+//! contrast, CAN be constructed either way: `ResourceLimits::new(cfg, workers)` builds
+//! one instance meant to be shared by `workers` callers (its `credits` array has one
+//! cache-padded cell per worker specifically so many workers can draw permits from ONE
+//! shared ceiling without contending on the same cache line), but nothing stops calling
+//! it with `workers == 1` to build a private, per-worker instance instead.
+//!
+//! **The wiring MUST use the second shape for a gradient-controlled pair: one
+//! `LeasedSemaphore` per worker per (cluster, priority), never the single semaphore
+//! shared by every worker that the static, non-adaptive `max_requests` config path
+//! uses.** Concretely, when [`GradientConfig::enabled`] is set for a (cluster, priority),
+//! the assembly component that builds `ResourceLimits` for it must call
+//! `ResourceLimits::new(cfg, 1)` once per worker rather than once per cluster, and route
+//! each worker's requests through only its own instance. [`GradientController::note_inflight`]
+//! must then be fed THAT SAME per-worker semaphore's `LeasedSemaphore::in_use()`, not a
+//! cluster-wide sum, so the `inflight < limit / 2` app-limited gate compares two
+//! per-worker quantities rather than a cluster-wide count against a per-worker one.
+//!
+//! This is the shape the rest of the module already assumes: every test below
+//! constructs its own single-worker `LeasedSemaphore::new(limit, 1, 1, ..)`, and the
+//! "aggregate floor an operator observes is `min_limit * workers`" note on
+//! [`GradientConfig::min_limit`] is true only when each worker enforces its own
+//! independent floor through its own semaphore, so a cluster's realized ceiling is the
+//! SUM of `workers` independent per-worker ceilings rather than one shared value that
+//! the last worker to call `set_limit` happens to win. The alternative (one shared
+//! semaphore, with each worker multiplying its limit by `workers` before publishing)
+//! was considered and rejected: it still has one worker's write clobber another's on
+//! every window (`set_limit` is not additive), it does not match the per-worker figures
+//! `min_limit`/`max_limit` are documented as, and no code in this module multiplies by
+//! `workers` anywhere. This module has no caller today, so nothing breaks by shipping
+//! with the ambiguity unresolved in code; this section is the resolution the wiring
+//! issue must follow.
+//!
 //! # The residual attack, and its bound
 //!
 //! A slow-request flood cannot raise the baseline: [`MonotonicMinDeque`] tracks a
@@ -49,13 +87,28 @@
 //!
 //! # Memory bounding
 //!
-//! A controller is roughly 30 KB (a `hdrhistogram::Histogram` plus a 600-entry
-//! [`MonotonicMinDeque`]), and `workers * clusters * priorities` controllers would not
-//! fit if every pair that is ever addressed kept one forever. The owner of the map from
-//! `(cluster, priority)` to controller (a data-plane assembly component, not this
-//! module) enforces three rules together, because lazy creation and idle dropping
-//! alone are not a bound: a client sending one request per second to every pair keeps
-//! every one of them alive.
+//! A controller is roughly 160 KB, not 30 KB: `hdrhistogram::Histogram::<u64>::
+//! new_with_bounds(1, 60_000_000, 3)` (the exact construction [`GradientController::new`]
+//! uses) has `distinct_values() == 17_408`, and the crate's `resize()` allocates its
+//! `Vec<u64>` counts array EAGERLY, in the constructor, before a single sample is
+//! recorded: `17_408 * size_of::<u64>() == 139_264` bytes (136 KB) on their own. Add the
+//! 600-entry [`MonotonicMinDeque`] (up to `600 * size_of::<(u64, u64)>() == 9_600` bytes
+//! of payload, more once the allocator's own bucket rounding is counted) and the fixed
+//! struct fields, and a real `GradientController`, measured end to end (process
+//! `ru_maxrss` growth over 1024 real instances, each driven through the public API to a
+//! fully retained 600-entry baseline, not estimated from field sizes) costs about 160 KB,
+//! matching the 136 KB histogram component to within the deque and allocator overhead.
+//! `workers * clusters * priorities` controllers at that size would not fit if every pair
+//! that is ever addressed kept one forever: 256 controllers is about 41 MB per worker,
+//! and 656 MB at `workers = 16`, which is the number the memory budget has to
+//! accommodate, not the 123 MB a 30 KB estimate would suggest. The histogram's bounds
+//! (1 microsecond to 60 seconds at 3 significant figures) are load-bearing elsewhere in
+//! this module and MUST NOT change to shrink this figure; if the budget above is too
+//! large for a target deployment, lower `max_controllers_per_worker` instead. The owner
+//! of the map from `(cluster, priority)` to controller (a data-plane assembly component,
+//! not this module) enforces three rules together, because lazy creation and idle
+//! dropping alone are not a bound: a client sending one request per second to every pair
+//! keeps every one of them alive.
 //!
 //! 1. A controller is created LAZILY, on the first request to a pair on that worker.
 //! 2. It is dropped once [`GradientController::is_idle`] reports true for the
@@ -257,9 +310,11 @@ pub struct GradientStats {
 /// One adaptive concurrency controller for one (cluster, priority) pair on one worker.
 ///
 /// Created lazily on the first request to that pair on that worker, and dropped after
-/// `idle_drop_windows` idle windows, because a controller is roughly 30 KB and
-/// `workers * clusters * priorities` instances would not fit. See the module
-/// documentation for the full memory-bounding rule.
+/// `idle_drop_windows` idle windows, because a controller is roughly 160 KB, not 30 KB
+/// (the `hdrhistogram::Histogram`'s counts array alone is a deterministic 136 KB; see
+/// the module documentation for the measurement), and `workers * clusters * priorities`
+/// instances would not fit. See the module documentation for the full memory-bounding
+/// rule.
 ///
 /// There is no forced measurement window. The baseline is the windowed minimum of an
 /// already-collected p50, so measuring costs nothing and never restricts traffic.
@@ -358,8 +413,12 @@ impl GradientController {
         self.loss_this_window = true;
     }
 
-    /// Record the current in-flight count, read from `LeasedSemaphore::in_use`. Feeds
-    /// the app-limited hold.
+    /// Record the current in-flight count, read from `LeasedSemaphore::in_use` on THIS
+    /// worker's own semaphore instance, not a cluster-wide sum shared across workers.
+    /// See the module's "Wiring" section: the semaphore this count comes from and the
+    /// one [`GradientController::maybe_close_window`] publishes into must be the same
+    /// per-worker instance, or the `inflight < limit / 2` app-limited gate compares
+    /// incompatible quantities. Feeds the app-limited hold.
     #[inline]
     pub fn note_inflight(&mut self, inflight: u32) {
         self.inflight_peak = self.inflight_peak.max(inflight);
@@ -395,8 +454,12 @@ impl GradientController {
     }
 
     /// Close the window if it is due, apply the control law, and publish the new limit
-    /// into `sem`. Returns the window's signals, or `None` when the window is not due
-    /// or had no samples.
+    /// into `sem`. `sem` MUST be a [`LeasedSemaphore`] instance private to this
+    /// controller's own worker (see the module's "Wiring" section), not one shared
+    /// with other workers: this call writes the whole limit, unmultiplied and
+    /// unsummed, so a semaphore shared across workers would have each worker's write
+    /// clobber the others'. Returns the window's signals, or `None` when the window is
+    /// not due or had no samples.
     ///
     /// Does nothing to `sem` when `cfg.enabled` is false, but still maintains the
     /// signals, so an operator can observe what the controller WOULD have done before
@@ -795,6 +858,50 @@ mod tests {
             "the smoothed law ran, not the doubling branch"
         );
         assert!((second.gradient - 0.5).abs() < f64::EPSILON);
+
+        // `second.slow_start` is `slow_start_fired` (whether the DOUBLING branch ran
+        // in window 2), which is already false whether or not `self.slow_start` was
+        // actually cleared: deleting `self.slow_start = false;` at the point gradient
+        // first drops below 1.0 leaves every assertion above unchanged, because the
+        // smoothed law still runs in window 2 either way (gradient < 1.0 takes the
+        // smoothed branch regardless of `self.slow_start`'s value). Assert the
+        // CONTROLLER's own state directly, the way `anti_windup_at_max` and
+        // `slow_start_doubling_clamped_at_max` already do for `limit`.
+        assert!(
+            !controller.slow_start,
+            "self.slow_start must be cleared once gradient first drops below 1.0, not \
+             merely have its doubling branch skipped for one window"
+        );
+
+        // Window 3: rtt_short = rtt_base (1_000 us, still the deque's minimum), so
+        // gradient clamps back to 1.0. With slow_start correctly cleared this must
+        // take the ADDITIVE smoothed-update branch (limit 8.0 -> 8.8), never the
+        // doubling branch (which would give 16.0): this is what an uncleared
+        // self.slow_start would actually do differently from here, since gradient ==
+        // 1.0 re-enters the doubling arm whenever self.slow_start is (incorrectly)
+        // still true.
+        now = now.add_ms(cfg.window_min_ms);
+        controller.note_inflight(1_000_000);
+        feed(&mut controller, 1_000, cfg.window_min_samples);
+        let third = controller
+            .maybe_close_window(now, &sem)
+            .expect("window due");
+
+        assert!(
+            (third.gradient - 1.0).abs() < f64::EPSILON,
+            "window 3 must reproduce gradient == 1.0"
+        );
+        assert!(
+            !third.slow_start,
+            "gradient == 1.0 in window 3 must not re-enter the doubling branch"
+        );
+        assert!(
+            (third.limit - 8.8).abs() < 1e-9,
+            "expected the additive smoothed update (8.0 -> 8.8), got {} (16.0 would \
+             mean the doubling branch ran instead, i.e. self.slow_start was never \
+             actually cleared)",
+            third.limit
+        );
     }
 
     /// Test 17: with `inflight_peak = 1` and `limit = 100`, the limit is unchanged and
@@ -1043,6 +1150,385 @@ mod tests {
         under_low.apply_smoothed_update(0.5);
         assert_eq!(under_low.limit(), 10.0);
         assert_eq!(under_low.stats().clamped_low, 1);
+    }
+
+    /// A mutation-testing gap: `reset_window`'s `self.loss_this_window = false` must
+    /// run at the end of EVERY window that takes the normal (baseline-established)
+    /// path, or a loss noted in one window keeps fast-downing every window after it
+    /// even though `note_loss` is never called again.
+    #[test]
+    fn reset_window_clears_loss_flag_between_windows() {
+        let cfg = GradientConfig::default();
+        let mut controller = GradientController::new(Millis(0), cfg).expect("valid config");
+        let sem = LeasedSemaphore::new(10_000_000, 1, 1, 100);
+        let mut now = Millis(0);
+
+        now = now.add_ms(cfg.window_min_ms);
+        controller.note_loss();
+        controller.note_inflight(1_000_000);
+        feed(&mut controller, 1_000, cfg.window_min_samples);
+        let first = controller
+            .maybe_close_window(now, &sem)
+            .expect("window due");
+        assert!(
+            first.fast_down,
+            "window 1 noted a loss, so fast_down must fire"
+        );
+
+        now = now.add_ms(cfg.window_min_ms);
+        controller.note_inflight(1_000_000);
+        feed(&mut controller, 1_000, cfg.window_min_samples);
+        let second = controller
+            .maybe_close_window(now, &sem)
+            .expect("window due");
+        assert!(
+            !second.fast_down,
+            "window 2 noted no loss; a stale loss flag surviving from window 1 must \
+             not fast-down it"
+        );
+    }
+
+    /// A mutation-testing gap: `reset_window`'s `self.inflight_peak = 0` must run
+    /// every window, or a high peak observed in one window keeps suppressing the
+    /// app-limited hold in every window after it, even one that never calls
+    /// `note_inflight` at all.
+    #[test]
+    fn reset_window_clears_inflight_peak_between_windows() {
+        let cfg = GradientConfig::default();
+        let mut controller = GradientController::new(Millis(0), cfg).expect("valid config");
+        let sem = LeasedSemaphore::new(10_000_000, 1, 1, 100);
+        let mut now = Millis(0);
+
+        now = now.add_ms(cfg.window_min_ms);
+        controller.note_inflight(1_000_000);
+        feed(&mut controller, 1_000, cfg.window_min_samples);
+        let first = controller
+            .maybe_close_window(now, &sem)
+            .expect("window due");
+        assert!(
+            !first.app_limited,
+            "window 1's high inflight must not app-limit"
+        );
+
+        // Window 2 never calls note_inflight at all: with the peak correctly reset to
+        // 0, `0 < limit / 2` holds and the app-limited hold must fire.
+        now = now.add_ms(cfg.window_min_ms);
+        feed(&mut controller, 1_000, cfg.window_min_samples);
+        let second = controller
+            .maybe_close_window(now, &sem)
+            .expect("window due");
+        assert!(
+            second.app_limited,
+            "window 2 called note_inflight zero times; a stale peak surviving from \
+             window 1 must not suppress the app-limited hold"
+        );
+    }
+
+    /// A mutation-testing gap: `reset_window`'s `self.window_started = now` must run
+    /// every window, or the escape hatch (`elapsed >= 10 * window_min_ms`, measured
+    /// from a STALE `window_started`) fires on a later window that has neither enough
+    /// elapsed time since its own start nor enough samples.
+    #[test]
+    fn reset_window_resets_window_started_for_the_escape_hatch() {
+        let cfg = GradientConfig::default();
+        let mut controller = GradientController::new(Millis(0), cfg).expect("valid config");
+        let sem = LeasedSemaphore::new(10_000_000, 1, 1, 100);
+
+        // Window 1: a full window, closing normally at t = window_min_ms and (if
+        // correct) resetting window_started to that value.
+        let mut now = Millis(cfg.window_min_ms);
+        controller.note_inflight(1_000_000);
+        feed(&mut controller, 1_000, cfg.window_min_samples);
+        controller
+            .maybe_close_window(now, &sem)
+            .expect("window due");
+
+        // Window 2: fewer than window_min_samples, so the sample-count condition
+        // cannot fire it, and only 900 ms elapse since window_started was (correctly)
+        // reset to 100 ms, short of the escape hatch's 1_000 ms threshold. If
+        // window_started were NOT reset (stuck at its pre-construction value of 0),
+        // elapsed-since-0 at t = 1_000 already reaches the escape hatch and the
+        // window closes anyway.
+        feed(&mut controller, 1_000, cfg.window_min_samples - 1);
+        now = Millis(10 * cfg.window_min_ms);
+        let result = controller.maybe_close_window(now, &sem);
+
+        assert!(
+            result.is_none(),
+            "window 2 is due neither by sample count nor by elapsed time since its \
+             own start; a stale window_started measuring elapsed time from window 1's \
+             start instead would make the escape hatch fire early"
+        );
+    }
+
+    /// A mutation-testing gap: `note_inflight` must track the PEAK inflight observed
+    /// during the window (`max`), not merely overwrite with the latest call's value.
+    /// Feeding a high value first and a much lower value second must still report the
+    /// high peak at window close.
+    #[test]
+    fn note_inflight_tracks_peak_not_last_call() {
+        let cfg = GradientConfig::default();
+        let mut controller = GradientController::new(Millis(0), cfg).expect("valid config");
+        controller.limit = 100.0;
+        let sem = LeasedSemaphore::new(10_000_000, 1, 1, 100);
+
+        controller.note_inflight(1_000_000);
+        controller.note_inflight(1); // a later, much smaller reading in the same window
+        feed(&mut controller, 1_000, cfg.window_min_samples);
+
+        let signals = controller
+            .maybe_close_window(Millis(cfg.window_min_ms), &sem)
+            .expect("window due");
+
+        assert!(
+            !signals.app_limited,
+            "note_inflight must retain the window's PEAK (1_000_000), not the last \
+             call's value (1): limit / 2 = 50 must not exceed the tracked peak"
+        );
+    }
+
+    /// A mutation-testing gap: the empty-window branch's `self.reset_window(now)` call
+    /// must run even though the window recorded zero samples, or a loss noted before
+    /// an empty window closes leaks into the next, unrelated window's fast-down
+    /// decision.
+    #[test]
+    fn empty_window_close_still_resets_loss_flag() {
+        let cfg = GradientConfig::default();
+        let mut controller = GradientController::new(Millis(0), cfg).expect("valid config");
+        let sem = LeasedSemaphore::new(10_000_000, 1, 1, 100);
+
+        // A loss is noted, but the window records zero samples and closes empty via
+        // the escape hatch.
+        controller.note_loss();
+        let mut now = Millis(10 * cfg.window_min_ms);
+        let empty = controller.maybe_close_window(now, &sem);
+        assert!(empty.is_none(), "zero samples: the empty-window path");
+        assert_eq!(controller.stats().empty_windows, 1);
+
+        // A full, ordinary window follows, with no new loss noted.
+        now = now.add_ms(cfg.window_min_ms);
+        controller.note_inflight(1_000_000);
+        feed(&mut controller, 1_000, cfg.window_min_samples);
+        let signals = controller
+            .maybe_close_window(now, &sem)
+            .expect("window due");
+
+        assert!(
+            !signals.fast_down,
+            "the loss was noted before an EMPTY window; if the empty-window branch \
+             skipped resetting loss_this_window, it would incorrectly fast-down this \
+             later, unrelated window"
+        );
+    }
+
+    /// A mutation-testing gap: the no-baseline early-return branch's
+    /// `self.reset_window(now)` call must run even though the baseline is not yet
+    /// established, or a loss noted during an unrepresentative window leaks into the
+    /// FIRST window that goes on to establish a baseline.
+    #[test]
+    fn no_baseline_window_close_still_resets_loss_flag() {
+        let cfg = GradientConfig::default();
+        let mut controller = GradientController::new(Millis(0), cfg).expect("valid config");
+        let sem = LeasedSemaphore::new(10_000_000, 1, 1, 100);
+
+        // A loss is noted, then the window closes via the escape hatch with a single
+        // sample: fewer than window_min_samples, so nothing is pushed to the (still
+        // empty) baseline, and this is the no-baseline early-return branch, not the
+        // empty-window branch (samples_this_window == 1, not 0).
+        controller.note_loss();
+        controller.record_sample(Micros(1));
+        let mut now = Millis(10 * cfg.window_min_ms);
+        let sparse = controller
+            .maybe_close_window(now, &sem)
+            .expect("window due via escape hatch");
+        assert!(
+            !sparse.fast_down,
+            "the no-baseline branch hardcodes fast_down: false regardless of the loss \
+             flag"
+        );
+        assert_eq!(controller.stats().baseline_push_skipped, 1);
+
+        // The very next window establishes the baseline for the first time (samples
+        // >= window_min_samples), with no new loss noted.
+        now = now.add_ms(cfg.window_min_ms);
+        controller.note_inflight(1_000_000);
+        feed(&mut controller, 1_000, cfg.window_min_samples);
+        let signals = controller
+            .maybe_close_window(now, &sem)
+            .expect("window due");
+
+        assert!(
+            !signals.fast_down,
+            "the loss was noted before the no-baseline window; if that branch skipped \
+             resetting loss_this_window, it would incorrectly fast-down the first \
+             window that establishes a baseline"
+        );
+    }
+
+    /// `stats().windows` counts every window CLOSE (`due == true`), regardless of
+    /// which of the three return paths (empty, no-baseline, normal) it takes; every
+    /// other test only asserts the path-specific counter (`empty_windows`,
+    /// `baseline_push_skipped`), never this one.
+    #[test]
+    fn stats_windows_counts_every_closed_window() {
+        let cfg = GradientConfig::default();
+        let mut controller = GradientController::new(Millis(0), cfg).expect("valid config");
+        let sem = LeasedSemaphore::new(10_000_000, 1, 1, 100);
+
+        // 1: the empty-window path.
+        let mut now = Millis(10 * cfg.window_min_ms);
+        assert!(controller.maybe_close_window(now, &sem).is_none());
+        assert_eq!(controller.stats().windows, 1);
+
+        // 2: the no-baseline path (one sample, closed via the escape hatch).
+        controller.record_sample(Micros(1));
+        now = now.add_ms(10 * cfg.window_min_ms);
+        assert!(controller.maybe_close_window(now, &sem).is_some());
+        assert_eq!(controller.stats().windows, 2);
+
+        // 3: the normal path.
+        now = now.add_ms(cfg.window_min_ms);
+        controller.note_inflight(1_000_000);
+        feed(&mut controller, 1_000, cfg.window_min_samples);
+        assert!(controller.maybe_close_window(now, &sem).is_some());
+        assert_eq!(controller.stats().windows, 3);
+    }
+
+    /// `stats().fast_downs` increments once per window that actually applies the
+    /// fast-down, and only that many: it is not driven by `note_loss()` calls, by
+    /// windows closed, or by any other counter.
+    #[test]
+    fn stats_fast_downs_counts_fast_down_windows() {
+        let cfg = GradientConfig::default();
+        let mut controller = GradientController::new(Millis(0), cfg).expect("valid config");
+        let sem = LeasedSemaphore::new(10_000_000, 1, 1, 100);
+        let mut now = Millis(0);
+
+        now = now.add_ms(cfg.window_min_ms);
+        controller.note_loss();
+        controller.note_inflight(1_000_000);
+        feed(&mut controller, 1_000, cfg.window_min_samples);
+        controller
+            .maybe_close_window(now, &sem)
+            .expect("window due");
+        assert_eq!(controller.stats().fast_downs, 1);
+
+        // No note_loss() this time: the counter must not move.
+        now = now.add_ms(cfg.window_min_ms);
+        controller.note_inflight(1_000_000);
+        feed(&mut controller, 1_000, cfg.window_min_samples);
+        controller
+            .maybe_close_window(now, &sem)
+            .expect("window due");
+        assert_eq!(controller.stats().fast_downs, 1);
+    }
+
+    /// `stats().slow_start_windows` increments once per window that actually takes
+    /// the doubling branch, and stops moving the moment slow start exits, even
+    /// though the controller keeps closing windows afterward.
+    #[test]
+    fn stats_slow_start_windows_counts_doubling_windows() {
+        let cfg = GradientConfig::default();
+        let mut controller = GradientController::new(Millis(0), cfg).expect("valid config");
+        let sem = LeasedSemaphore::new(10_000_000, 1, 1, 100);
+        let mut now = Millis(0);
+
+        // Window 1: self-referential baseline, gradient == 1.0, doubles.
+        now = now.add_ms(cfg.window_min_ms);
+        controller.note_inflight(1_000_000);
+        feed(&mut controller, 1_000, cfg.window_min_samples);
+        controller
+            .maybe_close_window(now, &sem)
+            .expect("window due");
+        assert_eq!(controller.stats().slow_start_windows, 1);
+
+        // Window 2: rtt_short 4x rtt_base exits slow start via the smoothed branch,
+        // not the doubling branch.
+        now = now.add_ms(cfg.window_min_ms);
+        controller.note_inflight(1_000_000);
+        feed(&mut controller, 4_000, cfg.window_min_samples);
+        controller
+            .maybe_close_window(now, &sem)
+            .expect("window due");
+        assert_eq!(controller.stats().slow_start_windows, 1);
+    }
+
+    /// `WindowSignals::rtt_base_us` must be the deque's own baseline, distinct from
+    /// `rtt_short_us` (this window's own p50) the moment the two diverge.
+    #[test]
+    fn window_signals_report_distinct_rtt_short_and_rtt_base() {
+        let cfg = GradientConfig::default();
+        let mut controller = GradientController::new(Millis(0), cfg).expect("valid config");
+        let sem = LeasedSemaphore::new(10_000_000, 1, 1, 100);
+        let mut now = Millis(0);
+
+        // Window 1: self-referential, rtt_short_us == rtt_base_us == 1_000.
+        now = now.add_ms(cfg.window_min_ms);
+        controller.note_inflight(1_000_000);
+        feed(&mut controller, 1_000, cfg.window_min_samples);
+        let first = controller
+            .maybe_close_window(now, &sem)
+            .expect("window due");
+        assert_eq!(first.rtt_short_us, 1_000);
+        assert_eq!(first.rtt_base_us, 1_000);
+
+        // Window 2: rtt_short_us tracks ~4_000 (the histogram's 3-significant-figure
+        // quantization can round this slightly, hence the tolerance below), but
+        // rtt_base_us stays at the deque's minimum, ~1_000: the two fields must now
+        // read DIFFERENT values, an order of magnitude apart.
+        now = now.add_ms(cfg.window_min_ms);
+        controller.note_inflight(1_000_000);
+        feed(&mut controller, 4_000, cfg.window_min_samples);
+        let second = controller
+            .maybe_close_window(now, &sem)
+            .expect("window due");
+        assert!(
+            second.rtt_short_us.abs_diff(4_000) <= 4,
+            "rtt_short_us should track this window's own p50 (~4_000), got {}",
+            second.rtt_short_us
+        );
+        assert!(
+            second.rtt_base_us.abs_diff(1_000) <= 4,
+            "rtt_base_us must report the baseline (~1_000), not this window's own p50 \
+             (~4_000); got {}",
+            second.rtt_base_us
+        );
+    }
+
+    /// `WindowSignals::slow_start` reports THIS window's action (`slow_start_fired`:
+    /// did the doubling branch run), not the controller's persistent
+    /// `self.slow_start` state, which can remain `true` on a window that did NOT
+    /// double because the app-limited hold ran first and pre-empted it.
+    #[test]
+    fn signals_slow_start_reports_this_windows_action_not_persistent_state() {
+        let cfg = GradientConfig::default();
+        let mut controller = GradientController::new(Millis(0), cfg).expect("valid config");
+        let sem = LeasedSemaphore::new(10_000_000, 1, 1, 100);
+
+        // limit starts at min_limit (4), so limit / 2 == 2; never calling
+        // note_inflight leaves inflight_peak at its default of 0, well under that,
+        // so the app-limited hold fires on this very first window, before slow
+        // start's own branch ever runs.
+        feed(&mut controller, 1_000, cfg.window_min_samples);
+        let signals = controller
+            .maybe_close_window(Millis(cfg.window_min_ms), &sem)
+            .expect("window due");
+
+        assert!(
+            signals.app_limited,
+            "the app-limited hold must fire this window"
+        );
+        assert!(
+            !signals.slow_start,
+            "the doubling branch did not run this window (the app-limited hold ran \
+             first), so slow_start_fired must be false"
+        );
+        assert!(
+            controller.slow_start,
+            "the controller is still internally in slow start (no window has yet \
+             shown gradient < 1.0 to clear it); this must differ from signals.slow_start \
+             above to prove the field reports slow_start_fired, not self.slow_start"
+        );
     }
 
     /// `is_idle(n)` is exactly `self.idle_windows >= n`: false before any window has
@@ -1385,16 +1871,26 @@ mod tests {
         );
     }
 
-    /// Test 28: a STATIONARY bimodal mix (90 percent at 1 ms, 10 percent at 500 ms,
-    /// identical every window) settles rather than oscillating: after warming up
-    /// (not part of the measured span, so the initial ramp from `min_limit` does not
-    /// contaminate the measurement) 200 more windows of the same mix keep the
-    /// coefficient of variation below 0.1. Two SEPARATE controllers, one per mode
-    /// against its OWN Little's law model (so the observed latency genuinely
-    /// responds to load), converge to distinct steady limits: this is the executable
-    /// form of "a client that can mix cheap and expensive requests can move the
-    /// shared control signal", and the mitigation is that a controller is per
-    /// (cluster, priority), never shared across a route mix.
+    /// Test 28: a bimodal mix (90 percent cheap, 10 percent expensive requests, same
+    /// split every window) settles rather than oscillating. BOTH modes' latency is
+    /// modeled against the ONE shared controller's own current limit via the same
+    /// Little's law upstream (`model_rtt_us`) the single-mode stability tests use, so
+    /// the fed latency genuinely responds to load: a fixed, load-INDEPENDENT latency
+    /// (as an earlier version of this test used) can never oscillate because there is
+    /// no feedback loop for it to oscillate through, which made a coefficient-of-
+    /// variation check on it pass vacuously (cv == 0 on 200 identical values, every
+    /// one of them `max_limit`, because a load-blind mixture keeps `gradient == 1.0`
+    /// forever and the controller just doubles until the ceiling clamps it). After
+    /// warming up (not part of the measured span, so the initial ramp from
+    /// `min_limit` does not contaminate the measurement) 200 more windows of the same
+    /// mix keep the coefficient of variation below 0.1, and the mean must land
+    /// strictly between `min_limit` and `max_limit`, ruling out the previous defect's
+    /// specific failure mode of a vacuous pass at a boundary. Two SEPARATE
+    /// controllers, one per mode against its OWN Little's law model, converge to
+    /// distinct steady limits: this is the executable form of "a client that can mix
+    /// cheap and expensive requests can move the shared control signal", and the
+    /// mitigation is that a controller is per (cluster, priority), never shared
+    /// across a route mix.
     #[allow(
         clippy::cast_precision_loss,
         reason = "n is this test's own fixed sample count (200), far below f64's exact-integer range"
@@ -1405,33 +1901,54 @@ mod tests {
                   when window_min_samples is not a multiple of 10, and the default \
                   (50) used by this test divides evenly, giving exactly 45/5"
     )]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "this test drives a shared-mixture controller through warm-up and a \
+                  measured span AND two separately-modelled single-mode controllers \
+                  through their own convergence and settling checks in one function, \
+                  because the second half depends on constants (capacity_c, the two \
+                  r0 values) established in the first; splitting it would only move \
+                  the line count into parameters threaded across two functions"
+    )]
     #[test]
     fn adversarial_bimodal_no_oscillation() {
         let cfg = GradientConfig::default();
         let sem = LeasedSemaphore::new(10_000_000, 1, 1, 100);
+        let capacity_c = 4_000.0;
+        let cheap_r0_us = 1_000.0;
+        let expensive_r0_us = 500_000.0;
 
-        // 90% at 1 ms, 10% at 500 ms: with window_min_samples == 50, 45 cheap and 5
+        // 90% cheap, 10% expensive: with window_min_samples == 50, 45 cheap and 5
         // expensive samples is exactly that split, and the p50 falls inside the cheap
-        // majority every window.
+        // majority every window (the expensive class's modeled latency never exceeds
+        // its own bandwidth-delay product within max_limit, so it never displaces the
+        // cheap class from the median; see the per-window feed below).
         let cheap_count = cfg.window_min_samples * 9 / 10;
         let expensive_count = cfg.window_min_samples - cheap_count;
+
+        // Feeds one window of the bimodal mix, with BOTH modes' latency computed
+        // against the controller's own CURRENT limit, and closes the window.
+        let feed_mixed_window = |mixed: &mut GradientController| {
+            let c = mixed.limit();
+            mixed.note_inflight(as_u32(c));
+            let cheap_rtt = as_u64(model_rtt_us(c, capacity_c, cheap_r0_us).max(1.0));
+            let expensive_rtt = as_u64(model_rtt_us(c, capacity_c, expensive_r0_us).max(1.0));
+            feed(mixed, cheap_rtt, cheap_count);
+            feed(mixed, expensive_rtt, expensive_count);
+        };
 
         let mut mixed = GradientController::new(Millis(0), cfg).expect("valid config");
         let mut now = Millis(0);
         for _ in 0..30 {
             now = now.add_ms(cfg.window_min_ms);
-            mixed.note_inflight(1_000_000);
-            feed(&mut mixed, 1_000, cheap_count);
-            feed(&mut mixed, 500_000, expensive_count);
+            feed_mixed_window(&mut mixed);
             mixed.maybe_close_window(now, &sem).expect("window due");
         }
 
         let mut limits = Vec::with_capacity(200);
         for _ in 0..200 {
             now = now.add_ms(cfg.window_min_ms);
-            mixed.note_inflight(1_000_000);
-            feed(&mut mixed, 1_000, cheap_count);
-            feed(&mut mixed, 500_000, expensive_count);
+            feed_mixed_window(&mut mixed);
             let signals = mixed.maybe_close_window(now, &sem).expect("window due");
             limits.push(signals.limit);
         }
@@ -1441,11 +1958,19 @@ mod tests {
         let variance = limits.iter().map(|x| (x - mean) * (x - mean)).sum::<f64>() / n;
         let cv = variance.sqrt() / mean;
         assert!(
+            mean > f64::from(cfg.min_limit) + f64::EPSILON
+                && mean < f64::from(cfg.max_limit) - f64::EPSILON,
+            "the mean {mean} sits AT a clamp boundary ({}..{}): a load-independent \
+             mixture pins the limit at max_limit and would satisfy cv < 0.1 vacuously; \
+             this bound rules that failure mode out",
+            cfg.min_limit,
+            cfg.max_limit
+        );
+        assert!(
             cv < 0.1,
             "bimodal coefficient of variation {cv} was not below 0.1 (mean {mean})"
         );
 
-        let capacity_c = 4_000.0;
         let mut cheap_controller = GradientController::new(Millis(0), cfg).expect("valid config");
         cheap_controller.base.push(as_u64(1_000.0));
         let mut expensive_controller =

@@ -53,25 +53,47 @@ fn bench_maybe_close_window_not_due(c: &mut Criterion) {
 
 /// `gradient/maybe_close_window_due`: a full window update including the quantile
 /// computation. Budget: under 3 microseconds.
+///
+/// `GradientController::new` and the `window_min_samples` fill are setup, run via
+/// `iter_batched` OUTSIDE the timed routine: an earlier version of this benchmark
+/// built a fresh controller (a ~136 KB eager histogram allocation; see the
+/// `concurrency` module's memory-bounding doc) inside the timed closure, so the
+/// reported number was dominated by an allocation the request path never repeats
+/// (measured on this machine: constructing the controller alone was 43 percent of
+/// the closure's total time), diluting exactly the regression this budget exists to
+/// catch. Only the window-close itself is timed here.
 fn bench_maybe_close_window_due(c: &mut Criterion) {
     let cfg = GradientConfig::default();
     let sem = LeasedSemaphore::new(1_000_000, 1, 1, 100);
     c.bench_function("gradient/maybe_close_window_due", |b| {
-        b.iter(|| {
-            let Ok(mut controller) = GradientController::new(Millis(0), cfg) else {
-                return None;
-            };
-            for _ in 0..cfg.window_min_samples {
-                controller.record_sample(Micros(1_000));
-            }
-            controller.note_inflight(1_000_000);
-            black_box(controller.maybe_close_window(Millis(cfg.window_min_ms), &sem))
-        });
+        b.iter_batched(
+            || {
+                let Ok(mut controller) = GradientController::new(Millis(0), cfg) else {
+                    return None;
+                };
+                for _ in 0..cfg.window_min_samples {
+                    controller.record_sample(Micros(1_000));
+                }
+                controller.note_inflight(1_000_000);
+                Some(controller)
+            },
+            |controller| {
+                let mut controller = controller?;
+                black_box(controller.maybe_close_window(Millis(cfg.window_min_ms), &sem))
+            },
+            criterion::BatchSize::SmallInput,
+        );
     });
 }
 
-/// `deque/push`, increasing case (worst space: every element retained). Budget:
-/// under 20 ns.
+/// `deque/push`, increasing case (worst space: every element retained). The issue's
+/// budget is under 20 ns per push; THIS benchmark reports the cost of the whole
+/// 600-push batch in `iter_batched`'s routine (needed so the "every element
+/// retained" worst case, and the amortized cost the "O(1) amortized" claim is
+/// about, are actually exercised across a full push sequence rather than measuring
+/// one push in isolation), so the number `cargo bench` prints must be divided by
+/// 600 before comparing it to the 20 ns figure: budget is under 12 microseconds for
+/// the batch (20 ns * 600).
 fn bench_deque_push_increasing(c: &mut Criterion) {
     c.bench_function("deque/push_increasing", |b| {
         b.iter_batched(
@@ -87,8 +109,11 @@ fn bench_deque_push_increasing(c: &mut Criterion) {
     });
 }
 
-/// `deque/push`, decreasing case (worst pop cascade, amortized `O(1)`). Budget:
-/// under 20 ns.
+/// `deque/push`, decreasing case (worst pop cascade, amortized `O(1)`). Same
+/// per-batch-vs-per-push accounting as `bench_deque_push_increasing` above: the
+/// issue's budget is under 20 ns per push, this benchmark times the whole 600-push
+/// batch (the pop cascade this case exists to exercise only shows up across a full
+/// descending sequence), so budget is under 12 microseconds for the batch.
 fn bench_deque_push_decreasing(c: &mut Criterion) {
     c.bench_function("deque/push_decreasing", |b| {
         b.iter_batched(
