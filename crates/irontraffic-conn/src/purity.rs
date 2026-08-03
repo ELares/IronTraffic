@@ -12,7 +12,9 @@
 //! 1. the response's framing did not resolve cleanly (`ResponseFramingRefused`);
 //! 2. the upstream sent a final response before we finished sending the request body
 //!    (`EarlyFinalResponse`);
-//! 3. the response body's octet count did not match its declared `Content-Length`
+//! 3. the response body's octet count did not match its declared `Content-Length`,
+//!    or one or more octets were reported with no exchange in flight, for example
+//!    after the response already completed or before any exchange began
 //!    (`BodyLengthMismatch`);
 //! 4. we sent N requests and received a number other than N responses
 //!    (`ExchangeCountMismatch`);
@@ -222,14 +224,30 @@ impl ExchangeLedger {
 
     /// Records `n` response body octets.
     ///
+    /// `n == 0` is never an error and never changes `purity()` or `may_pool()`,
+    /// whether or not an exchange is in flight: reporting zero octets is not
+    /// "octets arriving" and is not the `TrailingBytes` condition under a
+    /// different name (edge case 22, clarified 2026-08-02).
+    ///
     /// # Errors
-    /// The current `Purity` when the octets arrive with no exchange in flight (for
-    /// example, after the response already completed, regardless of whether that
-    /// response declared a length), when the count exceeds a declared length, or when
-    /// already poisoned.
+    /// The current `Purity` when one or more octets arrive with no exchange in
+    /// flight (for example, after the response already completed, or before any
+    /// exchange began, regardless of whether that response declared a length),
+    /// when the count exceeds a declared length, or when already poisoned.
     pub fn response_body_bytes(&mut self, n: u64) -> Result<(), Purity> {
         if self.purity != Purity::Clean {
             return Err(self.purity);
+        }
+        if n == 0 {
+            // Zero octets is not "octets arriving": it is not the TrailingBytes
+            // condition under a different name, so it must never poison and must
+            // never touch `received_body`, whether or not an exchange is in
+            // flight. #85's pool is expected to relay a body with a uniform loop
+            // that reports every read's byte count, including a final
+            // zero-length read after the terminal chunk, and that call must not
+            // deny reuse of a perfectly healthy connection. Edge case 22,
+            // clarified 2026-08-02.
+            return Ok(());
         }
         if !self.in_flight {
             // No exchange is in flight to attribute these octets to: either the
@@ -239,7 +257,11 @@ impl ExchangeLedger {
             // `UntilClose` legitimately have no declared length (`declared_body ==
             // None`) while an exchange is genuinely in flight; that absence of a
             // declaration is not license to accept octets with nothing in flight at
-            // all. Same poison family as `TrailingBytes`, per edge case 22.
+            // all. The poison here comes from THIS guard alone: it returns before
+            // `received_body` or `declared_body` is ever read, so it does not
+            // depend on, and is not explained by, the declared-length comparison
+            // below (which never runs for this call). Same poison family as
+            // `TrailingBytes`, per edge case 22.
             return Err(self.poison(PoisonReason::BodyLengthMismatch));
         }
         self.received_body = self.received_body.saturating_add(n);
@@ -969,10 +991,17 @@ mod tests {
         assert_eq!(ledger.response_complete(), Err(before));
         assert_eq!(ledger.purity(), before);
 
-        // Edge case 22: bytes arriving after response_complete are measured against
-        // the finished exchange's declared length and received count, which are not
-        // reset until the next begin_request, so they poison with BodyLengthMismatch:
-        // the same family as TrailingBytes under a different name.
+        // Edge case 22: an octet arriving after response_complete has no exchange
+        // in flight to attribute it to, so the `!self.in_flight` guard in
+        // response_body_bytes poisons it with BodyLengthMismatch on its own --
+        // it returns before `declared_body` or `received_body` is ever read, so
+        // this is NOT a declared-length comparison, and it fires the same way
+        // regardless of what the finished exchange declared. Same poison family
+        // as TrailingBytes, under a different name. See
+        // `post_completion_octets_poison_regardless_of_declared_length` below
+        // for the case that actually distinguishes this guard from the
+        // declared-length check beneath it: Streamed framing, which has no
+        // declared length at all.
         let mut after_complete = ExchangeLedger::new();
         assert_eq!(after_complete.begin_request(), Ok(()));
         after_complete.request_body_written();
@@ -1005,6 +1034,114 @@ mod tests {
         assert_eq!(
             owner.purity(),
             Purity::Poisoned(PoisonReason::EarlyFinalResponse)
+        );
+    }
+
+    #[test]
+    fn post_completion_octets_poison_regardless_of_declared_length() {
+        // Re-review of PR 843, finding 1 (both lenses, independently): the edge
+        // case 22 assertion above only ever drove `ResponseFraming::Exact { len:
+        // 3 }` through the post-completion path. Its `known_len()` is `Some(3)`,
+        // so the PRE-EXISTING declared-length check below the `!self.in_flight`
+        // guard in `response_body_bytes` produces the identical
+        // `Err(Poisoned(BodyLengthMismatch))` with or without that guard:
+        // deleting the whole `if !self.in_flight { .. }` block, or regressing it
+        // to the pre-amendment `if !self.in_flight &&
+        // self.declared_body.is_some()` shape, left every test in this file
+        // green. `Streamed`'s `known_len()` is `None`, so it is the framing that
+        // actually distinguishes the guard from the declared-length check
+        // beneath it -- and per the amendment, it is "the framing an
+        // origin-controlling attacker would choose". This test fails under both
+        // of those reverts; the edge case 22 assertion above does not.
+        let mut chunked = ExchangeLedger::new();
+        assert_eq!(chunked.begin_request(), Ok(()));
+        chunked.request_body_written();
+        assert_eq!(chunked.response_head(ResponseFraming::Streamed), Ok(()));
+        assert_eq!(chunked.response_body_bytes(4096), Ok(()));
+        assert_eq!(chunked.response_complete(), Ok(()));
+        assert!(chunked.may_pool());
+        assert_eq!(
+            chunked.response_body_bytes(1),
+            Err(Purity::Poisoned(PoisonReason::BodyLengthMismatch)),
+            "a post-completion octet under Streamed framing (no declared \
+             length to fall back on) must still poison, on the !in_flight \
+             guard alone"
+        );
+        assert!(!chunked.may_pool());
+
+        // The other `!in_flight` state the guard must cover: nothing was ever
+        // begun, so `declared_body` is `None` here too (it is only ever set by
+        // `response_head`), and the weaker, reverted guard would let this
+        // through exactly as it would for Streamed above.
+        let mut never_begun = ExchangeLedger::new();
+        assert_eq!(
+            never_begun.response_body_bytes(1),
+            Err(Purity::Poisoned(PoisonReason::BodyLengthMismatch)),
+            "an octet reported with nothing ever begun must poison the same way"
+        );
+        assert!(!never_begun.may_pool());
+    }
+
+    #[test]
+    fn response_body_bytes_zero_octets_never_poisons() {
+        // Re-review of PR 843, finding 2 (both lenses): issue #45's edge case 22
+        // is amended (clarified 2026-08-02) to read that a call reporting ONE OR
+        // MORE octets while nothing is in flight poisons, and that
+        // `response_body_bytes(0)` must return `Ok` and leave `purity()` and
+        // `may_pool()` untouched, whether or not an exchange is in flight.
+        // Reporting zero octets is not "octets arriving" and is not the
+        // TrailingBytes condition under a different name. This matters because
+        // issue #85's pool is expected to relay a body with a uniform loop that
+        // reports every read's byte count, including a final zero-length read
+        // after the terminal chunk; poisoning on that call would deny reuse of
+        // a perfectly healthy connection -- a false positive, not failing
+        // closed.
+        //
+        // Idle after a clean, completed exchange.
+        let mut after_complete = ExchangeLedger::new();
+        assert_eq!(after_complete.begin_request(), Ok(()));
+        after_complete.request_body_written();
+        assert_eq!(after_complete.response_head(ResponseFraming::Empty), Ok(()));
+        assert_eq!(after_complete.response_complete(), Ok(()));
+        assert!(after_complete.may_pool());
+        assert_eq!(
+            after_complete.response_body_bytes(0),
+            Ok(()),
+            "zero octets after response_complete must not poison"
+        );
+        assert_eq!(after_complete.purity(), Purity::Clean);
+        assert!(after_complete.may_pool());
+
+        // Idle with nothing ever begun.
+        let mut never_begun = ExchangeLedger::new();
+        assert_eq!(
+            never_begun.response_body_bytes(0),
+            Ok(()),
+            "zero octets with nothing ever begun must not poison"
+        );
+        assert_eq!(never_begun.purity(), Purity::Clean);
+        assert!(never_begun.may_pool());
+
+        // Mid-flight, zero octets was already always Ok; pinned here as the
+        // same-call contrast to the idle cases above so the boundary (n == 0
+        // is exempt, n >= 1 is not, in every `!in_flight` state) reads as one
+        // fact rather than two unrelated ones.
+        let mut mid_flight = ExchangeLedger::new();
+        assert_eq!(mid_flight.begin_request(), Ok(()));
+        mid_flight.request_body_written();
+        assert_eq!(mid_flight.response_head(ResponseFraming::Streamed), Ok(()));
+        assert_eq!(mid_flight.response_body_bytes(0), Ok(()));
+        assert_eq!(mid_flight.purity(), Purity::Clean);
+        assert!(!mid_flight.may_pool(), "still in flight");
+
+        // The other direction, same states, one octet instead of zero: this is
+        // what post_completion_octets_poison_regardless_of_declared_length
+        // pins in full; repeated minimally here so the n == 0 / n >= 1 boundary
+        // is visible in one place.
+        let mut one_octet_never_begun = ExchangeLedger::new();
+        assert_eq!(
+            one_octet_never_begun.response_body_bytes(1),
+            Err(Purity::Poisoned(PoisonReason::BodyLengthMismatch))
         );
     }
 
