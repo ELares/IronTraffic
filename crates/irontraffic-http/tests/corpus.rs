@@ -35,7 +35,7 @@ use std::path::{Path, PathBuf};
 use bytes::BytesMut;
 use irontraffic_http::field::UnderscorePolicy;
 use irontraffic_http::forwarded::ForwardedChain;
-use irontraffic_http::framing::OtherCodings;
+use irontraffic_http::framing::{OtherCodings, RequestFraming};
 use irontraffic_http::h1::H1Parser;
 use irontraffic_http::h1::canonicalize::{H1Context, canonicalize_request};
 use irontraffic_http::h1::chunked::{ChunkedDecoder, ChunkedEvent};
@@ -310,6 +310,10 @@ fn h1_heads() {
     let entries = read_corpus_entries(file);
     let ctx = h1_context();
     let parser = H1Parser::new(&ctx.limits, ctx.underscores);
+    // Counts entries that pin `consumed`, so deleting the field from the
+    // one row that carries it (the pipelining row) is a red build rather
+    // than a silent, green relaxation of that row's contract.
+    let mut consumed_pins = 0usize;
 
     for entry in &entries {
         let bytes = entry.decode_bytes(file);
@@ -342,6 +346,7 @@ fn h1_heads() {
                             entry.locator(file)
                         );
                         if let Some(extra) = entry.extra {
+                            consumed_pins = consumed_pins.saturating_add(1);
                             let want: usize = extra.parse().unwrap_or_else(|e| {
                                 panic!(
                                     "{}: extra field {extra:?} is not a usize: {e}",
@@ -368,6 +373,13 @@ fn h1_heads() {
             }
         }
     }
+
+    assert_eq!(
+        consumed_pins, 1,
+        "h1-heads.txt: expected exactly 1 entry pinning `consumed` (the pipelining row); \
+         found {consumed_pins}. A count that dropped means a `consumed` field was deleted \
+         rather than the row being removed outright"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -426,6 +438,18 @@ fn paths() {
                 entry.locator(file)
             ),
         };
+
+        // Every `ok` entry must carry its expected output bytes (the
+        // acceptance criteria say so explicitly): a corpus row that only
+        // asserts acceptance, and not the normalized bytes it produced,
+        // would pass unchanged if normalization started producing the
+        // wrong output. Deleting the expected-output field is therefore
+        // not a silent, green way to relax an entry.
+        assert!(
+            !(matches!(outcome, Outcome::Ok) && expected_field.is_none()),
+            "{}: an `ok` entry must carry its expected output bytes",
+            entry.locator(file)
+        );
 
         let mut out = BytesMut::new();
         let result = NormalizedPath::parse_into(&target, &policy, &limits, &mut out);
@@ -502,6 +526,10 @@ fn drive_chunked(bytes: &[u8]) -> Option<Result<usize, RejectReason>> {
 fn chunked() {
     let file = "chunked.txt";
     let entries = read_corpus_entries(file);
+    // Counts entries that pin `Done { consumed }`, so deleting the field
+    // from the one row that carries it (the trailing-garbage row) is a red
+    // build rather than a silent, green relaxation of that row's contract.
+    let mut consumed_pins = 0usize;
 
     for entry in &entries {
         let bytes = entry.decode_bytes(file);
@@ -515,6 +543,7 @@ fn chunked() {
         match (outcome, result) {
             (Outcome::Ok, Ok(consumed)) => {
                 if let Some(extra) = entry.extra {
+                    consumed_pins = consumed_pins.saturating_add(1);
                     let want: usize = extra.parse().unwrap_or_else(|e| {
                         panic!(
                             "{}: extra field {extra:?} is not a usize: {e}",
@@ -541,6 +570,13 @@ fn chunked() {
             }
         }
     }
+
+    assert_eq!(
+        consumed_pins, 1,
+        "chunked.txt: expected exactly 1 entry pinning `Done {{ consumed }}` (the \
+         trailing-garbage row); found {consumed_pins}. A count that dropped means the field \
+         was deleted rather than the row being removed outright"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -682,6 +718,28 @@ fn mplex() {
         let post_outcome = parse_outcome(post_outcome_field, entry.line_no, file);
 
         if post_op == "finish" {
+            // The mplex test asserts the resolved framing for the row with
+            // neither `content-length` nor `transfer-encoding`, not only
+            // the `finish` outcome: if step 8 of `resolve_request_framing`
+            // is ever changed back to answering `Empty` on a multiplexed
+            // request, that maps to `declared: Some(0)`, and a `finish`
+            // call with zero received octets is `Ok` either way, so the
+            // outcome alone cannot tell `Streamed` (a real streaming
+            // upload) from `Empty` (no body permitted at all) apart. See
+            // `request-framing-resolution` (#27) step 8.
+            let has_length_field = pairs.iter().any(|&(name, _)| {
+                name.eq_ignore_ascii_case(b"content-length")
+                    || name.eq_ignore_ascii_case(b"transfer-encoding")
+            });
+            if !has_length_field {
+                assert_eq!(
+                    request.framing,
+                    RequestFraming::Streamed,
+                    "{}: a multiplexed request with neither content-length nor \
+                     transfer-encoding must resolve to RequestFraming::Streamed, not Empty",
+                    entry.locator(file)
+                );
+            }
             let mut acc = BodyAccounting::new(request.framing);
             let result = acc.finish();
             match (post_outcome, result) {
@@ -708,7 +766,35 @@ fn mplex() {
                 MplexTrailerBuilder::new(&trailer_arena, &limits, WireVersion::H2);
             let result = trailer_builder.push(&mut trailer_arena, name, value);
             match (post_outcome, result) {
-                (Outcome::Ok, Ok(())) => {}
+                (Outcome::Ok, Ok(())) => {
+                    // Edge case 12: a `trailer:` operation that is
+                    // expected to succeed asserts the finished trailer
+                    // section actually contains the pushed field (proving
+                    // `MplexTrailerBuilder::finish`, which no corpus
+                    // assertion called before this row existed) and that
+                    // it is a value separate from the request's own
+                    // headers, never merged into the head builder.
+                    let trailer_section = trailer_builder.finish(&mut trailer_arena);
+                    let pushed = trailer_section.get_all(name).any(|v| v == value);
+                    assert!(
+                        pushed,
+                        "{}: trailer operation succeeded but the finished trailer section \
+                         does not contain the pushed field {:?}={:?}",
+                        entry.locator(file),
+                        String::from_utf8_lossy(name),
+                        String::from_utf8_lossy(value)
+                    );
+                    let leaked_into_headers = request.headers.get_all(name).any(|v| v == value);
+                    assert!(
+                        !leaked_into_headers,
+                        "{}: trailer field {:?}={:?} appears in request.headers; a trailer \
+                         section must stay a separate value, never merged into the head \
+                         builder's fields",
+                        entry.locator(file),
+                        String::from_utf8_lossy(name),
+                        String::from_utf8_lossy(value)
+                    );
+                }
                 (Outcome::Reject(want), Err(got)) => {
                     assert_eq!(want, got, "{}: trailer operation", entry.locator(file));
                 }
@@ -726,9 +812,25 @@ fn mplex() {
         }
     };
 
+    // Counts rows carrying a post-head operation (`finish` or `trailer:`),
+    // so deleting one of the five (the `content-length: 100` finish row,
+    // the no-length-field finish row, and the three `trailer:` rows) is a
+    // red build rather than a silent, green relaxation of that row's
+    // contract back to a head-level-only check.
+    let mut post_op_rows = 0usize;
     for entry in &read_corpus_entries("mplex.txt") {
+        if entry.extra.is_some() {
+            post_op_rows = post_op_rows.saturating_add(1);
+        }
         run_entry(entry);
     }
+
+    assert_eq!(
+        post_op_rows, 5,
+        "mplex.txt: expected exactly 5 rows carrying a post-head operation (2 `finish`, 3 \
+         `trailer:`); found {post_op_rows}. A count that dropped means a post-op field was \
+         deleted rather than the row being removed outright"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1133,6 +1235,19 @@ fn emit_fuzz_seeds() {
             continue;
         }
         let payload = rest.get(1..).unwrap_or(&[]);
+        // Skip the `@repeat:` generator rows: their expansion (the
+        // 100,000-element row alone is 800,000 bytes) would seed
+        // fuzz_forwarded with a near-megabyte unit, and libFuzzer with no
+        // explicit `-max_len` sets MaxLen from the largest seed in the
+        // corpus, so one row would switch every generated input in the
+        // whole campaign from ~4 KiB to ~800 KB. A fuzzer also learns
+        // nothing from a row whose only content is one byte string
+        // repeated N times; the byte cap it exercises is already pinned
+        // by name in the `forwarded` test above, from this same corpus
+        // entry, every run.
+        if payload.starts_with(b"@repeat:") {
+            continue;
+        }
         let values = forwarded_marker_values(payload);
         let value = values.first().map_or(&[][..], Vec::as_slice);
         let seed = forwarded_seed_bytes(marker_byte, value);
@@ -1200,16 +1315,35 @@ fn threat_model_is_covered() {
         if !trimmed.starts_with('|') {
             continue;
         }
-        let cells: Vec<&str> = trimmed
+        // A literal pipe inside a cell must be written `\|` (GFM's escape);
+        // stand it aside on a sentinel byte that cannot otherwise appear in
+        // this ASCII-only document before splitting on the column
+        // separator, then restore it inside each cell. Without this, a row
+        // like `| attack text \| more text | citation | |` splits into 4
+        // cells instead of 3 and used to be silently skipped below rather
+        // than checked or rejected.
+        let escaped_pipe_sentinel = '\u{0}';
+        let unescaped = trimmed.replace("\\|", &escaped_pipe_sentinel.to_string());
+        let cells: Vec<String> = unescaped
             .trim_start_matches('|')
             .trim_end_matches('|')
             .split('|')
-            .map(str::trim)
+            .map(|c| c.trim().replace(escaped_pipe_sentinel, "|"))
             .collect();
-        if cells.len() != 3 {
-            continue;
-        }
-        let is_header = cells.first() == Some(&"Attack");
+        // A well-formed row always has exactly 3 columns (Attack, Corpus
+        // citation, Reason). A row that does not is not skipped: skipping
+        // it would let it pass with neither a citation nor a reason
+        // checked, which is the coverage gap `threat_model_is_covered`
+        // exists to close. Fail loudly and name the row instead.
+        assert_eq!(
+            cells.len(),
+            3,
+            "docs/THREAT-MODEL.md section 6, row {row_idx}: expected exactly 3 columns \
+             (Attack, Corpus citation, Reason) after splitting on `|`, found {} in {trimmed:?}; \
+             escape a literal pipe inside a cell as `\\|`",
+            cells.len()
+        );
+        let is_header = cells.first().map(String::as_str) == Some("Attack");
         let is_separator = cells
             .iter()
             .all(|c| !c.is_empty() && c.chars().all(|ch| ch == '-'));
@@ -1217,9 +1351,9 @@ fn threat_model_is_covered() {
             continue;
         }
 
-        let attack = cells.first().copied().unwrap_or("");
-        let citation = cells.get(1).copied().unwrap_or("");
-        let reason = cells.get(2).copied().unwrap_or("");
+        let attack = cells.first().map_or("", String::as_str);
+        let citation = cells.get(1).map_or("", String::as_str);
+        let reason = cells.get(2).map_or("", String::as_str);
 
         assert!(
             !citation.is_empty() || !reason.is_empty(),
@@ -1255,9 +1389,16 @@ fn threat_model_is_covered() {
         rows_checked = rows_checked.saturating_add(1);
     }
 
+    // The floor tracks the table's actual row count (50 as of this test), not
+    // an arbitrary low number: with the malformed-row panic above, the only
+    // way for `rows_checked` to fall short is a row that stopped starting
+    // with `|` at all (deleted, or turned into prose). Raise this floor
+    // when rows are legitimately added; never lower it to make a build
+    // green.
     assert!(
-        rows_checked >= 10,
-        "threat_model_is_covered parsed suspiciously few rows ({rows_checked}); the table \
-         format in docs/THREAT-MODEL.md may have changed"
+        rows_checked >= 50,
+        "threat_model_is_covered parsed only {rows_checked} evidence rows, fewer than the \
+         50 the table is expected to hold; a row may have been deleted or stopped starting \
+         with `|` in docs/THREAT-MODEL.md"
     );
 }

@@ -134,6 +134,10 @@ struct Entry<'a> {
     line_no: usize,
     outcome_field: &'a str,
     bytes_field: &'a str,
+    /// The optional third tab-separated field: for an `ok` `p:` row, the
+    /// expected `consumed` value, the byte offset where the PROXY header
+    /// ends and the forwarded HTTP stream begins.
+    extra: Option<&'a str>,
 }
 
 impl Entry<'_> {
@@ -167,10 +171,12 @@ fn parse_entries(text: &str) -> Vec<Entry<'_>> {
         let Some(bytes_field) = parts.next() else {
             panic!("forwarded.txt:{line_no}: expected `<outcome><TAB><bytes>`");
         };
+        let extra = parts.next();
         out.push(Entry {
             line_no,
             outcome_field,
             bytes_field,
+            extra,
         });
     }
     out
@@ -220,8 +226,30 @@ fn proxy() {
         let outcome = entry.outcome();
         let result = ProxyHeader::parse(payload);
         match (outcome, result) {
-            (Outcome::Ok, Ok(ParseStatus::Complete { .. }))
-            | (Outcome::Partial, Ok(ParseStatus::Partial)) => {}
+            (Outcome::Ok, Ok(ParseStatus::Complete { consumed, .. })) => {
+                // `consumed` is the desync boundary: it tells the caller
+                // where the PROXY header stops and the forwarded HTTP
+                // stream begins. An `ok` row with a third field pins it,
+                // so a parser that accepts the header but reports the
+                // wrong offset (and would hand the connection layer a
+                // buffer beginning mid-stream) fails here rather than
+                // passing on bare acceptance.
+                if let Some(expected_field) = entry.extra {
+                    let expected: usize = expected_field.parse().unwrap_or_else(|e| {
+                        panic!(
+                            "{}: extra field {expected_field:?} is not a valid consumed value: {e}",
+                            entry.locator()
+                        )
+                    });
+                    assert_eq!(
+                        consumed,
+                        expected,
+                        "{}: expected consumed {expected}, got {consumed}",
+                        entry.locator()
+                    );
+                }
+            }
+            (Outcome::Partial, Ok(ParseStatus::Partial)) => {}
             (Outcome::Reject(want), Err(got)) => assert_eq!(want, got, "{}", entry.locator()),
             (expected, got) => panic!("{}: expected {expected:?}, got {got:?}", entry.locator()),
         }

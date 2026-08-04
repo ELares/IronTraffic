@@ -22,7 +22,12 @@
 # repeated <count> times and is fed as the SOLE line for that marker's
 # iterator. This is the only generator marker this corpus uses.
 #
-# For `p:`, <rest> is the raw PROXY protocol header bytes, unmodified.
+# For `p:`, <rest> is the raw PROXY protocol header bytes, unmodified. An
+# `ok` `p:` row may carry a third tab-separated field naming the expected
+# `consumed` value: the byte offset where the PROXY header ends and the
+# forwarded HTTP stream begins. `corpus_proxy.rs`'s `proxy` test asserts it
+# when present, so accepting the header at the wrong offset is a failure
+# rather than a pass on bare acceptance.
 #
 # Driven by two tests, both reading this SAME file: `forwarded` (in
 # crates/irontraffic-http/tests/corpus.rs) handles `f:` and `x:` and skips
@@ -36,10 +41,10 @@ ok	f:Forwarded: for=unknown
 ok	f:Forwarded: for=_obfs
 ForwardedBytesLimit	x:@repeat:1.2.3.4,:100000
 ForwardedElementLimit	x:@repeat:1.2.3.4,:33
-ok	p:PROXY TCP4 1.2.3.4 5.6.7.8 1 2\r\n
+ok	p:PROXY TCP4 1.2.3.4 5.6.7.8 1 2\r\n	32
 V1BareLf	p:PROXY TCP4 1.2.3.4 5.6.7.8 1 2\n
 V1LineTooLong	p:PROXY TCP4 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
-ok	p:PROXY UNKNOWN\r\n
+ok	p:PROXY UNKNOWN\r\n	15
 V2BadVersion	p:\r\n\r\n\0\r\nQUIT\n\x11\x11\0\x0c\0\0\0\0\0\0\0\0\0\0\0\0
 partial	p:\r\n\r\n\0\r\nQUIT\n!!\0$\0\0\0\0\0\0\0\0\0\0\0\0
 partial	p:\r\n\r\n\0\r\nQUIT\n!\x11\xff\xff\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0

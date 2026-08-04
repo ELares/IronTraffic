@@ -42,9 +42,19 @@ PseudoHeaderDuplicate	:method=GET|:scheme=https|:path=/|:path=/x
 PseudoHeaderUnknown	:method=GET|:scheme=https|:path=/|:authority=a|:protocol=websocket
 ok	:method=OPTIONS|:scheme=https|:path=*|:authority=a
 TargetFormInvalid	:method=GET|:scheme=https|:path=*|:authority=a
+# HTTP/2 streaming-upload entry (request-framing-resolution (#27) step 8): no
+# content-length and no transfer-encoding resolves to RequestFraming::Streamed
+# (declared None), so `finish` with zero received octets is `ok`. The `mplex`
+# test additionally asserts the resolved framing is Streamed and not Empty,
+# because both answer `ok` here and only Streamed matches every real upload.
 ok	:method=POST|:scheme=https|:path=/|:authority=a	finish	ok
 ok	:method=GET|:scheme=https|:path=/|:authority=a	trailer::method=GET	PseudoHeaderInTrailer
 ok	:method=GET|:scheme=https|:path=/|:authority=a	trailer:host=evil	TrailerFieldForbidden
+# Edge case 12: a legitimately accepted trailer field. The `mplex` test
+# asserts the finished MplexTrailerBuilder section contains this field and
+# that request.headers (finished earlier, from the head builder alone)
+# does not, so the trailer section stays a separate value.
+ok	:method=GET|:scheme=https|:path=/|:authority=a	trailer:x-trace=1	ok
 AuthorityMismatch	:method=GET|:scheme=https|:path=/|:authority=good.com|host=evil.com
 AuthorityMismatch	:method=GET|:scheme=https|:path=/|:authority=a|host=a:80
 ok	:method=GET|:scheme=https|:path=/|:authority=a|host=a:443
