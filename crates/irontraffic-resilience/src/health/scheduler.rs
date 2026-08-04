@@ -152,6 +152,12 @@ pub struct HealthScheduler {
     max_concurrent: u32,
     inflight_count: u32,
     defer_ms: u32,
+    /// Next deadline `poll_due`'s concurrency-cap branch will hand out to a
+    /// deferred endpoint. A single scalar, not per-endpoint state: it is what
+    /// keeps a whole overloaded backlog from collapsing onto one shared
+    /// instant. See `poll_due`'s concurrency-cap branch for how it advances
+    /// and resyncs.
+    defer_cursor: Millis,
     instance_id: u64,
     has_traffic: bool,
     /// Reused between `poll_due` calls so the hot loop allocates nothing.
@@ -395,6 +401,7 @@ impl HealthScheduler {
             max_concurrent,
             inflight_count: 0,
             defer_ms: 5,
+            defer_cursor: now,
             instance_id,
             has_traffic,
             due_scratch: Vec::with_capacity(len),
@@ -464,7 +471,20 @@ impl HealthScheduler {
             }
 
             if self.inflight_count >= self.max_concurrent {
-                let at = now.add_ms(self.defer_ms);
+                // A monotonically increasing cursor, not the fixed `now +
+                // defer_ms` every concurrency-cap-deferred endpoint used to
+                // share: giving the whole backlog one instant collapses it
+                // onto a single wheel slot, which then reports as due
+                // together on the very next tick and repeats forever (issue
+                // #862). Resync when the cursor has fallen behind `now`
+                // (idle gap, or the very first deferral ever), then hand out
+                // strictly increasing millisecond deadlines so the backlog
+                // drains in close to arrival order and can never re-collapse.
+                if self.defer_cursor.is_at_or_before(now) {
+                    self.defer_cursor = now.add_ms(self.defer_ms);
+                }
+                let at = self.defer_cursor;
+                self.defer_cursor = self.defer_cursor.add_ms(1);
                 let _ = self.wheel.schedule(id, at); // it-allow: no-swallowed-error reason: see the identical justification above: `id` is a wheel-native id that just fired, so rescheduling it cannot fail.
                 self.stats.checks_deferred = self.stats.checks_deferred.saturating_add(1);
                 deferred = deferred.saturating_add(1);
@@ -3037,5 +3057,246 @@ mod tests {
             );
         }
         assert!(max_inflight <= 64);
+    }
+
+    /// Reproduces, at a scale the normal test suite can run quickly, the
+    /// central defect measured for issue #862: with a fully unresponsive
+    /// upstream and a backlog well past `max_concurrent`, the unfixed
+    /// concurrency-cap branch collapses the whole backlog onto one shared
+    /// deadline every cycle and burns work proportional to the backlog size
+    /// on every single poll, instead of the `O(1) + O(dispatched)` average
+    /// the module's own design commits to.
+    ///
+    /// The window and deferred-sum bound are NOT the issue's own illustrative
+    /// numbers (60 simulated seconds, "for example less than `20 * 200 =
+    /// 4000`"). Measured directly against this exact scenario, both on this
+    /// clone: with the fix, coverage does not reach 200/200 until roughly
+    /// `t = 100_000` ms (not within 60s), and the deferred sum at `t =
+    /// 60_000` ms alone is already 60,129 (not under 4000). Both follow from
+    /// `HealthCheckConfig::default`'s steady interval (2000ms) combined with
+    /// a check that occupies its concurrency slot for the FULL `timeout_ms`
+    /// (1000ms, per the issue's own reproduction methodology: "every
+    /// dispatched check reports `Fail(Timeout)` exactly `timeout_ms` after
+    /// dispatch"): 200 endpoints against `max_concurrent = 8` is a
+    /// PERSISTENTLY overloaded system (steady arrival around 100/sec against
+    /// a service rate of 8/sec), not a one-time startup transient that drains
+    /// to near zero, so the deferred sum grows for as long as the run does
+    /// rather than converging. This matches the issue's own larger-scale
+    /// numbers in kind, not just in direction: 601,892 deferred over 600s at
+    /// 2000 endpoints / `max_concurrent` 32 is also roughly 1,000/sec
+    /// sustained, and that same rate extrapolated to a 60s window at this
+    /// smaller scale predicts almost exactly the 60,129 measured here. This
+    /// test therefore uses the issue's own explicitly offered fallback
+    /// ("assert coverage by, generously, 125 simulated seconds if the test
+    /// window is extended") and a deferred-sum bound picked from what was
+    /// ACTUALLY measured on both sides of the fix for this exact scenario:
+    /// unfixed code (this same clone, `poll_due`'s concurrency-cap branch
+    /// reverted to `now.add_ms(self.defer_ms)`) produces 4,506,969 deferred
+    /// operations over the same 125s window; fixed code produces 125,123.
+    /// `1_000_000` sits with a wide margin on both sides (about 4.5x below
+    /// the unfixed number and about 8x above the fixed one), so it still
+    /// rules out the O(backlog)-per-poll storm without asserting a bound the
+    /// working system, under this exact persistent-overload scenario,
+    /// cannot actually meet.
+    #[test]
+    fn deferral_does_not_storm_under_overload() {
+        let cfg = HealthCheckConfig::default();
+        let t0 = Millis(0);
+        let ids: Vec<u64> = (0..200).collect();
+        let mut sched = HealthScheduler::new(t0, 1, &ids, cfg, 8, true).expect("valid");
+        let mut rng = Rng::from_seed(862);
+        let health = ClusterHealth::new(200, 0);
+        let mut out = Vec::new();
+        let mut seen: HashSet<u64> = HashSet::new();
+        let mut pending: Vec<(Millis, CheckReport)> = Vec::new();
+        let mut total_deferred: u64 = 0;
+
+        for step in 1..=125_000u32 {
+            let now = t0.add_ms(step);
+
+            // The fully unresponsive upstream: every dispatched check
+            // reports `Fail(Timeout)` exactly `timeout_ms` after dispatch,
+            // which is precisely `order.deadline`.
+            let mut still_pending = Vec::new();
+            for (fire_at, report) in pending.drain(..) {
+                if fire_at.is_at_or_before(now) {
+                    sched.record(now, report, &mut rng, &health);
+                } else {
+                    still_pending.push((fire_at, report));
+                }
+            }
+            pending = still_pending;
+
+            out.clear();
+            let stats = sched.poll_due(now, &mut rng, &mut out);
+            total_deferred += u64::from(stats.deferred);
+            for order in out.drain(..) {
+                seen.insert(order.endpoint_id);
+                pending.push((
+                    order.deadline,
+                    CheckReport {
+                        endpoint: order.endpoint,
+                        endpoint_id: order.endpoint_id,
+                        outcome: CheckOutcome::Fail(FailKind::Timeout),
+                        reconnected: false,
+                    },
+                ));
+            }
+        }
+
+        assert_eq!(
+            seen.len(),
+            200,
+            "every endpoint must be dispatched at least once within the 125s window"
+        );
+        assert!(
+            total_deferred < 1_000_000,
+            "deferred sum {total_deferred} over 125s is not within a controlled multiple of \
+             the endpoint count: unfixed code produces 4,506,969 over an identical scenario \
+             (measured on this same clone), so this bound still rules out the \
+             O(backlog)-per-poll storm with a wide margin on both sides"
+        );
+    }
+
+    /// Edge case 2: a long idle gap where nothing is ever deferred, followed
+    /// by a new bout of overload, must resync `defer_cursor` to the NEW
+    /// `now` rather than continuing to hand out deadlines anchored to
+    /// whatever `now` was in effect the last time anything was deferred.
+    ///
+    /// Uses `all_due_cfg()` with `max_checks_per_endpoint_per_sec` raised
+    /// only enough (1, from its default 1000) to floor every interval at
+    /// 1000 ms instead of 1 ms: comfortably above `defer_ms` (5), so a
+    /// just-reported endpoint's own next check cannot race a near-term
+    /// deferred backlog the way `all_due_cfg()`'s bare 1 ms floor would (see
+    /// `deferred_backlog_is_fair_under_single_concurrency`, which hits
+    /// exactly that unrelated interaction and is why this test avoids it).
+    #[test]
+    fn defer_cursor_resyncs_after_idle_gap() {
+        let mut cfg = all_due_cfg();
+        cfg.max_checks_per_endpoint_per_sec = 1;
+        let t0 = Millis(0);
+        let ids: Vec<u64> = (0..4).collect();
+        let mut sched = HealthScheduler::new(t0, 1, &ids, cfg, 1, true).expect("valid");
+        let mut rng = Rng::from_seed(862);
+        let health = ClusterHealth::new(4, 0);
+        let mut out = Vec::new();
+
+        // Every endpoint's phase falls inside [0, 1000); push them all due
+        // at once and force the other three through the concurrency-cap
+        // deferral path with `max_concurrent = 1`. This is the last poll
+        // that touches `defer_cursor` until the post-gap poll below.
+        let mut now = t0.add_ms(1_500);
+        let stats1 = sched.poll_due(now, &mut rng, &mut out);
+        assert_eq!(
+            stats1.dispatched, 1,
+            "exactly one endpoint fits the concurrency cap"
+        );
+        assert_eq!(
+            stats1.deferred, 3,
+            "the other three must be deferred, not dropped"
+        );
+
+        // Report every outstanding check and keep polling forward one
+        // millisecond at a time until a poll produces neither a dispatch nor
+        // a deferral with nothing in flight: the genuinely idle state edge
+        // case 2 requires before the gap. The three endpoints deferred above
+        // are not yet due (their cursor deadlines are a few ms ahead) and
+        // the just-reported endpoint's own next check is ~1000 ms out, so
+        // this reaches quiescence almost immediately; the loop bound is
+        // generous headroom, not an expectation of many iterations.
+        let mut pending_orders: Vec<CheckOrder> = std::mem::take(&mut out);
+        let mut quiescent = false;
+        for _ in 0..2_100u32 {
+            for order in pending_orders.drain(..) {
+                let report = CheckReport {
+                    endpoint: order.endpoint,
+                    endpoint_id: order.endpoint_id,
+                    outcome: CheckOutcome::Pass,
+                    reconnected: false,
+                };
+                sched.record(now, report, &mut rng, &health);
+            }
+            now = now.add_ms(1);
+            out.clear();
+            let stats = sched.poll_due(now, &mut rng, &mut out);
+            pending_orders = std::mem::take(&mut out);
+            if stats.dispatched == 0 && stats.deferred == 0 && sched.inflight() == 0 {
+                quiescent = true;
+                break;
+            }
+        }
+        assert!(
+            quiescent,
+            "the scheduler must reach a genuinely idle poll (nothing dispatched, nothing \
+             deferred, nothing in flight) before the gap"
+        );
+
+        // A long idle gap: 10 simulated minutes with `defer_cursor` never
+        // touched, since nothing becomes due or deferred during it.
+        now = now.add_ms(10 * 60 * 1000);
+        out.clear();
+        let post_gap_stats = sched.poll_due(now, &mut rng, &mut out);
+
+        // Every endpoint's own schedule (the just-reported one's ~1000 ms
+        // reschedule, and the three original deferred deadlines a handful
+        // of ms past `now1`) is now far in the past relative to `now`, so
+        // all four come due together: with `max_concurrent = 1`, one
+        // dispatches and three are deferred fresh, right after the gap.
+        assert_eq!(post_gap_stats.dispatched, 1);
+        assert_eq!(post_gap_stats.deferred, 3);
+
+        // Every one of the four endpoints' wheel deadlines, dispatched or
+        // deferred, must land close to the NEW `now`: `TimerWheel::schedule`
+        // collapses ANY deadline at or before its current time to `now + 1`
+        // on its own (see its doc comment), which alone would make a merely
+        // "close to now" check pass even for a cursor that was left
+        // completely untouched through the gap, so it is not by itself
+        // proof the cursor resynced. `defer_ms` is 5 by default; the
+        // dispatched endpoint's own watchdog lands at `now + timeout_ms(1) +
+        // defer_ms(5) = now + 6`, so every deadline must land within
+        // `defer_ms` plus the endpoint count (4) of `now`.
+        let dispatched_id = out.first().map(|o| o.endpoint_id);
+        let mut deferred_deadlines: Vec<Millis> = Vec::new();
+        for (i, &id) in ids.iter().enumerate() {
+            let i_u32 = u32::try_from(i).unwrap_or(u32::MAX);
+            let deadline = sched
+                .wheel
+                .deadline_of(i_u32)
+                .expect("every endpoint must always be scheduled in the wheel");
+            let delta = deadline.since(now);
+            assert!(
+                delta <= 5 + 4,
+                "endpoint {i} deadline is {delta} ms after the post-gap `now`, more than \
+                 defer_ms (5) plus the endpoint count (4): it looks anchored to the stale \
+                 pre-gap cursor instead of resyncing to the new `now`"
+            );
+            if Some(id) != dispatched_id {
+                deferred_deadlines.push(deadline);
+            }
+        }
+
+        // The property a "close to now" check alone cannot catch: a cursor
+        // left stale through the gap (never resynced) still produces
+        // deadlines close to `now`, because `TimerWheel::schedule`'s own
+        // past-deadline clamp independently collapses each of the three
+        // stale, pre-gap cursor values to `now + 1`, reproducing the exact
+        // shared-deadline storm this whole issue is about through a
+        // different door. Verified directly against a scheduler with the
+        // resync check (`is_at_or_before`) removed but the cursor's
+        // increment kept: run against this exact scenario, it deferred all
+        // three to the SAME instant (601505 for every one of them), not
+        // three distinct ones. A correctly resyncing cursor cannot produce
+        // that: three endpoints deferred in the same `poll_due` call always
+        // get three distinct, strictly increasing cursor values.
+        deferred_deadlines.sort_unstable_by_key(|m| m.0);
+        deferred_deadlines.dedup();
+        assert_eq!(
+            deferred_deadlines.len(),
+            3,
+            "the three newly deferred endpoints must receive three DISTINCT deadlines; fewer \
+             than three means at least two collapsed onto the same instant, which is the \
+             pre-#862 storm reproduced through a stale, unresynced cursor"
+        );
+        sched.debug_assert_consistent();
     }
 }
