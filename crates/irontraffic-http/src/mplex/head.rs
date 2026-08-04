@@ -556,6 +556,80 @@ impl MplexHeadBuilder {
     }
 }
 
+/// The guarded `charged()` bound: true up to and including the push whose
+/// OWN charge first crosses `limit`, not for any push after that.
+///
+/// `HeaderListBudget::charge` keeps adding to `used` on every later call
+/// once `count` is still within `max_field_count`, so `used` is not capped
+/// at `limit + one entry`, it is only bounded up to the crossing charge.
+/// Returns `None` when the guard does not apply: `charged_before` was
+/// already past `limit` going into this push, so this push's own bound is
+/// not checked (the OTHER invariant, [`push_poisons_budget`], is what
+/// proves nothing further gets stored past that point).
+///
+/// Shared by this crate's own
+/// `header_list_budget_used_keeps_growing_past_the_first_crossing`
+/// regression test and `fuzz_targets/fuzz_mplex_head.rs`'s per-push
+/// assertion, on purpose: the two check the SAME arithmetic fact about
+/// `HeaderListBudget::charge`, and one authoritative copy is what stops the
+/// two from silently drifting out of sync with each other or with `charge`'s
+/// own step order.
+#[must_use]
+pub fn guarded_charged_bound(
+    charged_before: u64,
+    limit: u64,
+    name_len: usize,
+    value_len: usize,
+) -> Option<u64> {
+    if charged_before > limit {
+        return None;
+    }
+    let entry = u64::try_from(name_len)
+        .unwrap_or(u64::MAX)
+        .saturating_add(u64::try_from(value_len).unwrap_or(u64::MAX))
+        .saturating_add(32);
+    Some(limit.saturating_add(entry))
+}
+
+/// Whether a `push` result poisons the header-list budget for every LATER
+/// push in the same sequence.
+///
+/// Terminal: `HeaderListTooLarge` (`HeaderListBudget::charge`'s `used` is
+/// monotonically non-decreasing, so once `used > limit` it stays `> limit`
+/// forever), and a `FieldCountExceeded` that the budget's OWN field-count
+/// ceiling raised (`charge`'s step 1, the count check, which returns before
+/// `used` is touched -- so `charged_after == charged_before` for THIS push).
+///
+/// NOT terminal: a `FieldCountExceeded` from [`CookieAccumulator`]'s own,
+/// independent `MAX_COOKIE_CRUMBS` (256) ceiling. That ceiling is reached
+/// only for a `cookie` push whose OWN charge against the header-list budget
+/// already succeeded (`push`'s step 1 runs `self.budget.charge` first,
+/// unconditionally, before the accumulator is ever consulted at step 4f), so
+/// `charged_after > charged_before` on THIS push. The budget's own `used`
+/// and `count` are untouched by the accumulator's refusal, so a later,
+/// non-cookie push can still be charged and stored -- see
+/// `cookie_crumb_flood_is_bounded`'s bound 3, which constructs exactly that
+/// push sequence, and
+/// `field_count_exceeded_from_cookie_accumulator_does_not_poison_the_budget`
+/// below, which pushes one step past it.
+///
+/// Shared with `fuzz_targets/fuzz_mplex_head.rs` for the same reason
+/// [`guarded_charged_bound`] above is: one authoritative copy of the
+/// distinction, not two independently written copies that can silently
+/// disagree.
+#[must_use]
+pub fn push_poisons_budget(
+    result: &Result<(), RejectReason>,
+    charged_before: u64,
+    charged_after: u64,
+) -> bool {
+    match result {
+        Err(RejectReason::HeaderListTooLarge) => true,
+        Err(RejectReason::FieldCountExceeded) => charged_after == charged_before,
+        _ => false,
+    }
+}
+
 /// Accumulates a decoded HTTP/2 or HTTP/3 TRAILER block. Separate from
 /// `MplexHeadBuilder` because a trailer section is a separate header block that
 /// arrives after the head was dispatched, and because its fields must never reach
@@ -755,6 +829,7 @@ impl MplexResponseBuilder {
 mod tests {
     use super::{
         MplexContext, MplexHeadBuilder, MplexResponseBuilder, MplexTrailerBuilder, RejectReason,
+        guarded_charged_bound, push_poisons_budget,
     };
     use crate::canonical::CanonicalRequest;
     use crate::field::UnderscorePolicy;
@@ -1717,6 +1792,12 @@ mod tests {
         // Reproduces the exact input that broke fuzz_mplex_head.rs's charged()
         // bound assertion: 100 pairs of (name = "x", value = 630 bytes), which
         // crosses the byte limit on push 99 and keeps accumulating past it.
+        //
+        // Calls `guarded_charged_bound` and `push_poisons_budget` rather than
+        // re-deriving the same arithmetic inline: those two functions are the
+        // ones `fuzz_targets/fuzz_mplex_head.rs` also calls, specifically so a
+        // regression in either shared function reddens THIS test (part of
+        // `cargo test`), not only a non-deterministic `cargo fuzz run`.
         let limits = Limits::DEFAULT.clamped();
         let mut arena = BytesMut::new();
         let mut builder = MplexHeadBuilder::new(&arena, &limits, WireVersion::H2);
@@ -1724,29 +1805,26 @@ mod tests {
         let value = vec![b'v'; 630];
 
         let mut budget_poisoned = false;
-        let mut last_charged_before_limit_check = 0u64;
         for i in 0..100u32 {
             let charged_before = builder.charged();
             let result = builder.push(&mut arena, name, &value);
+            let charged_after = builder.charged();
             if budget_poisoned {
                 assert!(result.is_err(), "push {i} after poisoning must fail");
             }
-            if matches!(
-                result,
-                Err(RejectReason::HeaderListTooLarge | RejectReason::FieldCountExceeded)
-            ) {
+            if push_poisons_budget(&result, charged_before, charged_after) {
                 budget_poisoned = true;
             }
-            if charged_before <= u64::from(limits.max_header_list_bytes) {
-                let bound = u64::from(limits.max_header_list_bytes)
-                    .saturating_add(name.len() as u64)
-                    .saturating_add(value.len() as u64)
-                    .saturating_add(32);
+            if let Some(bound) = guarded_charged_bound(
+                charged_before,
+                u64::from(limits.max_header_list_bytes),
+                name.len(),
+                value.len(),
+            ) {
                 assert!(
-                    builder.charged() <= bound,
+                    charged_after <= bound,
                     "guarded bound must hold at push {i}"
                 );
-                last_charged_before_limit_check = builder.charged();
             }
         }
         assert!(
@@ -1766,6 +1844,71 @@ mod tests {
              this must be strictly greater to prove the unguarded assertion was false",
             builder.charged()
         );
-        let _ = last_charged_before_limit_check;
+    }
+
+    /// Establishes the claim `docs/THREAT-MODEL.md` and
+    /// `fuzz_targets/fuzz_mplex_head.rs`'s module doc make: `FieldCountExceeded`
+    /// has two sources, and only the header-list budget's own is terminal.
+    ///
+    /// Pushes `CookieAccumulator`'s `MAX_COOKIE_CRUMBS` (256) crumbs (accepted),
+    /// a 257th (refused by the accumulator's own ceiling, NOT the budget), then
+    /// one more, unrelated field. Ran against the poisoning logic as it shipped
+    /// in this PR before this fix (treating every `FieldCountExceeded` as
+    /// terminal, i.e. `matches!(result, Err(HeaderListTooLarge |
+    /// FieldCountExceeded))`): the crumb-257 refusal set `budget_poisoned =
+    /// true`, so the assertion on the final push panicked with "push after
+    /// poisoning must fail" against an `Ok(())` result. `push_poisons_budget`
+    /// below is what tells the two sources apart.
+    #[test]
+    fn field_count_exceeded_from_cookie_accumulator_does_not_poison_the_budget() {
+        // Same limits as `cookie_crumb_flood_is_bounded`'s bound 3: a field
+        // count wide enough, and a byte budget large enough, that the
+        // accumulator's own 256-crumb ceiling fires before the budget's.
+        let limits = Limits {
+            max_field_count: 10_000,
+            max_header_list_bytes: Limits::CEILING.max_header_list_bytes,
+            ..Limits::DEFAULT
+        }
+        .clamped();
+        let mut arena = BytesMut::new();
+        let mut builder = MplexHeadBuilder::new(&arena, &limits, WireVersion::H2);
+        builder.push(&mut arena, b":method", b"GET").unwrap();
+        builder.push(&mut arena, b":scheme", b"https").unwrap();
+        builder.push(&mut arena, b":authority", b"a").unwrap();
+        builder.push(&mut arena, b":path", b"/").unwrap();
+
+        for n in 0..256u32 {
+            builder
+                .push(&mut arena, b"cookie", b"1")
+                .unwrap_or_else(|e| panic!("crumb {n} of 256 must be accepted: {e:?}"));
+        }
+
+        let charged_before = builder.charged();
+        let crumb_257 = builder.push(&mut arena, b"cookie", b"1");
+        let charged_after = builder.charged();
+        assert_eq!(
+            crumb_257,
+            Err(RejectReason::FieldCountExceeded),
+            "the 257th crumb must be refused by CookieAccumulator's own ceiling"
+        );
+        assert!(
+            !push_poisons_budget(&crumb_257, charged_before, charged_after),
+            "a FieldCountExceeded from CookieAccumulator's own ceiling must not poison the budget"
+        );
+
+        // The direct, load-bearing proof: an unrelated push right after is
+        // still accepted and charged. This is the exact claim
+        // docs/THREAT-MODEL.md's "whole block's work is bounded by the
+        // budget" paragraph and this fuzz target's module doc make.
+        let charged_before_after_push = builder.charged();
+        let after = builder.push(&mut arena, b"x-after", b"still-accepted");
+        assert!(
+            after.is_ok(),
+            "a push after a cookie-only FieldCountExceeded must still succeed, got {after:?}"
+        );
+        assert!(
+            builder.charged() > charged_before_after_push,
+            "the accepted push must be charged"
+        );
     }
 }
