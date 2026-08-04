@@ -509,6 +509,71 @@ in this file re-scans the whole accumulated block per pair. A fuzz target
 crosses the limit is itself recorded before being refused) and that the first refusal is terminal for
 the rest of the sequence.
 
+## 6. Evidence
+
+Every attack named in the sections above, and every attack this milestone's own reference
+material (Envoy CVE-2026-48743, HAProxy CVE-2026-33555, Envoy CVE-2026-47774, Traefik
+CVE-2026-54763, HAProxy CVE-2023-25725) names, gets one row here: either a corpus file plus the
+exact `RejectReason`, `ProxyError`, or `partial` outcome that proves it, or the reason no corpus
+entry can reach it yet. `desync-corpus-and-reject-table` (#47)'s `threat_model_is_covered` test
+parses this table and asserts every outcome name cited here really appears, under the cited file,
+in `corpus/*.txt`, so this table cannot silently rot out of sync with the corpus it describes. Do
+not add a row without either a citation or a stated reason: that is what keeps this table honest
+rather than aspirational.
+
+| Attack | Corpus citation | Reason |
+| --- | --- | --- |
+| Framing disagreement: `Transfer-Encoding` present with `Content-Length` present (RFC 9112 6.3 item 4) | `h1-heads.txt`: `TransferEncodingWithContentLength` | |
+| Framing disagreement: duplicate `Content-Length` | `h1-heads.txt`: `ContentLengthDuplicate` | |
+| Framing disagreement: TE.TE obfuscation (repeated `chunked`) | `h1-heads.txt`: `TransferEncodingChunkedRepeated` | |
+| Framing disagreement: non-`chunked` final transfer coding | `h1-heads.txt`: `TransferEncodingFinalNotChunked` | |
+| Framing disagreement: malformed transfer-coding token (a control byte inside it) | `h1-heads.txt`: `TransferEncodingUnsupportedCoding` | |
+| H2.TE: `Transfer-Encoding` on a multiplexed protocol | `mplex.txt`: `ConnectionSpecificField` | |
+| `Content-Length` syntax ambiguity (a list, a sign, a hex prefix) | `h1-heads.txt`: `ContentLengthInvalid` | |
+| `Content-Length` integer overflow | `h1-heads.txt`: `ContentLengthOverflow` | |
+| Headers-only request with a declared body reaching the router (Envoy CVE-2026-48743) | `mplex.txt`: `ContentLengthMismatch` | |
+| Standalone zero-payload end-of-stream signal (HAProxy CVE-2026-33555) | `mplex.txt`: `ContentLengthMismatch` | |
+| Empty field name (HAProxy CVE-2023-25725) | `h1-heads.txt`: `FieldNameEmpty` | |
+| Obsolete line folding | `h1-heads.txt`: `ObsFold` | |
+| Bare CR / bare LF line terminators | `h1-heads.txt`: `BareLf` | |
+| Whitespace between a field name and its colon | `h1-heads.txt`: `WhitespaceBeforeColon` | |
+| Underscore identity-header variant (Traefik CVE-2026-54763) | `h1-heads.txt`: `FieldNameUnderscore` | |
+| Uppercase field name on a multiplexed protocol | `mplex.txt`: `FieldNameUppercase` | |
+| CRLF / whitespace injection in a multiplexed field value | `mplex.txt`: `FieldValueLeadingWhitespace` | |
+| Obfuscated `Expect` (a `Connection` field hiding a bogus `Expect` value from the strip) | | `ExpectUnsupported` has no corpus entry: it needs an `Expect` field, which belongs to the response path, per the reject-table coverage test's own exclusion reason. The ordering property that makes the obfuscation possible at all (`check_expect` must run before `strip_ingress`) is pinned directly by `h1::canonicalize::tests::expect_ordering_is_load_bearing`, not by this corpus. |
+| Absolute-form target naming a non-HTTP scheme, or naming one on a reverse-proxy listener | `h1-heads.txt`: `TargetFormInvalid` | |
+| Encoded traversal: a percent-encoded dot segment | `paths.txt`: `PathEncodedDot` | |
+| Encoded traversal: a percent-encoded path separator | `paths.txt`: `PathEncodedSlash` | |
+| Literal traversal above the root | `paths.txt`: `PathTraversalAboveRoot` | |
+| Encoded NUL truncation | `paths.txt`: `PathEncodedNul` | |
+| Fragment smuggled into the request target | `paths.txt`: `TargetFragment` | |
+| `Host` / `:authority` virtual-host confusion | `mplex.txt`: `AuthorityMismatch` | |
+| Non-ASCII authority (IDNA-mapping smuggling) | `h1-heads.txt`: `AuthorityNonAscii` | |
+| Malformed or out-of-range authority port | `h1-heads.txt`: `AuthorityPortInvalid` | |
+| Present `Host` field with an empty value | `h1-heads.txt`: `AuthorityEmpty` | |
+| Pseudo-header ordering violation (a regular field before a pseudo-header) | `mplex.txt`: `PseudoHeaderAfterField` | |
+| Pseudo-header duplication | `mplex.txt`: `PseudoHeaderDuplicate` | |
+| Unsupported `:protocol` pseudo-header on a non-CONNECT request | `mplex.txt`: `PseudoHeaderUnknown` | |
+| Pseudo-header smuggled into a trailer block | `mplex.txt`: `PseudoHeaderInTrailer` | |
+| Trailer deny-list bypass (`Content-Length`, `Host`, `Authorization` moved to a trailer) | `chunked.txt`: `TrailerFieldForbidden` | |
+| `TE` carrying a value other than `trailers` | `mplex.txt`: `TeValueNotTrailers` | |
+| Chunk-extension obfuscation (an unterminated quoted string) | `chunked.txt`: `ChunkExtInvalid` | |
+| Chunk-size integer overflow | `chunked.txt`: `ChunkSizeOverflow` | |
+| Chunk terminator desync (a bare CR inside chunked framing) | `chunked.txt`: `ChunkTerminatorInvalid` | |
+| Trailing garbage after the terminal chunk | | `TrailingGarbage` has no corpus entry: the `0\r\n\r\nGARBAGE` row in `chunked.txt` is `ok` with `consumed: 5`, because the decoder reports where the message ended rather than refusing, per the reject-table coverage test's own exclusion reason. |
+| Cookie-crumb amplification (Envoy CVE-2026-47774) | | needs a real HPACK or QPACK decoder to replay a compressed cookie-crumb bomb; `mplex.txt` stores pushed, already-decoded pairs rather than compressed bytes. `mplex-pseudo-header-validation` (#38)'s own charge-before-store unit tests and `fuzz_mplex_head` own this property directly. |
+| Forwarding-chain duplicate parameter | `forwarded.txt`: `ForwardedDuplicateParam` | |
+| Forwarding-chain element-count amplification | `forwarded.txt`: `ForwardedElementLimit` | |
+| Forwarding-chain byte amplification | `forwarded.txt`: `ForwardedBytesLimit` | |
+| `X-Forwarded-For` claim from an untrusted peer | | depends on a `TrustPolicy`, and `ForwardedChain::parse_into`, the `x:` marker's consumer, takes none by design. Asserted by `trust-policy-and-peer-identity` (#32)'s own tests, not from this corpus. |
+| PROXY protocol: bare LF where CRLF is required | `forwarded.txt`: `V1BareLf` | |
+| PROXY protocol: an oversized v1 line | `forwarded.txt`: `V1LineTooLong` | |
+| PROXY protocol: a v2 version nibble other than 2 | `forwarded.txt`: `V2BadVersion` | |
+| PROXY protocol: a v2 declared length far exceeding the bytes actually received | `forwarded.txt`: `partial` | |
+| Raw HTTP sent to a listener configured for PROXY protocol | `forwarded.txt`: `NotAProxyHeader` | |
+| Frame-level floods (CONTINUATION, RST_STREAM, WINDOW_UPDATE, PING/SETTINGS) | | needs the HTTP/2 and HTTP/3 frame codec, which this milestone builds no part of (`mplex.txt` stores pushed decoded pairs, never frame bytes). Owned by `h3-connection-and-frame-layer` (#199); their pricing is unit-tested directly by `conn-budget-token-bucket` (#40) and `stream-slot-inflight-work` (#41). |
+| WebSocket frame attacks | | no WebSocket type exists in this milestone. Owned by `ws-crate-and-frame-codec` (#202) and `ws-h1-upgrade-validation` (#203). |
+
 ## Listening sockets and socket options
 
 **What the listening socket exposes.** A TCP port reachable by anyone who can route to the bound

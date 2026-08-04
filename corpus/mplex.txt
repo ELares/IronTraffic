@@ -1,0 +1,51 @@
+# corpus/mplex.txt: the HTTP/2 and HTTP/3 pushed-pair corpus.
+#
+# One entry per line:
+#   <outcome><TAB><pairs>[<TAB><post-op><TAB><post-op-outcome>]
+#
+# <outcome> is `ok` or the exact `RejectReason` variant name in PascalCase,
+# and is the HEAD-LEVEL result: pushing every pair into a fresh
+# `MplexHeadBuilder` (H2) and calling `finish`. <pairs> is `|`-separated
+# `name=value` pairs (escaped the same way as every other file: `\r`, `\n`,
+# `\t`, `\0`, `\\`, `\xHH`; a literal `|` or `=` that must survive as data
+# rather than as a separator is written `\x7c` or `\x3d`).
+#
+# <post-op>, when present, names an operation to run AFTER a successful
+# `finish`, and <post-op-outcome> (always present alongside <post-op>) is
+# that operation's own expected result, `ok` or a `RejectReason` name.
+# Exactly two operations exist:
+#   - `finish`: calls `BodyAccounting::new(request.framing).finish()` with
+#     no observed body octets, reproducing a headers-only or zero-payload
+#     end-of-stream signal (Envoy CVE-2026-48743, HAProxy CVE-2026-33555).
+#   - `trailer:<name>=<value>`: pushes exactly one pair into a fresh
+#     `MplexTrailerBuilder`, never into the head builder.
+# A row with a post-op always has `ok` as its head-level <outcome>: the
+# post-op only runs once the head itself finished cleanly.
+#
+# A line starting with `#` is a comment; an empty line is skipped.
+#
+# Driven by crates/irontraffic-http/tests/corpus.rs's `mplex` test, under a
+# fixed MplexContext (default limits, default path policy,
+# OtherCodings::Reject, UnderscorePolicy::Reject, Scheme::Https, a fixed
+# socket peer, TrustPolicy::None, will_buffer_body: false).
+ok	:method=GET|:scheme=https|:path=/|:authority=a|content-length=100	finish	ContentLengthMismatch
+ConnectionSpecificField	:method=GET|:scheme=https|:path=/|transfer-encoding=chunked
+ConnectionSpecificField	:method=GET|:scheme=https|:path=/|connection=keep-alive
+TeValueNotTrailers	:method=GET|:scheme=https|:path=/|te=gzip
+ok	:method=GET|:scheme=https|:path=/|:authority=a|te=trailers
+FieldNameUppercase	:method=GET|:scheme=https|:path=/|Host=a
+FieldNameInvalidByte	:method=GET|:scheme=https|:path=/|x:y=1
+FieldValueLeadingWhitespace	:method=GET|:scheme=https|:path=/|x= v
+PseudoHeaderMissing	:method=GET|:scheme=https
+PseudoHeaderAfterField	:method=GET|:scheme=https|host=a|:path=/
+PseudoHeaderDuplicate	:method=GET|:scheme=https|:path=/|:path=/x
+PseudoHeaderUnknown	:method=GET|:scheme=https|:path=/|:authority=a|:protocol=websocket
+ok	:method=OPTIONS|:scheme=https|:path=*|:authority=a
+TargetFormInvalid	:method=GET|:scheme=https|:path=*|:authority=a
+ok	:method=POST|:scheme=https|:path=/|:authority=a	finish	ok
+ok	:method=GET|:scheme=https|:path=/|:authority=a	trailer::method=GET	PseudoHeaderInTrailer
+ok	:method=GET|:scheme=https|:path=/|:authority=a	trailer:host=evil	TrailerFieldForbidden
+AuthorityMismatch	:method=GET|:scheme=https|:path=/|:authority=good.com|host=evil.com
+AuthorityMismatch	:method=GET|:scheme=https|:path=/|:authority=a|host=a:80
+ok	:method=GET|:scheme=https|:path=/|:authority=a|host=a:443
+ok	:method=GET|:scheme=https|:path=/|:authority=a|host=A
