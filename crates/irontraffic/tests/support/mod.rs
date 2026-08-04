@@ -291,14 +291,19 @@ pub(crate) fn wait_for_exit(child: &mut Child, timeout: Duration) -> ExitStatus 
 /// while waiting.
 ///
 /// Reads stderr on its own thread, concurrently with the wait, for the same reason
-/// `ProxyProcess::shutdown_capturing_stderr` does: the read blocks until the pipe
-/// closes, normally at process exit, so running it concurrently with the bounded
-/// wait means a child that never exits cannot block this function forever, and a
-/// child whose stderr output fills the pipe buffer before it exits cannot deadlock
-/// against a caller that only starts reading after the wait returns.
+/// [`StderrTap`]'s reader thread does (see that struct's own doc comment): the read
+/// blocks until the pipe closes, normally at process exit, so running it concurrently
+/// with the bounded wait means a child that never exits cannot block this function
+/// forever, and a child whose stderr output fills the pipe buffer before it exits
+/// cannot deadlock against a caller that only starts reading after the wait returns.
+/// This function does not itself build a `StderrTap`: it operates on a bare `Child`
+/// from [`spawn_binary`], which (unlike a `ProxyProcess`) is never first handed to a
+/// readiness check that would need to read the same pipe before this function does.
 #[allow(
     dead_code,
-    reason = "used by the control-mode tests, which are gated on the control-plane feature"
+    reason = "used by the control-mode tests, which are gated on the control-plane feature; also \
+              by two_children_on_one_port_collide_loudly's second (expected-to-fail) child, which \
+              is not"
 )]
 pub(crate) fn wait_for_exit_capturing_stderr(
     child: &mut Child,
@@ -321,11 +326,129 @@ pub(crate) fn wait_for_exit_capturing_stderr(
     (status, stderr_text)
 }
 
-/// Polls a TCP connect to `addr` until it succeeds or `timeout` passes.
-fn wait_for_connect(addr: SocketAddr, timeout: Duration) -> bool {
+/// Continuously drains a byte stream into a shared, growable buffer, so more than one
+/// piece of code can inspect what has arrived so far without racing each other for the
+/// single read of a pipe.
+///
+/// [`wait_for_connect`] polls a live snapshot of a spawned child's stderr while the
+/// child is still starting, looking for the `"listener bound"` line only a child that
+/// actually bound its listener can have produced; [`ProxyProcess::shutdown_capturing_
+/// stderr`] later reads the SAME accumulated bytes, complete by then, once the child
+/// has exited. Generic over [`std::io::Read`] rather than tied to
+/// `std::process::ChildStderr`: `wait_for_connect_rejects_a_foreign_listener` (in
+/// `smoke.rs`) constructs one over a plain in-memory byte source to stand in for a
+/// listener that produced no such line, without spawning a real child process to prove
+/// it.
+///
+/// The reader thread's own lifetime needs no timeout of its own: it returns the moment
+/// a read reports EOF (`Ok(0)`) or an error, which for a real child's pipe happens
+/// exactly once, when the child exits or closes its stderr.
+pub(crate) struct StderrTap {
+    /// Everything read so far.
+    buf: Arc<Mutex<Vec<u8>>>,
+    /// The thread doing the reading. Not joined by [`Self::snapshot`], only by
+    /// [`Self::finish`].
+    reader: std::thread::JoinHandle<()>,
+}
+
+impl StderrTap {
+    /// Spawns the draining thread over `pipe`.
+    pub(crate) fn spawn<R: std::io::Read + Send + 'static>(mut pipe: R) -> Self {
+        let buf = Arc::new(Mutex::new(Vec::new()));
+        let buf_for_reader = Arc::clone(&buf);
+        let reader = std::thread::spawn(move || {
+            let mut chunk = [0_u8; 4096];
+            loop {
+                match pipe.read(&mut chunk) {
+                    Ok(0) | Err(_) => return,
+                    Ok(n) => match chunk.get(..n) {
+                        Some(slice) => buf_for_reader
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .extend_from_slice(slice),
+                        // `Read::read` never reports more bytes filled than the buffer
+                        // it was given, so this is unreachable in practice; treat it
+                        // as an anomalous read and stop rather than index out of
+                        // bounds, mirroring Origin::start's identical handling of the
+                        // same situation.
+                        None => return,
+                    },
+                }
+            }
+        });
+        StderrTap { buf, reader }
+    }
+
+    /// Everything read so far, lossily decoded: a snapshot taken mid-write could in
+    /// principle land on a split multi-byte UTF-8 sequence, and `tracing_subscriber`'s
+    /// output is always UTF-8 in practice, so degrading that one boundary byte to
+    /// U+FFFD is preferable to panicking or discarding the rest of the buffer.
+    pub(crate) fn snapshot(&self) -> String {
+        String::from_utf8_lossy(
+            &self
+                .buf
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .into_owned()
+    }
+
+    /// Waits for the source to close (EOF) and returns everything read, consuming the
+    /// tap. The join is unbounded on its own, but every caller already waited for the
+    /// child's exit (which is what closes the pipe the reader thread is blocked
+    /// reading) before calling this, so in practice it returns immediately.
+    pub(crate) fn finish(self) -> String {
+        // Cloned before the join below, not read through `self.snapshot()` after it:
+        // `JoinHandle::join` takes `self.reader` by value, and Rust will not let a
+        // later call borrow `self` as a whole (which a `self.snapshot()` method call
+        // would) once one of its fields has been partially moved out, even though
+        // `snapshot` only ever touches the OTHER field, `buf`.
+        let buf = Arc::clone(&self.buf);
+        let _ = self.reader.join(); // it-allow: no-swallowed-error reason: the reader thread's own body never unwraps, expects, or panics, so a join Err (a panic) here is unreachable in practice; the buffer read below returns whatever was read regardless of how the join result reads
+        String::from_utf8_lossy(
+            &buf.lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
+        )
+        .into_owned()
+    }
+}
+
+/// Polls a TCP connect to `addr` until it succeeds AND the child whose stderr `tap`
+/// drains has itself logged binding that listener, or `timeout` passes.
+///
+/// A bare connect success is not enough on its own to prove `addr` is served by the
+/// specific child `tap` belongs to. Every caller of this function reaches `addr`
+/// through [`free_local_port`], which releases the port the instant it returns (see
+/// that function's own doc comment: 264 of 3000 sequential bind/close pairs repeated a
+/// port on a measured Linux host, the closest repeat 4 calls apart), so a concurrent
+/// test's own listener can occupy the exact same address in the window between drawing
+/// the port and this function's own child actually binding it. A plain connect-only
+/// probe would then report "ready" against that unrelated listener; issue #894
+/// measured the resulting flake directly: `ConnectionRefused` on a later, genuine
+/// connect, once the OTHER test's listener had since gone away, even though this
+/// function had already reported success for it.
+///
+/// The fix does not need to identify WHICH process owns the responding socket, only
+/// whether THIS function's own child does. `irontraffic_conn::listener::
+/// ShardedListener::bind` logs the literal line `"listener bound"` to stderr on
+/// success, and nothing else in this workspace emits that exact phrase. `tap` is built
+/// once per spawned child and never shared across children (see [`StderrTap`]'s own
+/// doc comment), so a snapshot of it containing that phrase can only mean THIS
+/// function's own child produced it. Checked as a plain substring on the raw,
+/// un-stripped snapshot: `smoke.rs`'s `strip_ansi` exists because
+/// `tracing_subscriber`'s ANSI colouring splits a `key=value` field across several
+/// escape-delimited spans, not because it splits the literal message text itself, and
+/// `shutdown_capturing_stderr`'s own established `"shutdown complete"` /
+/// `"connection cap"` checks elsewhere in this file already rely on exactly that
+/// (matching directly against raw, un-stripped stderr).
+///
+/// On a child that dies between binding and its first response, or that never binds at
+/// all, this loop simply never observes both conditions and returns `false` once
+/// `timeout` elapses: nothing here can hang past that bound.
+pub(crate) fn wait_for_connect(addr: SocketAddr, tap: &StderrTap, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if std::net::TcpStream::connect(addr).is_ok() {
+        if std::net::TcpStream::connect(addr).is_ok() && tap.snapshot().contains("listener bound") {
             return true;
         }
         std::thread::sleep(Duration::from_millis(20));
@@ -345,6 +468,20 @@ pub(crate) struct ProxyProcess {
     /// The fixture directory holding the generated configuration file, removed when
     /// this value is dropped.
     cfg_dir: PathBuf,
+    /// Everything the child has written to stderr since [`spawn_proxy_with_mode`]
+    /// spawned it, including whatever [`wait_for_connect`]'s readiness check already
+    /// read: `child.stderr` is taken exactly once, into this tap, at spawn time, so no
+    /// later reader (this struct's own `shutdown_capturing_stderr`) can take it a
+    /// second time and find it already gone. See [`StderrTap`]'s own doc comment.
+    ///
+    /// `Option`, not a bare `StderrTap`, because `ProxyProcess` implements `Drop`:
+    /// `shutdown_capturing_stderr` consumes `self` and needs to move this field's
+    /// value out to call `StderrTap::finish` (which itself consumes `self`), and Rust
+    /// does not allow moving a field out of a type that implements `Drop`, only
+    /// taking it through `Option::take`. Always `Some` from construction until
+    /// `shutdown_capturing_stderr` takes it; nothing else in this file ever sees it as
+    /// `None`.
+    stderr: Option<StderrTap>,
 }
 
 impl Drop for ProxyProcess {
@@ -352,6 +489,12 @@ impl Drop for ProxyProcess {
         let _ = self.child.kill(); // it-allow: no-swallowed-error reason: best-effort safety net for a test that panicked before calling shutdown(); killing an already-exited process is expected to fail and changes nothing
         let _ = self.child.wait(); // it-allow: no-swallowed-error reason: reaps the process so it does not become a zombie; a failure here means it was already reaped
         let _ = std::fs::remove_dir_all(&self.cfg_dir); // it-allow: no-swallowed-error reason: best-effort test fixture cleanup; a leftover temp directory does not affect any assertion
+        // `self.stderr`'s reader thread is intentionally not joined here: `self.child`
+        // has just been killed and waited on above, which is what closes the pipe it
+        // is blocked reading, so it is seconds (in practice, microseconds) from
+        // returning on its own; this path only runs when a test panicked or otherwise
+        // never called shutdown(), so nothing is waiting on its final content the way
+        // shutdown_capturing_stderr's caller is.
     }
 }
 
@@ -363,8 +506,9 @@ impl ProxyProcess {
     }
 
     /// Sends SIGTERM, waits (up to ten seconds) for exit, and returns the exit status
-    /// together with everything the child wrote to stderr. Used by the tests that
-    /// must inspect the shutdown log line rather than only the exit code.
+    /// together with everything the child wrote to stderr, from the moment
+    /// `spawn_proxy_with_mode` spawned it. Used by the tests that must inspect the
+    /// shutdown log line rather than only the exit code.
     pub(crate) fn shutdown_capturing_stderr(mut self) -> (ExitStatus, String) {
         let pid = self.child.id();
         // `Child::kill()` only sends SIGKILL; SIGTERM (the graceful-drain trigger) has
@@ -376,20 +520,19 @@ impl ProxyProcess {
             .arg(pid.to_string())
             .status(); // it-allow: no-swallowed-error reason: a failed signal send means the process will not drain in time, which the bounded wait below turns into a failed exit-status assertion rather than a silent hang
 
-        // Read stderr on its own thread: the read blocks until the pipe closes
-        // (normally at process exit), and running it concurrently with the bounded
-        // wait below means a hanging child cannot block this function forever.
-        let mut pipe = self.child.stderr.take();
-        let reader = std::thread::spawn(move || {
-            let mut buf = String::new();
-            if let Some(p) = pipe.as_mut() {
-                let _ = p.read_to_string(&mut buf); // it-allow: no-swallowed-error reason: a pipe read failure leaves buf short, which the caller's own assertion on its content then fails on
-            }
-            buf
-        });
-
         let status = wait_for_exit(&mut self.child, Duration::from_secs(10));
-        let stderr_text = reader.join().unwrap_or_default();
+        // `self.stderr` has been draining continuously since spawn time, not merely
+        // since this wait started (unlike the read this replaced, which only began
+        // once shutdown was called and could in principle have let the child's stderr
+        // pipe fill up and block it before then). `finish` joins the reader thread,
+        // which the wait above already made bounded: the child has exited, which is
+        // what closes the pipe the thread is blocked reading. `.take()`, not a move
+        // of `self.stderr` directly: see the field's own doc comment for why.
+        let stderr_text = self
+            .stderr
+            .take()
+            .map(StderrTap::finish)
+            .unwrap_or_default();
         (status, stderr_text)
     }
 }
@@ -423,6 +566,12 @@ pub(crate) fn spawn_proxy(cfg_yaml: &str) -> ProxyProcess {
               is undiagnosable; this is the designed failure mode after 3 retries, not a \
               production code path"
 )]
+#[allow(
+    clippy::expect_used,
+    reason = "test-support setup, not itself a #[test] fn (see Origin::start's identical \
+              reasoning); a child spawned two lines above with .stderr(Stdio::piped()) always \
+              has Some(ChildStderr) to take, exactly once, right here"
+)]
 pub(crate) fn spawn_proxy_with_mode(cfg_yaml: &str, mode: &str) -> ProxyProcess {
     let mut last_failure = String::new();
     for _ in 0..3 {
@@ -446,21 +595,31 @@ pub(crate) fn spawn_proxy_with_mode(cfg_yaml: &str, mode: &str) -> ProxyProcess 
             }
         };
 
+        // Taken exactly once, here: everything the child writes to stderr from this
+        // point to its exit flows through this one tap, which both the readiness
+        // check below and (on success) ProxyProcess::shutdown_capturing_stderr read
+        // from, rather than each racing to take child.stderr for themselves. See
+        // StderrTap's own doc comment.
+        let tap = StderrTap::spawn(
+            child
+                .stderr
+                .take()
+                .expect("spawn_proxy_with_mode: child.stderr was piped"),
+        );
+
         let addr = SocketAddr::from(([127, 0, 0, 1], port));
-        if wait_for_connect(addr, Duration::from_secs(5)) {
+        if wait_for_connect(addr, &tap, Duration::from_secs(5)) {
             return ProxyProcess {
                 child,
                 addr,
                 cfg_dir: dir,
+                stderr: Some(tap),
             };
         }
 
         let _ = child.kill(); // it-allow: no-swallowed-error reason: the attempt is being abandoned regardless; a failed kill means it already exited
-        let mut stderr_text = String::new();
-        if let Some(mut stderr) = child.stderr.take() {
-            let _ = stderr.read_to_string(&mut stderr_text); // it-allow: no-swallowed-error reason: best-effort diagnostic capture for the panic message below; a failed read just leaves it empty
-        }
         let _ = child.wait(); // it-allow: no-swallowed-error reason: reaps the abandoned attempt so it does not become a zombie
+        let stderr_text = tap.finish();
         last_failure =
             format!("the proxy did not start listening within 5s; stderr: {stderr_text}");
         let _ = std::fs::remove_dir_all(&dir); // it-allow: no-swallowed-error reason: best-effort test fixture cleanup on a retried attempt; a leftover temp directory does not affect any assertion
@@ -478,7 +637,8 @@ pub(crate) fn spawn_proxy_with_mode(cfg_yaml: &str, mode: &str) -> ProxyProcess 
 )]
 #[allow(
     dead_code,
-    reason = "used by the control-mode tests, which are gated on the control-plane feature"
+    reason = "used by the control-mode tests, which are gated on the control-plane feature; also \
+              by two_children_on_one_port_collide_loudly, which is not"
 )]
 pub(crate) fn spawn_binary(cfg_yaml: &str, mode: &str) -> (Child, PathBuf) {
     let (cfg_path, dir) = write_fixture(cfg_yaml);
@@ -536,22 +696,31 @@ pub(crate) fn spawn_proxy_under_nofile_limit(cfg_yaml: &str, nofile: u32) -> Opt
         env!("CARGO_BIN_EXE_irontraffic"),
         cfg_path.display()
     );
-    let child = Command::new("sh")
+    let mut child = Command::new("sh")
         .arg("-c")
         .arg(&shell_cmd)
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn_proxy_under_nofile_limit: spawn the ulimit-wrapped proxy");
 
+    // See spawn_proxy_with_mode's identical comment: taken exactly once, here.
+    let tap = StderrTap::spawn(
+        child
+            .stderr
+            .take()
+            .expect("spawn_proxy_under_nofile_limit: child.stderr was piped"),
+    );
+
     let addr = SocketAddr::from(([127, 0, 0, 1], port));
     assert!(
-        wait_for_connect(addr, Duration::from_secs(5)),
+        wait_for_connect(addr, &tap, Duration::from_secs(5)),
         "the ulimit-wrapped proxy did not start listening within 5s"
     );
     Some(ProxyProcess {
         child,
         addr,
         cfg_dir: dir,
+        stderr: Some(tap),
     })
 }
 

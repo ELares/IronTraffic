@@ -12,6 +12,7 @@ mod support;
 
 use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, TcpStream};
+use std::process::Child;
 use std::time::Duration;
 
 /// The request every test that does not care about its exact bytes sends.
@@ -24,12 +25,23 @@ const HELLO_RESPONSE: &[u8] =
 /// A minimal valid configuration: one listener, one upstream, and short timeouts so
 /// the tests that exercise deadlines and drains do not have to wait for the
 /// production defaults (a five-minute graceful timeout, a one-minute idle deadline).
+///
+/// `reuseport: false`, unlike `listeners[].reuseport`'s own documented default of
+/// `true`: issue #894 measured that the default lets a `free_local_port` collision (a
+/// concurrent test's proxy drawing the exact same port before this one's child binds
+/// it, issue #888's own measured 264-of-3000 repeat rate) succeed SILENTLY on both
+/// sides, sharing one `SO_REUSEPORT` group with no `EADDRINUSE` for anything to
+/// notice. `false` turns that same collision loud: the losing side's bind fails
+/// outright, which `spawn_proxy_with_mode`'s own existing retry (draw a fresh port,
+/// try again) already handles. See `two_children_on_one_port_collide_loudly` for a
+/// direct demonstration of the mechanism this switches off.
 fn cfg_yaml(upstream_port: u16) -> String {
     format!(
         "apiVersion: irontraffic.io/v1\n\
          listeners:\n\
          \x20\x20- name: web\n\
          \x20\x20\x20\x20bind: \"127.0.0.1:0\"\n\
+         \x20\x20\x20\x20reuseport: false\n\
          upstream:\n\
          \x20\x20address: \"127.0.0.1:{upstream_port}\"\n\
          timeouts:\n\
@@ -53,6 +65,16 @@ fn cfg_yaml_with_max_connections(upstream_port: u16, max_connections: u32) -> St
 /// A configuration with a concrete (non-zero) bind port, for the tests that must
 /// know the listener's address without going through [`support::spawn_proxy`]'s own
 /// port discovery (`control` mode never binds it, so there is nothing to discover).
+///
+/// Deliberately does NOT set `reuseport: false` the way [`cfg_yaml`] now does: its
+/// only caller, `control_mode_binds_nothing_and_exits_zero`, has its own doc comment
+/// with a directly measured (20-of-20, both ways) claim about what flags a REGRESSED
+/// bind attempt would carry if it incorrectly reached `ShardedListener::bind`, and
+/// that measurement was made against THIS function's reuseport default (`true`).
+/// Changing it here would leave that comment's specific numbers describing a
+/// configuration this function no longer produces. `cfg_yaml_with_bind_no_reuseport`,
+/// below, is the `reuseport: false` counterpart for the one test that actually wants
+/// it.
 #[allow(
     dead_code,
     reason = "used only by the control-mode test, which is gated on the control-plane feature"
@@ -63,6 +85,24 @@ fn cfg_yaml_with_bind(bind_port: u16, upstream_port: u16) -> String {
          listeners:\n\
          \x20\x20- name: web\n\
          \x20\x20\x20\x20bind: \"127.0.0.1:{bind_port}\"\n\
+         upstream:\n\
+         \x20\x20address: \"127.0.0.1:{upstream_port}\"\n"
+    )
+}
+
+/// [`cfg_yaml_with_bind`] with `reuseport: false` added, for
+/// `two_children_on_one_port_collide_loudly`: that test needs two children pointed at
+/// the identical, explicit bind port, which `cfg_yaml`'s `bind: "127.0.0.1:0"`
+/// placeholder cannot express, and it needs `reuseport: false` specifically (both
+/// sides) to demonstrate the collision issue #894 fixes, rather than relying on
+/// `cfg_yaml_with_bind`'s unrelated, already-measured default.
+fn cfg_yaml_with_bind_no_reuseport(bind_port: u16, upstream_port: u16) -> String {
+    format!(
+        "apiVersion: irontraffic.io/v1\n\
+         listeners:\n\
+         \x20\x20- name: web\n\
+         \x20\x20\x20\x20bind: \"127.0.0.1:{bind_port}\"\n\
+         \x20\x20\x20\x20reuseport: false\n\
          upstream:\n\
          \x20\x20address: \"127.0.0.1:{upstream_port}\"\n"
     )
@@ -440,12 +480,18 @@ fn still_open(result: &std::io::Result<usize>) -> bool {
 /// is about three orders of magnitude, but the constraint is two-sided and saying only
 /// "keep it small" would mislead the next person.
 ///
-/// The other assertion is a COUNT for the same reason. Nothing orders the two
-/// `try_admit` calls: `reuseport` gives one accept loop per worker racing a shared
-/// registry, and the only tiebreak is a roughly 70 microsecond `connect(2)` head
-/// start, which is precisely what load takes away. Asserting WHICH connection is
-/// admitted asserts the outcome of that race. Asserting that exactly one of them
-/// remains open does not.
+/// The other assertion is a COUNT for the same reason the test body itself does not
+/// assert an identity (see its own comment on that below). Before issue #894,
+/// `reuseport` defaulted to `true` and this listener ran one accept loop per worker,
+/// racing a shared registry with only a `connect(2)` head start (then measured at a
+/// median of about 70 microseconds) to order the two `try_admit` calls. Issue #894
+/// turned `reuseport` off in `cfg_yaml` (see that function's own doc comment, for an
+/// unrelated reason: a silent listen-port collision), which as a side effect also
+/// collapsed this listener to a single accept loop. Whether that loop's own admission
+/// order is now effectively deterministic has not been re-measured here, and this
+/// test does not need an answer either way: asserting WHICH connection is admitted
+/// would still assert something about admission order this test has no business
+/// depending on. Asserting that exactly one of the two remains open does not.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn connection_cap_rejects_the_extra_connection() {
     let origin = support::Origin::start("hello").await;
@@ -460,21 +506,22 @@ async fn connection_cap_rejects_the_extra_connection() {
     let mut a = connect(proxy.addr);
     let mut b = connect(proxy.addr);
 
-    // WHICH connection the cap admits is NOT asserted, deliberately. `reuseport` is
-    // on and the listener runs one accept loop per worker, so N threads race a single
-    // shared registry and nothing orders the two `try_admit` calls except the head
-    // start of one `connect(2)`, measured at a median of about 70 microseconds. Under
-    // load that head start is exactly what gets lost, so a test that names one of them
-    // as the admitted connection is asserting the outcome of a race.
+    // WHICH connection the cap admits is NOT asserted, deliberately. See this test's
+    // own module-level doc comment above for why: before issue #894 `reuseport`
+    // defaulted to true, giving one accept loop per worker racing a shared registry;
+    // #894 turned it off (an unrelated fix for a silent listen-port collision), which
+    // collapsed this listener to a single accept loop. This test does not depend on
+    // whether that single loop's admission order is now deterministic.
     //
-    // A previous revision did exactly that and simply relocated its own flake: when
-    // the second connection won, the cap still refused exactly one, the counter still
-    // read 1, and the identity assertion failed instead. Reproduced at 14 of 25 with
-    // the two connects barrier-synchronised.
+    // A previous revision asserted identity anyway (under the old, reuseport-true
+    // configuration) and simply relocated its own flake: when the second connection
+    // won, the cap still refused exactly one, the counter still read 1, and the
+    // identity assertion failed instead. Reproduced at 14 of 25 with the two connects
+    // barrier-synchronised.
     //
     // The property that actually matters is a COUNT, not an identity: offered two
     // against `max_connections: 1`, the cap must admit exactly one and refuse exactly
-    // one. Both assertions below are invariant under the race.
+    // one. Both assertions below are invariant either way.
     let mut buf_a = [0_u8; 16];
     let mut buf_b = [0_u8; 16];
     a.set_read_timeout(Some(Duration::from_millis(200)))
@@ -834,4 +881,145 @@ async fn connection_cap_is_clamped_to_the_descriptor_budget() {
     );
 
     origin.stop().await;
+}
+
+/// 15. `wait_for_connect_rejects_a_foreign_listener`: issue #894, item 1.
+///
+/// `support::wait_for_connect` used to report ready the moment a bare TCP connect
+/// succeeded, which is satisfied by ANY listener on that address, not only the child
+/// it was polling for. This bound a real, measured flake: `free_local_port` releases
+/// its port before the intended child ever binds it (issue #888's own measured
+/// 264-of-3000 repeat rate on Linux), so a concurrent test's listener can occupy the
+/// exact same address in that window, `wait_for_connect` reports ready against IT, and
+/// a later, genuine connect then fails once that unrelated listener has gone away.
+///
+/// This test does not need a second real process to stand in for "some other test's
+/// listener": a plain, in-process [`std::net::TcpListener`] is a real, working
+/// listener that answers every connect, which is the only property `wait_for_connect`
+/// used to check. Pairing it with an EMPTY source (never containing the `"listener
+/// bound"` line the real production binary logs on a successful bind) proves the
+/// connect succeeding is not enough on its own; pairing the SAME listener with a
+/// source that DOES contain the line proves the check is not simply, and
+/// uselessly, always false regardless of what it is given.
+#[test]
+fn wait_for_connect_rejects_a_foreign_listener() {
+    let foreign = std::net::TcpListener::bind("127.0.0.1:0")
+        .expect("wait_for_connect_rejects_a_foreign_listener: bind the foreign listener");
+    let addr = foreign
+        .local_addr()
+        .expect("wait_for_connect_rejects_a_foreign_listener: read the foreign listener's address");
+
+    // EOF on the very first read: its snapshot is always empty and can never contain
+    // "listener bound". Stands in for a foreign listener's stderr, which never
+    // contains this workspace's own log output at all.
+    let silent = support::StderrTap::spawn(std::io::empty());
+    let ready = support::wait_for_connect(addr, &silent, Duration::from_millis(300));
+    assert!(
+        !ready,
+        "wait_for_connect must not report ready against a listener whose source never \
+         logged \"listener bound\", even though a bare connect to it succeeds"
+    );
+
+    // The SAME listener, now paired with a source that DOES contain the line: this
+    // rules out the check being unconditionally false regardless of what it is given,
+    // the failure mode a negative-only assertion could otherwise hide.
+    let talkative = support::StderrTap::spawn(std::io::Cursor::new(
+        b"2026-01-01T00:00:00Z INFO irontraffic_conn::listener: listener bound listener=web"
+            .to_vec(),
+    ));
+    let ready = support::wait_for_connect(addr, &talkative, Duration::from_millis(300));
+    assert!(
+        ready,
+        "wait_for_connect must report ready once both a connect succeeds and the given \
+         source's snapshot contains \"listener bound\""
+    );
+
+    drop(foreign);
+}
+
+/// Kills and reaps the wrapped child on drop, including on an unwinding panic.
+///
+/// A raw [`std::process::Child`] from [`support::spawn_binary`] has no such
+/// guarantee on its own: `Child`'s own `Drop` only closes its pipes, never sends a
+/// signal. `two_children_on_one_port_collide_loudly` spawns two children outside
+/// [`support::ProxyProcess`] (which does have exactly this guarantee, but only for a
+/// child that reached it through `spawn_proxy_with_mode`'s own automatic port
+/// discovery, incompatible with this test's need for two children pointed at the
+/// identical, externally chosen port). Without this guard, a failing assertion in
+/// that test would leak a live, listening `irontraffic` process holding a port open
+/// indefinitely, which issue #894's own 300-consecutive-run acceptance loop would
+/// hit on every single failure.
+struct KillOnDrop(Child);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill(); // it-allow: no-swallowed-error reason: best-effort cleanup; a failed kill means the process already exited
+        let _ = self.0.wait(); // it-allow: no-swallowed-error reason: reaps the process so it does not become a zombie
+    }
+}
+
+/// 16. `two_children_on_one_port_collide_loudly`: issue #894, item 2.
+///
+/// With `reuseport: false` (see [`cfg_yaml_with_bind_no_reuseport`] and [`cfg_yaml`]'s
+/// own doc comments), a second child given the exact same listen port as a first,
+/// already-serving child fails loudly with `EADDRINUSE` (`ExitCode::from(5)` in
+/// `serve.rs`'s bind-failure path) rather than silently sharing the listener the way
+/// the previous, `reuseport: true` default let it.
+///
+/// No origin is needed: this test only proves the LISTEN side collides, never forwards
+/// a real request, so a held [`support::dead_local_port`] stands in for the upstream
+/// (same choice, and the same issue #888 reservation reasoning, as
+/// `dead_upstream_closes_the_connection_without_hanging`).
+#[test]
+fn two_children_on_one_port_collide_loudly() {
+    let upstream = support::dead_local_port();
+    // Drawn and released, like every other caller of free_local_port in this file
+    // accepts (issue #888's residual spawn-window race, item 3 of issue #894, left
+    // open rather than closed): the two binds below happen close enough together, and
+    // nothing else in this test binary binds a listening socket in between, that the
+    // window this leaves is not what this test is measuring.
+    let bind_port = support::free_local_port();
+    let addr = SocketAddr::from(([127, 0, 0, 1], bind_port));
+    let cfg = cfg_yaml_with_bind_no_reuseport(bind_port, upstream.port);
+
+    let (raw_a, dir_a) = support::spawn_binary(&cfg, support::DEFAULT_SPAWN_MODE);
+    let mut child_a = KillOnDrop(raw_a);
+    let tap_a = support::StderrTap::spawn(
+        child_a
+            .0
+            .stderr
+            .take()
+            .expect("two_children_on_one_port_collide_loudly: child A's stderr was piped"),
+    );
+    assert!(
+        support::wait_for_connect(addr, &tap_a, Duration::from_secs(5)),
+        "child A did not report itself listening on {addr} within 5s"
+    );
+
+    let (raw_b, dir_b) = support::spawn_binary(&cfg, support::DEFAULT_SPAWN_MODE);
+    let mut child_b = KillOnDrop(raw_b);
+    let (status_b, stderr_b) =
+        support::wait_for_exit_capturing_stderr(&mut child_b.0, Duration::from_secs(5));
+    assert_eq!(
+        status_b.code(),
+        Some(5),
+        "child B must exit with the bind-failure code (5) rather than serve; stderr:\n{stderr_b}"
+    );
+    assert!(
+        stderr_b.to_lowercase().contains("already in use"),
+        "expected an \"already in use\" bind failure in child B's stderr, got:\n{stderr_b}"
+    );
+
+    // Child A is unaffected by child B's failed attempt: a fresh connect to it still
+    // succeeds, proving the FIRST child, not some shared or confused state, is what is
+    // actually still listening.
+    assert!(
+        std::net::TcpStream::connect(addr).is_ok(),
+        "child A must still be accepting connections after child B's failed bind"
+    );
+
+    drop(child_a);
+    drop(child_b);
+    let _ = std::fs::remove_dir_all(&dir_a); // it-allow: no-swallowed-error reason: best-effort test fixture cleanup; a leftover temp directory does not affect any assertion
+    let _ = std::fs::remove_dir_all(&dir_b); // it-allow: no-swallowed-error reason: best-effort test fixture cleanup; a leftover temp directory does not affect any assertion
 }
