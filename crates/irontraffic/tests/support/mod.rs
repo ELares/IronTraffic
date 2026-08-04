@@ -413,11 +413,58 @@ impl StderrTap {
     }
 }
 
+/// Removes ANSI SGR escape sequences (`ESC [ ... <letter>`) from `text`.
+///
+/// `tracing_subscriber`'s default formatter emits them around the message, the
+/// level, the target, and every field name and value, even when stderr is a piped,
+/// non-terminal file descriptor (confirmed by running the binary manually with
+/// stderr redirected to a plain file), which splits an otherwise-contiguous
+/// `key=value` field across several such sequences (`connections_accepted` is one
+/// escape-delimited span, `=` another, the value a third). `logging.rs` is not a
+/// file this issue's table allows touching, so the parsing here tolerates its output
+/// instead of asking it to change.
+///
+/// Lives here, not in `smoke.rs`, because both [`wait_for_connect`] (matching a
+/// `"listener bound"` line's `addr=` field against the address being polled) and
+/// `smoke.rs`'s own field parsing over completed stderr text need it; a single copy
+/// keeps the two from drifting.
+pub(crate) fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for next in chars.by_ref() {
+                if next.is_ascii_alphabetic() {
+                    break; // the final byte of the escape sequence
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+/// Parses `<name>=<value>` out of `line`, stripping ANSI escapes first (see
+/// [`strip_ansi`]'s own doc comment for why that is necessary), and returning
+/// everything up to the next ASCII whitespace character as the value verbatim.
+///
+/// The string-valued counterpart to `smoke.rs`'s own `field_value`, which requires
+/// the value to be all-digit and so cannot parse `addr=127.0.0.1:PORT`.
+pub(crate) fn field_str(line: &str, name: &str) -> Option<String> {
+    let plain = strip_ansi(line);
+    let needle = format!("{name}=");
+    let start = plain.find(&needle)? + needle.len();
+    let rest = &plain[start..];
+    let end = rest.find(char::is_whitespace).unwrap_or(rest.len());
+    rest.get(..end).map(str::to_owned)
+}
+
 /// Polls a TCP connect to `addr` until it succeeds AND the child whose stderr `tap`
-/// drains has itself logged binding that listener, or `timeout` passes.
+/// drains has itself logged binding EXACTLY `addr`, or `timeout` passes.
 ///
 /// A bare connect success is not enough on its own to prove `addr` is served by the
-/// specific child `tap` belongs to. Every caller of this function reaches `addr`
+/// specific child `tap` belongs to. Most callers of this function reach `addr`
 /// through [`free_local_port`], which releases the port the instant it returns (see
 /// that function's own doc comment: 264 of 3000 sequential bind/close pairs repeated a
 /// port on a measured Linux host, the closest repeat 4 calls apart), so a concurrent
@@ -431,16 +478,39 @@ impl StderrTap {
 /// The fix does not need to identify WHICH process owns the responding socket, only
 /// whether THIS function's own child does. `irontraffic_conn::listener::
 /// ShardedListener::bind` logs the literal line `"listener bound"` to stderr on
-/// success, and nothing else in this workspace emits that exact phrase. `tap` is built
-/// once per spawned child and never shared across children (see [`StderrTap`]'s own
-/// doc comment), so a snapshot of it containing that phrase can only mean THIS
-/// function's own child produced it. Checked as a plain substring on the raw,
-/// un-stripped snapshot: `smoke.rs`'s `strip_ansi` exists because
-/// `tracing_subscriber`'s ANSI colouring splits a `key=value` field across several
-/// escape-delimited spans, not because it splits the literal message text itself, and
-/// `shutdown_capturing_stderr`'s own established `"shutdown complete"` /
-/// `"connection cap"` checks elsewhere in this file already rely on exactly that
-/// (matching directly against raw, un-stripped stderr).
+/// success, carrying an `addr=` field naming exactly what it bound, and nothing else
+/// in this workspace emits that exact phrase. `tap` is built once per spawned child
+/// and never shared across children (see [`StderrTap`]'s own doc comment), so a
+/// snapshot of it containing a `"listener bound"` line for `addr` can only mean THIS
+/// function's own child produced it. Matching the `addr=` field, not merely the bare
+/// phrase, additionally scopes this to the SPECIFIC listener a caller is polling for:
+/// a config with more than one listener would otherwise let listener A's line satisfy
+/// a caller polling for listener B, and because the tap's buffer is append-only, a
+/// line from a listener that later died stays visible forever, which is exactly the
+/// shape a port reused by an unrelated process after this child exits would produce
+/// (narrower, but not eliminated by this: see issue #894's own follow-up review for
+/// the residual gap and why closing it needs either a protocol-level identity check
+/// this data-plane does not have, or a platform-specific socket-owner lookup neither
+/// of the two mechanisms below).
+///
+/// Deliberately still a log-derived check, not a nonce the child echoes back or a PID
+/// check against the socket's owner, the two mechanisms issue #894's own Design
+/// section names: a nonce round-trip needs the proxy to speak some control protocol
+/// back to this harness, which does not exist in the data plane this binary actually
+/// runs (adding one would mean writing production protocol code, outside this issue's
+/// `Files` table); a PID check means resolving a bound address back to the owning
+/// process (`/proc/net/tcp` plus `/proc/<pid>/fd`, or platform equivalents), which is
+/// Linux-only and this workspace's own smoke suite is developed and run on macOS too.
+/// The address-scoped log line needs no production change and works identically on
+/// every platform this workspace targets, at the cost of the narrower (not zero) gap
+/// described above.
+///
+/// Checked against the snapshot with [`strip_ansi`] applied first: `field_str`'s own
+/// doc comment explains why a raw, un-stripped match cannot reliably find `addr=`'s
+/// value. The `"listener bound"` phrase itself is contiguous in the raw text (verified
+/// directly: `tracing_subscriber`'s ANSI colouring wraps the message as one span, not
+/// per-word), so stripping first changes nothing about whether that half of the match
+/// succeeds.
 ///
 /// On a child that dies between binding and its first response, or that never binds at
 /// all, this loop simply never observes both conditions and returns `false` once
@@ -448,12 +518,23 @@ impl StderrTap {
 pub(crate) fn wait_for_connect(addr: SocketAddr, tap: &StderrTap, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if std::net::TcpStream::connect(addr).is_ok() && tap.snapshot().contains("listener bound") {
+        if std::net::TcpStream::connect(addr).is_ok() && bound_line_names(tap, addr) {
             return true;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
     false
+}
+
+/// True once `tap`'s snapshot contains a `"listener bound"` line whose own `addr=`
+/// field parses to exactly `addr`. See [`wait_for_connect`]'s own doc comment for why
+/// the address must match rather than only the phrase.
+fn bound_line_names(tap: &StderrTap, addr: SocketAddr) -> bool {
+    let snapshot = tap.snapshot();
+    snapshot.lines().any(|line| {
+        line.contains("listener bound")
+            && field_str(line, "addr").and_then(|s| s.parse::<SocketAddr>().ok()) == Some(addr)
+    })
 }
 
 /// Unique fixture directory names across concurrently running tests.
@@ -699,6 +780,14 @@ pub(crate) fn spawn_proxy_under_nofile_limit(cfg_yaml: &str, nofile: u32) -> Opt
     let mut child = Command::new("sh")
         .arg("-c")
         .arg(&shell_cmd)
+        // Matches spawn_proxy_with_mode's and spawn_binary's identical env_remove:
+        // readiness is now log-derived (wait_for_connect requires an INFO-level
+        // "listener bound" line), so an inherited IRONTRAFFIC_LOG that hides INFO
+        // (warn, error, or a filter like "irontraffic=info" that does not match the
+        // irontraffic_conn::listener target) would make the assert below fail on a
+        // developer machine that happens to have the variable set, even though the
+        // proxy started successfully.
+        .env_remove("IRONTRAFFIC_LOG")
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn_proxy_under_nofile_limit: spawn the ulimit-wrapped proxy");

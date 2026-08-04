@@ -72,9 +72,13 @@ fn cfg_yaml_with_max_connections(upstream_port: u16, max_connections: u32) -> St
 /// bind attempt would carry if it incorrectly reached `ShardedListener::bind`, and
 /// that measurement was made against THIS function's reuseport default (`true`).
 /// Changing it here would leave that comment's specific numbers describing a
-/// configuration this function no longer produces. `cfg_yaml_with_bind_no_reuseport`,
-/// below, is the `reuseport: false` counterpart for the one test that actually wants
-/// it.
+/// configuration this function no longer produces.
+/// `two_children_on_one_port_collide_loudly`, the one test that wants
+/// `reuseport: false` on an explicit bind port, does not go through this function:
+/// it builds straight off [`cfg_yaml`] instead (see that test's own doc comment for
+/// why), which both carries the real `reuseport: false` fixture line issue #894 item
+/// 2 added and, unlike a third, parallel copy of this template would, actually breaks
+/// if that line is ever removed.
 #[allow(
     dead_code,
     reason = "used only by the control-mode test, which is gated on the control-plane feature"
@@ -85,24 +89,6 @@ fn cfg_yaml_with_bind(bind_port: u16, upstream_port: u16) -> String {
          listeners:\n\
          \x20\x20- name: web\n\
          \x20\x20\x20\x20bind: \"127.0.0.1:{bind_port}\"\n\
-         upstream:\n\
-         \x20\x20address: \"127.0.0.1:{upstream_port}\"\n"
-    )
-}
-
-/// [`cfg_yaml_with_bind`] with `reuseport: false` added, for
-/// `two_children_on_one_port_collide_loudly`: that test needs two children pointed at
-/// the identical, explicit bind port, which `cfg_yaml`'s `bind: "127.0.0.1:0"`
-/// placeholder cannot express, and it needs `reuseport: false` specifically (both
-/// sides) to demonstrate the collision issue #894 fixes, rather than relying on
-/// `cfg_yaml_with_bind`'s unrelated, already-measured default.
-fn cfg_yaml_with_bind_no_reuseport(bind_port: u16, upstream_port: u16) -> String {
-    format!(
-        "apiVersion: irontraffic.io/v1\n\
-         listeners:\n\
-         \x20\x20- name: web\n\
-         \x20\x20\x20\x20bind: \"127.0.0.1:{bind_port}\"\n\
-         \x20\x20\x20\x20reuseport: false\n\
          upstream:\n\
          \x20\x20address: \"127.0.0.1:{upstream_port}\"\n"
     )
@@ -151,37 +137,15 @@ fn read_all(stream: &mut TcpStream) -> Vec<u8> {
     out
 }
 
-/// Removes ANSI SGR escape sequences (`ESC [ ... <letter>`) from `text`.
-///
-/// `tracing_subscriber`'s default formatter emits them around the message, the
-/// level, the target, and every field name and value, even when stderr is a piped,
-/// non-terminal file descriptor (confirmed by running the binary manually with
-/// stderr redirected to a plain file), which splits an otherwise-contiguous
-/// `key=value` field across several such sequences (`connections_accepted` is one
-/// escape-delimited span, `=` another, the value a third). `logging.rs` is not a
-/// file this issue's table allows touching, so the parsing here tolerates its output
-/// instead of asking it to change.
-fn strip_ansi(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars();
-    while let Some(c) = chars.next() {
-        if c == '\u{1b}' {
-            for next in chars.by_ref() {
-                if next.is_ascii_alphabetic() {
-                    break; // the final byte of the escape sequence
-                }
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
 /// Parses `<name>=<digits>` out of `line`, tolerant of whatever else the line
 /// contains: a later field addition must not break this.
+///
+/// `support::strip_ansi` (see its own doc comment for why it exists) runs first:
+/// `wait_for_bound_addr`, below, needs the same ANSI-tolerant field parsing to read
+/// the `addr=` field out of a `"listener bound"` line, so that stripping now lives
+/// once, in `support`, rather than as a second, drifting copy here.
 fn field_value(line: &str, name: &str) -> Option<u64> {
-    let plain = strip_ansi(line);
+    let plain = support::strip_ansi(line);
     let needle = format!("{name}=");
     let start = plain.find(&needle)? + needle.len();
     let rest = &plain[start..];
@@ -189,6 +153,98 @@ fn field_value(line: &str, name: &str) -> Option<u64> {
         .find(|c: char| !c.is_ascii_digit())
         .unwrap_or(rest.len());
     rest.get(..end)?.parse().ok()
+}
+
+/// Polls `tap`'s growing snapshot until a `"listener bound"` line names a concrete
+/// address, up to `timeout`, and returns that address.
+///
+/// Exists so `two_children_on_one_port_collide_loudly` can point its second child at
+/// exactly the port the kernel handed the first, discovered from the very log line
+/// `support::wait_for_connect` already treats as this child's own proof of identity,
+/// instead of drawing a second, independent port with `support::free_local_port` and
+/// hoping the two coincide: on a host running other tests that are themselves
+/// drawing and releasing ports concurrently, they can differ, and that mismatch would
+/// be a false collision this test does not exist to prove. Returns `None`, never
+/// panics, once `timeout` elapses with no such line: the caller states what was
+/// actually missing.
+fn wait_for_bound_addr(tap: &support::StderrTap, timeout: Duration) -> Option<SocketAddr> {
+    let deadline = std::time::Instant::now() + timeout;
+    while std::time::Instant::now() < deadline {
+        let snapshot = tap.snapshot();
+        if let Some(addr) = snapshot
+            .lines()
+            .find(|line| line.contains("listener bound"))
+            .and_then(|line| support::field_str(line, "addr"))
+            .and_then(|s| s.parse().ok())
+        {
+            return Some(addr);
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    None
+}
+
+/// Calls `attempt` until it returns anything other than a signal-interrupted read
+/// (`ErrorKind::Interrupted`, `EINTR`), retrying immediately with no added delay.
+///
+/// `Read::read` on a raw `TcpStream` maps to one `recv(2)`: a signal delivered while
+/// that call is blocked aborts it having transferred nothing at all, neither real
+/// bytes nor an EOF determination, so the connection's true state is exactly what it
+/// was the instant before the call, and retrying loses no information already
+/// observed. This matters concretely in this suite: `connection_cap_rejects_the_
+/// extra_connection` runs alongside other tests in the same process that fork and
+/// reap child proxies (`spawn_binary`, `spawn_proxy_with_mode`), and a `SIGCHLD` from
+/// any of them can land mid-`recv` on this test's own, unrelated read. A prior,
+/// un-retried version of this test's read fed that `Interrupted` straight to
+/// `still_open`, which does not match it, scoring a connection that was never
+/// observed to close as "not open" instead: measured directly on Linux, every
+/// failure of this test across a paired 120-run A/B took exactly this shape
+/// (`first=Err(Interrupted)`), on both the pre- and post-#894 binary alike. A larger,
+/// separate 1050-run repetition study reached the same conclusion from the other
+/// direction: none of the three mechanisms issue #894's own Design section names
+/// produced a single failure, while this one and one other, unrelated production
+/// defect (a startup signal-handling gap, filed separately as issue #903 because it
+/// is outside this file's reach) accounted for the entire 51-run residual. Retrying
+/// asks the kernel again and reports whatever it actually says, rather than guessing
+/// "open" or "closed" from a call that answered neither.
+fn retry_on_eintr<T>(mut attempt: impl FnMut() -> std::io::Result<T>) -> std::io::Result<T> {
+    loop {
+        match attempt() {
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            other => return other,
+        }
+    }
+}
+
+/// Proves [`retry_on_eintr`]'s two claims deterministically, with no real socket or
+/// signal involved: it retries exactly the leading run of `Interrupted` results, and
+/// returns the first result that is not `Interrupted` verbatim, without retrying past
+/// it.
+///
+/// This is the discriminating regression test for the fix: reverting
+/// `retry_on_eintr`'s body to a single, un-retried `attempt()` call (the shape
+/// `connection_cap_rejects_the_extra_connection`'s reads had before this issue) makes
+/// `calls` read 1 instead of 3 and `outcome` read `Interrupted` instead of
+/// `WouldBlock`, failing both assertions below.
+#[test]
+fn retry_on_eintr_retries_interrupted_and_returns_the_first_other_result() {
+    let mut calls = 0_u32;
+    let outcome = retry_on_eintr(|| -> std::io::Result<usize> {
+        calls += 1;
+        if calls <= 2 {
+            Err(std::io::Error::from(std::io::ErrorKind::Interrupted))
+        } else {
+            Err(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+        }
+    });
+    assert_eq!(
+        calls, 3,
+        "must retry exactly the two Interrupted results, then stop"
+    );
+    assert!(
+        matches!(&outcome, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock),
+        "must return the first non-Interrupted result verbatim, got {outcome:?}"
+    );
 }
 
 /// 1. `one_request_is_proxied_end_to_end`: the milestone's acceptance test.
@@ -429,6 +485,12 @@ fn dead_local_port_refuses_connects_and_stays_reserved() {
 /// expired with nothing to report. This is the "still open" counterpart to
 /// [`closed_without_hanging`]: the two are never satisfied by the same outcome, so a
 /// connection can be proven open or proven closed, but never both.
+///
+/// Deliberately does not also match `ErrorKind::Interrupted`: an `EINTR` proves
+/// neither "open" nor "closed" (see [`retry_on_eintr`]'s doc comment for why), so
+/// folding it into either classifier here would be a guess dressed as a fact. Every
+/// caller of this function retries a read through `retry_on_eintr` first, which is
+/// what actually keeps `Interrupted` from ever reaching it.
 fn still_open(result: &std::io::Result<usize>) -> bool {
     matches!(
         result,
@@ -528,8 +590,8 @@ async fn connection_cap_rejects_the_extra_connection() {
         .expect("bound the first probe");
     b.set_read_timeout(Some(Duration::from_millis(200)))
         .expect("bound the second probe");
-    let ra = a.read(&mut buf_a);
-    let rb = b.read(&mut buf_b);
+    let ra = retry_on_eintr(|| a.read(&mut buf_a));
+    let rb = retry_on_eintr(|| b.read(&mut buf_b));
 
     // Exactly one of the two must still be open. `still_open` reports a read that
     // TIMED OUT, so "open" is the timeout case and "refused" is a real `Ok(0)`.
@@ -598,7 +660,13 @@ fn control_mode_binds_nothing_and_exits_zero() {
     // Measured directly on Linux 6.8 (20 trials each, raw socket probes against the
     // real option sets involved): a challenger that sets `SO_REUSEADDR` and
     // `SO_REUSEPORT`, which is what `irontraffic-io/src/sys/mod.rs`'s `bind_listener`
-    // always sets before binding, gets `EADDRINUSE` against `dead_local_port`'s socket
+    // sets before binding whenever the listener's own options and the platform's
+    // capability probe both agree (`opts.reuse_port && caps.reuse_port`, and
+    // separately `opts.reuse_addr && caps.reuse_addr`; true of THIS test's config,
+    // `cfg_yaml_with_bind`, which leaves `reuseport` unset and so defaults to `true`,
+    // unlike `cfg_yaml`'s explicit `false` since issue #894, on a Linux host, but not
+    // universally, and specifically not for `cfg_yaml`'s own listener since #894),
+    // gets `EADDRINUSE` against `dead_local_port`'s socket
     // (which sets neither flag, see its own doc comment) whether or not that socket is
     // listening: bind only, 20/20 refused; bind and listen, 20/20 refused. So `bind`
     // above needs no separate re-bind call. But give that SAME incumbent socket
@@ -899,8 +967,19 @@ async fn connection_cap_is_clamped_to_the_descriptor_budget() {
 /// used to check. Pairing it with an EMPTY source (never containing the `"listener
 /// bound"` line the real production binary logs on a successful bind) proves the
 /// connect succeeding is not enough on its own; pairing the SAME listener with a
-/// source that DOES contain the line proves the check is not simply, and
-/// uselessly, always false regardless of what it is given.
+/// source that DOES contain the line, naming this listener's OWN address, proves the
+/// check is not simply, and uselessly, always false regardless of what it is given.
+///
+/// A third case, added alongside the address-scoping fix: a source whose `"listener
+/// bound"` line names a DIFFERENT address must not satisfy this listener's check
+/// either, even though the phrase itself is present. Before that fix,
+/// `wait_for_connect` asked only whether the phrase occurred anywhere in the tap, so a
+/// stale line left over from a since-exited child (a real shape: a config's other
+/// listener, or a port later reused by an unrelated process, see `support::
+/// wait_for_connect`'s own doc comment) could satisfy a caller polling for a
+/// completely different address. This case is what actually catches that: reverting
+/// the address match back to a bare `.contains("listener bound")` makes it pass
+/// (wrongly) instead of failing.
 #[test]
 fn wait_for_connect_rejects_a_foreign_listener() {
     let foreign = std::net::TcpListener::bind("127.0.0.1:0")
@@ -920,18 +999,40 @@ fn wait_for_connect_rejects_a_foreign_listener() {
          logged \"listener bound\", even though a bare connect to it succeeds"
     );
 
-    // The SAME listener, now paired with a source that DOES contain the line: this
-    // rules out the check being unconditionally false regardless of what it is given,
-    // the failure mode a negative-only assertion could otherwise hide.
+    // The SAME listener, now paired with a source that DOES contain the line, naming
+    // this exact address: this rules out the check being unconditionally false
+    // regardless of what it is given, the failure mode a negative-only assertion could
+    // otherwise hide.
     let talkative = support::StderrTap::spawn(std::io::Cursor::new(
-        b"2026-01-01T00:00:00Z INFO irontraffic_conn::listener: listener bound listener=web"
-            .to_vec(),
+        format!(
+            "2026-01-01T00:00:00Z INFO irontraffic_conn::listener: listener bound listener=web \
+             addr={addr} shards=1 reuseport=false"
+        )
+        .into_bytes(),
     ));
     let ready = support::wait_for_connect(addr, &talkative, Duration::from_millis(300));
     assert!(
         ready,
-        "wait_for_connect must report ready once both a connect succeeds and the given \
-         source's snapshot contains \"listener bound\""
+        "wait_for_connect must report ready once a connect succeeds and the given source's \
+         snapshot contains a \"listener bound\" line naming this exact address"
+    );
+
+    // The SAME listener again, but this time the source's line names a DIFFERENT
+    // address: the phrase is present, the connect still succeeds, but the address
+    // does not match, so this must not report ready.
+    let other_addr: SocketAddr = "127.0.0.1:1".parse().expect("parse a throwaway address");
+    let wrong_address = support::StderrTap::spawn(std::io::Cursor::new(
+        format!(
+            "2026-01-01T00:00:00Z INFO irontraffic_conn::listener: listener bound listener=web \
+             addr={other_addr} shards=1 reuseport=false"
+        )
+        .into_bytes(),
+    ));
+    let ready = support::wait_for_connect(addr, &wrong_address, Duration::from_millis(300));
+    assert!(
+        !ready,
+        "wait_for_connect must not report ready when the source's \"listener bound\" line \
+         names a different address ({other_addr}) than the one being polled ({addr})"
     );
 
     drop(foreign);
@@ -960,11 +1061,31 @@ impl Drop for KillOnDrop {
 
 /// 16. `two_children_on_one_port_collide_loudly`: issue #894, item 2.
 ///
-/// With `reuseport: false` (see [`cfg_yaml_with_bind_no_reuseport`] and [`cfg_yaml`]'s
-/// own doc comments), a second child given the exact same listen port as a first,
+/// With `reuseport: false` (see [`cfg_yaml`]'s own doc comment for why that fixture
+/// line exists), a second child given the exact same listen port as a first,
 /// already-serving child fails loudly with `EADDRINUSE` (`ExitCode::from(5)` in
 /// `serve.rs`'s bind-failure path) rather than silently sharing the listener the way
 /// the previous, `reuseport: true` default let it.
+///
+/// Builds its config from [`cfg_yaml`] itself, the same fixture every other test in
+/// this file uses, rather than a third, parallel copy of the YAML template: a helper
+/// that never reads `cfg_yaml`'s own `reuseport: false` line cannot notice if that
+/// line is ever removed, which is exactly the gap an earlier revision of this test
+/// had (deleting the line left the whole suite green, 15/15, because this test read a
+/// different template). Child B's config is child A's own [`cfg_yaml`] output with
+/// the bind placeholder substituted for child A's REAL, kernel-assigned port
+/// (discovered from child A's own `"listener bound"` line via
+/// [`wait_for_bound_addr`]), the identical substitution
+/// `support::spawn_proxy_with_mode` performs for every other test.
+///
+/// Neither child draws a port with `support::free_local_port` first: child A binds
+/// `127.0.0.1:0` directly, so there is no window between drawing a port and a real
+/// listener holding it for a concurrent test to win. This closes a second,
+/// independent flake this test used to have: with a drawn-and-released port, a
+/// concurrent test's own listener could occupy it before child A bound, and this
+/// test's un-retried spawn (unlike `spawn_proxy_with_mode`, which retries) would then
+/// hard-fail on the very port race issue #894 exists to fix, rather than exercising
+/// the collision this test is actually about.
 ///
 /// No origin is needed: this test only proves the LISTEN side collides, never forwards
 /// a real request, so a held [`support::dead_local_port`] stands in for the upstream
@@ -973,14 +1094,7 @@ impl Drop for KillOnDrop {
 #[test]
 fn two_children_on_one_port_collide_loudly() {
     let upstream = support::dead_local_port();
-    // Drawn and released, like every other caller of free_local_port in this file
-    // accepts (issue #888's residual spawn-window race, item 3 of issue #894, left
-    // open rather than closed): the two binds below happen close enough together, and
-    // nothing else in this test binary binds a listening socket in between, that the
-    // window this leaves is not what this test is measuring.
-    let bind_port = support::free_local_port();
-    let addr = SocketAddr::from(([127, 0, 0, 1], bind_port));
-    let cfg = cfg_yaml_with_bind_no_reuseport(bind_port, upstream.port);
+    let cfg = cfg_yaml(upstream.port);
 
     let (raw_a, dir_a) = support::spawn_binary(&cfg, support::DEFAULT_SPAWN_MODE);
     let mut child_a = KillOnDrop(raw_a);
@@ -991,12 +1105,19 @@ fn two_children_on_one_port_collide_loudly() {
             .take()
             .expect("two_children_on_one_port_collide_loudly: child A's stderr was piped"),
     );
+    let addr = wait_for_bound_addr(&tap_a, Duration::from_secs(5)).unwrap_or_else(|| {
+        panic!(
+            "two_children_on_one_port_collide_loudly: child A never logged a \"listener \
+             bound\" address within 5s"
+        )
+    });
     assert!(
         support::wait_for_connect(addr, &tap_a, Duration::from_secs(5)),
         "child A did not report itself listening on {addr} within 5s"
     );
 
-    let (raw_b, dir_b) = support::spawn_binary(&cfg, support::DEFAULT_SPAWN_MODE);
+    let cfg_b = cfg.replace("127.0.0.1:0", &format!("127.0.0.1:{}", addr.port()));
+    let (raw_b, dir_b) = support::spawn_binary(&cfg_b, support::DEFAULT_SPAWN_MODE);
     let mut child_b = KillOnDrop(raw_b);
     let (status_b, stderr_b) =
         support::wait_for_exit_capturing_stderr(&mut child_b.0, Duration::from_secs(5));
