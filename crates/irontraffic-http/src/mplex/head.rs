@@ -1711,4 +1711,61 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn header_list_budget_used_keeps_growing_past_the_first_crossing() {
+        // Reproduces the exact input that broke fuzz_mplex_head.rs's charged()
+        // bound assertion: 100 pairs of (name = "x", value = 630 bytes), which
+        // crosses the byte limit on push 99 and keeps accumulating past it.
+        let limits = Limits::DEFAULT.clamped();
+        let mut arena = BytesMut::new();
+        let mut builder = MplexHeadBuilder::new(&arena, &limits, WireVersion::H2);
+        let name = b"x";
+        let value = vec![b'v'; 630];
+
+        let mut budget_poisoned = false;
+        let mut last_charged_before_limit_check = 0u64;
+        for i in 0..100u32 {
+            let charged_before = builder.charged();
+            let result = builder.push(&mut arena, name, &value);
+            if budget_poisoned {
+                assert!(result.is_err(), "push {i} after poisoning must fail");
+            }
+            if matches!(
+                result,
+                Err(RejectReason::HeaderListTooLarge | RejectReason::FieldCountExceeded)
+            ) {
+                budget_poisoned = true;
+            }
+            if charged_before <= u64::from(limits.max_header_list_bytes) {
+                let bound = u64::from(limits.max_header_list_bytes)
+                    .saturating_add(name.len() as u64)
+                    .saturating_add(value.len() as u64)
+                    .saturating_add(32);
+                assert!(
+                    builder.charged() <= bound,
+                    "guarded bound must hold at push {i}"
+                );
+                last_charged_before_limit_check = builder.charged();
+            }
+        }
+        assert!(
+            budget_poisoned,
+            "100 pushes of 663 bytes each must cross the limit"
+        );
+        // The named proof that the SHIPPED, unguarded assertion was false: the
+        // final charged() value exceeds what the unguarded bound would have
+        // allowed for the LAST pair pushed.
+        let unguarded_bound_for_last_pair = u64::from(limits.max_header_list_bytes)
+            .saturating_add(name.len() as u64)
+            .saturating_add(value.len() as u64)
+            .saturating_add(32);
+        assert!(
+            builder.charged() > unguarded_bound_for_last_pair,
+            "charged() = {}, unguarded bound = {unguarded_bound_for_last_pair}: \
+             this must be strictly greater to prove the unguarded assertion was false",
+            builder.charged()
+        );
+        let _ = last_charged_before_limit_check;
+    }
 }

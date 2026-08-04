@@ -17,10 +17,15 @@
 //! below are about.
 //!
 //! Asserted on every run:
-//! - `charged()` never exceeds `Limits::DEFAULT.max_header_list_bytes` by more
-//!   than one entry's worth: the charge that crosses the limit is recorded and
-//!   then refused, so the bound is `limit + name.len() + value.len() + 32` and
-//!   never more.
+//! - `charged()` is bounded by `Limits::DEFAULT.max_header_list_bytes + one
+//!   entry's worth` up to and including the charge that FIRST crosses the
+//!   byte limit, not for the rest of the sequence: `HeaderListBudget::charge`
+//!   keeps accumulating `used` on every later call once `count` is still
+//!   within `max_field_count`, so `used` is not capped at `limit + one
+//!   entry`, it merely stays above `limit` forever once crossed. Charges
+//!   after the crossing point are therefore not bounded by this assertion,
+//!   though they are provably inert: nothing further is stored, because
+//!   every subsequent charge also fails (see the OTHER assertion below).
 //! - Once a `push` fails with `HeaderListTooLarge` or `FieldCountExceeded`,
 //!   every later `push` in the same sequence also fails. This is narrower
 //!   than "the first `Err` is terminal" (a claim this target's own first
@@ -79,6 +84,16 @@ fuzz_target!(|data: &[u8]| {
 
     let mut budget_poisoned = false;
     for (name, value) in &pairs {
+        // FIXED semantics: capture charged() BEFORE this push. The tight
+        // bound only holds up to and including the charge that first
+        // crosses the byte limit; once already over, `used` keeps growing
+        // on every later charge (`HeaderListBudget::charge` never stops
+        // accumulating once `count` is still within `max_field_count`), so
+        // the bound is not re-checked past that point. The OTHER assertion
+        // below (once poisoned, every later push also fails) is what
+        // proves nothing further gets stored; this one is only about the
+        // `used` counter's own growth up to the crossing charge.
+        let charged_before = builder.charged();
         let result = builder.push(&mut arena, name, value);
         if budget_poisoned {
             assert!(
@@ -93,19 +108,17 @@ fuzz_target!(|data: &[u8]| {
             budget_poisoned = true;
         }
 
-        // Bounded by the limit, not by the input: the charge that crosses the
-        // limit is recorded and then refused, so the running total is never
-        // more than one entry's worth (name + value + the 32-byte per-entry
-        // overhead) past the limit.
-        let max_overshoot = u64::try_from(name.len())
-            .unwrap_or(u64::MAX)
-            .saturating_add(u64::try_from(value.len()).unwrap_or(u64::MAX))
-            .saturating_add(32);
-        assert!(
-            builder.charged()
-                <= u64::from(limits.max_header_list_bytes).saturating_add(max_overshoot),
-            "charged() exceeded the budget by more than one entry's worth for {data:?}"
-        );
+        if charged_before <= u64::from(limits.max_header_list_bytes) {
+            let max_overshoot = u64::try_from(name.len())
+                .unwrap_or(u64::MAX)
+                .saturating_add(u64::try_from(value.len()).unwrap_or(u64::MAX))
+                .saturating_add(32);
+            assert!(
+                builder.charged()
+                    <= u64::from(limits.max_header_list_bytes).saturating_add(max_overshoot),
+                "charged() exceeded the budget by more than one entry's worth for {data:?}"
+            );
+        }
     }
 
     let trust = TrustPolicy::None;

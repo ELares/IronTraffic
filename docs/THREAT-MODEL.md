@@ -505,9 +505,17 @@ different request from the one the peer sent.
 `push` and `finish` after the initial charge is `O(1)` or `O(l + v)` in the pair just charged; nothing
 in this file re-scans the whole accumulated block per pair. A fuzz target
 (`fuzz_targets/fuzz_mplex_head.rs`) asserts, over an arbitrary sequence of decoded pairs, that
-`charged()` never exceeds `max_header_list_bytes` by more than one entry's worth (the charge that
-crosses the limit is itself recorded before being refused) and that the first refusal is terminal for
-the rest of the sequence.
+`charged()` is bounded by `max_header_list_bytes` plus one entry's worth only up to and including the
+charge that first crosses the byte limit, not for the rest of the sequence (`HeaderListBudget::charge`
+keeps accumulating `used` on every later call once the field count is still within `max_field_count`,
+so `used` is not capped at `limit + one entry`, it merely stays above `limit` forever once crossed).
+The terminal property that actually holds is narrower than "the first refusal is terminal": once a
+push fails with `HeaderListTooLarge` or `FieldCountExceeded` specifically, every later push in the
+same sequence also fails, but a push failing for an unrelated, per-pair reason (an invalid field name,
+say) has no bearing on a later, unrelated, well-formed pair. The real memory bound this paragraph
+exists to describe is unaffected by either correction: a failed charge returns before anything is
+stored, so the amplification defense holds regardless; what was wrong was the `charged()` counter's
+own claimed ceiling and the "terminal" wording, not the memory guarantee.
 
 ## Listening sockets and socket options
 
