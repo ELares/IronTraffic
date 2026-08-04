@@ -245,7 +245,12 @@ impl MplexHeadBuilder {
             pseudo: PseudoSlots::default(),
             cookies: CookieAccumulator::new(),
             fields: FieldSectionBuilder::new(arena, limits),
-            scratch: BytesMut::new(),
+            // 128 bytes covers every pseudo-header value plus one unsplit
+            // `cookie` field in this crate's own bench `typical_head()` input
+            // (65 bytes total) with headroom, removing most of `scratch`'s
+            // own regrowth (issue #867). A fixed, one-time reservation, not a
+            // data-dependent one.
+            scratch: BytesMut::with_capacity(128),
             version,
         }
     }
@@ -400,6 +405,16 @@ impl MplexHeadBuilder {
         }
 
         let mut fields = self.fields.finish(arena);
+        // `self.fields.finish(arena)` calls `arena.split_off(self.base)`
+        // internally, which hands the entire remaining spare capacity of
+        // `arena` to the `Bytes` it returns and leaves `arena` with capacity
+        // exactly equal to its current length. Every write into `arena`
+        // after this point (`resolve_scheme_and_path`'s path normalization,
+        // `reconcile_authority`'s authority write, `ForwardedChain::from_section`'s
+        // write) would otherwise start from zero spare capacity and
+        // reallocate independently; this single reserve lets those three
+        // writes share the same growth (issue #867).
+        arena.reserve(256);
 
         // Step 2: method.
         let method_bytes =
