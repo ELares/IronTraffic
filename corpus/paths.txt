@@ -1,0 +1,41 @@
+# corpus/paths.txt: the path corpus.
+#
+# One entry per line: <outcome><TAB><escaped-target>[<TAB><extra>]
+#
+# <outcome> is `ok` or the exact `RejectReason` variant name in PascalCase.
+# Escapes: `\r`, `\n`, `\t`, `\0`, `\\`, and `\xHH`. A line starting with `#`
+# is a comment; an empty line is skipped.
+#
+# <extra> is one of two things, told apart by shape: when it starts with
+# `/` it is the expected NORMALIZED PATH bytes (required on every `ok`
+# entry, itself escaped the same way) under the DEFAULT policy; otherwise it
+# must be one of the five policy names `default`, `keep-dot`, `keep-slash`,
+# `keep-both`, `merge-slashes`, naming a NON-DEFAULT policy to run the entry
+# under, and a fourth field then carries the expected output for an `ok`
+# entry exactly as the third field would for a default-policy row.
+#
+# Driven by crates/irontraffic-http/tests/corpus.rs's `paths` test:
+# NormalizedPath::parse_into under the named policy (default when absent).
+ok	/api/../admin	/admin
+PathEncodedDot	/api/%2e%2e/admin
+PathEncodedDot	/api/%2E%2E/admin
+PathEncodedSlash	/api/..%2fadmin
+PathEncodedSlash	/api/..%5cadmin
+PathEncodedSlash	/api%2fadmin
+PathEncodedNul	/admin%00.txt
+PathPercentTruncated	/admin%
+PathPercentTruncated	/admin%2
+PathPercentInvalidHex	/admin%zz
+ok	//admin	//admin
+ok	/./admin	/admin
+PathTraversalAboveRoot	/a/b/../../../../etc/passwd
+ok	/a/b/..	/a/
+ok	/.	/
+PathTraversalAboveRoot	/..
+ok	/	/
+TargetFragment	/path#frag
+TargetFragment	/path?a=1#frag
+PathInvalidByte	/ path
+PathInvalidByte	/pa\0th
+PathInvalidByte	/pa\x7fth
+PathInvalidByte	/p\xc3\xa4th

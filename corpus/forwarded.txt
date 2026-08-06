@@ -1,0 +1,51 @@
+# corpus/forwarded.txt: the forwarding chain and PROXY protocol corpus.
+#
+# One entry per line: <outcome><TAB><marker><rest>
+#
+# <outcome> is `ok`, `partial`, or a `RejectReason` (for an `f:`/`x:` entry)
+# or `ProxyError` (for a `p:` entry) variant name in PascalCase. Escapes:
+# `\r`, `\n`, `\t`, `\0`, `\\`, and `\xHH`. A line starting with `#` is a
+# comment; an empty line is skipped.
+#
+# <marker> selects the consumer and is always the first two decoded bytes:
+#   - `f:` feeds <rest> to `ForwardedChain::parse_into`'s `forwarded_values`.
+#   - `x:` feeds <rest> to `ForwardedChain::parse_into`'s `xff_values`.
+#   - `p:` feeds <rest> to `ProxyHeader::parse`.
+#
+# For `f:` and `x:`, <rest> is `|`-separated field LINES of the form
+# `<FieldName>: <value>`, matching how the same `#list` field may legally
+# arrive on the wire as several field lines that are semantically one
+# comma-joined list; each segment's value (the text after its own first
+# `:`, with one leading space trimmed) is fed to the matching iterator in
+# order. The ONE exception is the generator marker: <rest> may instead be
+# exactly `@repeat:<token>:<count>`, which expands at test time to <token>
+# repeated <count> times and is fed as the SOLE line for that marker's
+# iterator. This is the only generator marker this corpus uses.
+#
+# For `p:`, <rest> is the raw PROXY protocol header bytes, unmodified. An
+# `ok` `p:` row may carry a third tab-separated field naming the expected
+# `consumed` value: the byte offset where the PROXY header ends and the
+# forwarded HTTP stream begins. `corpus_proxy.rs`'s `proxy` test asserts it
+# when present, so accepting the header at the wrong offset is a failure
+# rather than a pass on bare acceptance.
+#
+# Driven by two tests, both reading this SAME file: `forwarded` (in
+# crates/irontraffic-http/tests/corpus.rs) handles `f:` and `x:` and skips
+# `p:`; `proxy` (in crates/irontraffic-conn/tests/corpus_proxy.rs) handles
+# `p:` and skips `f:`/`x:`. Each asserts it saw at least one line of its own
+# kind.
+ok	x:X-Forwarded-For: a, b|X-Forwarded-For: c
+ForwardedDuplicateParam	f:Forwarded: for=1.2.3.4;for=5.6.7.8
+ok	f:Forwarded: for="[2001:db8::1]:8080"
+ok	f:Forwarded: for=unknown
+ok	f:Forwarded: for=_obfs
+ForwardedBytesLimit	x:@repeat:1.2.3.4,:100000
+ForwardedElementLimit	x:@repeat:1.2.3.4,:33
+ok	p:PROXY TCP4 1.2.3.4 5.6.7.8 1 2\r\n	32
+V1BareLf	p:PROXY TCP4 1.2.3.4 5.6.7.8 1 2\n
+V1LineTooLong	p:PROXY TCP4 aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+ok	p:PROXY UNKNOWN\r\n	15
+V2BadVersion	p:\r\n\r\n\0\r\nQUIT\n\x11\x11\0\x0c\0\0\0\0\0\0\0\0\0\0\0\0
+partial	p:\r\n\r\n\0\r\nQUIT\n!!\0$\0\0\0\0\0\0\0\0\0\0\0\0
+partial	p:\r\n\r\n\0\r\nQUIT\n!\x11\xff\xff\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0
+NotAProxyHeader	p:GET / HTTP/1.1

@@ -1,0 +1,27 @@
+# corpus/chunked.txt: the chunked transfer-coding and trailer corpus.
+#
+# One entry per line: <outcome><TAB><escaped-bytes>[<TAB><extra>]
+#
+# <outcome> is `ok` or the exact `RejectReason` variant name in PascalCase.
+# Escapes: `\r`, `\n`, `\t`, `\0`, `\\`, and `\xHH`. A line starting with `#`
+# is a comment; an empty line is skipped.
+#
+# <extra>, when present on an `ok` entry, is the expected `consumed` value
+# of the final `Done` event (used only by the trailing-garbage row: bytes
+# from that offset onward are not part of this message).
+#
+# Driven by crates/irontraffic-http/tests/corpus.rs's `chunked` test: the
+# whole entry is fed to a fresh `ChunkedDecoder` (default limits,
+# `UnderscorePolicy::Reject`), looping `decode` calls until `Done` or an
+# `Err`.
+ok	1\r\nA\r\n0\r\n\r\n
+ChunkExtInvalid	1;ext="unterminated\r\nA\r\n0\r\n\r\n
+ChunkSizeInvalid	+1\r\nA\r\n0\r\n\r\n
+ChunkSizeInvalid	 1\r\nA\r\n0\r\n\r\n
+ChunkSizeOverflow	FFFFFFFFFFFFFFFFF\r\n
+ChunkTerminatorInvalid	1\rA\r\n0\r\n\r\n
+ChunkTerminatorInvalid	1\r\nA\n0\r\n\r\n
+TrailerFieldForbidden	0\r\nContent-Length: 10\r\n\r\n
+TrailerFieldForbidden	0\r\nHost: evil\r\n\r\n
+TrailerFieldForbidden	0\r\nAuthorization: Bearer x\r\n\r\n
+ok	0\r\n\r\nGARBAGE	5

@@ -1,0 +1,65 @@
+# corpus/h1-heads.txt: the HTTP/1 head corpus.
+#
+# One entry per line: <outcome><TAB><escaped-bytes>[<TAB><extra>]
+#
+# <outcome> is `ok` or the exact `RejectReason` variant name in PascalCase.
+# Escapes in the byte field: `\r`, `\n`, `\t`, `\0`, `\\`, and `\xHH` for any
+# other byte. A line starting with `#` is a comment; an empty line is
+# skipped.
+#
+# <extra>, when present on an `ok` entry, is the expected `consumed` value
+# (used only by the pipelining row: everything from that offset onward is
+# the start of the next, pipelined message).
+#
+# Driven by crates/irontraffic-http/tests/corpus.rs's `h1_heads` test:
+# H1Parser::parse_request_head, then on Complete, canonicalize_request under
+# a fixed H1Context (default limits, default path policy,
+# OtherCodings::Reject, UnderscorePolicy::Reject, Scheme::Https, a fixed
+# socket peer, TrustPolicy::None, no default authority, forward_proxy:
+# false, will_buffer_body: false).
+ContentLengthDuplicate	GET / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\n
+ContentLengthDuplicate	GET / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n
+ContentLengthInvalid	GET / HTTP/1.1\r\nHost: a\r\nContent-Length: 5, 5\r\n\r\n
+ContentLengthInvalid	GET / HTTP/1.1\r\nHost: a\r\nContent-Length: +5\r\n\r\n
+ContentLengthInvalid	GET / HTTP/1.1\r\nHost: a\r\nContent-Length: 0x5\r\n\r\n
+ContentLengthOverflow	GET / HTTP/1.1\r\nHost: a\r\nContent-Length: 18446744073709551616\r\n\r\n
+TransferEncodingWithContentLength	GET / HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n
+TransferEncodingWithContentLength	GET / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nContent-Length: 5\r\n\r\n
+TransferEncodingFinalNotChunked	GET / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: identity\r\n\r\n
+TransferEncodingChunkedRepeated	GET / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked, chunked\r\n\r\n
+TransferEncodingFinalNotChunked	GET / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: gzip\r\n\r\n
+TransferEncodingFinalNotChunked	GET / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunkedX\r\n\r\n
+TransferEncodingFinalNotChunked	GET / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: xchunked\r\n\r\n
+ObsFold	GET / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding:\r\n\tchunked\r\n\r\n
+WhitespaceBeforeColon	GET / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding : chunked\r\n\r\n
+WhitespaceBeforeColon	GET / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding\t: chunked\r\n\r\n
+TransferEncodingOnHttp10	GET / HTTP/1.0\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n
+TransferEncodingUnsupportedCoding	GET / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: \x0bchunked\r\n\r\n
+TransferEncodingUnsupportedCoding	GET / HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\x0c\r\n\r\n
+BareLf	GET / HTTP/1.1\nHost: a\n\n
+BareCr	GET / HTTP/1.1\r\nHost: a\rX: 1\r\n\r\n
+ObsFold	GET / HTTP/1.1\r\nHost: a\r\n Continued\r\n\r\n
+FieldNameEmpty	GET / HTTP/1.1\r\n: novalue\r\nHost: a\r\n\r\n
+FieldNameInvalidByte	GET / HTTP/1.1\r\nHost: a\r\nX\0Y: 1\r\n\r\n
+FieldValueInvalidByte	GET / HTTP/1.1\r\nHost: a\r\nX: va\0lue\r\n\r\n
+BareCr	GET / HTTP/1.1\r\nHost: a\r\nX: va\rlue\r\n\r\n
+BareLf	GET / HTTP/1.1\r\nHost: a\r\nX: va\nlue\r\n\r\n
+ok	GET / HTTP/1.1\r\nHost: a\r\nX:  leading-ows-only \r\n\r\n
+FieldNameInvalidByte	GET / HTTP/1.1\r\nHost: a\r\nX\xffY: 1\r\n\r\n
+HostDuplicate	GET / HTTP/1.1\r\nHost: a\r\nHost: b\r\n\r\n
+HostMissing	GET / HTTP/1.1\r\n\r\n
+RequestLineMalformed	GET /  HTTP/1.1\r\nHost: a\r\n\r\n
+RequestLineMalformed	GET / HTTP/1.1 \r\nHost: a\r\n\r\n
+FieldNameUnderscore	GET / HTTP/1.1\r\nHost: a\r\nX_Forwarded_For: 1.2.3.4\r\n\r\n
+TargetFormInvalid	GET ftp://internal/x HTTP/1.1\r\nHost: a\r\n\r\n
+TargetFormInvalid	GET http://evil.com/path HTTP/1.1\r\nHost: a\r\n\r\n
+ok	OPTIONS * HTTP/1.1\r\nHost: a\r\n\r\n
+TargetFormInvalid	GET * HTTP/1.1\r\nHost: a\r\n\r\n
+ok	GET / HTTP/1.1\r\nHost: a\r\nX: 1\r\n\r\nGET /x HTTP/1.1\r\n	33
+AuthorityInvalidByte	GET / HTTP/1.1\r\nHost: [::1\r\n\r\n
+AuthorityInvalidByte	GET / HTTP/1.1\r\nHost: a b\r\n\r\n
+ok	GET / HTTP/1.1\r\nHost: xn--e1afmkfd.xn--p1ai\r\n\r\n
+AuthorityNonAscii	GET / HTTP/1.1\r\nHost: \xd0\xbf\xd1\x80\xd0\xb8\xd0\xbc\xd0\xb5\xd1\x80.\xd1\x80\xd1\x84\r\n\r\n
+AuthorityPortInvalid	GET / HTTP/1.1\r\nHost: a:99999\r\n\r\n
+AuthorityPortInvalid	GET / HTTP/1.1\r\nHost: a:-1\r\n\r\n
+AuthorityEmpty	GET / HTTP/1.1\r\nHost: \r\n\r\n
