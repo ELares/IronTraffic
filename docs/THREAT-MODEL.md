@@ -505,9 +505,27 @@ different request from the one the peer sent.
 `push` and `finish` after the initial charge is `O(1)` or `O(l + v)` in the pair just charged; nothing
 in this file re-scans the whole accumulated block per pair. A fuzz target
 (`fuzz_targets/fuzz_mplex_head.rs`) asserts, over an arbitrary sequence of decoded pairs, that
-`charged()` never exceeds `max_header_list_bytes` by more than one entry's worth (the charge that
-crosses the limit is itself recorded before being refused) and that the first refusal is terminal for
-the rest of the sequence.
+`charged()` is bounded by `max_header_list_bytes` plus one entry's worth only up to and including the
+charge that first crosses the byte limit, not for the rest of the sequence (`HeaderListBudget::charge`
+keeps accumulating `used` on every later call once the field count is still within `max_field_count`,
+so `used` is not capped at `limit + one entry`, it merely stays above `limit` forever once crossed).
+The terminal property that actually holds is narrower still. `FieldCountExceeded` has two independent
+sources: the header-list budget's own field-count ceiling (`HeaderListBudget::charge`'s count check,
+which runs first, unconditionally, on every push, before `used` is touched), and `CookieAccumulator`'s
+own, separate `MAX_COOKIE_CRUMBS` ceiling (256 crumbs), reached only for a `cookie` push whose charge
+against the header-list budget already succeeded. Once a push fails with `HeaderListTooLarge`, or with
+`FieldCountExceeded` that the budget's own field-count check raised, every later push in the same
+sequence also fails, because the budget's `used` and `count` are both monotonically non-decreasing once
+past their limits. A `FieldCountExceeded` from `CookieAccumulator`'s ceiling is different: it leaves the
+budget's `used` and `count` exactly where they were, so a later, non-cookie push can still be charged
+and stored; refusing the 257th `cookie` crumb says nothing about whether the very next, unrelated field
+succeeds. (`CookieAccumulator`'s own ceiling is itself monotone, so a 258th `cookie` crumb is refused
+again, for the same reason; only a DIFFERENT field name gets through.) A push failing for a per-pair
+reason unrelated to either budget, an invalid field name say, likewise has no bearing on a later,
+unrelated, well-formed pair. The real memory bound this paragraph exists to describe is unaffected by
+any of this: a failed charge, wherever it originates, always returns before anything is stored for that
+push, so the amplification defense holds regardless; what was wrong was the `charged()` counter's own
+claimed ceiling and the "terminal" wording, not the memory guarantee.
 
 ## Listening sockets and socket options
 
